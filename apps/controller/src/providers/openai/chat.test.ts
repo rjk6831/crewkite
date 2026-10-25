@@ -593,8 +593,8 @@ test('an image or audio file goes as a local input only to a model that takes it
     listed?: boolean;
   }> = [
     {
-      // An earlier image goes as a path line, so a text-only model runs the turn and the model
-      // list is never read. A missing earlier file is named the same way.
+      // An earlier image is listed in the packet, so a text-only model runs the turn, the model
+      // list is never read, and the request adds no line of its own.
       files: [
         { ...png, earlier: true },
         { ...missing, earlier: true },
@@ -605,7 +605,7 @@ test('an image or audio file goes as a local input only to a model that takes it
       input: [
         {
           type: 'text',
-          text: `${systemContext}\n\n${prompt}\n\nAttached earlier: screen.png (image/png, 10 bytes) at ${png.path}\nAttached earlier: screen.png (image/png, 10 bytes) at ${missing.path}`,
+          text: `${systemContext}\n\n${prompt}`,
         },
       ],
     },
@@ -618,7 +618,7 @@ test('an image or audio file goes as a local input only to a model that takes it
         { type: 'localAudio', path: voice.path },
         {
           type: 'text',
-          text: `${systemContext}\n\n${prompt}\n\nAttached file: spec.pdf (application/pdf, 8 bytes) at ${pdf.path}`,
+          text: `${systemContext}\n\n${prompt}\n\nFiles attached to this message:\nscreen.png, image/png, 10 bytes, sent as an image input above\nspec.pdf, application/pdf, 8 bytes, Path: ${pdf.path}\ncall.ogg, audio/ogg, 8 bytes, sent as an audio input above`,
         },
       ],
     },

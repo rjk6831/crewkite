@@ -31,6 +31,7 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
+import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
@@ -377,6 +378,7 @@ function openStored(path: string) {
  */
 function userMessage(text: string, files: readonly TurnFile[], staging: string) {
   const blocks: unknown[] = [];
+  let body = text;
   const lines: string[] = [];
   let room = NATIVE_BYTES;
   let staged = false;
@@ -391,13 +393,13 @@ function userMessage(text: string, files: readonly TurnFile[], staging: string) 
   };
   for (const file of files) {
     const { attachment, path } = file;
-    const about = `${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes)`;
+    // The packet lists an earlier file by its stored path. The client reads only the staged copy.
     if (file.earlier) {
       let target: string | null = null;
       try {
         if (isAbsolute(path)) target = stage(file);
       } catch {}
-      lines.push(target ? `Attached earlier: ${about} at ${target}` : `Attached earlier: ${about}`);
+      body = body.replaceAll(`Path: ${path}`, target ? `Path: ${target}` : 'not available');
       continue;
     }
     const type = attachment.mimeType.split(';')[0].trim().toLowerCase();
@@ -439,7 +441,15 @@ function userMessage(text: string, files: readonly TurnFile[], staging: string) 
               source: { type: 'text', media_type: 'text/plain', data: utf8.decode(bytes) },
             };
           } catch {}
-        if (block) room -= opened.size;
+        if (block) {
+          room -= opened.size;
+          lines.push(
+            attachedLine(
+              attachment,
+              `sent as ${kind === 'image' ? 'an image block' : kind === 'pdf' ? 'a PDF document block' : 'a text document block'} above`,
+            ),
+          );
+        }
       }
     } finally {
       closeSync(opened.fd);
@@ -454,11 +464,13 @@ function userMessage(text: string, files: readonly TurnFile[], staging: string) 
     } catch {
       throw new UnreadableFile(attachment.name);
     }
-    lines.push(`Attached file: ${about} at ${target}`);
+    lines.push(attachedLine(attachment, `Path: ${target}`));
   }
-  const body = [text, lines.join('\n')].filter(Boolean).join('\n\n');
   return {
-    content: [...blocks, { type: 'text', text: body }],
+    content: [
+      ...blocks,
+      { type: 'text', text: [body, attachedSection(lines)].filter(Boolean).join('\n\n') },
+    ],
     native: blocks.length > 0,
     folders: staged ? [staging] : [],
   };

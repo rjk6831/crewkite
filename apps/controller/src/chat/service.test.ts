@@ -825,7 +825,7 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${thread.turns[2].id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];
   assert.match(request.prompt, /moved from OpenAI to Google\. Reason: usage limit reached\./);
-  assert.match(request.prompt, /New message:\nFix the rounding\./);
+  assert.match(request.prompt, /New message from the person:\nFix the rounding\./);
   assert.match(request.prompt, /^net\.mjs \+1 -0$/m);
   assert.match(request.prompt, /^\+\/\/ half done$/m);
   assert.match(
@@ -1862,7 +1862,7 @@ test('send now stops the running turn and starts the queued message with its pac
   const packet = scripted.requests[1].prompt;
   assert.match(packet, /^The last reply on OpenAI was stopped before it finished\./m);
   assert.match(packet, /^OpenAI ended its last turn early\. Reason: stopped by the person\.$/m);
-  assert.match(packet, /New message:\nThird\.$/);
+  assert.match(packet, /New message from the person:\nThird\.$/);
   assert.equal(scripted.requests[2].prompt, 'Second.');
 });
 
@@ -1986,7 +1986,7 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   assert.deepEqual(readdirSync(dirname(dirname(path))), [file.id]);
   assert.deepEqual(readdirSync(dirname(path)), ['chart.png']);
 
-  // Try with Google takes the handoff path, and the packet names the file it carries.
+  // Try with Google takes the handoff path, and the file travels in the request's files.
   const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
   const retry = (mode: 'retry' | 'regenerate', turnId: string, choice?: ChatModelSelection) =>
     act(store, (effects) =>
@@ -2001,7 +2001,8 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   const requests = (adapters.get('google')?.requests ?? []) as ChatTurnRequest[];
   const [carried] = requests;
   assert.match(carried.prompt, /^This thread moved from OpenAI to Google\./);
-  assert.match(carried.prompt, /^chart\.png \(image\/png, 40 bytes\)$/m);
+  // The adapter lists the file of the message itself under the text, so the packet holds no line for it.
+  assert.doesNotMatch(carried.prompt, /chart\.png/);
   assert.deepEqual(carried.files, sent.files);
 
   // Regenerate keeps the first reply. The rerun starts a fresh session, since the old one holds
@@ -2013,7 +2014,7 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   await regenerated;
   const again = requests[1];
   assert.match(again.prompt, /^This message runs again on Google in a new session\./);
-  assert.match(again.prompt, /New message:\nWhat is in this chart\?$/);
+  assert.match(again.prompt, /New message from the person:\nWhat is in this chart\?$/);
   assert.equal(again.session, null);
   assert.deepEqual(again.files, sent.files);
   const thread = read();
@@ -2066,7 +2067,7 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
       assert.deepEqual(request.history, [], family);
       assert.match(request.prompt, /^This message runs again on .+ in a new session\./, family);
       assert.match(request.prompt, /^Person:\nFirst\.\n\nAssistant:\nOne\.$/m, family);
-      assert.match(request.prompt, /New message:\nSecond\.$/, family);
+      assert.match(request.prompt, /New message from the person:\nSecond\.$/, family);
       assert.doesNotMatch(request.prompt, /Two\./, family);
     }
   }
@@ -2125,6 +2126,21 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   assert.deepEqual(names(families.get('openai')?.requests[2] as ScriptedChatRequest), [
     'n33.txt earlier',
   ]);
+  // The handoff packet lists the earlier files once, ahead of the message, and not the file the
+  // message itself carries.
+  const sentToGoogle = families.get('google')?.requests[0] as unknown as ChatTurnRequest;
+  const packetText = sentToGoogle.prompt;
+  assert.equal(
+    packetText.match(
+      /^n\d+\.txt, text\/plain, .*came with "Read these\.", sent as a file link below$/gm,
+    )?.length,
+    32,
+  );
+  assert.ok(
+    packetText.indexOf('Files attached earlier in this thread.') <
+      packetText.indexOf('New message from the person:'),
+  );
+  assert.doesNotMatch(packetText, /^n33\.txt/m);
 });
 
 test('rename sets the thread title, and delete removes the thread, its scratch copy and files for good', {

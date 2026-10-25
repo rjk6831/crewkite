@@ -165,6 +165,7 @@ function run(
   permissionPolicy: ChatPermissionPolicy = 'ask',
   effort: ChatEffort = 'default',
   files: File[] = [],
+  message = prompt,
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
   mkdirSync(join(root, 'scratch'));
@@ -193,7 +194,7 @@ function run(
     taskId: 'tsk_00000000000000000000000001',
     role: 'assistant',
     selection: { family: 'anthropic', model, effort },
-    prompt,
+    prompt: message,
     systemContext,
     history: [],
     session,
@@ -589,6 +590,7 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     badge?: string;
     effort?: ChatEffort;
     files?: File[];
+    message?: string;
     content?: unknown[] | ((work: string) => unknown[]);
   }> = [
     { session: null, argv: base, text: `${systemContext}\n\n${prompt}`, id: fresh },
@@ -645,28 +647,37 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
         },
         {
           type: 'text',
-          text: `${framed}\n\nAttached file: plan.xlsx (application/vnd.ms-excel, 8 bytes) at ${copy(work, sheet)}`,
+          text: `${framed}\n\nFiles attached to this message:\nscreen.png, image/png, 7 bytes, sent as an image block above\nplan.xlsx, application/vnd.ms-excel, 8 bytes, Path: ${copy(work, sheet)}\nspec.pdf, application/pdf, 13 bytes, sent as a PDF document block above\nnotes.md, text/markdown; charset=utf-8, 16 bytes, sent as a text document block above`,
         },
       ],
     },
     {
-      // An earlier file goes as a path line whatever its type. A PDF past the block budget goes
-      // as a path line and is never read.
+      // An earlier file is listed in the packet by its stored path, and the client gets the staged
+      // copy's path in its place. A PDF past the block budget goes as a path line and is never read.
       session: null,
       argv: (work) => [...base, '--add-dir', join(work, 'files')],
       text: framed,
       id: fresh,
       files: [{ ...pdf, earlier: true }, large],
+      message: `${prompt}\n\nspec.pdf, application/pdf, 13 bytes, came with "the spec", Path: ${pdf.path}`,
       content: (work) => [
         {
           type: 'text',
-          text: `${framed}\n\nAttached earlier: spec.pdf (application/pdf, 13 bytes) at ${copy(work, pdf)}\nAttached file: large.pdf (application/pdf, 26214400 bytes) at ${copy(work, large)}`,
+          text: `${framed}\n\nspec.pdf, application/pdf, 13 bytes, came with "the spec", Path: ${copy(work, pdf)}\n\nFiles attached to this message:\nlarge.pdf, application/pdf, 25.0 MiB, Path: ${copy(work, large)}`,
         },
       ],
     },
   ];
   for (const row of rows) {
-    const turn = run(streamed(row.id, row.reported), row.session, [], 'ask', row.effort, row.files);
+    const turn = run(
+      streamed(row.id, row.reported),
+      row.session,
+      [],
+      'ask',
+      row.effort,
+      row.files,
+      row.message,
+    );
     t.after(turn.cleanup);
     const result = await turn.handle.result;
     const resolved = (value: unknown) => (typeof value === 'function' ? value(turn.work) : value);

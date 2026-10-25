@@ -36,6 +36,8 @@ export type ChatTurnRequest = Readonly<{
      * or link, and never refuse the turn over it.
      */
     earlier?: boolean;
+    /** For an earlier file: a short quote of the message it came with. */
+    came?: string;
   }>[];
   /** CrewKite's framing for the model: project, scratch rules, what to do with results. */
   systemContext: string;

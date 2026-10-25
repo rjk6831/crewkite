@@ -4,7 +4,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type { ChatFamily } from '@crewkite/contracts';
-import { instructionFiles, systemContext } from './prompt.ts';
+import {
+  attachedLine,
+  attachedSection,
+  type EarlierFile,
+  earlierReach,
+  handoffPacket,
+  instructionFiles,
+  systemContext,
+} from './prompt.ts';
 
 const [shared, anthropic, google] = instructionFiles;
 
@@ -46,4 +54,97 @@ test('instruction files reach Anthropic and Local only, a link counts once, and 
   const section = cut.slice(cut.indexOf(`Project instructions from ${shared}:`));
   assert.ok(Buffer.byteLength(section) < 64 * 1024 + 100);
   assert.match(section, /x{99}\n\[The project instructions stop here at the 64 KiB limit\.\]$/);
+});
+
+test('a request holds the new message once and lists each file once, in the section its message owns', () => {
+  const file = (name: string, mimeType: string, bytes: number) => ({ name, mimeType, bytes });
+  const old = file('old.png', 'image/png', 2048);
+  const fresh = file('fresh.pdf', 'application/pdf', 100);
+  const earlier = (to: ChatFamily): EarlierFile[] => [
+    {
+      attachment: old,
+      came: 'the first screenshot',
+      reach: earlierReach(to, '/home/files/old.png'),
+    },
+  ];
+  const message = 'Compare the two.';
+  // The adapter adds the lines for the message's own files directly under the text.
+  const request = (to: ChatFamily, files: EarlierFile[], own: string[], packet: boolean) => {
+    const text = packet
+      ? handoffPacket({
+          from: 'openai',
+          to,
+          reason: 'manual',
+          history: [{ role: 'user', text: 'Look at this.' }],
+          files: [],
+          prompt: message,
+          earlier: files,
+        })
+      : message;
+    return [text, attachedSection(own)].filter(Boolean).join('\n\n');
+  };
+  const own = [attachedLine(fresh, 'Path: /home/files/fresh.pdf')];
+  const rows: {
+    label: string;
+    text: string;
+    names: string[];
+    heading: boolean;
+    before: boolean;
+  }[] = [
+    {
+      label: 'no earlier files',
+      text: request('anthropic', [], [], true),
+      names: [],
+      heading: false,
+      before: true,
+    },
+    {
+      label: 'earlier plus one new',
+      text: request('anthropic', earlier('anthropic'), own, true),
+      names: ['old.png', 'fresh.pdf'],
+      heading: true,
+      before: true,
+    },
+    {
+      label: 'Local sees the packet side only',
+      text: request('local', earlier('local'), [], true),
+      names: ['old.png'],
+      heading: true,
+      before: true,
+    },
+    {
+      label: 'same-family resume carries no earlier list',
+      text: request('openai', earlier('openai'), own, false),
+      names: ['fresh.pdf'],
+      heading: false,
+      before: false,
+    },
+  ];
+  for (const { label, text, names, heading, before } of rows) {
+    const marker = 'New message from the person:';
+    const packet = before ? 1 : 0;
+    assert.equal(text.split(message).length - 1, 1, label);
+    assert.equal(text.split(marker).length - 1, packet, label);
+    // A path ends in the name, so a file counts by the lines that start with it.
+    for (const name of names)
+      assert.equal(
+        text.split('\n').filter((line) => line.startsWith(`${name},`)).length,
+        1,
+        `${label} ${name}`,
+      );
+    const earlierHeading =
+      'Files attached earlier in this thread. They are not part of the new message.';
+    assert.equal(text.includes(earlierHeading), heading, label);
+    if (heading) assert.ok(text.indexOf(earlierHeading) < text.indexOf(marker), label);
+    if (names.includes('fresh.pdf'))
+      assert.ok(text.indexOf(message) < text.indexOf('Files attached to this message:'), label);
+  }
+  assert.match(
+    request('anthropic', earlier('anthropic'), [], true),
+    /old\.png, image\/png, 2\.0 KiB, came with "the first screenshot", Path: \/home\/files\/old\.png/,
+  );
+  assert.match(
+    request('local', earlier('local'), [], true),
+    /came with "the first screenshot", not sent to Local/,
+  );
 });

@@ -98,8 +98,9 @@ import {
 import { scratchPath } from './local-tools.ts';
 import {
   adviceContext,
-  byteSize,
   challengeContext,
+  earlierFileLine,
+  earlierReach,
   familyName,
   fixerBrief,
   type HandoffReason,
@@ -2082,7 +2083,17 @@ export class ChatService {
         files: [...changeList(changes), ...stopped, ...patches, ...checks],
         prompt: input.prompt,
         instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
-        attachments: input.files.map((file) => file.attachment),
+        earlier: input.files.flatMap((file) =>
+          file.earlier
+            ? [
+                {
+                  attachment: file.attachment,
+                  came: file.came ?? '',
+                  reach: earlierReach(turn.selection.family, file.path),
+                },
+              ]
+            : [],
+        ),
       });
     const room = PACKET_BYTES - Buffer.byteLength(build([], []));
     const patches = changes
@@ -2158,6 +2169,7 @@ export class ChatService {
     message: ConversationEntry,
     carries: boolean,
     resumed: ChatFamily | null,
+    since?: bigint,
   ): NonNullable<ChatTurnRequest['files']> {
     const own = message.kind === 'user-message' ? (message.files ?? []) : [];
     const key = (attachment: ChatAttachment) => `${attachment.id}/${attachment.name}`;
@@ -2173,16 +2185,17 @@ export class ChatService {
     if (!carries) return files;
     const earlier: typeof files = [];
     let listed = 0;
-    for (const attachment of this.earlierFiles(taskId, message.cursor, resumed)) {
+    for (const { attachment, came } of this.earlierFiles(taskId, message.cursor, resumed, since)) {
       if (earlier.length === EARLIER_FILES) break;
       if (seen.has(key(attachment))) continue;
       seen.add(key(attachment));
       const stored = this.storedAttachment(taskId, attachment);
       if (!stored) continue;
-      const { name, mimeType, bytes } = stored.attachment;
-      listed += Buffer.byteLength(`${name} (${mimeType}, ${byteSize(bytes)})\n`);
+      listed += Buffer.byteLength(
+        `${earlierFileLine({ attachment: stored.attachment, came, reach: `Path: ${stored.path}` })}\n`,
+      );
       if (listed > EARLIER_FILE_LINE_BYTES) break;
-      earlier.push({ ...stored, earlier: true });
+      earlier.push({ ...stored, earlier: true, came });
     }
     return [...earlier.reverse(), ...files];
   }
@@ -2203,27 +2216,30 @@ export class ChatService {
   }
 
   /**
-   * Files on the user messages inside the packet's transcript window, newest first. With a
-   * resumed session, the messages a writing turn on its family ran are left out.
+   * Files on the user messages inside the packet's transcript window, newest first, each with a
+   * short quote of its message. With a resumed session, the messages a writing turn on its family
+   * ran are left out, and `since` leaves out messages at or before that sequence.
    */
   private earlierFiles(
     taskId: string,
     beforeCursor: string,
     resumed: ChatFamily | null,
-  ): ChatAttachment[] {
+    since = 0n,
+  ): { attachment: ChatAttachment; came: string }[] {
     const ran = this.deps.store.db.prepare(
       "SELECT 1 FROM chat_turns WHERE task_id=? AND json_extract(body,'$.userMessageId')=? AND json_extract(body,'$.selection.family')=? AND json_extract(body,'$.role') IN ('assistant','fixer')",
     );
     return this.deps.store.db
       .prepare(
-        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence<? AND json_extract(body,'$.kind') IN ('user-message','chat-assistant') ORDER BY sequence DESC LIMIT ?",
+        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence<? AND sequence>? AND json_extract(body,'$.kind') IN ('user-message','chat-assistant') ORDER BY sequence DESC LIMIT ?",
       )
-      .all(taskId, BigInt(beforeCursor), HISTORY_LIMIT)
+      .all(taskId, BigInt(beforeCursor), since, HISTORY_LIMIT)
       .flatMap((row) => {
         const entry = ConversationEntrySchema.parse(JSON.parse(row.body as string));
         if (entry.kind !== 'user-message') return [];
         if (resumed && ran.get(taskId, entry.id, resumed)) return [];
-        return [...(entry.files ?? [])].reverse();
+        const came = clip(entry.text.replace(/\s+/g, ' ').trim(), 60);
+        return [...(entry.files ?? [])].reverse().map((attachment) => ({ attachment, came }));
       });
   }
 

@@ -17,6 +17,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import type { Schedule } from '../../host/worker.ts';
 import {
@@ -357,7 +358,10 @@ function promptBlocks(
 ) {
   const blocks: PromptBlock[] = [{ type: 'text', text }];
   const linked: string[] = [];
-  let bytes = Buffer.byteLength(JSON.stringify(blocks));
+  const lines: string[] = [];
+  // The lines for this message's files join the text block last, so their size is held back now.
+  let bytes =
+    Buffer.byteLength(JSON.stringify(blocks)) + files.filter((file) => !file.earlier).length * 1024;
   const fits = (block: PromptBlock) => bytes + Buffer.byteLength(JSON.stringify(block)) + 1;
   for (const { attachment, path, earlier } of files) {
     const { mimeType, name } = attachment;
@@ -420,7 +424,19 @@ function promptBlocks(
     if (block === link && kind) linked.push(name);
     bytes = fits(block);
     blocks.push(block);
+    // The packet lists an earlier file already.
+    if (!earlier)
+      lines.push(
+        attachedLine(
+          attachment,
+          block === link
+            ? 'sent as a file link below'
+            : `sent as ${block.type === 'resource' ? 'an embedded resource' : `an ${block.type} block`} below`,
+        ),
+      );
   }
+  const section = attachedSection(lines);
+  if (section) blocks[0] = { type: 'text', text: `${text}\n\n${section}` };
   return { blocks, linked, attached: files.some((file) => !file.earlier) };
 }
 

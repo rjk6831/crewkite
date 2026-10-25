@@ -303,8 +303,8 @@ export function handoffPacket(input: {
   prompt: string;
   /** Instruction files at the scratch root. The next provider reads them from the copy. */
   instructions?: readonly string[];
-  /** Files the conversation carried. The request for the new message sends each of them again. */
-  attachments?: readonly Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>[];
+  /** Files from earlier messages that travel with this request. The new message's own files are not here. */
+  earlier?: readonly EarlierFile[];
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -340,15 +340,61 @@ export function handoffPacket(input: {
     ...(input.instructions?.length
       ? [`Project instructions: ${input.instructions.join(', ')}`]
       : []),
-    ...(input.attachments?.length
-      ? [
-          `Files the person attached in this thread. They come with the new message:\n${input.attachments
-            .map((file) => `${file.name} (${file.mimeType}, ${byteSize(file.bytes)})`)
-            .join('\n')}`,
-        ]
-      : []),
-    `New message:\n${input.prompt}`,
-  ].join('\n\n');
+    earlierFilesSection(input.earlier ?? []),
+    newMessageBlock(input.prompt),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+/** A file from an earlier message, and how this request reaches it. */
+export type EarlierFile = {
+  attachment: Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>;
+  /** A short quote of the message the file came with. */
+  came: string;
+  /** What the family does with it: `Path: <path>`, or the link or note the adapter sends. */
+  reach: string;
+};
+
+/**
+ * How an earlier file reaches a family. Anthropic's adapter swaps the stored path for its staged
+ * copy. Google gets a link block after the text. Local reads no file by path.
+ */
+export function earlierReach(family: ChatFamily, path: string): string {
+  if (family === 'google') return 'sent as a file link below';
+  return family === 'local' ? 'not sent to Local' : `Path: ${path}`;
+}
+
+/** The message text under its heading. The request carries it once. */
+export function newMessageBlock(text: string): string {
+  return `New message from the person:\n${text}`;
+}
+
+/** One line for a file: name, type, size, then the tail. */
+export function attachedLine(
+  file: Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>,
+  tail: string,
+): string {
+  return `${file.name}, ${file.mimeType}, ${byteSize(file.bytes)}, ${tail}`;
+}
+
+/** The files of the new message, one line each, or nothing. Adapters add it directly under the text. */
+export function attachedSection(lines: readonly string[]): string {
+  return lines.length ? `Files attached to this message:\n${lines.join('\n')}` : '';
+}
+
+export function earlierFileLine(file: EarlierFile): string {
+  return attachedLine(file.attachment, `came with "${file.came}", ${file.reach}`);
+}
+
+/** Files from before the new message, listed once, or nothing. The packet and the delta packet both use it. */
+export function earlierFilesSection(files: readonly EarlierFile[]): string {
+  return files.length
+    ? [
+        'Files attached earlier in this thread. They are not part of the new message.',
+        ...files.map(earlierFileLine),
+      ].join('\n')
+    : '';
 }
 
 /** "812 bytes", "12.4 KiB", "3.0 MiB". */
