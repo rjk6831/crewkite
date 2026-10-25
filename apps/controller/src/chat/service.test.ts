@@ -1910,7 +1910,8 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   assert.equal(retry('regenerate', answered.id).outcome, 'applied');
   await regenerated;
   const again = requests[1];
-  assert.equal(again.prompt, 'What is in this chart?');
+  assert.match(again.prompt, /^This message runs again on Google in a new session\./);
+  assert.match(again.prompt, /New message:\nWhat is in this chart\?$/);
   assert.equal(again.session, null);
   assert.deepEqual(again.files, sent.files);
   const thread = read();
@@ -1926,6 +1927,47 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
     ],
   );
   assert.ok(thread.turns.every((value) => value.userMessageId === turn.userMessageId));
+
+  // Rows: Regenerate, then Retry after it fails, on the family that answered. Anthropic and Google
+  // read no history in a new session, so each rerun carries the conversation before the message.
+  const broke = chatFailure({ stage: 'stream', kind: 'internal', message: 'The reply broke.' });
+  for (const family of ['anthropic', 'google'] as const) {
+    const pick = { family, model: `${family}-model`, effort: 'default' } as const;
+    const scripted = createScriptedChatAdapter({
+      family,
+      turns: [
+        reply('One.'),
+        reply('Two.'),
+        [{ kind: 'fail', stopReason: 'error', failure: broke }],
+        reply('Three.'),
+      ],
+    });
+    const rerun = standalone(t, { adapters: new Map([[family, scripted]]) });
+    const again = (mode: 'retry' | 'regenerate', turnId: string, state: ChatTurn['state']) => {
+      const reached = turnReaches({ store: rerun.store }, state);
+      act(rerun.store, (effects) =>
+        rerun.service.retryTurn({ taskId: rerun.taskId, turnId, mode }, effects),
+      );
+      return reached;
+    };
+    for (const text of ['First.', 'Second.']) {
+      const done = turnReaches({ store: rerun.store }, 'done');
+      rerun.send(text, pick);
+      await done;
+    }
+    const answered = rerun.read().turns.at(-1) as ChatTurn;
+    const failed = await again('regenerate', answered.id, 'failed');
+    await again('retry', failed.id, 'done');
+    assert.equal(scripted.requests[1].session?.sessionId, `session-${scripted.requests[0].turnId}`);
+    for (const request of scripted.requests.slice(2)) {
+      assert.equal(request.session, null, family);
+      assert.deepEqual(request.history, [], family);
+      assert.match(request.prompt, /^This message runs again on .+ in a new session\./, family);
+      assert.match(request.prompt, /^Person:\nFirst\.\n\nAssistant:\nOne\.$/m, family);
+      assert.match(request.prompt, /New message:\nSecond\.$/, family);
+      assert.doesNotMatch(request.prompt, /Two\./, family);
+    }
+  }
 });
 
 test('rename sets the thread title, and delete removes the thread, its scratch copy and files for good', {

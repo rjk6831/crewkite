@@ -20,9 +20,11 @@ export const familyName: Record<ChatFamily, string> = {
   local: 'Local',
 };
 
-export type HandoffReason = 'manual' | 'limit' | 'steer';
+// rerun: Retry or Regenerate on the family that already answered the message, in a new session.
+export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun';
 
 export function handoffReason(reason: HandoffReason): string {
+  if (reason === 'rerun') return 'the person asked for the reply again';
   if (reason === 'steer') return 'the person sent a new message during the reply';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
@@ -320,11 +322,14 @@ export function handoffPacket(input: {
         ? input.files.join('\n')
         : 'No files changed yet.';
   // Send now stops a reply and starts the next message on the same family. The packet then tells
-  // the model what the stopped reply left behind.
+  // the model what the stopped reply left behind. A rerun starts a new session, since the old one
+  // holds the reply it replaces.
   const opening =
-    input.from === input.to
-      ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-      : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+    input.reason === 'rerun'
+      ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+      : input.from === input.to
+        ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+        : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
