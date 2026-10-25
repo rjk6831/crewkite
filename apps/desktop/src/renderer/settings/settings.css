@@ -232,7 +232,7 @@
   min-width: 220px;
   max-width: 100%;
 }
-.st-controls select[aria-label="Effort"] {
+.st-controls select.effort-select {
   min-width: 120px;
 }
 .st-segment {

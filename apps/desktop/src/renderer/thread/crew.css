@@ -32,6 +32,19 @@
 .th-crew-role {
   color: var(--text-dim);
 }
+.th-crew-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+.th-crew-pick select {
+  flex: 1 1 140px;
+  min-width: 0;
+}
+.th-crew-pick select.effort-select {
+  flex: 0 1 auto;
+}
 .th-crew-model {
   min-width: 0;
   overflow: hidden;
@@ -80,4 +93,9 @@
   align-items: center;
   color: var(--text-dim);
   font-size: 12px;
+}
+.st-crew-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
 }
