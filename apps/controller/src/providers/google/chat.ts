@@ -1,5 +1,7 @@
+import { readFileSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
+import { pathToFileURL } from 'node:url';
 import type {
   AgentEvent,
   ChatFailure,
@@ -50,6 +52,9 @@ export type GoogleChatLaunch = {
   spawn?: AcpSpawn;
   schedule?: Schedule;
 };
+
+/** The block types the agent said it takes in a prompt. The protocol defaults each to false. */
+export type GooglePromptCapabilities = { image: boolean; audio: boolean; embeddedContext: boolean };
 
 type RpcId = Parameters<AcpConnection['respond']>[0];
 type Fault = { code: number; message: string; data?: unknown };
@@ -107,10 +112,17 @@ const permissionRequest = z.object({
   toolCall: toolUpdate,
   options: z.array(z.unknown()),
 });
+const flag = z.boolean().optional().catch(undefined);
 const initialized = z.object({
   protocolVersion: z.number().optional().catch(undefined),
   agentCapabilities: z
-    .object({ loadSession: z.boolean().optional().catch(undefined) })
+    .object({
+      loadSession: flag,
+      promptCapabilities: z
+        .object({ image: flag, audio: flag, embeddedContext: flag })
+        .optional()
+        .catch(undefined),
+    })
     .optional()
     .catch(undefined),
 });
@@ -323,12 +335,91 @@ function historyBlock(history: readonly ChatHistoryEntry[]) {
   return picked.length ? `Earlier in this conversation:\n\n${picked.join('\n\n')}` : '';
 }
 
+type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
+type PromptBlock = Record<string, unknown>;
+
+// AcpConnection refuses any line over 1 MiB. The margin covers the request envelope.
+const promptLineBytes = 1_048_576 - 16 * 1024;
+const textTypes = /^(text\/|application\/(json|xml|yaml|x-yaml|toml|javascript|sql|x-sh)$)/;
+
+/**
+ * The prompt as content blocks, text first, then one block per file in the richest form the
+ * agent declared. Every agent must accept a resource_link, so a file gets one when no flag
+ * covers it, or when its inline form would not fit in the frame. `linked` names the files that
+ * had an inline form and went as a link for size.
+ */
+function promptBlocks(
+  text: string,
+  files: readonly TurnFile[],
+  capabilities: GooglePromptCapabilities,
+  stage: ChatFailure['stage'],
+) {
+  const blocks: PromptBlock[] = [{ type: 'text', text }];
+  const linked: string[] = [];
+  let bytes = Buffer.byteLength(JSON.stringify(blocks));
+  const fits = (block: PromptBlock) => bytes + Buffer.byteLength(JSON.stringify(block)) + 1;
+  for (const { attachment, path } of files) {
+    const { mimeType, name } = attachment;
+    const uri = pathToFileURL(path).href;
+    const link: PromptBlock = {
+      type: 'resource_link',
+      uri,
+      name,
+      mimeType,
+      size: attachment.bytes,
+    };
+    const kind =
+      capabilities.image && mimeType.startsWith('image/')
+        ? 'image'
+        : capabilities.audio && mimeType.startsWith('audio/')
+          ? 'audio'
+          : capabilities.embeddedContext
+            ? 'resource'
+            : null;
+    let block = link;
+    // Base64 is four bytes for every three. A file that cannot fit is never read.
+    if (kind && bytes + Math.ceil(attachment.bytes / 3) * 4 + 512 <= promptLineBytes) {
+      let raw: Buffer;
+      try {
+        raw = readFileSync(path);
+      } catch (error) {
+        throw new TurnFailure(
+          chatFailure({
+            stage,
+            kind: 'internal',
+            message: `CrewKite could not read the stored file ${clip(name, 200)}.`,
+            providerMessage: error instanceof Error ? clip(error.message, 2000) : null,
+          }),
+        );
+      }
+      const decoded = raw.toString('utf8');
+      const plain = textTypes.test(mimeType) && Buffer.from(decoded).equals(raw);
+      block =
+        kind === 'resource'
+          ? {
+              type: 'resource',
+              resource: plain
+                ? { uri, mimeType, text: decoded }
+                : { uri, mimeType, blob: raw.toString('base64') },
+            }
+          : { type: kind, data: raw.toString('base64'), mimeType };
+    }
+    // Escaped text can grow past the estimate, so the built block is measured too.
+    if (block !== link && fits(block) > promptLineBytes) block = link;
+    if (block === link && kind) linked.push(name);
+    bytes = fits(block);
+    blocks.push(block);
+  }
+  return { blocks, linked };
+}
+
 function failureFor(
   error: unknown,
   stage: ChatFailure['stage'],
   fault: Fault | undefined,
   stderr: AcpStderrSummary | null,
   now: number,
+  attached = false,
 ): ChatFailure {
   if (error instanceof TurnFailure) return error.failure;
   if (!(error instanceof AcpError))
@@ -364,6 +455,14 @@ function failureFor(
         ...base,
         kind: 'signed-out',
         message: 'The Google client is not signed in.',
+      });
+    // The protocol names no error for a block the agent refuses. A prompt error on a prompt
+    // that carried files is read as a refusal of the files, with the agent's own words.
+    if (attached && diagnostic.method === 'session/prompt')
+      return chatFailure({
+        ...base,
+        kind: 'attachment-rejected',
+        message: 'The Google client did not accept the attached files.',
       });
     return chatFailure({
       ...base,
@@ -440,6 +539,8 @@ type Call = {
 
 export function googleChatAdapter(deps: {
   launch: (request: ChatTurnRequest) => GoogleChatLaunch;
+  /** Called with what each initialize declared, so the catalog can say which files go native. */
+  onPromptCapabilities?: (capabilities: GooglePromptCapabilities) => void;
 }): ChatAdapter {
   return {
     family: 'google',
@@ -493,6 +594,8 @@ export function googleChatAdapter(deps: {
       let stage: ChatFailure['stage'] = 'launch';
       let promptStarted = false;
       let promptDone = false;
+      // The prompt carries a block other than its text.
+      let attached = false;
       let cancelled = false;
       let defect: unknown = null;
       let workError: unknown = null;
@@ -987,6 +1090,15 @@ export function googleChatAdapter(deps: {
                 message: 'The Google client speaks a protocol version this app does not.',
               }),
             );
+          const declared = handshake.agentCapabilities?.promptCapabilities;
+          const capabilities: GooglePromptCapabilities = {
+            image: declared?.image === true,
+            audio: declared?.audio === true,
+            embeddedContext: declared?.embeddedContext === true,
+          };
+          try {
+            deps.onPromptCapabilities?.(capabilities);
+          } catch {}
           stage = 'session';
           let resumed = false;
           if (prior && handshake.agentCapabilities?.loadSession && !cancelled) {
@@ -1052,14 +1164,22 @@ export function googleChatAdapter(deps: {
           }
           parts.push(request.prompt);
           stage = 'prompt';
+          const { blocks, linked } = promptBlocks(
+            parts.filter(Boolean).join('\n\n'),
+            request.files ?? [],
+            capabilities,
+            stage,
+          );
+          attached = blocks.length > 1;
+          if (linked.length)
+            notice(
+              `Sent as a file link, too large to send inline: ${linked.map((name) => clip(name, 200)).join(', ')}.`,
+            );
           phase = 'turn';
           promptStarted = true;
           for (const params of buffered.splice(0)) guard(() => update(params));
           const reply = promptResult.safeParse(
-            await live.request('session/prompt', {
-              sessionId: id,
-              prompt: [{ type: 'text', text: parts.filter(Boolean).join('\n\n') }],
-            }),
+            await live.request('session/prompt', { sessionId: id, prompt: blocks }),
           );
           promptDone = true;
           phase = 'done';
@@ -1139,7 +1259,14 @@ export function googleChatAdapter(deps: {
 
       function conclude(outcome: AcpProcessOutcome<void>): Ending {
         const fail = (error: unknown): Ending => {
-          const failure = failureFor(error, stage, lastFault(), outcome.stderrSummary, now());
+          const failure = failureFor(
+            error,
+            stage,
+            lastFault(),
+            outcome.stderrSummary,
+            now(),
+            attached,
+          );
           return { stopReason: failure.kind === 'usage-limit' ? 'limit' : 'error', failure };
         };
         if (defect) return fail(defect);

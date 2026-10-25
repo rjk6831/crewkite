@@ -645,6 +645,7 @@ export const acpChatPeerCases = [
   'chat-refusal',
   'chat-max-tokens',
   'chat-unknown',
+  'chat-attach',
 ] as const;
 export type AcpChatPeerCase = (typeof acpChatPeerCases)[number];
 
@@ -820,7 +821,13 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
         result(message.id, {
           protocolVersion: 1,
           agentInfo: { name: 'fixture', version: '1.4.0' },
-          agentCapabilities: { loadSession: true },
+          agentCapabilities: {
+            loadSession: true,
+            // The attach case takes every block the protocol defines. The others declare none.
+            ...(scenario === 'chat-attach'
+              ? { promptCapabilities: { image: true, audio: true, embeddedContext: true } }
+              : {}),
+          },
           authMethods: [{ id: 'oauth-personal', name: 'Personal' }],
         });
       } else if (message.method === 'session/new') {
