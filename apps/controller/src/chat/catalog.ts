@@ -63,9 +63,21 @@ export type CatalogObservation = Pick<
  */
 export function buildChatCatalog(input: ChatCatalogInput): ChatCatalogRead {
   return ChatCatalogReadSchema.parse({
-    families: [openai(input), anthropic(input), google(input), local(input)],
+    families: [openai(input), anthropic(input), google(input), local(input)].map((value) => ({
+      ...value,
+      unlisted: unlisted[value.family],
+    })),
   });
 }
+
+// What happens to a file the client does not list. Anthropic and OpenAI get a path line their tools
+// can open, Google gets a resource_link, and Local reads no file by path.
+const unlisted: Record<ChatFamily, 'path' | 'none'> = {
+  openai: 'path',
+  anthropic: 'path',
+  google: 'path',
+  local: 'none',
+};
 
 function openai(input: ChatCatalogInput): Entry {
   const profiles = input.profiles.filter((profile) => profile.family === 'openai');
