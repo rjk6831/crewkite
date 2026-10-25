@@ -43,7 +43,15 @@
 // - SIGINT to the group ends a running turn. A failed resume exits non-zero without a result.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { after, test } from 'node:test';
@@ -144,7 +152,7 @@ function file(name: string, mimeType: string, bytes: Buffer) {
   writeFileSync(path, bytes);
   return { attachment: { id, name, mimeType, bytes: bytes.length }, path };
 }
-type File = ReturnType<typeof file>;
+type File = ReturnType<typeof file> & { earlier?: boolean };
 const png = file('screen.png', 'image/png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]));
 const pdf = file('spec.pdf', 'application/pdf', Buffer.from('%PDF-1.7 spec'));
 const notes = file('notes.md', 'text/markdown; charset=utf-8', Buffer.from('# Notes\nShip it.'));
@@ -437,12 +445,44 @@ test('a file the API refuses or CrewKite cannot read fails the turn as attachmen
     'drain',
   ];
   const missing = { ...png, path: join(folder, 'gone', 'screen.png') };
-  const rows = [
+  // Stored under the hash of other bytes, as after a write through a link to the store.
+  const changed = file('changed.png', 'image/png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 9]));
+  writeFileSync(changed.path, Buffer.from([0x89, 0x50, 0x4e, 0x47, 8]));
+  const rows: Array<{
+    files: File[];
+    kind: string;
+    provider: string | null;
+    spawned: boolean;
+    message?: string;
+  }> = [
     { files: [png], kind: 'attachment-rejected', provider: refusal, spawned: true },
     // A path line sends nothing the API reads as a file, so the refusal is about something else.
     { files: [sheet], kind: 'protocol', provider: refusal, spawned: true },
     { files: [], kind: 'protocol', provider: refusal, spawned: true },
-    { files: [missing], kind: 'attachment-rejected', provider: null, spawned: false },
+    // Earlier files go as path lines, so neither an image nor a missing file refuses the turn.
+    {
+      files: [
+        { ...png, earlier: true },
+        { ...missing, earlier: true },
+      ],
+      kind: 'protocol',
+      provider: refusal,
+      spawned: true,
+    },
+    {
+      files: [missing],
+      kind: 'attachment-rejected',
+      provider: null,
+      spawned: false,
+      message: 'CrewKite could not read the attached file screen.png.',
+    },
+    {
+      files: [changed],
+      kind: 'attachment-rejected',
+      provider: null,
+      spawned: false,
+      message: 'The stored file changed.png changed after it was attached, so it was not sent.',
+    },
   ];
   for (const row of rows) {
     const turn = run(refused, null, [], 'ask', 'default', row.files);
@@ -452,8 +492,8 @@ test('a file the API refuses or CrewKite cannot read fails the turn as attachmen
     assert.equal(failure?.kind, row.kind, JSON.stringify(row.files));
     assert.equal(failure?.providerMessage, row.provider);
     assert.equal(turn.launched.argv.length > 0, row.spawned);
-    if (!row.spawned)
-      assert.equal(failure?.message, 'CrewKite could not read the attached file screen.png.');
+    if (row.message) assert.equal(failure?.message, row.message);
+    assert.equal(existsSync(join(turn.work, 'files')), false);
   }
 });
 
@@ -535,7 +575,22 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
   // The client's own report of its effort wins. Without one, the level passed is the level, and
   // minimal, which the client lacks, runs at default.
   const saving = { family: 'anthropic' as const, sessionId: saved, model, updatedAt: 'x' };
-  const rows = [
+  // Path lines name copies in the turn's own folder, so the client never reaches the store.
+  const copy = (work: string, { attachment }: File) =>
+    join(work, 'files', attachment.id, attachment.name);
+  const framed = `${systemContext}\n\n${prompt}`;
+  const large = file('large.pdf', 'application/pdf', Buffer.alloc(25 * 1024 * 1024, 0x20));
+  const rows: Array<{
+    session: ChatSession | null;
+    argv: string[] | ((work: string) => string[]);
+    text: string;
+    id: string;
+    reported?: string | null;
+    badge?: string;
+    effort?: ChatEffort;
+    files?: File[];
+    content?: unknown[] | ((work: string) => unknown[]);
+  }> = [
     { session: null, argv: base, text: `${systemContext}\n\n${prompt}`, id: fresh },
     {
       session: saving,
@@ -563,13 +618,13 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     },
     {
       // Images, PDFs and UTF-8 text go as blocks in file order before the text. A spreadsheet
-      // has no block, so its path goes in the text and its folder joins the launch.
+      // has no block, so a copy's path goes in the text and the copies' folder joins the launch.
       session: null,
-      argv: [...base, '--add-dir', folder],
-      text: `${systemContext}\n\n${prompt}`,
+      argv: (work) => [...base, '--add-dir', join(work, 'files')],
+      text: framed,
       id: fresh,
       files: [png, sheet, pdf, notes],
-      content: [
+      content: (work) => [
         {
           type: 'image',
           source: { type: 'base64', media_type: 'image/png', data: 'iVBORwECAw==' },
@@ -590,7 +645,22 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
         },
         {
           type: 'text',
-          text: `${systemContext}\n\n${prompt}\n\nAttached file: plan.xlsx (application/vnd.ms-excel, 8 bytes) at ${sheet.path}`,
+          text: `${framed}\n\nAttached file: plan.xlsx (application/vnd.ms-excel, 8 bytes) at ${copy(work, sheet)}`,
+        },
+      ],
+    },
+    {
+      // An earlier file goes as a path line whatever its type. A PDF past the block budget goes
+      // as a path line and is never read.
+      session: null,
+      argv: (work) => [...base, '--add-dir', join(work, 'files')],
+      text: framed,
+      id: fresh,
+      files: [{ ...pdf, earlier: true }, large],
+      content: (work) => [
+        {
+          type: 'text',
+          text: `${framed}\n\nAttached earlier: spec.pdf (application/pdf, 13 bytes) at ${copy(work, pdf)}\nAttached file: large.pdf (application/pdf, 26214400 bytes) at ${copy(work, large)}`,
         },
       ],
     },
@@ -599,14 +669,20 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     const turn = run(streamed(row.id, row.reported), row.session, [], 'ask', row.effort, row.files);
     t.after(turn.cleanup);
     const result = await turn.handle.result;
-    assert.deepEqual(turn.launched.argv, row.argv);
+    const resolved = (value: unknown) => (typeof value === 'function' ? value(turn.work) : value);
+    assert.deepEqual(turn.launched.argv, resolved(row.argv));
     const started = turn.events.find((event) => event.type === 'turn.started');
     assert.equal(started?.effort, row.badge ?? 'default', JSON.stringify(row));
     assert.deepEqual(JSON.parse(turn.launched.input[0] ?? ''), {
       type: 'user',
-      message: { role: 'user', content: row.content ?? [{ type: 'text', text: row.text }] },
+      message: {
+        role: 'user',
+        content: resolved(row.content) ?? [{ type: 'text', text: row.text }],
+      },
     });
     assert.equal(result.session?.sessionId, row.id);
+    // The copies go when the turn ends.
+    assert.equal(existsSync(join(turn.work, 'files')), false);
   }
 });
 
