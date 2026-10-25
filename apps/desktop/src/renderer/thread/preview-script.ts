@@ -77,6 +77,7 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       author,
       text,
       attachments: [],
+      files: [],
     };
     messages.push(stored);
     return stored;
@@ -154,6 +155,7 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
           text: 'Then add a test for a discount larger than the subtotal.',
           role: 'assistant',
           attachments: [],
+          files: [],
         },
       ],
       sessions: [
@@ -373,6 +375,7 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
             text,
             role: 'assistant' as const,
             attachments: [],
+            files: [],
           };
           setThread({ queued: [...thread.queued, message] });
           return ok;

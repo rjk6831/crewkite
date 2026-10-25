@@ -139,7 +139,7 @@ type Ending = {
   effort?: ChatModelSelection['effort'];
 };
 type FileDiff = ChatChangesRead['files'][number];
-type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments'>;
+type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments' | 'files'>;
 type LiveTurn = {
   taskId: string;
   role: ChatTurn['role'];
@@ -233,6 +233,7 @@ const blocked = (reason: string, next?: string): CommandResult => ({
   reason,
   ...(next ? { next } : {}),
 });
+const unavailable = (action: string) => blocked('not-available', `${action} is not available yet.`);
 // The numbers are what the person looks for with ps. The next command checks them again.
 const ownershipUnknown = (groups: readonly number[], then: string) =>
   blocked('ownership-unknown', `Quit process ${groupNames(groups)}, then ${then}.`);
@@ -274,6 +275,8 @@ export class ChatService {
   sendMessage(payload: Payload<'SendChatMessage'>, effects: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
+    // No adapter reads stored files, so a message that names one would reach the model without it.
+    if (payload.files.length) return unavailable('Sending files');
     const { thread, left } = this.checkedThread(task);
     const free = !thread.activeTurnId && !left.length;
     if (free && !thread.queued.length) return this.begin(task, thread, payload, effects);
@@ -540,6 +543,36 @@ export class ChatService {
   async branchStatus(payload: Payload<'ReadChatBranchStatus'>): Promise<CommandResult> {
     const status = await readChatBranchStatus(this.gitHost(), payload);
     return { outcome: 'applied', data: { kind: 'chat-branch-status', ...status } };
+  }
+
+  importAttachment(payload: Payload<'ImportChatAttachment'>): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    return unavailable('Attaching files');
+  }
+
+  retryTurn(payload: Payload<'RetryChatTurn'>, _effects: Effects): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    return unavailable(payload.mode === 'retry' ? 'Retry' : 'Regenerate');
+  }
+
+  readTurnEvents(payload: Payload<'ReadChatTurnEvents'>): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    return unavailable('Reading earlier turn events');
+  }
+
+  discardChange(payload: Payload<'DiscardChatChange'>): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    return unavailable('Discard');
+  }
+
+  renameThread(payload: Payload<'RenameChatThread'>): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    return unavailable('Rename');
+  }
+
+  deleteThread(payload: Payload<'DeleteChatThread'>, _effects: Effects): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    return unavailable('Delete');
   }
 
   private gitHost(): ChatGitHost {
@@ -1301,7 +1334,7 @@ export class ChatService {
     const started = this.begin(
       task,
       saved,
-      { text, role: CREW_ROLES[step], selection, attachments: [] },
+      { text, role: CREW_ROLES[step], selection, attachments: [], files: [] },
       effects,
     );
     if (started.outcome !== 'applied')
@@ -1442,6 +1475,7 @@ export class ChatService {
         text: input.text,
         role: input.role,
         attachments: input.attachments,
+        files: input.files,
         ...(own ? { selection } : {}),
       },
     ];
@@ -1939,9 +1973,14 @@ function chatMessage(entry: ConversationEntry): ChatMessage | undefined {
     text: entry.text,
   };
   if (entry.kind === 'user-message')
-    return { ...common, author: { kind: 'user' }, attachments: entry.attachments ?? [] };
+    return {
+      ...common,
+      author: { kind: 'user' },
+      attachments: entry.attachments ?? [],
+      files: entry.files ?? [],
+    };
   return entry.kind === 'chat-assistant' || entry.kind === 'chat-system'
-    ? { ...common, author: entry.author, attachments: [] }
+    ? { ...common, author: entry.author, attachments: [], files: [] }
     : undefined;
 }
 
@@ -1951,6 +1990,7 @@ function userEntry(input: Message): EntryDraft {
     author: { kind: 'user' },
     text: input.text,
     ...(input.attachments.length ? { attachments: input.attachments } : {}),
+    ...(input.files.length ? { files: input.files } : {}),
   };
 }
 

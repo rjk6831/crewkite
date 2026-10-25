@@ -113,7 +113,7 @@ function asMessage(payload: unknown): ChatMessage | null {
   if (!entry.success || !['user-message', 'guidance', 'answer'].includes(entry.data.kind))
     return null;
   const { id, taskId, at, cursor, text } = entry.data;
-  return { id, taskId, at, cursor, text, author: { kind: 'user' }, attachments: [] };
+  return { id, taskId, at, cursor, text, author: { kind: 'user' }, attachments: [], files: [] };
 }
 
 function addMessages(state: ThreadState, incoming: ChatMessage[], replace = false): ThreadState {

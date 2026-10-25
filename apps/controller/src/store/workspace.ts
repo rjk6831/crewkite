@@ -194,6 +194,7 @@ export function taskPage(store: Store, input: TaskPageRequest, now = () => perfo
         revision: row.revision as number,
         runId: row.runId as string | null,
         next: row.next as string | null,
+        chatActivity: 'idle',
         ...(match ? { match } : {}),
       };
       if (

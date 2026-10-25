@@ -94,6 +94,7 @@ export function catalog(): ChatCatalogRead {
           reading('five-hour', 'Five-hour', 0, 100),
           reading('weekly', 'Weekly', 80, 2880),
         ],
+        accepts: null,
       },
       {
         family: 'anthropic',
@@ -102,6 +103,7 @@ export function catalog(): ChatCatalogRead {
         models: fill(pair('large-2', 'fast-2')),
         defaultModel: 'large-2',
         remaining: [reading('weekly', 'Weekly', 30, 120)],
+        accepts: null,
       },
       {
         family: 'google',
@@ -110,6 +112,7 @@ export function catalog(): ChatCatalogRead {
         models: [],
         defaultModel: null,
         remaining: [],
+        accepts: null,
       },
       {
         family: 'local',
@@ -118,6 +121,7 @@ export function catalog(): ChatCatalogRead {
         models: [{ model: 'local-27b', label: 'Local 27B', efforts: [], defaultEffort: 'default' }],
         defaultModel: 'local-27b',
         remaining: [],
+        accepts: null,
       },
     ],
   };

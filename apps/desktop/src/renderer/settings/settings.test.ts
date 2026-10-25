@@ -40,6 +40,7 @@ const entry = (
   models: connected ? models.map((model) => ({ ...model, efforts: [...model.efforts] })) : [],
   defaultModel: connected ? 'large-1' : null,
   remaining,
+  accepts: null,
 });
 
 test('saved thread defaults and crew presets survive bad storage and apply only to connected, listed models', () => {

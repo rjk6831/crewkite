@@ -252,6 +252,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     defaultModel: 'large-1',
     remaining,
     readAt: at(-2),
+    accepts: null,
     ...more,
   });
   const loaded = {

@@ -1151,6 +1151,11 @@ export class Controller {
         'HandoffChatThread',
         'AcceptChatChanges',
         'SteerChatMessage',
+        'ImportChatAttachment',
+        'RetryChatTurn',
+        'DiscardChatChange',
+        'RenameChatThread',
+        'DeleteChatThread',
       ].includes(command.command)
     ) {
       // A thread streams events many times a second. Its commands serialize on the active turn,
@@ -1303,6 +1308,18 @@ export class Controller {
         return this.chat().handoff(command.payload, effects);
       case 'SteerChatMessage':
         return this.chat().steer(command.payload, effects);
+      case 'ImportChatAttachment':
+        return this.chat().importAttachment(command.payload);
+      case 'RetryChatTurn':
+        return this.chat().retryTurn(command.payload, effects);
+      case 'DiscardChatChange':
+        return this.chat().discardChange(command.payload);
+      case 'RenameChatThread':
+        return this.chat().renameThread(command.payload);
+      case 'DeleteChatThread':
+        return this.chat().deleteThread(command.payload, effects);
+      case 'ReadChatTurnEvents':
+        return this.chat().readTurnEvents(command.payload);
       case 'AcceptChatChanges':
         return this.chat().accept(
           command.payload,

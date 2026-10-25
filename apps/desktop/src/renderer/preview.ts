@@ -180,7 +180,19 @@ export function createPreviewSource(): DesktopSource {
         ];
         if (pattern && !fields.some((text) => pattern.test(text))) return [];
         const { id, projectId, title, state: status, waitingReason, revision, runId, next } = task;
-        return [{ id, projectId, title, state: status, waitingReason, revision, runId, next }];
+        return [
+          {
+            id,
+            projectId,
+            title,
+            state: status,
+            waitingReason,
+            revision,
+            runId,
+            next,
+            chatActivity: 'idle' as const,
+          },
+        ];
       });
     return {
       kind: 'task-page' as const,

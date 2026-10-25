@@ -289,6 +289,7 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
           text,
           role: 'assistant',
           attachments: [],
+          files: [],
           ...(choice ? { selection: choice } : {}),
         },
         effects,
@@ -317,6 +318,7 @@ function familyEntry(
     ],
     defaultModel: `${family}-model`,
     remaining: [{ windowId: 'weekly', label: 'weekly', percent, resetsAt, observedAt }],
+    accepts: null,
   };
 }
 
@@ -327,7 +329,14 @@ test('startup recovery fails a turn whose controller stopped before it finished'
   // The command commits, then the process ends before its launch effect runs.
   store.transaction(() =>
     start().sendMessage(
-      { taskId, text: 'Start the change.', selection, role: 'assistant', attachments: [] },
+      {
+        taskId,
+        text: 'Start the change.',
+        selection,
+        role: 'assistant',
+        attachments: [],
+        files: [],
+      },
       [],
     ),
   );

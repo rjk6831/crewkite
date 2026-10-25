@@ -129,6 +129,7 @@ export const ChatFailureSchema = z.strictObject({
     'timeout',
     'stopped',
     'internal',
+    'attachment-rejected',
   ]),
   message: z.string().min(1).max(4096),
   providerMessage: z.string().max(16_384).nullable().default(null),
@@ -293,6 +294,29 @@ export type ChatSession = z.infer<typeof ChatSessionSchema>;
 
 export const ChatPermissionPolicySchema = z.enum(['ask', 'allow-edits', 'allow-all']);
 
+/**
+ * A file the controller stored under its home for one thread, keyed by the hash of its bytes. The
+ * name is what the chip shows and the provider sees, so it carries no folder part.
+ */
+export const ChatAttachmentSchema = z.strictObject({
+  id: z.string().regex(/^[a-f0-9]{64}$/),
+  name: z
+    .string()
+    .min(1)
+    .max(255)
+    .refine(
+      (value) => value.isWellFormed() && !/[/\\\p{Cc}]/u.test(value),
+      'A file name needs no folder part and no control characters.',
+    ),
+  /** What the controller detected from the bytes. */
+  mimeType: z.string().min(1).max(255),
+  bytes: z.number().int().nonnegative(),
+});
+export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
+/** Files on one message. Saved threads hold path strings in `attachments`, which still parse. */
+const files = z.array(ChatAttachmentSchema).max(32).default([]);
+const legacyAttachments = z.array(z.string().min(1).max(4096)).max(32).default([]);
+
 /** A message waiting for the running turn to finish. The composer can still take it back. */
 export const ChatQueuedMessageSchema = z.strictObject({
   id: id('msg'),
@@ -300,7 +324,8 @@ export const ChatQueuedMessageSchema = z.strictObject({
   text: z.string().min(1).max(65_536),
   role: ChatRoleSchema.default('assistant'),
   selection: ChatModelSelectionSchema.optional(),
-  attachments: z.array(z.string().min(1).max(4096)).max(32).default([]),
+  attachments: legacyAttachments,
+  files,
 });
 export type ChatQueuedMessage = z.infer<typeof ChatQueuedMessageSchema>;
 
@@ -360,8 +385,25 @@ export const ChatThreadSchema = z.strictObject({
     })
     .nullable()
     .optional(),
+  /**
+   * Entries of the repository the scratch copy could not hold, for one line in the first turn.
+   * The thread record travels in every chat.thread event, so the list stays short.
+   */
+  skipped: z
+    .array(
+      z.strictObject({
+        path: z.string().min(1).max(4096),
+        reason: z.enum(['link-outside', 'submodule', 'path-encoding']),
+      }),
+    )
+    .max(64)
+    .optional(),
 });
 export type ChatThread = z.infer<typeof ChatThreadSchema>;
+
+/** What the rail dot shows for a thread. */
+export const ChatThreadActivitySchema = z.enum(['idle', 'running', 'waiting', 'failed']);
+export type ChatThreadActivity = z.infer<typeof ChatThreadActivitySchema>;
 
 // Command payloads, listed in CommandSchema.
 export const SendChatMessagePayloadSchema = z.strictObject({
@@ -369,7 +411,8 @@ export const SendChatMessagePayloadSchema = z.strictObject({
   text: z.string().min(1).max(65_536),
   selection: ChatModelSelectionSchema.optional(),
   role: ChatRoleSchema.default('assistant'),
-  attachments: z.array(z.string().min(1).max(4096)).max(32).default([]),
+  attachments: legacyAttachments,
+  files,
 });
 export const ResolveChatPermissionPayloadSchema = z.strictObject({
   taskId: id('tsk'),
@@ -473,6 +516,56 @@ export const HandoffChatThreadPayloadSchema = z.strictObject({
 // setup already holds.
 export const RefreshChatModelsPayloadSchema = z.strictObject({ family: z.literal('openai') });
 
+/**
+ * Pasted bytes cross the socket as base64, so each item is capped. A path the controller copies
+ * has no CrewKite cap.
+ */
+export const MAX_CHAT_PASTE_BYTES = 32 * 1024 * 1024;
+const PASTE_BASE64_LENGTH = Math.ceil(MAX_CHAT_PASTE_BYTES / 3) * 4;
+const pasteBase64 = z
+  .string()
+  .min(4)
+  .max(PASTE_BASE64_LENGTH)
+  .refine((value) => {
+    // Length first, so an oversized paste never reaches the pattern.
+    if (value.length > PASTE_BASE64_LENGTH || value.length % 4 !== 0) return false;
+    const padding = value.endsWith('==') ? 2 : value.endsWith('=') ? 1 : 0;
+    return (
+      (value.length / 4) * 3 - padding <= MAX_CHAT_PASTE_BYTES &&
+      /^[A-Za-z0-9+/]*={0,2}$/.test(value)
+    );
+  }, 'Pasted bytes need base64 of at most 32 MiB.');
+const absolutePath = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) => (value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value)) && !value.includes('\0'),
+    'A file to attach needs an absolute path.',
+  );
+/** Store one file for a thread. Picker and drop send a path. Paste sends the bytes. */
+export const ImportChatAttachmentPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  source: z.union([
+    z.strictObject({ path: absolutePath }),
+    z.strictObject({
+      name: ChatAttachmentSchema.shape.name,
+      mimeType: ChatAttachmentSchema.shape.mimeType,
+      base64: pasteBase64,
+    }),
+  ]),
+});
+/** Run the message that started a turn again. Regenerate keeps the earlier reply in the thread. */
+export const RetryChatTurnPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  turnId: ChatTurnIdSchema,
+  selection: ChatModelSelectionSchema.optional(),
+  mode: z.enum(['retry', 'regenerate']),
+});
+/** Same bounds as a task title. */
+export const RenameChatThreadPayloadSchema = z.strictObject({ taskId: id('tsk'), title: short });
+export const DeleteChatThreadPayloadSchema = z.strictObject({ taskId: id('tsk') });
+
 /** Sent when a model read ends, so open pickers read the catalog again. */
 export const ChatCatalogChangeSchema = z.strictObject({
   family: z.literal('openai'),
@@ -507,7 +600,8 @@ export const ChatMessageSchema = z.strictObject({
     z.strictObject({ kind: z.literal('system'), turnId: ChatTurnIdSchema.nullable() }),
   ]),
   text: z.string().max(262_144),
-  attachments: z.array(z.string().min(1).max(4096)).max(32).default([]),
+  attachments: legacyAttachments,
+  files,
 });
 export type ChatMessage = z.infer<typeof ChatMessageSchema>;
 
@@ -521,6 +615,27 @@ export const ChatThreadReadSchema = z.strictObject({
   cursor: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
 });
 export type ChatThreadRead = z.infer<typeof ChatThreadReadSchema>;
+
+/** A finished turn's stored events, oldest first, for a view that reopens it. */
+export const MAX_CHAT_TURN_EVENTS_BYTES = 524_288;
+export const ChatTurnEventsReadSchema = z
+  .strictObject({
+    taskId: id('tsk'),
+    turnId: ChatTurnIdSchema,
+    events: z.array(AgentEventSchema).max(5000),
+    /** Pass as afterCursor to read on. Null once the read reached the turn's last event. */
+    nextAfterCursor: z
+      .string()
+      .regex(/^(0|[1-9][0-9]{0,19})$/)
+      .nullable(),
+  })
+  .superRefine((page, context) => {
+    if (page.events.some((event) => event.turnId !== page.turnId))
+      context.addIssue({ code: 'custom', message: 'Turn events belong to the turn they read.' });
+    if (new TextEncoder().encode(JSON.stringify(page)).byteLength > MAX_CHAT_TURN_EVENTS_BYTES)
+      context.addIssue({ code: 'custom', message: 'A turn event page exceeds its byte limit.' });
+  });
+export type ChatTurnEventsRead = z.infer<typeof ChatTurnEventsReadSchema>;
 
 export const ChatChangesReadSchema = z.strictObject({
   taskId: id('tsk'),
@@ -569,6 +684,11 @@ export const ChatCatalogEntrySchema = z.strictObject({
   needsConnect: z.boolean().optional(),
   /** The last turn's stats on this family, for the rail and the Local card. */
   lastTurnStats: ChatTurnStatsSchema.nullable().optional(),
+  /**
+   * MIME patterns such as `image/*` or `application/pdf` the client reports it takes natively.
+   * Null when the client reports nothing.
+   */
+  accepts: z.array(z.string().max(128)).max(64).nullable().default(null),
 });
 export const ChatCatalogReadSchema = z.strictObject({
   families: z.array(ChatCatalogEntrySchema).max(4),
@@ -582,6 +702,14 @@ export const ReadChatThreadPayloadSchema = z.strictObject({
     .regex(/^(0|[1-9][0-9]{0,19})$/)
     .optional(),
   limit: z.number().int().min(1).max(200).default(100),
+});
+export const ReadChatTurnEventsPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  turnId: ChatTurnIdSchema,
+  afterCursor: z
+    .string()
+    .regex(/^(0|[1-9][0-9]{0,19})$/)
+    .optional(),
 });
 export const ReadChatChangesPayloadSchema = z.strictObject({ taskId: id('tsk') });
 export const ReadChatCatalogPayloadSchema = z.strictObject({ taskId: id('tsk').optional() });

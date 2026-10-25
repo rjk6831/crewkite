@@ -60,6 +60,7 @@ const user = (cursor: number, text: string): ThreadEvent => {
     author: { kind: 'user' },
     text,
     attachments: [],
+    files: [],
   };
   return { type: 'conversation.entry', cursor: String(cursor), taskId: task, payload: message };
 };
@@ -328,7 +329,7 @@ test('a message the controller queued leaves no pending bubble', () => {
     crew: null,
     flightMode: 'manual',
     crewChain: null,
-    queued: [{ id: id('msg', 9), at: stamp, text, role: 'assistant', attachments: [] }],
+    queued: [{ id: id('msg', 9), at: stamp, text, role: 'assistant', attachments: [], files: [] }],
   };
   const pending = { localId: 'local-1', text, attachments: [], at: stamp };
   const sent = reduceThread(initialThreadState(task), { type: 'sending', pending });
@@ -659,6 +660,7 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
         },
         text: 'Two findings.',
         attachments: [],
+        files: [],
       },
     ],
     liveEvents: [],
@@ -780,6 +782,7 @@ const connected = (name: ChatFamily, percent: number | null) => ({
     percent === null
       ? []
       : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
+  accepts: null,
 });
 
 test('the offer ranks the other connected families by the thread mode and leaves out one at zero', () => {

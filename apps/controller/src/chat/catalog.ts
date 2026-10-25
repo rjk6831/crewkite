@@ -136,6 +136,7 @@ function local(input: ChatCatalogInput): Entry {
     // between launches. A machine that never set one up shows nothing.
     needsConnect: !connected && input.local.endpoint !== null,
     lastTurnStats: lastTurnStats(input, 'local'),
+    accepts: null,
   };
 }
 
@@ -161,6 +162,7 @@ function entry(
     // nothing about the account now, so it does not count.
     needsConnect: !connected && windows.some((window) => window.percent !== null),
     lastTurnStats: lastTurnStats(input, family),
+    accepts: null,
   };
 }
 

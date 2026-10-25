@@ -2,6 +2,7 @@ import { z } from 'zod';
 import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
+  ChatAttachmentSchema,
   ChatBranchStatusSchema,
   ChatCatalogChangeSchema,
   ChatCatalogReadSchema,
@@ -12,20 +13,27 @@ import {
   ChatPushResultSchema,
   ChatQueuedMessageSchema,
   ChatRoleSchema,
+  ChatThreadActivitySchema,
   ChatThreadReadSchema,
   ChatThreadSchema,
+  ChatTurnEventsReadSchema,
   ChatTurnIdSchema,
   ChatTurnSchema,
   ConfigureChatThreadPayloadSchema,
+  DeleteChatThreadPayloadSchema,
   HandoffChatThreadPayloadSchema,
+  ImportChatAttachmentPayloadSchema,
   OpenChatPullRequestPayloadSchema,
   PushChatBranchPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
+  ReadChatTurnEventsPayloadSchema,
   RefreshChatModelsPayloadSchema,
+  RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
+  RetryChatTurnPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -1925,6 +1933,8 @@ export const ConversationEntrySchema = z
       author: conversationUser,
       context: ConversationContextRefsSchema.optional(),
       attachments: z.array(z.string().min(1).max(4096)).max(32).optional(),
+      // Optional like attachments, so planning messages that share this kind keep their shape.
+      files: z.array(ChatAttachmentSchema).max(32).optional(),
     }),
     z.strictObject({
       ...conversationEntryFields,
@@ -2355,6 +2365,11 @@ export const TaskConversationStateSchema = z
     if (conversationBytes(state) > 32768) fail('Conversation state exceeds 32768 encoded bytes.');
   });
 export type TaskConversationState = z.infer<typeof TaskConversationStateSchema>;
+/** Restore one path in the scratch copy to the thread's base. */
+export const DiscardChatChangePayloadSchema = z.strictObject({
+  taskId: TaskIdSchema,
+  path: NativeTargetPathSchema,
+});
 export const CommandSchema = z.discriminatedUnion('command', [
   mutate('SendChatMessage', SendChatMessagePayloadSchema),
   mutate('ResolveChatPermission', ResolveChatPermissionPayloadSchema),
@@ -2370,6 +2385,12 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
   mutate('OpenChatPullRequest', OpenChatPullRequestPayloadSchema),
   read('ReadChatBranchStatus', ReadChatBranchStatusPayloadSchema),
+  mutate('ImportChatAttachment', ImportChatAttachmentPayloadSchema),
+  mutate('RetryChatTurn', RetryChatTurnPayloadSchema),
+  read('ReadChatTurnEvents', ReadChatTurnEventsPayloadSchema),
+  mutate('DiscardChatChange', DiscardChatChangePayloadSchema),
+  mutate('RenameChatThread', RenameChatThreadPayloadSchema),
+  mutate('DeleteChatThread', DeleteChatThreadPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -3263,6 +3284,7 @@ export const TaskSummarySchema = z
     revision: TaskSchema.shape.revision,
     runId: TaskSchema.shape.runId,
     next: TaskSchema.shape.next,
+    chatActivity: ChatThreadActivitySchema.default('idle'),
     match: z
       .strictObject({
         field: z.enum(['title', 'project', 'outcome', 'criterion', 'task-id', 'project-id']),
@@ -3423,6 +3445,9 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatPushResultSchema.extend({ kind: z.literal('chat-push') }),
   ChatPullRequestResultSchema.extend({ kind: z.literal('chat-pull-request') }),
   ChatBranchStatusSchema.extend({ kind: z.literal('chat-branch-status') }),
+  ChatAttachmentSchema.extend({ kind: z.literal('chat-attachment') }),
+  // The byte check on the page stays with the kind tag.
+  ChatTurnEventsReadSchema.safeExtend({ kind: z.literal('chat-turn-events') }),
   /** What a stop took out of the thread's queue, so the composer can give the text back. */
   z.strictObject({
     kind: z.literal('chat-queue'),

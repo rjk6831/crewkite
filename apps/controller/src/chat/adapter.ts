@@ -92,6 +92,7 @@ export function chatFailure(
       timeout: 'Send again with a smaller request, or raise the turn limit in Settings.',
       stopped: 'Send a new message to continue.',
       internal: 'Send again. If it repeats, report the details.',
+      'attachment-rejected': 'Try another provider for these files.',
     }[input.kind];
   return {
     stage: input.stage,
