@@ -133,11 +133,16 @@ export function useThread(
       histories.current.add(turnId);
       const events: AgentEvent[] = [];
       let afterCursor: string | undefined;
+      // Stays true when a page after the first fails or the page cap ends the loop.
+      let partial = true;
       try {
         for (let page = 0; page < MAX_EVENT_PAGES; page++) {
           const read = await readTurnEvents(source, { taskId, turnId, afterCursor });
           events.push(...read.events);
-          if (read.nextAfterCursor === null || read.nextAfterCursor === afterCursor) break;
+          if (read.nextAfterCursor === null || read.nextAfterCursor === afterCursor) {
+            partial = false;
+            break;
+          }
           afterCursor = read.nextAfterCursor;
         }
       } catch (failure) {
@@ -146,7 +151,7 @@ export function useThread(
           return;
         }
       }
-      dispatch({ type: 'history', turnId, events });
+      dispatch({ type: 'history', turnId, events, partial });
     },
     [source, taskId],
   );

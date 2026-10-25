@@ -65,8 +65,8 @@ export type ThreadAction =
   | { type: 'loaded'; read: ChatThreadRead }
   /** A page of older messages, read with the oldest loaded cursor as `beforeCursor`. */
   | { type: 'earlier'; read: ChatThreadRead }
-  /** Every stored event of one finished turn, oldest first. */
-  | { type: 'history'; turnId: string; events: AgentEvent[] }
+  /** Every stored event of one finished turn, oldest first. `partial` when the paging stopped early. */
+  | { type: 'history'; turnId: string; events: AgentEvent[]; partial?: boolean }
   | { type: 'history-note'; turnId: string; note: string }
   | { type: 'events'; events: ThreadEvent[] }
   | { type: 'sending'; pending: PendingMessage }
@@ -275,7 +275,10 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
         view,
         settled: true,
       };
-      return { ...state, turns: { ...state.turns, [action.turnId]: record } };
+      const turns = { ...state.turns, [action.turnId]: record };
+      if (!action.partial) return { ...state, turns };
+      const note = "Part of this turn's history could not load.";
+      return { ...state, turns, historyNotes: { ...state.historyNotes, [action.turnId]: note } };
     }
     case 'history-note':
       return {
