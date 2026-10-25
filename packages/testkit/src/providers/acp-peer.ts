@@ -632,3 +632,247 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
   });
   input.once('close', () => process.stdin.destroy());
 }
+
+export const acpChatPeerCases = [
+  'chat-stream',
+  'chat-lost',
+  'chat-permission',
+  'chat-permission-execute',
+  'chat-permission-outside',
+  'chat-cancel',
+  'chat-quota',
+  'chat-error',
+  'chat-refusal',
+  'chat-max-tokens',
+  'chat-unknown',
+] as const;
+export type AcpChatPeerCase = (typeof acpChatPeerCases)[number];
+
+/**
+ * A scripted agent for the chat adapter. It advertises session loading, keeps one session id
+ * and plays one script per prompt. Each transition follows a received message, and the peer
+ * uses no clock or network. The writer peer above is untouched.
+ */
+export function runAcpChatPeer(scenario: AcpChatPeerCase) {
+  assert(acpChatPeerCases.includes(scenario));
+  const session = 'chat-session-1';
+  let cwd = '',
+    promptId: string | number | undefined,
+    answered = false;
+  const emit = (value: object) => {
+    const line = `${JSON.stringify(value)}\n`;
+    process.stdout.write(line.slice(0, 11));
+    process.stdout.write(line.slice(11));
+  };
+  const result = (id: string | number, value: unknown) =>
+    emit({ jsonrpc: '2.0', id, result: value });
+  const update = (value: object) =>
+    emit({
+      jsonrpc: '2.0',
+      method: 'session/update',
+      params: { sessionId: session, update: value },
+    });
+  const chunk = (kind: string, text: string) =>
+    update({ sessionUpdate: kind, content: { type: 'text', text } });
+  const terminal = (stopReason: string) => {
+    assert(promptId !== undefined);
+    answered = true;
+    result(promptId, { stopReason });
+  };
+  const config = [
+    {
+      id: 'model-slot',
+      name: 'Model',
+      category: 'model',
+      type: 'select',
+      currentValue: 'fixture-model',
+      options: [
+        { value: 'fixture-model', name: 'Model' },
+        { value: 'fixture-other', name: 'Other' },
+      ],
+    },
+    {
+      id: 'mode-slot',
+      name: 'Mode',
+      category: 'mode',
+      type: 'select',
+      currentValue: 'fixture-open',
+      options: [
+        { value: 'fixture-review', name: 'Review' },
+        { value: 'fixture-open', name: 'Open' },
+      ],
+    },
+  ];
+  function script() {
+    const file = join(cwd, 'net.mjs');
+    if (scenario === 'chat-stream') {
+      update({ sessionUpdate: 'usage_update', used: 12, size: 1024 });
+      chunk('agent_thought_chunk', 'Looking at ');
+      chunk('agent_thought_chunk', 'the files.');
+      chunk('agent_message_chunk', 'I will read ');
+      chunk('agent_message_chunk', 'the file first.');
+      update({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'read-1',
+        title: 'Read net.mjs',
+        kind: 'read',
+        status: 'in_progress',
+        rawInput: { path: 'net.mjs' },
+        locations: [{ path: file }],
+      });
+      update({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'read-1',
+        status: 'completed',
+        content: [{ type: 'content', content: { type: 'text', text: 'export const total = 0;' } }],
+      });
+      update({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'edit-1',
+        title: 'Edit net.mjs',
+        kind: 'edit',
+        status: 'pending',
+      });
+      update({
+        sessionUpdate: 'tool_call_update',
+        toolCallId: 'edit-1',
+        status: 'completed',
+        locations: [{ path: file }],
+        content: [
+          {
+            type: 'diff',
+            path: file,
+            oldText: 'export const total = 0;\n',
+            newText: 'export const total = 1;\nexport const label = "a";\n',
+          },
+        ],
+      });
+      chunk('agent_message_chunk', 'Changed it.');
+      terminal('end_turn');
+    } else if (scenario.startsWith('chat-permission')) {
+      const execute = scenario === 'chat-permission-execute';
+      chunk('agent_message_chunk', 'Asking first.');
+      update({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'tool-1',
+        title: execute ? 'Run ls?' : 'Run replace_file_content?',
+        kind: execute ? 'execute' : 'edit',
+        status: 'pending',
+        rawInput: execute ? { command: 'ls' } : { TargetFile: file },
+        // The outside case is one edit that touches a file in the scratch copy and one beside it.
+        locations:
+          scenario === 'chat-permission-outside'
+            ? [{ path: file }, { path: join(cwd, '..', 'outside.md') }]
+            : [{ path: file }],
+      });
+      emit({
+        jsonrpc: '2.0',
+        id: 'perm-1',
+        method: 'session/request_permission',
+        params: {
+          sessionId: session,
+          toolCall: { toolCallId: 'tool-1' },
+          options: [
+            { optionId: 'once', name: 'Once', kind: 'allow_once' },
+            { optionId: 'always', name: 'Always', kind: 'allow_always' },
+            { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+          ],
+        },
+      });
+    } else if (scenario === 'chat-cancel') chunk('agent_message_chunk', 'working');
+    else if (scenario === 'chat-quota')
+      emit({
+        jsonrpc: '2.0',
+        id: promptId,
+        error: {
+          code: -32603,
+          message:
+            "Quota exceeded for quota metric 'requests'. Your quota will reset after 2h30m0s.",
+        },
+      });
+    else if (scenario === 'chat-error')
+      emit({
+        jsonrpc: '2.0',
+        id: promptId,
+        error: { code: -32603, message: 'Internal error: boom' },
+      });
+    else if (scenario === 'chat-refusal') terminal('refusal');
+    else if (scenario === 'chat-max-tokens') {
+      chunk('agent_message_chunk', 'cut off');
+      terminal('max_tokens');
+    } else if (scenario === 'chat-unknown') {
+      update({ sessionUpdate: 'fancy_new_update', detail: 1 });
+      emit({ jsonrpc: '2.0', method: '$/progress', params: { value: 1 } });
+      update({ sessionUpdate: 'fancy_new_update', detail: 2 });
+      chunk('agent_message_chunk', 'still here');
+      terminal('end_turn');
+    } else terminal('end_turn');
+  }
+  const input = createInterface({ input: process.stdin, crlfDelay: Infinity });
+  input.on('line', (line) => {
+    try {
+      const message = JSON.parse(line);
+      if (message.method === 'initialize') {
+        assert.deepEqual(message.params.clientCapabilities, {
+          fs: { readTextFile: false, writeTextFile: false },
+          terminal: false,
+        });
+        result(message.id, {
+          protocolVersion: 1,
+          agentInfo: { name: 'fixture', version: '1.4.0' },
+          agentCapabilities: { loadSession: true },
+          authMethods: [{ id: 'oauth-personal', name: 'Personal' }],
+        });
+      } else if (message.method === 'session/new') {
+        cwd = message.params.cwd;
+        assert.deepEqual(message.params.mcpServers, []);
+        // The new-session reply and a trailing update share one write, as the writer peer does.
+        process.stdout.write(
+          `${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: session, configOptions: config } })}\n${JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: session, update: { sessionUpdate: 'available_commands_update', availableCommands: [] } } })}\n`,
+        );
+      } else if (message.method === 'session/load') {
+        cwd = message.params.cwd;
+        if (scenario === 'chat-lost' || message.params.sessionId !== session)
+          emit({
+            jsonrpc: '2.0',
+            id: message.id,
+            error: { code: -32602, message: 'Session not found' },
+          });
+        else {
+          // The old conversation comes back as updates before the reply.
+          chunk('user_message_chunk', 'old question');
+          chunk('agent_message_chunk', 'old answer');
+          result(message.id, null);
+        }
+      } else if (message.method === 'session/set_config_option') {
+        const option = config.find((v) => v.id === message.params.configId);
+        assert(option);
+        assert(option.options.some((v) => v.value === message.params.value));
+        option.currentValue = message.params.value;
+        result(message.id, { configOptions: config });
+      } else if (message.method === 'session/prompt') {
+        assert.equal(message.params.sessionId, session);
+        promptId = message.id;
+        script();
+      } else if (message.method === 'session/cancel') {
+        // A cancel can trail a prompt that a declined permission already ended.
+        if (!answered) terminal('cancelled');
+      } else if (message.id === 'perm-1') {
+        const outcome = message.result?.outcome;
+        chunk('agent_message_chunk', ` outcome=${JSON.stringify(outcome)}`);
+        update({
+          sessionUpdate: 'tool_call_update',
+          toolCallId: 'tool-1',
+          status:
+            outcome?.outcome === 'selected' && outcome.optionId !== 'deny' ? 'completed' : 'failed',
+        });
+        terminal(outcome?.outcome === 'cancelled' ? 'cancelled' : 'end_turn');
+      } else throw Error('Unsupported fixture request.');
+    } catch {
+      process.exitCode = 2;
+      process.stdin.destroy();
+      input.close();
+    }
+  });
+  input.once('close', () => process.stdin.destroy());
+}

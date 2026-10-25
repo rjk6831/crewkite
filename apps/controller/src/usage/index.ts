@@ -12,6 +12,22 @@ export function nonnegative(value: number, name: string): number {
   return value;
 }
 
+/**
+ * The state of one window from its fields: a future observation or a missing remaining says
+ * nothing, a passed reset says nothing about now, and past the maximum age it is stale.
+ */
+export function windowState(
+  observation: Pick<Observation, 'observedAt' | 'resetsAt' | 'remaining'>,
+  clock: { nowMs: number; maxAgeMs: number },
+): Window['state'] {
+  const observedAt = Date.parse(observation.observedAt);
+  if (!(observedAt <= clock.nowMs)) return 'unknown';
+  if (observation.resetsAt !== null && Date.parse(observation.resetsAt) <= clock.nowMs)
+    return 'reset-pending';
+  if (observation.remaining === null) return 'unknown';
+  return clock.nowMs - observedAt > clock.maxAgeMs ? 'stale' : 'fresh';
+}
+
 export function deriveWindow(
   observation: Observation,
   clock: { nowMs: number; maxAgeMs: number },
@@ -19,14 +35,7 @@ export function deriveWindow(
   const parsed = ObservationSchema.parse(observation);
   nonnegative(clock.nowMs, 'Time');
   nonnegative(clock.maxAgeMs, 'Maximum age');
-  const observedAt = Date.parse(parsed.observedAt);
-  let state: Window['state'];
-  if (observedAt > clock.nowMs) state = 'unknown';
-  else if (parsed.resetsAt !== null && Date.parse(parsed.resetsAt) <= clock.nowMs)
-    state = 'reset-pending';
-  else if (parsed.remaining === null) state = 'unknown';
-  else state = clock.nowMs - observedAt > clock.maxAgeMs ? 'stale' : 'fresh';
-  return { observation: parsed, state };
+  return { observation: parsed, state: windowState(parsed, clock) };
 }
 
 export function availableAllowance(input: {

@@ -12,7 +12,12 @@ import {
 } from '@crewkite/contracts';
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
-import { type DiscoveryMetadata, OpenAiDiscovery, type OpenAiUsageHook } from './discovery.ts';
+import {
+  authorityNotice,
+  type DiscoveryMetadata,
+  OpenAiDiscovery,
+  type OpenAiUsageHook,
+} from './discovery.ts';
 import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
 
 const MAX_CONTENT = 65_536;
@@ -174,33 +179,6 @@ const fields = [
   'path',
   'baseHash',
 ] as const;
-// A transcript ignores a notice it does not consume, unless the notice ends or moves the thread,
-// opens a realtime session, reroutes the model, starts a hook or MCP server, changes the account or
-// remote control, or touches approvals.
-const authorityNotices: ReadonlySet<string> = new Set([
-  'thread/archived',
-  'thread/unarchived',
-  'thread/deleted',
-  'thread/closed',
-  'thread/reverted',
-  'thread/environment/connected',
-  'thread/environment/disconnected',
-  'remoteControl/status/changed',
-  'model/rerouted',
-  'hook/started',
-  'hook/completed',
-  'account/updated',
-  'account/login/completed',
-  'account/gatewayOAuth/changed',
-  'item/autoApprovalReview/started',
-  'item/autoApprovalReview/completed',
-  'autoApprovalReview/strictReviewRequired',
-  'guardianWarning',
-]);
-export const authorityNotice = (method: string) =>
-  authorityNotices.has(method) ||
-  method.startsWith('thread/realtime/') ||
-  method.startsWith('mcpServer/');
 
 /** Ignored notices are counted by method hash so a completion record shows what arrived. */
 export class NoticeCensus {
@@ -333,11 +311,8 @@ export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: Structured
     (creditBucket.rateLimitReachedType === null ||
       creditBucket.rateLimitReachedType === 'rate_limit_reached');
   return (
-    metadata.account.plan === 'pro' &&
     (limits.ordinaryUsageAllowed === true || !!existingCreditsAllowed) &&
-    choiceFailure(metadata, plan) === null &&
-    !!metadata.mcpServers &&
-    !Object.values(metadata.mcpServers).some((enabled) => enabled)
+    choiceFailure(metadata, plan) === null
   );
 }
 
@@ -559,6 +534,8 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           if (!this.awaiting || value.id !== this.frameRequest) this.refuse();
           if (this.step === 'thread' && value.id === 10) {
             this.site = 'thread-response';
+            // The client also reports its service tier, reasoning effort and reviewer. CrewKite
+            // acts on none of them, so a new value there is not a reason to refuse the thread.
             const response = z
               .object({
                 thread: z.object({ id, ephemeral: z.literal(true) }),
@@ -566,13 +543,10 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
                 modelProvider: z.literal('openai'),
                 cwd: z.literal(this.plan.directory),
                 approvalPolicy: z.literal('on-request'),
-                approvalsReviewer: z.literal('user'),
                 sandbox: z.object({
                   type: z.literal('readOnly'),
-                  networkAccess: z.literal(false).optional(),
+                  networkAccess: z.boolean().optional(),
                 }),
-                reasoningEffort: z.literal(this.plan.effort),
-                serviceTier: z.literal('default'),
               })
               .parse(value.result);
             if (this.threadId && this.threadId !== response.thread.id) this.refuse();
@@ -627,14 +601,11 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
           threadSettings: z.object({
             model: z.literal(this.plan.model),
             modelProvider: z.literal('openai'),
-            effort: z.literal(this.plan.effort),
-            serviceTier: z.literal('default'),
             cwd: z.literal(this.plan.directory),
             approvalPolicy: z.literal('on-request'),
-            approvalsReviewer: z.literal('user'),
             sandboxPolicy: z.object({
               type: z.literal('readOnly'),
-              networkAccess: z.literal(false).optional(),
+              networkAccess: z.boolean().optional(),
             }),
           }),
         })

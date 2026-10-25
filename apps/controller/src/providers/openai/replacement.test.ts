@@ -479,16 +479,9 @@ test('native proposals and reviews require one matching completed turn and bound
       method: 'thread/settings/updated',
       params: {
         threadId: 'thread-1',
-        threadSettings: { ...threadSettings(directory), effort: undefined },
-      },
-    },
-    {
-      method: 'thread/settings/updated',
-      params: {
-        threadId: 'thread-1',
         threadSettings: {
           ...threadSettings(directory),
-          sandboxPolicy: { type: 'readOnly', networkAccess: true },
+          sandboxPolicy: { type: 'workspaceWrite', networkAccess: false },
         },
       },
     },
@@ -718,7 +711,6 @@ test('native proposals and reviews require one matching completed turn and bound
   }
   for (const mcp_servers of [
     undefined,
-    { fixture_server: { enabled: true } },
     { fixture_server: { enabled: 'false' } },
     { 'unsafe.name': { enabled: false } },
     Object.fromEntries(
@@ -1662,6 +1654,70 @@ test('native proposals and reviews require one matching completed turn and bound
   assert.equal(unsolicited.submitted, false);
 });
 
+test('new client fields, tiers and plans are admitted while the sandbox must stay read-only', () => {
+  const directory = resolve('internal/replacement-fixture');
+  const start = (overrides: Record<string, unknown> = {}) => {
+    const reader = new ReplacementTranscript(plan(directory), { now: () => 1, timeoutMs: 300_000 });
+    metadata(reader, overrides);
+    return reader;
+  };
+  // A plan other than pro and an enabled MCP server of the person's own do not block admission.
+  const reader = start({
+    'account/read': { account: { type: 'chatgpt', planType: 'plus' }, requiresOpenaiAuth: true },
+    'config/read': {
+      config: { ...configuration, mcp_servers: { fixture_server: { enabled: true } } },
+    },
+  });
+  reader.push(
+    bytes({
+      id: 10,
+      result: {
+        ...threadResult(directory),
+        serviceTier: 'priority',
+        reasoningEffort: 'high',
+        approvalsReviewer: 'auto_review',
+        sandbox: { type: 'readOnly', networkAccess: true, futureRule: ['a'] },
+        futureField: { nested: true },
+      },
+    }),
+  );
+  assert.equal(
+    JSON.parse(Buffer.from(reader.next() as Uint8Array).toString()).method,
+    'turn/start',
+  );
+  reader.push(
+    bytes({
+      method: 'thread/settings/updated',
+      params: {
+        threadId: 'thread-1',
+        threadSettings: {
+          ...threadSettings(directory),
+          effort: 'high',
+          serviceTier: null,
+          approvalsReviewer: 'auto_review',
+          sandboxPolicy: { type: 'readOnly', networkAccess: true },
+          futureField: 1,
+        },
+      },
+    }),
+  );
+  assert.equal(reader.complete, false);
+  const writable = start();
+  assert.throws(() =>
+    writable.push(
+      bytes({
+        id: 10,
+        result: {
+          ...threadResult(directory),
+          sandbox: { type: 'workspaceWrite', networkAccess: false },
+        },
+      }),
+    ),
+  );
+  assert.equal(writable.diagnostic?.site, 'thread-response');
+  assert.equal(writable.submitted, false);
+});
+
 test('both task transcripts refuse every notice that carries authority', () => {
   const directory = resolve('internal/replacement-fixture');
   const scratch = resolve(directory, 'scratch');
@@ -2033,7 +2089,6 @@ test('native task submission and interruption share one deadline through owned c
       'rpc-error',
       'prepare-cancel',
       'prepare-deadline',
-      'mcp-drift',
     ]) {
       const directory = resolve(root, mode);
       mkdirSync(directory, { mode: 0o700 });
@@ -2102,10 +2157,7 @@ test('native task submission and interruption share one deadline through owned c
                 Buffer.from(data).toString().includes('"method":"turn/start"') ||
                 (Buffer.from(data).toString().includes('"method":"config/read"') &&
                   mode === 'prepare-cancel' &&
-                  phase === 'prepare') ||
-                (Buffer.from(data).toString().includes('"method":"model/list"') &&
-                  mode === 'mcp-drift' &&
-                  phase === 'task')
+                  phase === 'prepare')
               ) {
                 child.stdout.once('data', () => {
                   requestStop?.();
@@ -2133,7 +2185,7 @@ test('native task submission and interruption share one deadline through owned c
           ?.work();
       }
       const result = await handle.result;
-      const submitted = mode.startsWith('prepare-') || mode === 'mcp-drift' ? 0 : 1;
+      const submitted = mode.startsWith('prepare-') ? 0 : 1;
       assert.equal(submission, submitted, mode);
       assert.equal(
         writes.filter((value) => value.includes('"method":"turn/start"')).length,
@@ -2162,7 +2214,7 @@ test('native task submission and interruption share one deadline through owned c
           result.reason,
           mode === 'unknown'
             ? 'ownership'
-            : mode === 'rpc-error' || mode === 'mcp-drift'
+            : mode === 'rpc-error'
               ? 'protocol'
               : mode === 'cancel' || mode === 'prepare-cancel'
                 ? 'stopped'

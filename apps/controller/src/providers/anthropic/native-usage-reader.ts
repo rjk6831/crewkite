@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { userInfo } from 'node:os';
 import { isAbsolute, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { z } from 'zod';
@@ -12,6 +13,7 @@ import {
 import {
   AnthropicUsageReader,
   anthropicUsageReaderPlan,
+  maximumDetail,
   UsageReaderError,
 } from './usage-reader.ts';
 
@@ -28,7 +30,7 @@ type Owner = Pick<
   | 'quiescent'
 >;
 type Reading = ReturnType<AnthropicUsageReader['finish']>;
-type Reason = 'protocol' | 'output-limit' | 'deadline' | 'stopped' | 'exit' | 'ownership';
+type Reason = UsageReaderError['reason'] | 'deadline' | 'stopped' | 'exit' | 'ownership';
 export type AnthropicUsageReaderContext = Readonly<{
   operationId: string;
   executable: string;
@@ -51,6 +53,15 @@ const usageScope = {
   generationRequest: false,
   policyHooks: 'covered-by-native-client-trust',
 } as const;
+
+// A read that fails says only which part was missing. What the client wrote is the cause, so the
+// result keeps its reply text and, after a blank line, the end of its error output.
+function detail(reply: string, errors: Buffer) {
+  // The tail can start inside a character. Its replacement mark says nothing.
+  const tail = new TextDecoder().decode(errors).replace(/^\u{FFFD}+/u, '');
+  const text = [reply, tail.trim()].filter(Boolean).join('\n\n');
+  return text ? text.slice(0, maximumDetail) : null;
+}
 
 /** The caller obtains explicit native-client trust for this scope before starting the command. */
 export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
@@ -130,6 +141,10 @@ export function startAnthropicUsageReader(
     directory: context.directory,
     environment: {
       HOME: context.home,
+      // The client reads its sign-in from the Keychain under this name, so without it /usage runs
+      // signed out and prints no usage report.
+      USER: userInfo().username,
+      LOGNAME: userInfo().username,
       TMPDIR: context.temporary,
       PATH: '/usr/bin:/bin',
       LANG: 'C',
@@ -139,9 +154,10 @@ export function startAnthropicUsageReader(
   });
   if (!owner.stdoutStream || !owner.stderrStream) {
     owner.stop();
-    throw new UsageReaderError('protocol');
+    throw new UsageReaderError('client');
   }
-  const parser = new AnthropicUsageReader(plan.sessionId);
+  const parser = new AnthropicUsageReader();
+  let errors = Buffer.alloc(0);
   let reason: Reason | null = null;
   let cancelCleanup: (() => void) | undefined;
   const boundary = Promise.withResolvers<void>();
@@ -162,14 +178,11 @@ export function startAnthropicUsageReader(
         bytes += chunk.byteLength;
         const limit = stdout ? plan.maximumStdoutBytes : plan.maximumStderrBytes;
         if (bytes > limit) stop('output-limit');
+        if (!stdout) errors = Buffer.concat([errors, chunk]).subarray(-maximumDetail);
         if (reason === null && stdout) parser.feed(chunk);
       }
     } catch (error) {
-      stop(
-        error instanceof UsageReaderError && error.reason === 'output-limit'
-          ? 'output-limit'
-          : 'protocol',
-      );
+      stop(error instanceof UsageReaderError ? error.reason : 'exit');
     }
   };
   const output = Promise.all([drain(owner.stdoutStream, true), drain(owner.stderrStream, false)]);
@@ -183,7 +196,7 @@ export function startAnthropicUsageReader(
       Promise.all([owner.closed, owner.inputCompleted, output]).then(
         () => true,
         () => {
-          stop('protocol');
+          stop('exit');
           return false;
         },
       ),
@@ -218,8 +231,8 @@ export function startAnthropicUsageReader(
     if (reason === null) {
       try {
         reading = parser.finish((options.receivedAt ?? (() => new Date().toISOString()))());
-      } catch {
-        reason = 'protocol';
+      } catch (error) {
+        reason = error instanceof UsageReaderError ? error.reason : 'exit';
       }
     }
     cancelDeadline();
@@ -230,6 +243,7 @@ export function startAnthropicUsageReader(
       quiescent,
       exitCode: exit?.code ?? null,
       signal: exit?.signal ?? null,
+      detail: detail(parser.reply(), errors),
       modelPrompt: false as const,
     };
   })();

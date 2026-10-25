@@ -37,9 +37,13 @@ const outgoing = z.union([
     }),
   }),
   z.strictObject({
-    id: z.literal(4),
+    id: z.union([z.literal(4), z.literal(7)]),
     method: z.literal('model/list'),
-    params: z.strictObject({ limit: z.literal(20), includeHidden: z.literal(false) }),
+    params: z.strictObject({
+      limit: z.literal(20),
+      includeHidden: z.boolean(),
+      cursor: text(200).optional(),
+    }),
   }),
   z.strictObject({
     id: z.literal(5),
@@ -67,91 +71,59 @@ const requests: z.input<typeof outgoing>[][] = [
       params: { supportsLunaReserve: false, excludeResetCreditDetails: true },
     },
   ],
-  [{ id: 4, method: 'model/list', params: { limit: 20, includeHidden: false } }],
 ];
+// The fixed requests, then model/list, whose page and cursor depend on the read.
+const STEPS = requests.length + 1;
+// A reply holds a result or an error, never both. Envelope fields a later client adds pass.
+const responseId = z.number().int().min(1).max(7);
 const response = z.union([
-  z.strictObject({ id: z.number().int().min(1).max(6), result: z.unknown() }),
-  z.strictObject({ id: z.number().int().min(1).max(6), error: z.unknown() }),
+  z.object({ id: responseId, result: z.unknown(), error: z.never().optional() }),
+  z.object({ id: responseId, error: z.unknown(), result: z.never().optional() }),
 ]);
 
-const position = z.strictObject({
-  line: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
-  column: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER),
-});
-const emittedAtMs = z
-  .number()
-  .int()
-  .min(Number.MIN_SAFE_INTEGER)
-  .max(Number.MAX_SAFE_INTEGER)
-  .optional();
-const notification = z.union([
-  z.strictObject({
-    method: z.literal('configWarning'),
-    emittedAtMs,
-    params: z.strictObject({
-      summary: z.string().max(4096),
-      details: z.string().max(16_384).nullable(),
-      path: z.string().max(4096).optional(),
-      range: z.strictObject({ start: position, end: position }).optional(),
-    }),
-  }),
-  z.strictObject({
-    method: z.literal('account/updated'),
-    emittedAtMs,
-    params: z.strictObject({
-      authMode: z
-        .enum([
-          'apikey',
-          'chatgpt',
-          'chatgptAuthTokens',
-          'headers',
-          'agentIdentity',
-          'personalAccessToken',
-          'bedrockApiKey',
-          'bedrockAccessKeys',
-        ])
-        .nullable(),
-      planType: z
-        .enum([
-          'free',
-          'go',
-          'plus',
-          'pro',
-          'prolite',
-          'promax',
-          'team',
-          'self_serve_business_prolite',
-          'self_serve_business_usage_based',
-          'business',
-          'ent26',
-          'enterprise_cbp_automation',
-          'enterprise_cbp_usage_based',
-          'enterprise',
-          'edu',
-          'edu_plus',
-          'edu_pro',
-          'unknown',
-        ])
-        .nullable(),
-    }),
-  }),
-  z.strictObject({
-    method: z.literal('remoteControl/status/changed'),
-    emittedAtMs,
-    params: z.strictObject({
-      status: z.literal('disabled'),
-      serverName: z.string().max(4096),
-      installationId: z.string().max(4096),
-      environmentId: z.string().max(4096).nullable(),
-    }),
-  }),
+// Discovery reads nothing else from a notice, so any method and params pass and only count toward
+// the bound. A server request carries an id and waits for an answer this reader never sends, so it
+// still stops discovery.
+const notification = z.object({ method: z.string().min(1).max(200), id: z.never().optional() });
+// A task's metadata phase runs through this reader, and remote control reaching the client
+// refuses a task. Only the status decides; the notice's other fields pass.
+const remoteControl = z.object({ params: z.object({ status: z.literal('disabled') }) });
+// A notice carries authority when it ends or moves the thread, opens a realtime session, reroutes
+// the model, starts a hook or MCP server, changes the account or remote control, or touches
+// approvals. A task's transcript refuses every one of them. Discovery runs as a task's metadata
+// phase, so it refuses them too, except the account update and remote control status that arrive
+// at startup. Any other notice passes.
+const authorityNotices: ReadonlySet<string> = new Set([
+  'thread/archived',
+  'thread/unarchived',
+  'thread/deleted',
+  'thread/closed',
+  'thread/reverted',
+  'thread/environment/connected',
+  'thread/environment/disconnected',
+  'remoteControl/status/changed',
+  'model/rerouted',
+  'hook/started',
+  'hook/completed',
+  'account/updated',
+  'account/login/completed',
+  'account/gatewayOAuth/changed',
+  'item/autoApprovalReview/started',
+  'item/autoApprovalReview/completed',
+  'autoApprovalReview/strictReviewRequired',
+  'guardianWarning',
 ]);
+export const authorityNotice = (method: string) =>
+  authorityNotices.has(method) ||
+  method.startsWith('thread/realtime/') ||
+  method.startsWith('mcpServer/');
 export type DiscoveryEnvelope =
   | 'response'
   | 'error'
   | 'config-warning'
   | 'account-updated'
   | 'remote-control-status'
+  | 'notification'
   | 'invalid'
   | null;
 
@@ -299,15 +271,9 @@ const bucket = z
     secondary: window.optional(),
     credits: creditSnapshot,
     spendControlReached: z.boolean().nullish(),
-    rateLimitReachedType: z
-      .enum([
-        'rate_limit_reached',
-        'workspace_owner_credits_depleted',
-        'workspace_member_credits_depleted',
-        'workspace_owner_usage_limit_reached',
-        'workspace_member_usage_limit_reached',
-      ])
-      .nullish(),
+    // Admission spends existing credits only when this is null or rate_limit_reached. Any other
+    // value, including one a later client adds, refuses there and never stops discovery.
+    rateLimitReachedType: z.string().max(64).nullish(),
   })
   .transform(
     ({ limitId, primary, secondary, credits, spendControlReached, rateLimitReachedType }) => ({
@@ -493,6 +459,10 @@ export function openAiUsageReporter(hook: OpenAiUsageHook | undefined): UsageRep
   };
 }
 
+// shortcut: the conversation catalog contract holds at most 20 models, so a read keeps 20. The
+// client sorts hidden models in among the listed ones, so with hidden models a full first page can
+// push a listed model off it. Only then does the read take one more page, and listed models come
+// first in what it keeps. Upgrade: raise the contract bound and page through model/list.
 const models = z
   .object({
     data: z
@@ -503,16 +473,18 @@ const models = z
             model: id,
             supportedReasoningEfforts: z.array(z.object({ reasoningEffort: text(32) })).max(16),
             defaultReasoningEffort: text(32),
+            hidden: z.boolean().nullish(),
           })
-          .transform(({ supportedReasoningEfforts, ...value }) => ({
+          .transform(({ supportedReasoningEfforts, hidden, ...value }) => ({
             ...value,
             supportedReasoningEfforts: supportedReasoningEfforts.map(
               (entry) => entry.reasoningEffort,
             ),
+            ...(hidden ? { hidden: true as const } : {}),
           })),
       )
       .max(20),
-    nextCursor: text(256).nullable(),
+    nextCursor: text(200).nullish(),
   })
   .refine(
     (catalog) =>
@@ -524,7 +496,7 @@ const models = z
           defaultEffort: entry.defaultReasoningEffort,
         })),
       ).success,
-    'A complete model catalog needs distinct bounded identifiers and supported efforts.',
+    'A model catalog needs distinct bounded identifiers and supported efforts.',
   );
 
 const configuration = z
@@ -612,11 +584,11 @@ export type DiscoveryRequest =
 type Failure =
   | 'invalid-message'
   | 'unexpected-message'
+  | 'authority-notice'
   | 'upstream-error'
   | 'limit'
   | 'deadline'
   | 'incomplete'
-  | 'catalog-incomplete'
   | 'unsupported-account';
 
 export class DiscoveryError extends Error {
@@ -653,6 +625,10 @@ export class OpenAiDiscovery {
   private requirementsRequested = false;
   private requirements?: DiscoveryMetadata['requirements'];
   private readonly configurationDirectory?: string;
+  private readonly includeHidden: boolean;
+  private readonly modelPages: DiscoveryMetadata['models'][] = [];
+  // Set once a full first page with hidden models names a next page.
+  private modelCursor: string | null = null;
   // One reporter per client process. Transcripts send their sparse updates through it too, so
   // an update merges with this process's read.
   readonly reportUsage: UsageReporter;
@@ -664,6 +640,8 @@ export class OpenAiDiscovery {
     readMcpConfiguration?: boolean;
     configurationDirectory?: string;
     onUsage?: OpenAiUsageHook;
+    /** List the models the client keeps out of its picker, flagged hidden. */
+    includeHidden?: boolean;
   }) {
     this.now = options.now;
     this.reportUsage = openAiUsageReporter(options.onUsage);
@@ -683,6 +661,7 @@ export class OpenAiDiscovery {
     this.configurationDirectory = options.configurationDirectory;
     if (this.readConfiguration && !text(4096).safeParse(this.configurationDirectory).success)
       throw new DiscoveryError('invalid-message');
+    this.includeHidden = options.includeHidden ?? false;
   }
 
   private fail(reason: Failure): never {
@@ -699,7 +678,7 @@ export class OpenAiDiscovery {
 
   next(): Uint8Array | null {
     this.check();
-    if (this.awaiting || this.pending.length || this.step === requests.length) return null;
+    if (this.awaiting || this.pending.length || this.step === STEPS) return null;
     if (this.readConfiguration && this.step === 2 && !this.configuration) {
       this.configurationRequested = true;
       this.awaiting = true;
@@ -714,7 +693,22 @@ export class OpenAiDiscovery {
         `${JSON.stringify(outgoing.parse({ id: 6, method: 'configRequirements/read' }))}\n`,
       );
     }
-    const messages = requests[this.step].map((message) => outgoing.parse(message));
+    const cursor = this.modelCursor;
+    const messages = (
+      this.step === requests.length
+        ? [
+            {
+              id: cursor ? 7 : 4,
+              method: 'model/list',
+              params: {
+                limit: 20,
+                includeHidden: this.includeHidden,
+                ...(cursor ? { cursor } : {}),
+              },
+            },
+          ]
+        : requests[this.step]
+    ).map((message) => outgoing.parse(message));
     this.awaiting = true;
     return new TextEncoder().encode(
       `${messages.map((message) => JSON.stringify(message)).join('\n')}\n`,
@@ -744,13 +738,18 @@ export class OpenAiDiscovery {
         diagnostic = refusedEnvelope(decoded);
         if (decoded !== null && typeof decoded === 'object' && 'method' in decoded) {
           const value = notification.parse(decoded);
+          if (value.method === 'remoteControl/status/changed') remoteControl.parse(decoded);
+          else if (value.method !== 'account/updated' && authorityNotice(value.method))
+            this.fail('authority-notice');
           if (this.step === 0) this.fail('unexpected-message');
           this.envelope =
             value.method === 'configWarning'
               ? 'config-warning'
               : value.method === 'account/updated'
                 ? 'account-updated'
-                : 'remote-control-status';
+                : value.method === 'remoteControl/status/changed'
+                  ? 'remote-control-status'
+                  : 'notification';
           if (++this.notificationCount > 32) this.fail('limit');
           continue;
         }
@@ -793,9 +792,28 @@ export class OpenAiDiscovery {
             this.limits = limits.parse(value.result);
             break;
           case 3: {
-            const catalog = models.parse(value.result);
-            if (catalog.nextCursor !== null) this.fail('catalog-incomplete');
-            this.models = catalog.data;
+            const page = models.parse(value.result);
+            this.modelPages.push(page.data);
+            if (
+              this.includeHidden &&
+              !this.modelCursor &&
+              page.data.length === 20 &&
+              page.nextCursor
+            ) {
+              this.modelCursor = page.nextCursor;
+              this.awaiting = false;
+              continue;
+            }
+            const all = this.modelPages.flat();
+            if (
+              new Set(all.map((entry) => entry.id)).size !== all.length ||
+              new Set(all.map((entry) => entry.model)).size !== all.length
+            )
+              this.fail('invalid-message');
+            this.models = [
+              ...all.filter((entry) => !entry.hidden),
+              ...all.filter((entry) => entry.hidden),
+            ].slice(0, 20);
             break;
           }
         }
@@ -813,7 +831,7 @@ export class OpenAiDiscovery {
     this.check();
     if (
       this.pending.length ||
-      this.step !== requests.length ||
+      this.step !== STEPS ||
       !this.platform ||
       !this.account ||
       !this.limits ||
@@ -834,7 +852,9 @@ export class OpenAiDiscovery {
   }
 
   private expectedId(): number {
-    return this.configurationRequested ? 5 : this.requirementsRequested ? 6 : this.step + 1;
+    if (this.configurationRequested) return 5;
+    if (this.requirementsRequested) return 6;
+    return this.step === requests.length && this.modelCursor ? 7 : this.step + 1;
   }
 
   get lastEnvelope(): DiscoveryEnvelope {
@@ -850,7 +870,7 @@ export class OpenAiDiscovery {
   }
 
   get complete(): boolean {
-    return this.step === requests.length && this.failed === null && this.pending.length === 0;
+    return this.step === STEPS && this.failed === null && this.pending.length === 0;
   }
 
   get pendingRequest(): DiscoveryRequest {

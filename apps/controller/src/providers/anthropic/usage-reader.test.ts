@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
@@ -24,219 +24,172 @@ const sessionId = '46eb17cd-01e8-480d-99f4-a741f189715d';
 const uuid = '46eb17cd-01e8-480d-99f4-a741f189715f';
 const sha256 = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37';
 const at = '2026-10-21T01:00:00.000Z';
-const usage = {
-  input_tokens: 0,
-  output_tokens: 0,
-  cache_creation_input_tokens: 0,
-  cache_read_input_tokens: 0,
-};
-const report = {
-  session: {
-    total_cost_usd: 0,
-    total_api_duration_ms: 0,
-    total_duration_ms: 13,
-    total_lines_added: 0,
-    total_lines_removed: 0,
-    model_usage: {},
+// Client 2.1.302 output for the exact plan, with display text, paths and long lists replaced.
+const [init, assistant, terminal] = readFileSync(
+  new URL('./usage-fixture.jsonl', import.meta.url),
+  'utf8',
+)
+  .trim()
+  .split('\n')
+  .map((line) => JSON.parse(line));
+const limits = assistant.usage_report.rate_limits.limits;
+const withLimits = (value: unknown) => ({
+  ...assistant,
+  usage_report: {
+    ...assistant.usage_report,
+    rate_limits: { ...assistant.usage_report.rate_limits, limits: value },
   },
-  rate_limits: {
-    limits: [
-      {
-        kind: 'session',
-        group: 'session',
-        percent: 0,
-        resets_at: at,
-        severity: 'normal',
-        is_active: true,
-      },
-      {
-        kind: 'weekly_scoped',
-        group: 'weekly',
-        percent: 70,
-        resets_at: null,
-        scope: { model: { display_name: 'Advertised model' } },
-        severity: 'warning',
-        is_active: false,
-      },
-    ],
-    extra_usage: {
-      is_enabled: false,
-      monthly_limit: 100,
-      used_credits: 0,
-      utilization: 0,
-      currency: 'USD',
-    },
-  },
-};
-const init = {
-  type: 'system',
-  subtype: 'init',
-  session_id: sessionId,
-  uuid,
-  tools: [],
-  mcp_servers: [],
-  plugins: [],
-};
-const local = {
-  type: 'system',
-  subtype: 'local_command_output',
-  session_id: sessionId,
-  uuid,
-  content: 'private display text is discarded',
-};
-const assistant = {
-  type: 'assistant',
-  session_id: sessionId,
-  uuid,
-  parent_tool_use_id: null,
-  local_command_run: { command: 'usage', args: '' },
-  usage_report: report,
-  message: {
-    role: 'assistant',
-    content: [{ type: 'text', text: 'private account display is discarded' }],
-    stop_reason: 'end_turn',
-    usage,
-  },
-};
-const subagents = {
-  spawned: 0,
-  requested: { background: 0, foreground: 0, unset: 0 },
-  started_in_background: 0,
-  by_type: {},
-  max_depth: 0,
-  spawned_by_subagents: 0,
-  completed: 0,
-  failed: 0,
-  killed: { parent: 0, user: 0, system: 0 },
-  refused: { depth_limit: 0, concurrency_limit: 0, budget: 0 },
-};
-const terminal = {
-  type: 'result',
-  subtype: 'success',
-  session_id: sessionId,
-  uuid,
-  is_error: false,
-  num_turns: 0,
-  duration_api_ms: 0,
-  total_cost_usd: 0,
-  modelUsage: {},
-  usage,
-  permission_denials: [],
-  subagent_stats: subagents,
-  safety_stops: 0,
-};
+});
+const usageWindow = (windowId: string, value: number, resetsAt: string | null) => ({
+  windowId,
+  remaining: { value, unit: 'percent' as const },
+  resetsAt,
+});
+const reported = [
+  usageWindow('five-hour', 50, '2026-10-23T18:20:00.448Z'),
+  usageWindow('weekly', 83, '2026-10-30T07:00:00.448Z'),
+  usageWindow('weekly-fable', 81, '2026-10-30T07:00:00.449Z'),
+];
 const bytes = (frames: unknown[]) =>
   Buffer.from(`${frames.map((frame) => JSON.stringify(frame)).join('\n')}\n`);
-const read = (frames: unknown[]) => {
-  const parser = new AnthropicUsageReader(sessionId);
-  parser.feed(bytes(frames));
-  return parser.finish(at);
-};
 
-test('local usage reports preserve server rows and unknown age without model work', () => {
-  const expected = read([init, local, assistant, terminal]);
-  assert.equal(expected.status, 'reported');
-  assert.equal(expected.observedAt, null);
-  assert.equal(expected.freshness, 'unknown');
-  assert.equal(expected.receivedAt, at);
-  assert.deepEqual(expected.windows, report.rate_limits.limits);
-  assert.deepEqual(expected.extraUsage, report.rate_limits.extra_usage);
-  assert.equal(expected.modelTurns, 0);
-  assert.equal(JSON.stringify(expected).includes('private'), false);
-  assert.equal(
-    read([init, { ...assistant, usage_report: { ...report, rate_limits: null } }, terminal]).status,
-    'unavailable',
-  );
-  assert.equal(
-    read([
-      init,
-      { ...assistant, usage_report: { ...report, rate_limits: { limits: null } } },
-      terminal,
-    ]).status,
-    'unavailable',
-  );
-  assert.equal(
-    read([
-      init,
-      { ...assistant, usage_report: { ...report, rate_limits: { limits: [] } } },
-      terminal,
-    ]).status,
-    'reported',
-  );
-  const raw = bytes([init, local, assistant, terminal]);
-  const chunked = new AnthropicUsageReader(sessionId);
-  for (const byte of raw) chunked.feed(Uint8Array.of(byte));
-  assert.deepEqual(chunked.finish(at), expected);
-  for (const invalid of [
-    [assistant, terminal],
-    [init, assistant],
-    [init, local, terminal],
-    [init, assistant, assistant, terminal],
-    [init, assistant, terminal, local],
-    [init, { ...assistant, session_id: uuid }, terminal],
-    [init, { ...assistant, local_command_run: { command: 'other', args: '' } }, terminal],
-    [
-      init,
-      { ...assistant, local_command_run: { command: 'usage', args: '', plugin: 'foreign' } },
-      terminal,
-    ],
-    [init, { ...assistant, local_command_outcome: { kind: 'failed' } }, terminal],
-    [
-      init,
-      {
-        ...assistant,
-        message: { ...assistant.message, content: [{ type: 'tool_use', text: 'private' }] },
-      },
-      terminal,
-    ],
-    [
-      init,
-      { ...assistant, message: { ...assistant.message, usage: { ...usage, output_tokens: 1 } } },
-      terminal,
-    ],
-    [init, { ...assistant, batch_tool_uses: [{}] }, terminal],
-    [init, assistant, { ...terminal, deferred_tool_use: {} }],
-    [init, assistant, { ...terminal, subagent_stats: [] }],
-    [init, assistant, { ...terminal, subagent_stats: { ...subagents, spawned: 1 } }],
-    [init, assistant, { ...terminal, queued_turn_count: 1 }],
-    [init, assistant, { ...terminal, safety_stops: 1 }],
-    [
-      init,
-      assistant,
-      {
-        ...terminal,
-        usage: { ...usage, server_tool_use: { web_search_requests: 1, web_fetch_requests: 0 } },
-      },
-    ],
-    [init, assistant, { ...terminal, usage: { ...usage, iterations: [{}] } }],
-    [init, assistant, { ...terminal, num_turns: 1 }],
-    [init, assistant, { ...terminal, duration_api_ms: 1 }],
-    [init, assistant, { ...terminal, total_cost_usd: 0.01 }],
-    [init, assistant, { ...terminal, modelUsage: { model: {} } }],
-    [init, { type: 'rate_limit_event', session_id: sessionId }, assistant, terminal],
-    [init, { type: 'control_request', session_id: sessionId }, assistant, terminal],
-    [init, { ...assistant, usage_report: { ...report, secret: 'private' } }, terminal],
-    [
-      init,
-      {
-        ...assistant,
-        usage_report: {
-          ...report,
-          rate_limits: { limits: [{ ...report.rate_limits.limits[0], percent: 101 }] },
+test('a usage read maps each reported limit and ignores what it does not show', () => {
+  const later = { later_field: { nested: [1] } };
+  const rows: {
+    name: string;
+    input: Buffer;
+    bytewise?: boolean;
+    status?: string;
+    windows?: unknown[];
+    model?: string | null;
+    error?: UsageReaderError['reason'];
+    reply?: string;
+  }[] = [
+    { name: 'full report', input: bytes([init, assistant, terminal]), windows: reported },
+    {
+      name: 'full report one byte at a time',
+      input: bytes([init, assistant, terminal]),
+      bytewise: true,
+      windows: reported,
+    },
+    {
+      name: 'unknown limit kind past its cap',
+      input: bytes([
+        init,
+        withLimits([
+          ...limits,
+          { ...limits[0], kind: 'monthly_pool', percent: 110, resets_at: null },
+        ]),
+        terminal,
+      ]),
+      windows: [...reported, usageWindow('monthly_pool', 0, null)],
+    },
+    {
+      name: 'a limit it cannot read is dropped and the others stay',
+      input: bytes([
+        init,
+        withLimits([
+          ...limits,
+          { ...limits[0], kind: 'monthly_pool', percent: null },
+          { ...limits[1], kind: 'daily_pool', resets_at: '2026-10-30T07:00:00' },
+        ]),
+        terminal,
+      ]),
+      windows: reported,
+    },
+    {
+      name: 'a scoped model name with a dot and a space takes the model ID form',
+      input: bytes([
+        init,
+        withLimits([
+          ...limits.slice(0, 2),
+          { ...limits[2], scope: { model: { display_name: 'Opus 4.1' } } },
+        ]),
+        terminal,
+      ]),
+      windows: [
+        ...reported.slice(0, 2),
+        usageWindow('weekly-opus-4-1', 81, '2026-10-30T07:00:00.449Z'),
+      ],
+    },
+    {
+      name: 'unknown fields and frames',
+      input: bytes([
+        { ...init, ...later },
+        { type: 'rate_limit_event', ...later },
+        { type: 'system', subtype: 'status', ...later },
+        {
+          ...withLimits(
+            limits.map((row: { scope: object | null }) => ({
+              ...row,
+              ...later,
+              scope: row.scope && { ...row.scope, ...later },
+            })),
+          ),
+          ...later,
         },
-      },
-      terminal,
-    ],
-  ])
-    assert.throws(() => read(invalid), UsageReaderError);
-  for (const raw of [Buffer.from('{\n'), Buffer.from([0xff, 10]), Buffer.alloc(131073, 65)]) {
-    const parser = new AnthropicUsageReader(sessionId);
-    assert.throws(() => parser.feed(raw), UsageReaderError);
-    assert.throws(() => parser.finish(at), UsageReaderError);
+        { ...terminal, ...later },
+      ]),
+      windows: reported,
+    },
+    {
+      name: 'init with a model it cannot read',
+      input: bytes([{ ...init, model: 7 }, assistant, terminal]),
+      windows: reported,
+      model: null,
+    },
+    {
+      name: 'no rate limits',
+      input: bytes([init, withLimits(null), terminal]),
+      status: 'unavailable',
+      windows: [],
+    },
+    { name: 'no report', input: bytes([init, terminal]), error: 'no-usage-report' },
+    {
+      name: 'a reply with no report keeps its text',
+      input: bytes([init, { ...assistant, usage_report: undefined }, terminal]),
+      error: 'no-usage-report',
+      reply: 'Usage summary placeholder.',
+    },
+    { name: 'no result', input: bytes([init, assistant]), error: 'no-result' },
+    {
+      name: 'error result',
+      input: bytes([init, assistant, { ...terminal, is_error: true }]),
+      error: 'client-error',
+    },
+    {
+      name: 'unreadable limit list',
+      input: bytes([init, withLimits({ session: 50 }), terminal]),
+      error: 'unreadable-report',
+    },
+    { name: 'not JSON', input: Buffer.from('{\n'), error: 'not-json' },
+    { name: 'not UTF-8', input: Buffer.from([0xff, 10]), error: 'not-json' },
+    { name: 'over the output limit', input: Buffer.alloc(131073, 65), error: 'output-limit' },
+  ];
+  for (const row of rows) {
+    const parser = new AnthropicUsageReader();
+    const read = () => {
+      if (row.bytewise) for (const byte of row.input) parser.feed(Uint8Array.of(byte));
+      else parser.feed(row.input);
+      return parser.finish(at);
+    };
+    if (row.error) {
+      assert.throws(
+        read,
+        (error: unknown) => error instanceof UsageReaderError && error.reason === row.error,
+        row.name,
+      );
+      if (row.reply !== undefined) assert.equal(parser.reply(), row.reply, row.name);
+      continue;
+    }
+    const reading = read();
+    assert.equal(reading.status, row.status ?? 'reported', row.name);
+    assert.deepEqual(reading.windows, row.windows, row.name);
+    assert.deepEqual(reading.extraUsage, { is_enabled: false }, row.name);
+    assert.equal(reading.model, row.model === undefined ? 'claude-opus-5-5' : row.model, row.name);
+    assert.equal(reading.observedAt, null, row.name);
+    assert.equal(reading.freshness, 'unknown', row.name);
   }
-  const truncated = new AnthropicUsageReader(sessionId);
-  truncated.feed(Buffer.from('{'));
-  assert.throws(() => truncated.finish(at), UsageReaderError);
   const plan = anthropicUsageReaderPlan({ clientSha256: sha256, sessionId });
   assert.equal(plan.argv.at(-1), '/usage');
   assert.equal(plan.argv.includes('--print'), true);
@@ -340,7 +293,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
     'stdout-limit',
     'stderr-limit',
     'group-present',
-    'model-turn',
+    'error-result',
     'deadline',
     'stopped',
     'unclosed',
@@ -368,10 +321,10 @@ test('the usage owner bounds output and refuses metadata before physical closure
       else if (stdout)
         yield bytes([
           init,
-          local,
           assistant,
-          mode === 'model-turn' ? { ...terminal, num_turns: 1 } : terminal,
+          mode === 'error-result' ? { ...terminal, is_error: true } : terminal,
         ]);
+      else yield Buffer.from('Loaded no settings.\n');
     }
     const request = {
       ...context,
@@ -399,6 +352,8 @@ test('the usage owner bounds output and refuses metadata before physical closure
         assert.equal(launch.executableSha256, context.executableSha256);
         assert.equal(launch.executable, context.executable);
         assert.equal(launch.environment.HOME, context.home);
+        // The client finds its Keychain sign-in under this name.
+        assert.equal(launch.environment.USER, userInfo().username);
         assert.equal(launch.directory, context.directory);
         return {
           stdoutStream: output(true),
@@ -420,6 +375,9 @@ test('the usage owner bounds output and refuses metadata before physical closure
     });
     if (mode === 'stopped') handle.stop();
     const result = await handle.result;
+    // What the client wrote stays with the result, its reply first, whether or not the read failed.
+    if (mode === 'success' || mode === 'error-result')
+      assert.equal(result.detail, 'Usage summary placeholder.\n\nLoaded no settings.');
     if (mode === 'success' || mode === 'caller-mutation') {
       assert(result.reading);
       assert.equal(result.reason, null);
@@ -435,7 +393,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
             ? 'ownership'
             : mode === 'deadline' || mode === 'stopped'
               ? mode
-              : 'protocol',
+              : 'client-error',
       );
       assert(stopped.length > 0);
     }
@@ -445,12 +403,13 @@ test('the usage owner bounds output and refuses metadata before physical closure
 
 function refreshFixture(
   t: TestContext,
-  mode: 'success' | 'held' | 'unknown' | 'protocol' | 'large' = 'success',
+  mode: 'success' | 'held' | 'unknown' | 'error' | 'large' = 'success',
 ) {
   const directory = mkdtempSync(join(realpathSync(tmpdir()), 'ck-usage-'));
   const clock = createTestClock(at);
   const id = createTestIds(at);
   let calls = 0;
+  const timers: { work: () => void; milliseconds: number }[] = [];
   const released = Promise.withResolvers<void>();
   const owned = Promise.withResolvers<void>();
   let profile: NativeProfileResolution = {
@@ -487,6 +446,7 @@ function refreshFixture(
       assert.fail('No native auth or model process is allowed.');
     },
     schedule(work: () => void, milliseconds: number) {
+      timers.push({ work, milliseconds });
       if (mode === 'unknown' && (milliseconds === 25 || milliseconds === 3000))
         queueMicrotask(work);
       return () => {};
@@ -500,9 +460,11 @@ function refreshFixture(
         assert.deepEqual(Object.keys(launch.environment).sort(), [
           'HOME',
           'LANG',
+          'LOGNAME',
           'NO_COLOR',
           'PATH',
           'TMPDIR',
+          'USER',
         ]);
         launch.lifecycle.intent({
           operationId: launch.operationId,
@@ -524,28 +486,14 @@ function refreshFixture(
               [
                 init,
                 mode === 'large'
-                  ? {
-                      ...assistant,
-                      usage_report: {
-                        ...report,
-                        rate_limits: {
-                          limits: Array.from({ length: 48 }, (_, index) => ({
-                            kind: '漢'.repeat(128),
-                            group: `${index}${'漢'.repeat(126)}`,
-                            severity: '漢'.repeat(128),
-                            percent: 50,
-                            resets_at: null,
-                            is_active: true,
-                            scope: {
-                              model: { display_name: '漢'.repeat(128) },
-                              surface: { display_name: '漢'.repeat(128) },
-                            },
-                          })),
-                        },
-                      },
-                    }
+                  ? withLimits(
+                      Array.from({ length: 64 }, () => ({
+                        ...limits[2],
+                        scope: { model: { display_name: '漢'.repeat(128) }, surface: null },
+                      })),
+                    )
                   : assistant,
-                mode === 'protocol' ? { ...terminal, num_turns: 1 } : terminal,
+                mode === 'error' ? { ...terminal, is_error: true } : terminal,
               ].map((frame) => ({ ...frame, session_id: selectedSession })),
             );
         }
@@ -589,6 +537,8 @@ function refreshFixture(
     command,
     status,
     clock,
+    id,
+    timers,
     owned: owned.promise,
     calls: () => calls,
     changeScope() {
@@ -601,34 +551,42 @@ function refreshFixture(
   };
 }
 
-test('manual usage consent and the age-unknown report survive exact retries and reopen', async (t) => {
+test('a usage read needs no consent and survives retries and reopen, and a turn replaces only its windows', async (t) => {
   const f = refreshFixture(t);
+  const whenDue = () => f.controller.anthropicUsage().refreshWhenDue(f.command().key);
+  const turn = (windows: ReturnType<typeof usageWindow>[]) =>
+    f.controller.anthropicUsage().recordTurnReading({
+      source: 'turn-rate-limit',
+      status: 'reported',
+      receivedAt: f.clock.now(),
+      observedAt: null,
+      freshness: 'unknown',
+      windows,
+      extraUsage: null,
+      model: null,
+      modelTurns: 0,
+      qualified: false,
+    });
   const initial = f.status();
-  assert(initial?.available && initial.trust && !initial.trust.accepted);
+  assert(initial?.available && initial.trust?.accepted);
   const untouched = f.controller
     .workspaceState()
     .usageReaders.filter((reader) => reader.family !== 'anthropic');
-  assert.equal(
-    (await f.controller.execute(f.command(), 'local-owner')).reason,
-    'native-trust-required',
-  );
-  assert.equal(f.calls(), 0);
-  const request = f.command('RefreshAnthropicUsage', {
-    trust: { nativeTrust: 'accepted', scopeHash: initial.trust.scopeHash },
-  });
+  const request = f.command();
   assert.equal((await f.controller.execute(request, 'local-owner')).outcome, 'applied');
   assert.equal(f.calls(), 1);
   const retained = f.status();
-  assert.equal(retained?.trust?.accepted, true);
   assert.equal(retained?.lastObservedAt, null);
   assert.equal(retained?.reading?.observedAt, null);
   assert.equal(retained?.reading?.freshness, 'unknown');
   assert.equal(retained?.reading?.receivedAt, at);
-  assert.deepEqual(retained?.reading?.windows, report.rate_limits.limits);
+  assert.deepEqual(retained?.reading?.windows, reported);
+  assert.equal(f.controller.anthropicUsage().clientModel(), 'claude-opus-5-5');
   assert.equal(retained?.readingScopeHash, retained?.trust?.scopeHash);
   assert.equal((await f.controller.execute(request, 'local-owner')).outcome, 'already-applied');
+  const trust = { nativeTrust: 'accepted', scopeHash: initial.trust.scopeHash };
   assert.equal(
-    (await f.controller.execute({ ...request, payload: {} }, 'local-owner')).reason,
+    (await f.controller.execute({ ...request, payload: { trust } }, 'local-owner')).reason,
     'idempotency-key-reused',
   );
   assert.equal(
@@ -641,27 +599,52 @@ test('manual usage consent and the age-unknown report survive exact retries and 
   );
   await f.reopen();
   assert.deepEqual(f.status()?.reading, retained?.reading);
-  assert.equal(f.status()?.trust?.accepted, true);
   assert.equal(f.calls(), 1);
+  // A settled turn reads again only once the last read is more than a minute old.
+  f.clock.advance(60000);
+  assert.equal(whenDue(), undefined);
+  f.clock.advance(1);
+  await whenDue();
+  assert.equal(f.calls(), 2);
+  // The turn frame reports the five-hour window. The weekly and per-model windows stay.
+  f.clock.advance(1);
+  const turnAt = f.clock.now();
+  turn([usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z')]);
+  assert.deepEqual(f.status()?.reading?.windows, [
+    usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z'),
+    ...reported.slice(1),
+  ]);
+  assert.equal(f.controller.anthropicUsage().clientModel(), 'claude-opus-5-5');
+  // The catalog dates each window by the read that produced it, and a repeated frame inside a
+  // minute writes no second artifact.
+  const artifacts = () => f.controller.store.list('artifact').length;
+  const published = artifacts();
+  turn([usageWindow('five-hour', 71, '2026-10-23T18:20:00.000Z')]);
+  assert.equal(artifacts(), published);
+  const dated = Object.fromEntries(
+    f.controller
+      .anthropicUsage()
+      .catalogWindows()
+      .map(({ observation }) => [observation.windowId, observation.observedAt]),
+  );
+  assert.equal(dated['five-hour'], turnAt);
+  assert.equal(dated.weekly, f.status()?.lastAttemptAt ?? null);
   f.clock.advance(60000);
   assert.equal((await f.controller.execute(f.command(), 'local-owner')).outcome, 'applied');
-  assert.equal(f.calls(), 2);
+  assert.equal(f.calls(), 3);
+  assert.deepEqual(f.status()?.reading?.windows, reported);
   const previousReport = f.status()?.reading;
   f.clock.advance(60000);
   f.changeScope();
-  assert.equal(f.status()?.trust?.accepted, false);
-  assert.equal(
-    (await f.controller.execute(f.command('RefreshAnthropicUsage', request.payload), 'local-owner'))
-      .reason,
-    'native-trust-scope-changed',
-  );
-  assert.equal(
-    (await f.controller.execute(f.command(), 'local-owner')).reason,
-    'native-trust-required',
-  );
   assert.deepEqual(f.status()?.reading, previousReport);
   assert.notEqual(f.status()?.readingScopeHash, f.status()?.trust?.scopeHash);
-  assert.equal(f.calls(), 2);
+  // A trust payload an earlier desktop sends still reads, under the new scope too.
+  assert.equal(
+    (await f.controller.execute(f.command('RefreshAnthropicUsage', { trust }), 'local-owner'))
+      .outcome,
+    'applied',
+  );
+  assert.equal(f.calls(), 4);
 });
 
 test('manual usage Stop, failed cooldown and uncertain ownership never replay a native read', async (t) => {
@@ -680,7 +663,7 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
     'applied',
   );
   const largeReading = large.status()?.reading;
-  assert(largeReading && Buffer.byteLength(JSON.stringify(largeReading)) > 65536);
+  assert.equal(largeReading?.windows.length, 64);
   await large.reopen();
   assert.deepEqual(large.status()?.reading, largeReading);
   const publicationFailure = refreshFixture(t);
@@ -702,7 +685,7 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
   assert.equal(failedResult.reason, 'usage-read-failed');
   assert.equal(publicationFailure.calls(), 0);
   assert.equal(publicationFailure.status()?.readState, 'quiescent');
-  for (const mode of ['held', 'unknown', 'protocol'] as const) {
+  for (const mode of ['held', 'unknown', 'error'] as const) {
     const f = refreshFixture(t, mode);
     const trust = f.status()?.trust;
     assert(trust);
@@ -726,6 +709,7 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
       'anthropic-metadata-ownership-pending',
     );
     if (mode === 'held') {
+      assert.equal(f.controller.anthropicUsage().refreshWhenDue(f.command().key), undefined);
       assert.equal(
         (await f.controller.execute(f.command(), 'local-owner')).reason,
         'anthropic-metadata-ownership-pending',
@@ -773,4 +757,47 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
       );
     assert.equal(f.calls(), 1);
   }
+});
+
+test('the gauge reads every ten minutes while no Anthropic turn runs', async (t) => {
+  const f = refreshFixture(t);
+  // The reader's own timers stay under a minute. The periodic read is the one at a minute or more.
+  const periodic = () => f.timers.filter((timer) => timer.milliseconds >= 60_000);
+  const read = async () => {
+    periodic().at(-1)?.work();
+    while (f.status()?.readState === 'intent' || f.status()?.readState === 'owned')
+      await new Promise(setImmediate);
+  };
+  const taskId = f.id('tsk');
+  const turn = (state: string) =>
+    f.controller.store.db
+      .prepare(
+        'INSERT INTO chat_turns(id,task_id,sequence,body) VALUES (?,?,0,?) ON CONFLICT(id) DO UPDATE SET body=excluded.body',
+      )
+      .run('trn_fixture', taskId, JSON.stringify({ selection: { family: 'anthropic' }, state }));
+  f.controller.store.db
+    .prepare("INSERT INTO entities(id,kind,revision,body) VALUES (?,'task',0,'{}')")
+    .run(taskId);
+  const rows: { claim: string; advance: number; turn: string | null; calls: number }[] = [
+    { claim: 'the first timer reads when nothing was read yet', advance: 0, turn: null, calls: 1 },
+    { claim: 'a timer before ten minutes reads nothing', advance: 59_000, turn: null, calls: 1 },
+    {
+      claim: 'a running Anthropic turn holds the read',
+      advance: 541_000,
+      turn: 'running',
+      calls: 1,
+    },
+    { claim: 'the read runs once the turn settles', advance: 60_000, turn: 'done', calls: 2 },
+  ];
+  for (const row of rows) {
+    f.clock.advance(row.advance);
+    if (row.turn) turn(row.turn);
+    await read();
+    assert.equal(f.calls(), row.calls, row.claim);
+  }
+  // Each timer lands ten minutes after the last attempt, and a missed one checks again a minute on.
+  assert.deepEqual(
+    periodic().map((timer) => timer.milliseconds),
+    [600_000, 600_000, 541_000, 60_000, 600_000],
+  );
 });

@@ -96,7 +96,7 @@ export function verificationCommand(
           preload,
           definition.entrypoints.desktop,
           'test',
-          'e2e/desktop.spec.ts',
+          'e2e/thread.spec.ts',
           '--workers=1',
           '--retries=0',
           '--reporter=./apps/controller/src/evidence/desktop-reporter.ts',

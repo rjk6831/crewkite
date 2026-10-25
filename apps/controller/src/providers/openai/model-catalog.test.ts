@@ -36,12 +36,12 @@ const replies = {
   'account/rateLimits/read': { ordinaryUsageAllowed: true, rateLimits: {} },
   'model/list': {
     data: [
-      { id: 'fixture-a', model: 'fixture-a', supportedReasoningEfforts: [
-        { reasoningEffort: 'low' }, { reasoningEffort: 'high' }
-      ], defaultReasoningEffort: 'low' },
       { id: 'fixture-b', model: 'fixture-b', supportedReasoningEfforts: [
         { reasoningEffort: 'medium' }
-      ], defaultReasoningEffort: 'medium' },
+      ], defaultReasoningEffort: 'medium', hidden: true },
+      { id: 'fixture-a', model: 'fixture-a', supportedReasoningEfforts: [
+        { reasoningEffort: 'low' }, { reasoningEffort: 'high' }
+      ], defaultReasoningEffort: 'low', hidden: false },
     ],
     nextCursor: null,
   },
@@ -50,12 +50,13 @@ const input = createInterface({ input: process.stdin });
 input.on('line', line => {
   const message = JSON.parse(line);
   if (message.method) process.stderr.write('method:' + message.method + '\\n');
+  if (message.method === 'model/list') process.stderr.write('params:' + JSON.stringify(message.params) + '\\n');
   if (message.id) process.stdout.write(JSON.stringify({ id: message.id, result: replies[message.method] }) + '\\n');
 });
 input.on('close', () => process.exit(0));
 `;
 
-test('OpenAI catalog refresh retains only advertised pairs after owned peer closure', async () => {
+test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged, after owned peer closure', async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/openai-model-catalog-'));
   const directory = resolve(root, 'run');
@@ -136,9 +137,15 @@ test('OpenAI catalog refresh retains only advertised pairs after owned peer clos
       'model/list',
     ]);
     assert(methods.every((method) => !method.startsWith('thread/') && !method.startsWith('turn/')));
+    // The read asks for the models the client keeps out of its picker. They stay flagged and
+    // follow the listed ones.
+    assert.deepEqual(
+      [...errors.matchAll(/^params:(.+)$/gm)].map((match) => JSON.parse(match[1])),
+      [{ limit: 20, includeHidden: true }],
+    );
     assert.deepEqual(outcome.metadata?.models, [
       { model: 'fixture-a', efforts: ['low', 'high'], defaultEffort: 'low' },
-      { model: 'fixture-b', efforts: ['medium'], defaultEffort: 'medium' },
+      { model: 'fixture-b', efforts: ['medium'], defaultEffort: 'medium', hidden: true },
     ]);
     assert.equal(outcome.metadata?.profileHash, hashCanonical(profile.facts));
     assert(outcome.metadata && matchesOpenAiModelCatalogObservation(profile, outcome.metadata));

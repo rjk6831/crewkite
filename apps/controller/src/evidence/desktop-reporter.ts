@@ -10,7 +10,7 @@ import type {
   TestResult,
 } from '@playwright/test/reporter';
 
-const file = 'e2e/desktop.spec.ts';
+const file = 'e2e/thread.spec.ts';
 function expectedJourney(): { file: typeof file; title: string } | undefined {
   const text = process.env.CREWKITE_CHECK_JOURNEY;
   if (!text || Buffer.byteLength(text) > 1024) return;

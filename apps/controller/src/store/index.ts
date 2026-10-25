@@ -372,20 +372,6 @@ export class Store {
     return this.localGenerationBlocker();
   }
 
-  conversationTask(taskId: string): unknown {
-    const row = this.db.prepare('SELECT body FROM task_conversations WHERE task_id=?').get(taskId);
-    return row ? JSON.parse(row.body as string) : undefined;
-  }
-
-  putConversationTask(taskId: string, body: unknown) {
-    if (!this.transactionEvents) throw new Error('Conversation writes require a transaction.');
-    this.db
-      .prepare(
-        'INSERT INTO task_conversations(task_id,body) VALUES (?,?) ON CONFLICT(task_id) DO UPDATE SET body=excluded.body',
-      )
-      .run(taskId, canonicalJson(body));
-  }
-
   runPurpose(runId: string): 'conversation' | 'execution' | undefined {
     const row = this.db.prepare('SELECT purpose FROM run_purposes WHERE run_id=?').get(runId);
     return row?.purpose as 'conversation' | 'execution' | undefined;

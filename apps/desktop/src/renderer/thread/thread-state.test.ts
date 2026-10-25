@@ -1,0 +1,876 @@
+// Frames assumed from the controller, one per event:
+//   { type: 'agent.event', cursor: '12', taskId: <tsk>, payload: <AgentEvent> }
+//   { type: 'conversation.entry', cursor: '10', taskId: <tsk>, payload: <ChatMessage> }
+// A thread read carries the log cursor it reflects when the controller sends one. The live events
+// inside a read carry no cursor of their own.
+import assert from 'node:assert/strict';
+import { test } from 'node:test';
+import type {
+  AgentEvent,
+  ChatCatalogRead,
+  ChatFailure,
+  ChatFamily,
+  ChatMessage,
+  ChatRole,
+  ChatThread,
+  ChatThreadRead,
+  ChatTurn,
+} from '@crewkite/contracts';
+import { limitOffer, offerChoices } from './handoff-offer.ts';
+import {
+  FIRST_READ_BACKOFF,
+  initialThreadState,
+  lastFamily,
+  reduceThread,
+  retryRead,
+  type ThreadEvent,
+  type ThreadItem,
+  TRY_AGAIN_AFTER_MS,
+  threadItems,
+} from './thread-state.ts';
+import { type Block, runLabel, type ToolBlock, viewBlocks } from './turn-fold.ts';
+
+const id = (prefix: string, n: number) => `${prefix}_0${String(n).padStart(25, '0')}`;
+const task = id('tsk', 1);
+const turn = id('trn', 1);
+const stamp = '2026-10-23T10:00:00.000Z';
+
+type Body = AgentEvent extends infer E ? (E extends AgentEvent ? Omit<E, 'turnId'> : never) : never;
+const on = (turnId: string, cursor: number, event: Body): ThreadEvent => ({
+  type: 'agent.event',
+  cursor: String(cursor),
+  taskId: task,
+  payload: { ...event, turnId },
+});
+const agent = (cursor: number, event: Body) => on(turn, cursor, event);
+const begin = (turnId: string, cursor: number) =>
+  on(turnId, cursor, {
+    type: 'turn.started',
+    family: 'openai',
+    model: 'large-1',
+    effort: 'default',
+    role: 'assistant',
+  });
+const user = (cursor: number, text: string): ThreadEvent => {
+  const message: ChatMessage = {
+    id: id('msg', cursor),
+    taskId: task,
+    at: stamp,
+    cursor: String(cursor),
+    author: { kind: 'user' },
+    text,
+    attachments: [],
+  };
+  return { type: 'conversation.entry', cursor: String(cursor), taskId: task, payload: message };
+};
+const started = (cursor: number) => begin(turn, cursor);
+const run = (events: ThreadEvent[]) =>
+  threadItems(reduceThread(initialThreadState(task), { type: 'events', events }));
+const turnOf = (items: ThreadItem[]) => {
+  const found = items.find((item) => item.kind === 'turn');
+  assert.ok(found && found.kind === 'turn');
+  return found.turn;
+};
+
+test('events fold into one timeline in cursor order', () => {
+  const items = run([
+    agent(13, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+    started(11),
+    user(10, 'Add the guard'),
+    agent(12, { type: 'tool.started', callId: 'c1', kind: 'read', title: 'Read net.mjs' }),
+  ]);
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ['user', 'turn'],
+  );
+  assert.deepEqual(
+    turnOf(items).blocks.map((block) => block.kind),
+    ['tool', 'text'],
+  );
+});
+
+test('a turn sits right after the user message that started it', () => {
+  // Messages count on the conversation, 13 and 15, and agent events on the event log, 616 and 657.
+  // The message decides where the turn goes.
+  const [first, second] = [id('trn', 2), id('trn', 3)];
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: null,
+    autoHandoff: false,
+    handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
+    queued: [],
+  };
+  const at = (minutes: number) => new Date(Date.parse(stamp) + minutes * 60_000).toISOString();
+  const record = (turnId: string, sequence: number, asked: number, more: Partial<ChatTurn> = {}) =>
+    ({
+      id: turnId,
+      taskId: task,
+      sequence,
+      role: 'assistant',
+      selection: { family: 'openai', model: 'large-1', effort: 'default' },
+      userMessageId: id('msg', asked),
+      assistantMessageId: null,
+      state: 'done',
+      startedAt: stamp,
+      endedAt: stamp,
+      failure: null,
+      handoffFrom: null,
+      ...more,
+    }) satisfies ChatTurn;
+  const meta = (turn: ChatTurn, cursor: number): ThreadEvent => ({
+    type: 'chat.turn',
+    cursor: String(cursor),
+    taskId: task,
+    payload: turn,
+  });
+  const line = (cursor: number, author: ChatMessage['author'], text: string, written = stamp) => ({
+    ...(user(cursor, text).payload as ChatMessage),
+    author,
+    at: written,
+  });
+  const reply = (cursor: number, turnId: string, written = stamp) =>
+    line(
+      cursor,
+      { kind: 'assistant', turnId, family: 'openai', model: 'large-1', role: 'assistant' },
+      'Done.',
+      written,
+    );
+  const asked = (cursor: number) => user(cursor, `Question ${cursor}`).payload as ChatMessage;
+  const keys = (state: ReturnType<typeof initialThreadState>) =>
+    threadItems(state).map((item) => item.key);
+  const load = (turns: ChatTurn[], messages: ChatMessage[]) =>
+    reduceThread(initialThreadState(task), {
+      type: 'loaded',
+      read: { thread, turns, messages, liveEvents: [], cursor: '700' },
+    });
+  const interleaved = [id('msg', 13), `turn:${first}`, id('msg', 15), `turn:${second}`];
+
+  // Two finished turns restored from a read, with every message written in the same minute.
+  assert.deepEqual(
+    keys(
+      load(
+        [record(first, 0, 13), record(second, 1, 15)],
+        [asked(13), reply(14, first), asked(15), reply(16, second)],
+      ),
+    ),
+    interleaved,
+  );
+
+  // Both turns built from the stream. The second is still running when its record arrives.
+  let live = reduceThread(initialThreadState(task), {
+    type: 'events',
+    events: [
+      user(13, 'Question 13'),
+      begin(first, 616),
+      on(first, 617, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+      on(first, 618, { type: 'turn.completed', stopReason: 'done', failure: null }),
+      meta(record(first, 0, 13), 619),
+      user(15, 'Question 15'),
+      begin(second, 657),
+      on(second, 658, { type: 'text.delta', itemId: 'a', text: 'Look' }),
+    ],
+  });
+  assert.deepEqual(keys(live), interleaved);
+  live = reduceThread(live, {
+    type: 'events',
+    events: [meta(record(second, 1, 15, { state: 'running', endedAt: null }), 659)],
+  });
+  assert.deepEqual(keys(live), interleaved);
+
+  // A limit handoff runs the same message again. The rerun follows the handoff line, and the
+  // first turn's failure stays above both.
+  const limit: ChatFailure = {
+    stage: 'stream',
+    kind: 'usage-limit',
+    message: 'The weekly limit is reached.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Continue on another provider.',
+  };
+  assert.deepEqual(
+    keys(
+      load(
+        [
+          record(first, 0, 10, { state: 'failed', failure: limit }),
+          record(second, 1, 10, { startedAt: at(2) }),
+        ],
+        [
+          asked(10),
+          line(11, { kind: 'system', turnId: first }, 'OpenAI reached its usage limit.', at(1)),
+          line(12, { kind: 'system', turnId: null }, 'Continued on Anthropic from OpenAI.', at(2)),
+          reply(13, second, at(3)),
+        ],
+      ),
+    ),
+    [id('msg', 10), `failure:${first}`, id('msg', 12), `turn:${second}`],
+  );
+});
+
+test('text deltas accumulate into one assistant message that the completed text replaces', () => {
+  const deltas = ['The ', 'guard ', 'is in.'].map((text, index) =>
+    agent(11 + index, { type: 'text.delta', itemId: 'a', text }),
+  );
+  const streaming = turnOf(run([started(10), ...deltas])).blocks;
+  assert.equal(streaming.length, 1);
+  assert.equal(streaming[0].kind === 'text' && streaming[0].text, 'The guard is in.');
+  const completed = turnOf(
+    run([
+      started(10),
+      ...deltas.slice(0, 2),
+      agent(14, { type: 'text.completed', itemId: 'a', text: 'The guard is in.' }),
+    ]),
+  ).blocks;
+  assert.equal(completed.length, 1);
+  assert.equal(completed[0].kind === 'text' && completed[0].text, 'The guard is in.');
+});
+
+test('a permission request holds the turn until its resolution arrives', () => {
+  const request = agent(11, {
+    type: 'permission.requested',
+    requestId: 'p1',
+    callId: null,
+    question: 'Run the tests?',
+    detail: null,
+    options: [{ id: 'once', label: 'Allow once', kind: 'allow-once' }],
+  });
+  assert.equal(turnOf(run([started(10), request])).status, 'waiting-permission');
+  const resolved = turnOf(
+    run([
+      started(10),
+      request,
+      agent(12, { type: 'permission.resolved', requestId: 'p1', choice: 'once' }),
+    ]),
+  );
+  assert.equal(resolved.status, 'running');
+  const card = resolved.blocks[0];
+  assert.equal(card.kind === 'permission' && card.choice, 'once');
+});
+
+test('a failed turn adds a system line with the cause and the next action', () => {
+  const failure: ChatFailure = {
+    stage: 'prompt',
+    kind: 'usage-limit',
+    message: 'The weekly limit is reached.',
+    providerMessage: 'rate_limit_exceeded',
+    method: 'turn/start',
+    code: 429,
+    resetsAt: null,
+    nextAction: 'Continue on another provider.',
+  };
+  const items = run([
+    started(10),
+    agent(11, { type: 'turn.completed', stopReason: 'limit', failure }),
+  ]);
+  // The turn produced nothing to show, so the line stands alone.
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ['failure'],
+  );
+  const line = items[0];
+  assert.ok(line.kind === 'failure');
+  assert.equal(line.failure.nextAction, 'Continue on another provider.');
+});
+
+test('a stopped turn ends quietly with its partial text and no failure line', () => {
+  const stop: ChatFailure = {
+    stage: 'stream',
+    kind: 'stopped',
+    message: 'The turn was stopped.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Send a new message to continue.',
+  };
+  const end = (cursor: number) =>
+    agent(cursor, { type: 'turn.completed', stopReason: 'stopped', failure: stop });
+  const items = run([
+    started(10),
+    agent(11, { type: 'text.delta', itemId: 'a', text: 'The guard ' }),
+    end(12),
+  ]);
+  assert.deepEqual(
+    items.map((item) => item.kind),
+    ['turn'],
+  );
+  const view = turnOf(items);
+  assert.equal(view.status, 'stopped');
+  assert.equal(view.failure, null);
+  assert.equal(view.blocks[0].kind === 'text' && view.blocks[0].text, 'The guard ');
+  // A stop before any output still leaves a row, so the person sees that it stopped.
+  assert.equal(turnOf(run([started(10), end(11)])).status, 'stopped');
+});
+
+// The view only guesses whether a message will wait. When the controller queues one the view
+// thought would start, the queued list shows it and the bubble goes.
+test('a message the controller queued leaves no pending bubble', () => {
+  const text = 'Then the totals.';
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: turn,
+    autoHandoff: false,
+    handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
+    queued: [{ id: id('msg', 9), at: stamp, text, role: 'assistant', attachments: [] }],
+  };
+  const pending = { localId: 'local-1', text, attachments: [], at: stamp };
+  const sent = reduceThread(initialThreadState(task), { type: 'sending', pending });
+  const event: ThreadEvent = { type: 'chat.thread', cursor: '20', taskId: task, payload: thread };
+  const queued = reduceThread(sent, { type: 'events', events: [event] });
+  assert.deepEqual(threadItems(queued), []);
+  assert.deepEqual(
+    queued.thread?.queued.map((message) => message.text),
+    [text],
+  );
+});
+
+test('the limit offer shows only while the newest turn is the one that hit a limit', () => {
+  const second = id('trn', 2);
+  const failure = (kind: ChatFailure['kind']): ChatFailure => ({
+    stage: 'stream',
+    kind,
+    message: 'The turn stopped.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Continue on another provider.',
+  });
+  const end = (turnId: string, cursor: number, stopReason: 'limit' | 'error' | 'done') =>
+    on(turnId, cursor, {
+      type: 'turn.completed',
+      stopReason,
+      failure:
+        stopReason === 'done'
+          ? null
+          : failure(stopReason === 'limit' ? 'usage-limit' : 'client-exit'),
+    });
+  const offer = (events: ThreadEvent[], pending = false) => {
+    let state = reduceThread(initialThreadState(task), { type: 'events', events });
+    if (pending)
+      state = reduceThread(state, {
+        type: 'sending',
+        pending: { localId: 'local-1', text: 'Add the guard', attachments: [], at: stamp },
+      });
+    return limitOffer(state);
+  };
+  const stopped = [user(10, 'Add the guard'), begin(turn, 11), end(turn, 12, 'limit')];
+
+  assert.deepEqual(offer(stopped), { turnId: turn, family: 'openai', mode: 'most-left' });
+  // The message is on its way to another provider, so the choice is made.
+  assert.equal(offer(stopped, true), null);
+  // A newer turn that finished, or stopped for another reason, leaves nothing to offer.
+  const newer = (stopReason: 'limit' | 'error' | 'done') => [
+    ...stopped,
+    user(13, 'Try again'),
+    begin(second, 14),
+    end(second, 15, stopReason),
+  ];
+  assert.equal(offer(newer('done')), null);
+  assert.equal(offer(newer('error')), null);
+  // A newer turn that also hit a limit moves the offer to it.
+  assert.equal(offer(newer('limit'))?.turnId, second);
+
+  // A reopened thread has the stored turns and no stream. The stored failure carries the cause.
+  const stored = (
+    n: number,
+    state: ChatTurn['state'],
+    cause: ChatFailure['kind'],
+    stopReason?: ChatTurn['stopReason'],
+  ): ChatTurn => ({
+    id: id('trn', n),
+    taskId: task,
+    sequence: n - 1,
+    role: 'assistant',
+    selection: { family: 'anthropic', model: 'large-2', effort: 'default' },
+    userMessageId: id('msg', 10 * n),
+    assistantMessageId: null,
+    state,
+    startedAt: stamp,
+    endedAt: stamp,
+    failure: state === 'failed' ? failure(cause) : null,
+    handoffFrom: null,
+    ...(stopReason ? { stopReason } : {}),
+  });
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: false,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: null,
+    autoHandoff: false,
+    handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
+    queued: [],
+  };
+  const reopened = (turns: ChatTurn[]) =>
+    limitOffer(
+      reduceThread(initialThreadState(task), {
+        type: 'loaded',
+        read: {
+          thread,
+          turns,
+          messages: [user(10, 'Add the guard'), user(20, 'Try again')].map(
+            (event) => event.payload as ChatMessage,
+          ),
+          liveEvents: [],
+          cursor: '20',
+        },
+      }),
+    );
+  const first = stored(1, 'failed', 'usage-limit');
+  assert.equal(reopened([first])?.family, 'anthropic');
+  assert.equal(reopened([first, stored(2, 'done', 'usage-limit')]), null);
+  assert.equal(reopened([first, stored(2, 'failed', 'client-exit')]), null);
+  // A stored stop reason decides before the failure kind. Turns without one keep the fallback above.
+  assert.equal(reopened([stored(1, 'failed', 'client-exit', 'limit')])?.family, 'anthropic');
+  assert.equal(reopened([stored(1, 'failed', 'usage-limit', 'error')]), null);
+});
+
+test('finished reads and searches in a row fold into one line, and anything to act on stands alone', () => {
+  const tool = (call: string, toolKind: ToolBlock['toolKind'], more: Partial<ToolBlock> = {}) =>
+    ({
+      kind: 'tool',
+      id: `tool:${call}`,
+      toolKind,
+      title: call,
+      input: undefined,
+      output: '',
+      truncated: false,
+      status: 'ok',
+      diff: null,
+      summary: null,
+      ...more,
+    }) satisfies ToolBlock;
+  const thought = (item: string, text: string, done = true): Block => ({
+    kind: 'thinking',
+    id: `thinking:${item}`,
+    text,
+    done,
+  });
+  const said: Block = { kind: 'text', id: 'text:a', text: 'Now the tests.', done: true };
+  const asked: Block = {
+    kind: 'permission',
+    id: 'permission:p1',
+    requestId: 'p1',
+    callId: 'r3',
+    question: 'Read the key file?',
+    detail: null,
+    options: [{ id: 'once', label: 'Allow once', kind: 'allow-once' }],
+    choice: 'once',
+  };
+  // A run shows as its label and any other block as its id.
+  const cases: { name: string; blocks: Block[]; ended?: boolean; want: string[] }[] = [
+    {
+      name: 'reads and searches fold',
+      blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('s1', 'search')],
+      want: ['Read 2 files, searched once'],
+    },
+    { name: 'a lone read keeps its card', blocks: [tool('r1', 'read')], want: ['tool:r1'] },
+    {
+      name: 'a running read ends the run',
+      blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('r3', 'read', { status: 'running' })],
+      ended: false,
+      want: ['Read 2 files', 'tool:r3'],
+    },
+    {
+      name: 'an edit, a command, a failure and text stand alone',
+      blocks: [
+        tool('s1', 'search'),
+        tool('s2', 'search'),
+        tool('e1', 'edit'),
+        tool('r1', 'read'),
+        said,
+        tool('r2', 'read'),
+        tool('c1', 'command'),
+        tool('r3', 'read', { status: 'error' }),
+      ],
+      want: ['Searched 2 times', 'tool:e1', 'tool:r1', 'text:a', 'tool:r2', 'tool:c1', 'tool:r3'],
+    },
+    {
+      name: 'a read that asked first stands alone',
+      blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('r3', 'read'), asked],
+      want: ['Read 2 files', 'tool:r3', 'permission:p1'],
+    },
+    {
+      name: 'a thought that ended with no text draws nothing and keeps the run',
+      blocks: [tool('r1', 'read'), thought('a', ''), tool('r2', 'read'), thought('b', 'Tests.')],
+      want: ['Read 2 files', 'thinking:b'],
+    },
+    {
+      name: 'a live thought with no text yet still shows',
+      blocks: [thought('a', '', false)],
+      ended: false,
+      want: ['thinking:a'],
+    },
+  ];
+  for (const { name, blocks, ended = true, want } of cases)
+    assert.deepEqual(
+      viewBlocks(blocks, ended).map((item) => (item.kind === 'run' ? runLabel(item) : item.id)),
+      want,
+      name,
+    );
+});
+
+test('the thread moves away from the family of its newest assistant turn, even one with no text', () => {
+  const second = id('trn', 2);
+  const limit: ChatFailure = {
+    stage: 'stream',
+    kind: 'usage-limit',
+    message: 'The weekly limit is reached.',
+    providerMessage: null,
+    method: null,
+    code: null,
+    resetsAt: null,
+    nextAction: 'Continue on another provider.',
+  };
+  const opened = (turnId: string, cursor: number, family: ChatFamily, role: ChatRole) =>
+    on(turnId, cursor, { type: 'turn.started', family, model: 'large-1', effort: 'default', role });
+  const done = (turnId: string, cursor: number) =>
+    on(turnId, cursor, { type: 'turn.completed', stopReason: 'done', failure: null });
+  const record = (
+    turnId: string,
+    sequence: number,
+    family: ChatFamily,
+    state: ChatTurn['state'],
+  ): ThreadEvent => ({
+    type: 'chat.turn',
+    cursor: String(30 + sequence),
+    taskId: task,
+    payload: {
+      id: turnId,
+      taskId: task,
+      sequence,
+      role: 'assistant',
+      selection: { family, model: 'large-1', effort: 'default' },
+      userMessageId: id('msg', 10),
+      assistantMessageId: null,
+      state,
+      startedAt: stamp,
+      endedAt: stamp,
+      failure: state === 'failed' ? limit : null,
+      handoffFrom: null,
+    } satisfies ChatTurn,
+  });
+  const family = (events: ThreadEvent[]) => {
+    const state = reduceThread(initialThreadState(task), { type: 'events', events });
+    return lastFamily(state, threadItems(state));
+  };
+
+  // Anthropic answered, then OpenAI hit its limit before any text. That turn has no row, and the
+  // controller still counts it as the family the thread is on.
+  assert.equal(
+    family([
+      user(10, 'Add the guard'),
+      record(turn, 0, 'anthropic', 'done'),
+      opened(turn, 11, 'anthropic', 'assistant'),
+      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+      done(turn, 13),
+      record(second, 1, 'openai', 'failed'),
+      opened(second, 14, 'openai', 'assistant'),
+      on(second, 15, { type: 'turn.completed', stopReason: 'limit', failure: limit }),
+    ]),
+    'openai',
+  );
+
+  // Before any record arrives the rows decide. A second opinion borrows another family for one
+  // turn, so it is never the family the thread moves away from.
+  assert.equal(
+    family([
+      opened(turn, 11, 'openai', 'assistant'),
+      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+      done(turn, 13),
+      opened(second, 14, 'local', 'advisor'),
+      on(second, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
+      done(second, 16),
+    ]),
+    'openai',
+  );
+});
+
+test('a reply restored from a thread read keeps the role, effort and stats of its turn', () => {
+  const read = (role: 'reviewer' | 'advisor' | 'fixer', effort?: 'ultra'): ChatThreadRead => ({
+    thread: {
+      taskId: task,
+      scratchReady: true,
+      base: null,
+      selection: null,
+      permissionPolicy: 'ask',
+      sessions: [],
+      activeTurnId: null,
+      autoHandoff: false,
+      handoffMode: 'most-left',
+      crew: null,
+      flightMode: 'manual',
+      crewChain: null,
+      queued: [],
+    },
+    turns: [
+      {
+        id: turn,
+        taskId: task,
+        sequence: 0,
+        role,
+        selection: { family: 'google', model: 'large-2', effort: 'default' },
+        userMessageId: id('msg', 10),
+        assistantMessageId: id('msg', 11),
+        state: 'done',
+        startedAt: stamp,
+        endedAt: stamp,
+        failure: null,
+        handoffFrom: null,
+        stats,
+      },
+    ],
+    messages: [
+      {
+        id: id('msg', 11),
+        taskId: task,
+        at: stamp,
+        cursor: '11',
+        author: {
+          kind: 'assistant',
+          turnId: turn,
+          family: 'google',
+          model: 'large-2',
+          role,
+          ...(effort ? { effort } : {}),
+        },
+        text: 'Two findings.',
+        attachments: [],
+      },
+    ],
+    liveEvents: [],
+    cursor: '11',
+  });
+  const stats = {
+    tokensIn: 5800,
+    tokensOut: 300,
+    tokensPerSecond: 18,
+    firstTokenMs: 900,
+    turnMs: 21000,
+    contextUsed: 6097,
+    contextCapacity: 8192,
+    summaries: 2,
+  };
+  for (const [role, effort] of [
+    ['reviewer', undefined],
+    ['advisor', undefined],
+    ['fixer', 'ultra'],
+  ] as const) {
+    const state = reduceThread(initialThreadState(task), {
+      type: 'loaded',
+      read: read(role, effort),
+    });
+    assert.deepEqual(
+      turnOf(threadItems(state)).identity,
+      { family: 'google', model: 'large-2', effort: effort ?? 'default', role },
+      role,
+    );
+    // The live events are gone after a reload; the turn row still carries the stats line.
+    assert.deepEqual(turnOf(threadItems(state)).stats, stats, role);
+  }
+});
+
+test('stream events that a thread read already covers apply once', () => {
+  const thread: ChatThread = {
+    taskId: task,
+    scratchReady: true,
+    base: null,
+    selection: null,
+    permissionPolicy: 'ask',
+    sessions: [],
+    activeTurnId: turn,
+    autoHandoff: false,
+    handoffMode: 'most-left',
+    crew: null,
+    flightMode: 'manual',
+    crewChain: null,
+    queued: [],
+  };
+  const delta = (cursor: number, text: string) =>
+    agent(cursor, { type: 'text.delta', itemId: 'a', text });
+  const output = (cursor: number, chunk: string) =>
+    agent(cursor, { type: 'tool.output', callId: 'c1', chunk });
+  const shown = (state: ReturnType<typeof initialThreadState>) => {
+    const { blocks } = turnOf(threadItems(state));
+    const text = blocks.find((block) => block.kind === 'text');
+    const tool = blocks.find((block) => block.kind === 'tool');
+    return {
+      text: text?.kind === 'text' ? text.text : '',
+      output: tool?.kind === 'tool' ? tool.output : '',
+    };
+  };
+  // Every case is a view that folded `before`, then reloaded while `after` was still queued.
+  const fresh = [started(10), delta(11, 'Hello'), output(12, 'line\n')];
+  const cases = [
+    {
+      name: 'view had folded nothing',
+      before: [],
+      live: fresh,
+      cursor: '12',
+      after: [...fresh, delta(13, ' there'), output(14, 'more\n')],
+      want: { text: 'Hello there', output: 'line\nmore\n' },
+    },
+    {
+      name: 'view had folded part of the read',
+      before: [started(10), delta(11, 'Hel')],
+      live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
+      cursor: '12',
+      after: [delta(12, 'lo'), delta(13, '!')],
+      want: { text: 'Hello!', output: '' },
+    },
+    {
+      // The stream got past the read before the read returned. The snapshot must not erase what
+      // the stream already delivered, because the stream will not send it again.
+      name: 'view had folded an event past the read cursor',
+      before: [started(10), delta(11, 'Hel'), delta(12, 'lo'), delta(13, '!')],
+      live: [started(10), delta(11, 'Hel'), delta(12, 'lo')],
+      cursor: '12',
+      after: [delta(14, '?')],
+      want: { text: 'Hello!?', output: '' },
+    },
+  ];
+  for (const { name, before, live, cursor, after, want } of cases) {
+    let state = reduceThread(initialThreadState(task), { type: 'events', events: before });
+    state = reduceThread(state, {
+      type: 'loaded',
+      read: {
+        thread,
+        turns: [],
+        messages: [],
+        liveEvents: live.map((event) => event.payload as AgentEvent),
+        cursor,
+      },
+    });
+    state = reduceThread(state, { type: 'events', events: after });
+    assert.deepEqual(shown(state), want, name);
+  }
+});
+
+// A connected family on one model with one weekly window, or no window when the percent is null.
+const connected = (name: ChatFamily, percent: number | null) => ({
+  family: name,
+  connected: true,
+  reason: null,
+  models: [{ model: 'm', label: 'M', efforts: [], defaultEffort: 'default' as const }],
+  defaultModel: 'm',
+  remaining:
+    percent === null
+      ? []
+      : [{ windowId: 'weekly', label: 'Weekly', percent, resetsAt: null, observedAt: null }],
+});
+
+test('the offer ranks the other connected families by the thread mode and leaves out one at zero', () => {
+  const catalog: ChatCatalogRead = {
+    families: [
+      connected('openai', 5),
+      connected('anthropic', 60.9),
+      connected('google', 0),
+      connected('local', null),
+    ],
+  };
+  // Anthropic leads on allowance, the local family has no figure and ranks last, and Google is
+  // out because a turn there would end on the limit it already hit. OpenAI stopped.
+  assert.deepEqual(
+    offerChoices(catalog, 'openai').map(({ family, percent }) => [family, percent]),
+    [
+      ['anthropic', 60],
+      ['local', null],
+    ],
+  );
+  assert.deepEqual(
+    offerChoices(catalog, 'anthropic').map(({ family }) => family),
+    ['openai', 'local'],
+  );
+  // In resets-first mode the allowance that resets soonest goes first, while it lasts.
+  const soon = {
+    ...connected('google', 20),
+    remaining: [
+      { windowId: 'weekly', label: 'Weekly', percent: 20, resetsAt: stamp, observedAt: null },
+    ],
+  };
+  const families = [connected('anthropic', 60.9), soon];
+  assert.deepEqual(
+    offerChoices({ families }, 'openai', 'resets-first').map(({ family }) => family),
+    ['google', 'anthropic'],
+  );
+});
+
+test("an empty pool for another model does not hold back the family's default model", () => {
+  // Google reports a weekly pool for one model next to the family's own windows. The default
+  // model still has 95% of the weekly window.
+  const pooled = (percent: number, windowId: string) => ({
+    windowId,
+    label: windowId,
+    percent,
+    resetsAt: null,
+    observedAt: null,
+  });
+  const google = {
+    ...connected('google', null),
+    models: [
+      { model: 'acme-quick', label: 'Quick', efforts: [], defaultEffort: 'default' as const },
+      { model: 'acme-deep', label: 'Deep', efforts: [], defaultEffort: 'default' as const },
+    ],
+    defaultModel: 'acme-quick',
+    remaining: [pooled(95, 'acme-weekly'), pooled(100, 'acme-5h'), pooled(0, 'acme-deep-weekly')],
+  };
+  assert.deepEqual(
+    offerChoices({ families: [connected('anthropic', 60.9), google] }, 'openai').map(
+      ({ family, selection, percent }) => [family, selection.model, percent],
+    ),
+    [
+      ['google', 'acme-quick', 95],
+      ['anthropic', 'm', 60],
+    ],
+  );
+});
+
+test('the first read retries on the backoff and offers Try again only after ten seconds', async () => {
+  let now = 0;
+  const waits: number[] = [];
+  const clock = {
+    now: () => now,
+    wait: async (ms: number) => {
+      waits.push(ms);
+      now += ms;
+    },
+  };
+  const options = { delays: FIRST_READ_BACKOFF, giveUpAfter: TRY_AGAIN_AFTER_MS };
+  // A controller busy for a second and a half answers on the fourth try, with no failure shown.
+  let calls = 0;
+  const slow = () => (++calls < 4 ? Promise.reject(new Error('busy')) : Promise.resolve('read'));
+  assert.equal(await retryRead(slow, clock, options), 'read');
+  assert.deepEqual(waits, [250, 500, 1000]);
+  // One that never answers fails once ten seconds have passed, the last delay repeating.
+  now = 0;
+  waits.length = 0;
+  await assert.rejects(
+    retryRead(() => Promise.reject(new Error('down')), clock, options),
+    /down/,
+  );
+  assert.deepEqual(waits, [250, 500, 1000, 2000, 2000, 2000, 2000, 2000]);
+  assert.ok(now >= TRY_AGAIN_AFTER_MS && now - 2000 < TRY_AGAIN_AFTER_MS);
+});

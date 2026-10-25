@@ -15,9 +15,11 @@ import { userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import type { ApprovalBinding } from '@crewkite/contracts';
+import { type ApprovalBinding, CommandSchema } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { createTestClock, createTestIds } from '../../../../../../packages/testkit/src/fixtures.ts';
 import type { AcpPeerCase } from '../../../../../../packages/testkit/src/providers/acp-peer.ts';
+import { Controller } from '../../../commands/controller.ts';
 import { spawnCheckChild } from '../../../host/check-ownership.ts';
 import { groupAbsent } from '../../../host/worker.ts';
 import {
@@ -2229,4 +2231,79 @@ setInterval(() => {}, 1000);
   await assert.rejects(pending);
   assert.equal(reason, 'output-limit');
   output.destroy();
+});
+
+test('a controller that registers the Google client sets it up at launch and leaves the sign-in to the person', async () => {
+  const f = fixture('complete');
+  const clock = createTestClock();
+  const id = createTestIds();
+  const client = { HOME: userInfo().homedir, PATH: process.env.PATH };
+  const open = () =>
+    new Controller({
+      home: join(f.home, 'controller'),
+      now: clock.now,
+      id,
+      registerGoogleAcp: true,
+      googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+      googleAcp: {
+        reviewMappings: [f.mapping],
+        spawn: spawnCheckChild as AcpSpawn,
+        resolve: (proof) => ({
+          ...resolveGoogleAcpProfile({ home: f.home, proof, environment: client }),
+          client: f.client,
+          environment: client,
+        }),
+      },
+    });
+  const steps = (controller: Controller) =>
+    controller.store.googleMetadataOperations().map((row) => `${row.kind} ${row.state}`);
+  let controller = open();
+  try {
+    // A fresh client initializes on its own and stops before the browser sign-in.
+    await controller.googleAcpPreparation;
+    let setup = controller.store.googleAcpSetup();
+    assert.equal(setup.state, 'authentication-required');
+    assert.deepEqual(steps(controller), ['acp-initialize quiescent']);
+
+    const signIn = await controller.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: id('cmd'),
+        actor: { id: 'terminal', kind: 'cli' },
+        command: 'AuthenticateGoogleAcp',
+        expectedRevision: setup.revision,
+        payload: {
+          profileId: 'google-acp-v1',
+          proofId: setup.proofId,
+          method: 'oauth-personal',
+          consent: 'explicit',
+        },
+      }),
+      'local-owner',
+    );
+    assert.equal(signIn.outcome, 'applied');
+    assert.equal(controller.store.googleAcpSetup().state, 'discovery-required');
+    await controller.close();
+
+    // A proof that records the sign-in goes on to discover at the next launch.
+    controller = open();
+    await controller.googleAcpPreparation;
+    setup = controller.store.googleAcpSetup();
+    assert.equal(setup.state, 'ready');
+    assert.deepEqual(steps(controller), [
+      'acp-initialize quiescent',
+      'acp-authenticate quiescent',
+      'acp-discover quiescent',
+    ]);
+    await controller.close();
+
+    // A ready client with a valid proof starts nothing.
+    controller = open();
+    await controller.googleAcpPreparation;
+    assert.deepEqual(controller.store.googleAcpSetup(), setup);
+    assert.equal(steps(controller).length, 3);
+  } finally {
+    await controller.close();
+    f.dispose();
+  }
 });
