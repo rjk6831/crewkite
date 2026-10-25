@@ -6,12 +6,16 @@
 //   session/new                {cwd:<scratch>, mcpServers:[]}
 //   session/load               {sessionId, cwd:<scratch>, mcpServers:[]}
 //   session/set_config_option  {sessionId, configId, value}, once for the model, once for the mode
-//   session/prompt             {sessionId, prompt:[{type:'text', text}]}
+//   session/prompt             {sessionId, prompt:[{type:'text', text}, ...one block per file]},
+//                              each file as {type:'image'|'audio', data, mimeType},
+//                              {type:'resource', resource:{uri, mimeType, text|blob}} or
+//                              {type:'resource_link', uri, name, mimeType, size}
 //   session/cancel             notification {sessionId}
 //   reply to a permission      {outcome:{outcome:'selected', optionId}} or {outcome:{outcome:'cancelled'}}
 //
 // The agent writes:
-//   initialize result          {protocolVersion:1, agentCapabilities:{loadSession:true}}
+//   initialize result          {protocolVersion:1, agentCapabilities:{loadSession:true,
+//                              promptCapabilities?:{image, audio, embeddedContext}}}
 //   session/new result         {sessionId, configOptions:[...]}, then maybe an update on the same write
 //   session/load result        null, after the old conversation came back as updates
 //   session/update             {sessionId, update:{sessionUpdate, ...}} with sessionUpdate one of
@@ -38,7 +42,7 @@ import type { ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import type { AcpLifecycle, AcpSpawn } from './acp/client.ts';
-import { googleChatAdapter } from './chat.ts';
+import { type GooglePromptCapabilities, googleChatAdapter } from './chat.ts';
 
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const suffix = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
@@ -148,7 +152,9 @@ async function run(
     }) as typeof child.stdin.write;
     return child;
   };
+  const capabilities: GooglePromptCapabilities[] = [];
   const adapter = googleChatAdapter({
+    onPromptCapabilities: (value) => capabilities.push(value),
     launch: () => ({
       client: f.client,
       configuration: {
@@ -170,7 +176,16 @@ async function run(
   const last = events.at(-1);
   assert.equal(last?.type, 'turn.completed');
   assert.equal(events[0]?.type, 'turn.started');
-  return { events, frames, result, handle };
+  return { events, frames, result, handle, capabilities };
+}
+
+/** A file stored the way the controller stores one, under the rig's home. */
+function stored(f: Rig, name: string, mimeType: string, body: string | Buffer) {
+  const id = sha(body);
+  const path = join(f.home, 'files', id, name);
+  mkdirSync(join(f.home, 'files', id), { recursive: true });
+  writeFileSync(path, body);
+  return { attachment: { id, name, mimeType, bytes: Buffer.byteLength(body) }, path };
 }
 const types = (events: AgentEvent[]) => events.map((event) => event.type);
 const of = <T extends AgentEvent['type']>(events: AgentEvent[], type: T) =>
@@ -775,13 +790,108 @@ test('stop sends a cancel, keeps the partial text, declines a parked permission 
   }
 });
 
-test('the end of a prompt becomes a stop reason, and a quota error carries its reset time', async () => {
+test('the end of a prompt becomes a stop reason, a quota error carries its reset time, and files go as the blocks the agent declared', async () => {
+  type Stored = ReturnType<typeof stored>;
+  const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1]);
+  const link = ({ attachment, path }: Stored) => ({
+    type: 'resource_link',
+    uri: pathToFileURL(path).href,
+    name: attachment.name,
+    mimeType: attachment.mimeType,
+    size: attachment.bytes,
+  });
+  const declared = { image: true, audio: true, embeddedContext: true };
+  const none = { image: false, audio: false, embeddedContext: false };
   for (const row of [
     {
       scenario: 'chat-max-tokens',
       stopReason: 'done',
       failure: null,
       notice: 'The reply stopped at the model output limit.',
+    },
+    {
+      // Each file goes in the richest block the agent declared. Text files embed as text.
+      scenario: 'chat-attach',
+      stopReason: 'done',
+      failure: null,
+      files: (f: Rig) => [
+        stored(f, 'shot.png', 'image/png', png),
+        stored(f, 'memo.wav', 'audio/wav', 'RIFF fixture'),
+        stored(f, 'notes.md', 'text/markdown', '# Notes\n'),
+        stored(f, 'report.pdf', 'application/pdf', '%PDF-1.7 fixture'),
+      ],
+      blocks: (files: Stored[]) => [
+        { type: 'image', data: png.toString('base64'), mimeType: 'image/png' },
+        {
+          type: 'audio',
+          data: Buffer.from('RIFF fixture').toString('base64'),
+          mimeType: 'audio/wav',
+        },
+        {
+          type: 'resource',
+          resource: {
+            uri: pathToFileURL(files[2].path).href,
+            mimeType: 'text/markdown',
+            text: '# Notes\n',
+          },
+        },
+        {
+          type: 'resource',
+          resource: {
+            uri: pathToFileURL(files[3].path).href,
+            mimeType: 'application/pdf',
+            blob: Buffer.from('%PDF-1.7 fixture').toString('base64'),
+          },
+        },
+      ],
+      capabilities: declared,
+    },
+    {
+      // An inline form past the frame limit goes as a link, and the turn says so.
+      scenario: 'chat-attach',
+      stopReason: 'done',
+      failure: null,
+      files: (f: Rig) => [stored(f, 'large.png', 'image/png', Buffer.alloc(800 * 1024, 1))],
+      blocks: (files: Stored[]) => files.map(link),
+      capabilities: declared,
+      notice: 'Sent as a file link, too large to send inline: large.png.',
+    },
+    {
+      // An agent that declares nothing gets a link, which every agent must accept.
+      scenario: 'chat-stream',
+      stopReason: 'done',
+      failure: null,
+      files: (f: Rig) => [stored(f, 'shot.png', 'image/png', png)],
+      blocks: (files: Stored[]) => files.map(link),
+      capabilities: none,
+    },
+    {
+      scenario: 'chat-error',
+      stopReason: 'error',
+      failure: {
+        kind: 'attachment-rejected',
+        method: 'session/prompt',
+        code: -32603,
+        resetsAt: null,
+        providerMessage: 'Internal error: boom',
+      },
+      files: (f: Rig) => [stored(f, 'shot.png', 'image/png', png)],
+      blocks: (files: Stored[]) => files.map(link),
+      capabilities: none,
+    },
+    {
+      // A quota error stays a quota error when the prompt carried files.
+      scenario: 'chat-quota',
+      stopReason: 'limit',
+      failure: {
+        kind: 'usage-limit',
+        method: 'session/prompt',
+        code: -32603,
+        resetsAt: '2026-10-23T14:30:00.000Z',
+      },
+      files: (f: Rig) => [stored(f, 'shot.png', 'image/png', png)],
+      blocks: (files: Stored[]) => files.map(link),
+      capabilities: none,
     },
     {
       scenario: 'chat-refusal',
@@ -806,7 +916,23 @@ test('the end of a prompt becomes a stop reason, and a quota error carries its r
   ] as const) {
     const f = rig(row.scenario);
     try {
-      const turn = await run(f, request(f));
+      const files = row.files?.(f) ?? [];
+      const turn = await run(f, request(f, { files }));
+      if (row.blocks) {
+        const [prompt] = withMethod(turn.frames, 'session/prompt');
+        assert(prompt?.params, row.scenario);
+        const [text, ...rest] = prompt.params.prompt as unknown[];
+        assert.deepEqual(
+          text,
+          {
+            type: 'text',
+            text: 'You are working in a scratch copy of demo.\n\nWhat does this project do?',
+          },
+          row.scenario,
+        );
+        assert.deepEqual(rest, row.blocks(files), row.scenario);
+        assert.deepEqual(turn.capabilities, [row.capabilities], row.scenario);
+      }
       assert.equal(turn.result.stopReason, row.stopReason, row.scenario);
       const last = of(turn.events, 'turn.completed')[0];
       assert.equal(last.stopReason, row.stopReason, row.scenario);
@@ -820,6 +946,9 @@ test('the end of a prompt becomes a stop reason, and a quota error carries its r
             method: failure?.method,
             code: failure?.code,
             resetsAt: failure?.resetsAt,
+            ...('providerMessage' in row.failure
+              ? { providerMessage: failure?.providerMessage }
+              : {}),
           },
           row.failure,
           row.scenario,

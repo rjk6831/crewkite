@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  ChatAttachment,
   ChatFailure,
   ChatFamily,
   ChatModelSelection,
@@ -22,6 +23,11 @@ export type ChatTurnRequest = Readonly<{
   selection: ChatModelSelection;
   /** The user's text for this turn. A handoff packet is prepended by the controller. */
   prompt: string;
+  /**
+   * Files on this turn's message. `path` is the stored file under the controller home, at
+   * `<home>/chat/<taskId>/files/<sha256>/<name>`, never in the scratch copy.
+   */
+  files?: readonly Readonly<{ attachment: ChatAttachment; path: string }>[];
   /** CrewKite's framing for the model: project, scratch rules, what to do with results. */
   systemContext: string;
   /** Transcript so far, oldest first. Adapters with a resumable native session may ignore it. */
