@@ -10,6 +10,7 @@ import {
   ChatThreadReadSchema,
   type CommandResult,
   ConfigureChatThreadPayloadSchema,
+  DiscardChatChangePayloadSchema,
   HandoffChatThreadPayloadSchema,
   OpenChatPullRequestPayloadSchema,
   PushChatBranchPayloadSchema,
@@ -133,6 +134,21 @@ export async function acceptChanges(
     return { accepted: true, branch, commit, fileCount, note: result.next ?? null };
   }
   return { accepted: false, reason: result.reason ?? 'not-accepted', next: result.next ?? null };
+}
+
+export type Discard =
+  | { discarded: true }
+  | { discarded: false; reason: string; next: string | null };
+// Refusals come back as values, like Accept, so the file row can say why on its own line.
+export async function discardChange(
+  source: ThreadSource,
+  input: Input<typeof DiscardChatChangePayloadSchema>,
+): Promise<Discard> {
+  const payload = DiscardChatChangePayloadSchema.safeParse(input);
+  if (!payload.success) return { discarded: false, reason: 'outside-copy', next: null };
+  const result = await dispatch(source, 'DiscardChatChange', payload.data);
+  if (result.outcome === 'applied') return { discarded: true };
+  return { discarded: false, reason: result.reason ?? 'not-discarded', next: result.next ?? null };
 }
 
 export type GitStep =

@@ -64,7 +64,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from './adapter.ts';
-import { scratchChanges } from './changes.ts';
+import { discardScratchPath, scratchChanges, writeThreadBaseRef } from './changes.ts';
 import {
   type ChatGitHost,
   openChatPullRequest,
@@ -234,6 +234,13 @@ const blocked = (reason: string, next?: string): CommandResult => ({
   reason,
   ...(next ? { next } : {}),
 });
+const discardRefusals: Record<string, string> = {
+  'link-path': 'Links come from the base commit as they are. Discard leaves them alone.',
+  'skipped-path': 'The scratch copy does not hold this entry, so there is nothing to discard.',
+  'outside-copy': 'This path leads outside the scratch copy.',
+  'path-blocked': 'Another entry in the scratch copy sits at this path. Discard that one first.',
+  'not-changed': 'This file has no changes to discard.',
+};
 const unavailable = (action: string) => blocked('not-available', `${action} is not available yet.`);
 // The numbers are what the person looks for with ps. The next command checks them again.
 const ownershipUnknown = (groups: readonly number[], then: string) =>
@@ -498,6 +505,7 @@ export class ChatService {
     }
     // The new tree is the copy's files plus the base entries it left out, so the copy matches
     // the new base and Changes starts empty.
+    this.pinBase(task, root, commit);
     this.putThread(task, {
       ...thread,
       base: commit,
@@ -571,9 +579,41 @@ export class ChatService {
     return unavailable('Reading earlier turn events');
   }
 
+  /**
+   * Put one path of the scratch copy back the way the thread's base has it. Changes then leaves it
+   * out, so Accept carries only what is left. A system line records each discard.
+   */
   discardChange(payload: Payload<'DiscardChatChange'>): CommandResult {
-    if (!this.task(payload.taskId)) return blocked('task-not-found');
-    return unavailable('Discard');
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const { thread, left } = this.checkedThread(task);
+    if (thread.activeTurnId)
+      return blocked('turn-running', 'Wait for the reply or stop it, then discard.');
+    if (left.length) return ownershipUnknown(left, 'discard');
+    const root = this.deps.projectPath(task.projectId);
+    if (!root) return blocked('project-not-found', 'Add the project again, then discard.');
+    const base = thread.base;
+    if (!base || !thread.scratchReady)
+      return blocked('not-changed', 'This file has no changes to discard.');
+    let outcome: ReturnType<typeof discardScratchPath>;
+    try {
+      outcome = discardScratchPath(root, this.scratchDirectory(task.id), base, payload.path);
+    } catch {
+      return blocked('scratch-unreadable', 'The scratch copy could not be read. Discard again.');
+    }
+    if ('refused' in outcome) return blocked(outcome.refused, discardRefusals[outcome.refused]);
+    const short = base.slice(0, 7);
+    this.appendEntry(task, {
+      kind: 'chat-system',
+      author: { kind: 'system', turnId: null },
+      text:
+        outcome.done === 'removed'
+          ? `Discarded ${payload.path}, a file added in this thread.`
+          : outcome.done === 'recovered'
+            ? `Restored ${payload.path} from the base commit ${short}.`
+            : `Discarded the changes to ${payload.path}. It matches the base commit ${short}.`,
+    });
+    return { outcome: 'applied' };
   }
 
   renameThread(payload: Payload<'RenameChatThread'>): CommandResult {
@@ -951,19 +991,40 @@ export class ChatService {
 
   private ensureScratch(task: Task, root: string): ChatThread {
     const thread = this.thread(task.id);
-    if (thread.scratchReady) return thread;
     if (!thread.base) throw Error('The thread has no base commit.');
+    // A thread from before the ref existed gets one on its next turn.
+    if (thread.scratchReady) {
+      this.pinBase(task, root, thread.base);
+      return thread;
+    }
     const directory = this.scratchDirectory(task.id);
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
     const source = committedFiles(root, thread.base, { scratch: true });
     materialize(directory, source.files, source.links);
-    // shortcut: the skipped list stays here until the thread record has a field for it. Upgrade:
-    // store it on the thread record once the contracts carry `skipped`.
-    const _skipped = source.skipped;
+    this.pinBase(task, root, thread.base);
+    // The thread record travels in every chat.thread event, so it keeps the first 64 entries.
+    // shortcut: a longer list shows as 64 or more. Upgrade: a total count on the thread record.
+    const skipped = source.skipped.slice(0, 64);
     return this.deps.store.transaction(() =>
-      this.putThread(task, { ...this.thread(task.id), scratchReady: true }),
+      this.putThread(task, {
+        ...this.thread(task.id),
+        scratchReady: true,
+        ...(skipped.length ? { skipped } : {}),
+      }),
     );
+  }
+
+  /**
+   * Keep the thread's base reachable from a ref of its own. A failed write leaves the thread
+   * working, and the next turn or Accept writes it again.
+   */
+  private pinBase(task: Task, root: string, base: string) {
+    try {
+      writeThreadBaseRef(root, task.id, base);
+    } catch {
+      // The accepted branch or HEAD still holds the base until the person deletes it.
+    }
   }
 
   private record(turn: ChatTurn, live: LiveTurn, value: AgentEvent, settling = false) {

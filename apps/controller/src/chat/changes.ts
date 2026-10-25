@@ -1,5 +1,24 @@
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { ChatChangesRead } from '@crewkite/contracts';
-import { committedFiles, type FileContent, readCandidateFiles } from '../host/source.ts';
+import { committedFiles, type FileContent, git, readCandidateFiles } from '../host/source.ts';
 
 type FileDiff = ChatChangesRead['files'][number];
 type Op = { op: ' ' | '-' | '+'; line: string };
@@ -39,6 +58,135 @@ export function scratchChanges(
     files.push({ ...diff, patch: keep ? diff.patch : null });
   }
   return files;
+}
+
+export type DiscardOutcome =
+  | { done: 'restored' | 'removed' | 'recovered' }
+  | { refused: 'link-path' | 'skipped-path' | 'outside-copy' | 'path-blocked' | 'not-changed' };
+
+const pathKey = (path: string) => path.normalize('NFC').toLowerCase();
+
+/**
+ * Put one path of the scratch copy back the way the base has it. A changed file gets the base bytes
+ * and mode, a file the copy added is removed, and a file the copy deleted comes back. Links and
+ * entries the copy never held stay as they are, because Accept always takes them from the base.
+ */
+export function discardScratchPath(
+  repository: string,
+  scratch: string,
+  base: string,
+  path: string,
+): DiscardOutcome {
+  const source = committedFiles(repository, base, { scratch: true });
+  // A case-insensitive volume reaches a held entry under any spelling.
+  const wanted = pathKey(path);
+  const covers = (held: string) =>
+    wanted === pathKey(held) || wanted.startsWith(`${pathKey(held)}/`);
+  if (source.links.some((link) => covers(link.path))) return { refused: 'link-path' };
+  if (source.skipped.some((entry) => covers(entry.path))) return { refused: 'skipped-path' };
+  const root = realpathSync.native(scratch);
+  const target = resolve(root, path);
+  if (!target.startsWith(`${root}${sep}`)) return { refused: 'outside-copy' };
+  const parts = path.split('/');
+  // Every write below goes through real directories only. A link the copy added on the way could
+  // send it anywhere.
+  for (let end = 1; end < parts.length; end++) {
+    const state = lstatSync(join(root, ...parts.slice(0, end)), { throwIfNoEntry: false });
+    if (!state) break;
+    if (state.isSymbolicLink()) {
+      const resolved = realpathSync.native(join(root, ...parts.slice(0, end)));
+      return resolved === root || resolved.startsWith(`${root}${sep}`)
+        ? { refused: 'link-path' }
+        : { refused: 'outside-copy' };
+    }
+    if (!state.isDirectory()) return { refused: 'path-blocked' };
+  }
+  const state = lstatSync(target, { throwIfNoEntry: false });
+  if (state?.isSymbolicLink()) return { refused: 'link-path' };
+  if (state && (!state.isFile() || !readdirSync(dirname(target)).includes(basename(target))))
+    return { refused: 'path-blocked' };
+  const original = source.files.find((file) => file.path === path);
+  if (!original) {
+    if (source.files.some((file) => pathKey(file.path) === wanted))
+      return { refused: 'path-blocked' };
+    if (!state) return { refused: 'not-changed' };
+    unlinkSync(target);
+    prune(root, dirname(target));
+    return { done: 'removed' };
+  }
+  if (state && sameFile(target, original)) return { refused: 'not-changed' };
+  mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+  // A rename replaces the directory entry, so a hard link the copy made to another file keeps its
+  // bytes.
+  const temporary = join(dirname(target), `.${basename(target)}.${randomBytes(6).toString('hex')}`);
+  const mode = original.mode === '100755' ? 0o755 : 0o644;
+  try {
+    writeFileSync(temporary, original.content, { flag: 'wx', mode });
+    chmodSync(temporary, mode);
+    renameSync(temporary, target);
+  } catch (error) {
+    rmSync(temporary, { force: true });
+    throw error;
+  }
+  return { done: state ? 'restored' : 'recovered' };
+}
+
+function sameFile(file: string, original: FileContent) {
+  const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+  try {
+    const state = fstatSync(fd);
+    const bytes = readFileSync(fd);
+    return (
+      (state.mode & 0o111 ? '100755' : '100644') === original.mode &&
+      createHash('sha256').update(bytes).digest('hex') === original.hash
+    );
+  } finally {
+    closeSync(fd);
+  }
+}
+
+// A fresh copy has a directory only where a file or link sits under it, so an emptied one goes too.
+function prune(root: string, directory: string) {
+  for (let at = directory; at !== root && at.startsWith(`${root}${sep}`); at = dirname(at)) {
+    if (readdirSync(at).length) return;
+    rmdirSync(at);
+  }
+}
+
+/** Keeps a thread's base commit reachable after its accepted branch is deleted and git collects. */
+export function threadBaseRef(taskId: string) {
+  if (!/^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/.test(taskId))
+    throw new Error('Invalid thread identity.');
+  return `refs/crewkite/threads/${taskId}`;
+}
+
+function refCommit(repository: string, ref: string): string | null {
+  try {
+    return git(repository, ['rev-parse', '--verify', '--quiet', ref]).toString('utf8').trim();
+  } catch (error) {
+    if ((error as { status?: number }).status === 1) return null;
+    throw error;
+  }
+}
+
+/**
+ * Point the thread's ref at its current base. The old value goes to update-ref, so a concurrent
+ * writer makes this fail. No working tree, index, HEAD or branch changes.
+ */
+export function writeThreadBaseRef(repository: string, taskId: string, base: string) {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(base)) throw new Error('Invalid base commit.');
+  const ref = threadBaseRef(taskId);
+  const current = refCommit(repository, ref);
+  if (current === base) return;
+  git(repository, ['update-ref', '--no-deref', ref, base, current ?? '0'.repeat(base.length)]);
+}
+
+/** Remove the thread's base ref when the thread goes. A missing ref is already gone. */
+export function deleteThreadBaseRef(repository: string, taskId: string) {
+  const ref = threadBaseRef(taskId);
+  const current = refCommit(repository, ref);
+  if (current === null) return;
+  git(repository, ['update-ref', '--no-deref', '-d', ref, current]);
 }
 
 function byPath(files: FileContent[]) {

@@ -4,7 +4,18 @@
 //   and turn.completed { stopReason, failure } before the result settles.
 // On stop it reports only completed items, like a native client that drops the open item.
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  appendFileSync,
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type TestContext, test } from 'node:test';
@@ -43,6 +54,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from './adapter.ts';
+import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
@@ -1065,6 +1077,10 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const done = turnReaches(controller, 'done');
   await send('Fix the rounding.');
   await done;
+  const pinned = () => repo('rev-parse', threadBaseRef(task.id));
+  const started = await read();
+  assert.deepEqual(started.thread.skipped, [{ path: 'vendor/lib', reason: 'submodule' }]);
+  assert.equal(pinned(), started.thread.base);
   const scratch = adapter.requests[0].scratch.directory;
   // The edit goes through the link. The file under the skipped submodule is never accepted.
   appendFileSync(join(scratch, 'NOTES.md'), '// accepted\n');
@@ -1102,6 +1118,7 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
     `CrewKite: ${task.title}|Fixture owner <owner@example.invalid>`,
   );
   assert.deepEqual(checkout(), before);
+  assert.equal(pinned(), commit);
   const thread = await read();
   assert.equal(thread.thread.lastAcceptance?.commit, commit);
   assert.equal(thread.messages.at(-1)?.text, 'Accepted 1 file to branch crewkite/fix-rounding.');
@@ -1147,10 +1164,15 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   assert.deepEqual(checkout(), moved);
   const last = await read();
   assert.equal(last.thread.base, stacked);
+  assert.equal(pinned(), stacked);
   assert.equal(last.messages.at(-1)?.text, `Accepted 1 file to branch crewkite/second. ${note}`);
+  // Thread delete removes the ref and nothing else.
+  deleteThreadBaseRef(source.directory, task.id);
+  assert.equal(repo('for-each-ref', 'refs/crewkite/'), '');
+  assert.deepEqual(checkout(), moved);
 });
 
-test('accept is refused while a turn is running', { timeout: 30000 }, async (t) => {
+test('accept and discard are refused while a turn is running', { timeout: 30000 }, async (t) => {
   const { controller, task, run, send } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['Working'], complete: false }, { kind: 'wait' }],
   ]);
@@ -1163,6 +1185,134 @@ test('accept is refused while a turn is running', { timeout: 30000 }, async (t) 
 
   const result = await run('AcceptChatChanges', { branch: 'crewkite/fix-rounding' }, task.revision);
   assert.deepEqual([result.outcome, result.reason], ['blocked', 'turn-running']);
+  const discard = await run('DiscardChatChange', { path: 'net.mjs' }, task.revision);
+  assert.deepEqual([discard.outcome, discard.reason], ['blocked', 'turn-running']);
+});
+
+test('discard restores, removes or recovers one path and refuses links and entries the copy never held', {
+  timeout: 30000,
+}, async (t) => {
+  const { controller, adapter, task, run, send, read, source } = await chat(t, [
+    [{ kind: 'text', itemId: 'reply', chunks: ['Edited.'] }],
+  ]);
+  const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
+  // The base gains a link that stays inside and a submodule the copy skips.
+  const blob = git(source.directory, ['hash-object', '-w', '--stdin'], 'net.mjs').toString().trim();
+  const vendor = git(source.directory, ['mktree'], `160000 commit ${'c'.repeat(40)}\tlib\n`)
+    .toString()
+    .trim();
+  const tree = git(
+    source.directory,
+    ['mktree'],
+    `${repo('ls-tree', 'HEAD')}\n120000 blob ${blob}\tNOTES.md\n040000 tree ${vendor}\tvendor\n`,
+  )
+    .toString()
+    .trim();
+  const identity = {
+    name: 'Fixture',
+    email: 'fixture@example.invalid',
+    at: '2026-10-15T18:00:00Z',
+  };
+  repo(
+    'update-ref',
+    'refs/heads/main',
+    git(source.directory, ['commit-tree', tree, '-p', 'HEAD'], 'link\n', identity)
+      .toString()
+      .trim(),
+  );
+  const done = turnReaches(controller, 'done');
+  await send('Fix the rounding.');
+  await done;
+  const scratch = adapter.requests[0].scratch.directory;
+  const outside = mkdtempSync(join(tmpdir(), 'crewkite-outside-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  const committed = (path: string) => git(source.directory, ['show', `HEAD:${path}`]);
+  appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
+  appendFileSync(join(scratch, 'sentinels/executable.sh'), '# changed\n');
+  chmodSync(join(scratch, 'sentinels/executable.sh'), 0o644);
+  mkdirSync(join(scratch, 'notes/new'), { recursive: true });
+  writeFileSync(join(scratch, 'notes/new/added.txt'), 'added\n');
+  rmSync(join(scratch, 'index.html'));
+  const discard = (path: string) => run('DiscardChatChange', { path }, task.revision);
+  const changed = async () =>
+    ((await run('ReadChatChanges', {})).data as { files: { path: string }[] }).files.map(
+      (file) => file.path,
+    );
+  assert.deepEqual(await changed(), [
+    'index.html',
+    'net.mjs',
+    'notes/new/added.txt',
+    'sentinels/executable.sh',
+  ]);
+  const rows: {
+    path: string;
+    reason?: string;
+    line?: string;
+    check?: () => void;
+    before?: () => void;
+  }[] = [
+    {
+      path: 'sentinels/executable.sh',
+      line: 'Discarded the changes to sentinels/executable.sh. It matches the base commit',
+      check: () => {
+        assert.deepEqual(
+          readFileSync(join(scratch, 'sentinels/executable.sh')),
+          committed('sentinels/executable.sh'),
+        );
+        assert.equal(statSync(join(scratch, 'sentinels/executable.sh')).mode & 0o777, 0o755);
+      },
+    },
+    {
+      path: 'notes/new/added.txt',
+      line: 'Discarded notes/new/added.txt, a file added in this thread.',
+      check: () => assert.equal(existsSync(join(scratch, 'notes')), false),
+    },
+    {
+      path: 'index.html',
+      line: 'Restored index.html from the base commit',
+      check: () =>
+        assert.deepEqual(readFileSync(join(scratch, 'index.html')), committed('index.html')),
+    },
+    { path: 'index.html', reason: 'not-changed' },
+    { path: 'NOTES.md', reason: 'link-path' },
+    { path: 'vendor/lib', reason: 'skipped-path' },
+    {
+      path: 'vendor/lib/extra.txt',
+      reason: 'skipped-path',
+      before: () => {
+        mkdirSync(join(scratch, 'vendor/lib'), { recursive: true });
+        writeFileSync(join(scratch, 'vendor/lib/extra.txt'), 'local only\n');
+      },
+    },
+    {
+      path: 'linked.md',
+      reason: 'link-path',
+      before: () => symlinkSync('net.mjs', join(scratch, 'linked.md')),
+    },
+    {
+      path: 'away/secret.txt',
+      reason: 'outside-copy',
+      before: () => {
+        writeFileSync(join(outside, 'secret.txt'), 'keep\n');
+        symlinkSync(outside, join(scratch, 'away'));
+      },
+    },
+  ];
+  for (const row of rows) {
+    row.before?.();
+    const result = await discard(row.path);
+    if (row.reason) {
+      assert.deepEqual([result.outcome, result.reason], ['blocked', row.reason], row.path);
+      continue;
+    }
+    assert.equal(result.outcome, 'applied', row.path);
+    assert.ok((await read()).messages.at(-1)?.text.startsWith(row.line ?? ''), row.path);
+    row.check?.();
+    // Accept carries only what is left.
+    if (row.path === 'index.html') assert.deepEqual(await changed(), ['net.mjs']);
+  }
+  assert.equal(readFileSync(join(outside, 'secret.txt'), 'utf8'), 'keep\n');
+  assert.match(readFileSync(join(scratch, 'net.mjs'), 'utf8'), /\/\/ changed\n$/);
 });
 
 // Builder and fixer run on OpenAI, the reviewer on Anthropic, the challenger on Google. The crew
