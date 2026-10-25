@@ -362,16 +362,9 @@ test('Local generation binds its loopback authentication mode and loaded instanc
       reason: 'identity',
     },
     {
-      name: 'extra resident model',
+      name: 'bound instance listed twice',
       change: (f) => {
         f.client.llm.listLoaded = async () => [f.model, f.model];
-      },
-      reason: 'identity',
-    },
-    {
-      name: 'resident embedding',
-      change: (f) => {
-        f.client.embedding.listLoaded = async () => [{}];
       },
       reason: 'identity',
     },
@@ -397,11 +390,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
       reason: 'identity',
     },
     {
-      name: 'wrong context',
+      name: 'context changes between reads',
       change: (f) => {
-        f.model.getModelInfo = async () => ({ ...info, contextLength: 16384 });
+        let reads = 0;
+        f.model.getModelInfo = async () =>
+          reads++ ? { ...info, contextLength: info.contextLength * 2 } : info;
       },
-      reason: 'identity',
+      reason: 'context',
     },
     {
       name: 'busy model',
@@ -453,6 +448,90 @@ test('Local generation binds its loopback authentication mode and loaded instanc
         status: row.name === 'missing draft evidence' ? 'missing' : 'mismatch',
       });
     }
+  }
+  // The bound instance decides. Another resident model or an embedding model stays out of the
+  // attempt, and the prompt check and proof use the context the instance reports.
+  for (const contextLength of [info.contextLength, 1_048_576]) {
+    const f = fixture();
+    const reported = { ...info, contextLength };
+    f.model.getModelInfo = async () => reported;
+    f.client.llm.listLoaded = async () => [
+      { ...f.model, modelKey: 'other-model', instanceReference: 'instance-2' },
+      f.model,
+    ];
+    f.client.embedding.listLoaded = async () => [{}];
+    const run = startLocalPrediction(plan, {
+      createClient: () => f.client,
+      schedule: f.schedule,
+      now: () => 0,
+    });
+    await flush();
+    assert.equal(f.submitted, 1, String(contextLength));
+    const done = terminal();
+    f.resolve({
+      ...done,
+      modelInfo: reported,
+      loadConfig: kv({ 'llm.load.contextLength': contextLength }),
+    });
+    const outcome = await run.result;
+    assert.equal(outcome.kind, 'completed', String(contextLength));
+    assert(outcome.kind === 'completed');
+    assert.equal(outcome.proof.contextLength, contextLength);
+  }
+  // Qualification rows: the selected instance qualifies when it is loaded and eligible, whatever
+  // else is resident and whatever context it reports, and the read carries that context unchanged.
+  const other = {
+    ...info,
+    modelKey: 'other-model',
+    instanceReference: 'instance-2',
+    path: 'other.gguf',
+    contextLength: 32768,
+  };
+  let selectionId: string | undefined;
+  for (const [label, contextLength, loaded, qualifies] of [
+    ['two resident, selected loaded', info.contextLength, 'both', true],
+    ['selected unloaded, other resident', info.contextLength, 'other', false],
+    ['selected reports 1,048,576', 1_048_576, 'selected', true],
+  ] as const) {
+    const f = fixture();
+    const reported = { ...info, contextLength };
+    f.model.getModelInfo = async () => reported;
+    const second = {
+      ...f.model,
+      modelKey: other.modelKey,
+      instanceReference: other.instanceReference,
+      getModelInfo: async () => other,
+    };
+    f.client.llm.listLoaded = async () =>
+      loaded === 'both' ? [f.model, second] : loaded === 'other' ? [second] : [f.model];
+    f.client.embedding.listLoaded = async () => [{}];
+    const discovery = await discoverLocalModels(discoveryClient(f), { now: () => 0 });
+    assert(discovery.kind === 'observed', label);
+    const { observation } = discovery;
+    const choice = observation.models.find((model) => model.identity.modelKey === info.modelKey);
+    assert(choice, label);
+    selectionId ??= choice.selectionId;
+    assert.equal(choice.selectionId, selectionId, label);
+    assert.deepEqual(
+      observation.residents?.map((resident) => [resident.modelKey, resident.contextLength]),
+      loaded === 'both'
+        ? [
+            [info.modelKey, contextLength],
+            [other.modelKey, other.contextLength],
+          ]
+        : loaded === 'other'
+          ? [[other.modelKey, other.contextLength]]
+          : [[info.modelKey, contextLength]],
+      label,
+    );
+    const resolved = resolveLocalConnection(
+      { endpoint: plan.endpoint, connectionRevision: 1, observation, selectionId },
+      { platform: 'darwin', arch: 'arm64', secretConfigured: true },
+    );
+    assert.equal(resolved.connection !== null, qualifies, label);
+    assert.equal(resolved.facts.contextLength, qualifies ? contextLength : null, label);
+    if (qualifies) assert.equal(choice.contextLength, contextLength, label);
+    else assert.equal(choice.state, 'installed-unloaded', label);
   }
   for (const [format, catalog] of [
     ['gguf', 'exact'],
@@ -589,7 +668,7 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     assert.equal(f.submitted, 1);
     f.resolve({ ...terminal(), modelInfo: metadata });
     assert.equal((await run.result).kind, 'completed');
-    for (const drift of ['runtime', 'model-path', 'model-variant', 'extra-resident'] as const) {
+    for (const drift of ['runtime', 'model-path', 'model-variant', 'instance-gone'] as const) {
       const next = fixture();
       next.model.getModelInfo = async () => metadata;
       const changed = discoveryClient(next, [metadata]);
@@ -604,8 +683,10 @@ test('Local generation binds its loopback authentication mode and loaded instanc
             next.model.getModelInfo = async () => ({ ...metadata, path: 'different-model' });
           if (drift === 'model-variant')
             next.model.getModelInfo = async () => ({ ...metadata, selectedVariant: 'other' });
-          if (drift === 'extra-resident')
-            changed.llm.listLoaded = async () => [next.model, next.model];
+          if (drift === 'instance-gone')
+            changed.llm.listLoaded = async () => [
+              { ...next.model, instanceReference: 'instance-2' },
+            ];
         },
       });
       const outcome = await refused.result;

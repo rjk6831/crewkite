@@ -318,6 +318,23 @@ test('Local secret input returns one current private result after helper cleanup
     resolveLocalConnection(selection, { ...capability, secretConfigured: false }).facts.available,
     false,
   );
+  // Other residents, an embedding model and the reported context size never refuse the selected
+  // instance. The profile carries the context the instance reports.
+  for (const observation of [
+    { ...observed, residentLlms: 2 },
+    { ...observed, embeddingInstances: 1 },
+    { ...observed, models: [{ ...observed.models[0], contextLength: 16384 }] },
+  ]) {
+    const kept = resolveLocalConnection(
+      {
+        ...selection,
+        observation: { ...observation, observationHash: hashCanonical(observation) },
+      },
+      capability,
+    );
+    assert(kept.connection);
+    assert.equal(kept.facts.contextLength, observation.models[0].contextLength);
+  }
   for (const [input, platform] of [
     [null, capability],
     [legacyConfiguration, capability],
@@ -328,9 +345,6 @@ test('Local secret input returns one current private result after helper cleanup
     [{ ...selection, endpoint: 'ws://localhost:1234' }, capability],
     [{ ...selection, endpoint: 'ws://127.0.0.1:65536' }, capability],
     ...[
-      { ...observed, residentLlms: 2 },
-      { ...observed, embeddingInstances: 1 },
-      { ...observed, models: [{ ...observed.models[0], contextLength: 16384 }] },
       { ...observed, models: [{ ...observed.models[0], instanceReference: 'bad\ninstance' }] },
     ].map(
       (observation) =>

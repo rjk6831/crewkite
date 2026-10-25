@@ -57,7 +57,7 @@ export function resolveLocalConnection(
       model: 'unknown',
       modelBinding: null,
       billing: 'local',
-      contextLength: 8192,
+      contextLength: null,
       maximumOutputTokens: 4096,
       qualifiedAt: null,
       maximumTaskMs: 300000,
@@ -94,14 +94,9 @@ export function resolveLocalConnection(
     )
   )
     return unavailable('model-setup-unavailable');
+  // The selected instance decides. Other residents and the size of its context do not.
   const choice = observation.models.find((model) => model.selectionId === selectionId);
-  if (
-    choice?.state !== 'loaded-eligible' ||
-    !choice.instanceReference ||
-    choice.contextLength !== 8192 ||
-    observation.residentLlms !== 1 ||
-    observation.embeddingInstances !== 0
-  )
+  if (choice?.state !== 'loaded-eligible' || !choice.instanceReference || !choice.contextLength)
     return unavailable('model-setup-unavailable');
   const binding = LocalModelBindingSchema.safeParse({
     version: 2,
@@ -125,6 +120,7 @@ export function resolveLocalConnection(
       ...unavailable('connection-unavailable').facts,
       model: binding.data.modelKey,
       modelBinding: binding.data,
+      contextLength: choice.contextLength,
       available: connected,
       reason: connected ? 'qualification-pending' : 'connection-unavailable',
     }),
@@ -135,4 +131,19 @@ export function resolveLocalConnection(
       modelBinding: binding.data,
     },
   };
+}
+
+/**
+ * The choice in a fresh read that keeps the selection. A reload or a runtime update changes the
+ * selection ID, so the match is by model key, and only to one choice with a loaded instance. Null
+ * clears the selection, and the person picks again.
+ */
+export function retainedSelection(
+  modelKey: string | null,
+  next: z.output<typeof LocalModelObservationSchema>,
+): z.output<typeof LocalModelObservationSchema>['models'][number] | null {
+  const loaded = next.models.filter(
+    (model) => model.identity.modelKey === modelKey && model.instanceReference !== null,
+  );
+  return modelKey !== null && loaded.length === 1 ? loaded[0] : null;
 }

@@ -32,10 +32,13 @@ import {
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
 import { startGoogleAcpSetup } from '../providers/google/acp/writer.ts';
+import { probeLocalWithoutToken } from '../providers/local/chat-connect.ts';
 import {
   localConfiguredConnectionHash,
   resolveLocalConnection,
+  retainedSelection,
 } from '../providers/local/connection.ts';
+import { availableMemory, refreshAvailableMemory } from '../providers/local/hardware.ts';
 import { startLocalDiscovery } from '../providers/local/replacement.ts';
 import { type LocalInputResult, startLocalSecretInput } from '../providers/local/secure-input.ts';
 import {
@@ -807,6 +810,9 @@ export class ProviderCommands {
         : null,
       generation: generation === 'generation-unknown' ? 'unknown' : generation ? 'active' : 'idle',
       observation: control.observation,
+      observedAt: control.observedAt,
+      contextTokens: choice?.contextLength ?? null,
+      availableMemoryBytes: control.availableMemoryBytes,
       selection: control.selection,
       reason,
     });
@@ -841,7 +847,9 @@ export class ProviderCommands {
         noneConnected: false,
         connectionFailed: false,
         observation: null,
+        observedAt: null,
         selection: null,
+        selectedModelKey: null,
         setupHash: null,
         operation: control.operation
           ? {
@@ -901,7 +909,9 @@ export class ProviderCommands {
         connectionFailed: false,
         connectionRevision: control.connectionRevision + 1,
         observation: null,
+        observedAt: null,
         selection: null,
+        selectedModelKey: null,
         setupHash: null,
         operation: null,
       });
@@ -909,17 +919,19 @@ export class ProviderCommands {
     }
     if (!control.endpoint) return { outcome: 'blocked', reason: 'local-not-configured' };
     if (command.command === 'SelectLocalModel') {
+      const picked = control.observation?.models.find(
+        (value) => value.selectionId === command.payload.selectionId,
+      );
       if (
         !control.observation ||
         command.payload.observationHash !== control.observation.observationHash ||
-        !control.observation.models.some(
-          (value) => value.selectionId === command.payload.selectionId,
-        )
+        !picked
       )
         return { outcome: 'blocked', reason: 'local-selection-stale' };
       this.saveLocal({
         ...control,
         selection: command.payload,
+        selectedModelKey: picked.identity.modelKey,
         setupHash: hashCanonical({
           version: 2,
           connectionHash: localConfiguredConnectionHash(
@@ -939,6 +951,7 @@ export class ProviderCommands {
         noneConnected: true,
         connectionFailed: false,
         observation: null,
+        observedAt: null,
         selection: null,
         setupHash: null,
       });
@@ -969,6 +982,7 @@ export class ProviderCommands {
       ...control,
       connectionFailed: false,
       observation: kind === 'discovery' ? control.observation : null,
+      observedAt: kind === 'discovery' ? control.observedAt : null,
       selection: kind === 'discovery' ? control.selection : null,
       setupHash: kind === 'discovery' ? control.setupHash : null,
       operation: {
@@ -1063,6 +1077,7 @@ export class ProviderCommands {
               ) &&
             !this.store.localGenerationBlocker();
           let observation = control.observation;
+          let { observedAt, availableMemoryBytes, selectedModelKey } = control;
           let selection = control.selection;
           let setupHash = control.setupHash;
           if (known && live && value && 'kind' in value && value.kind === 'ready') {
@@ -1083,22 +1098,17 @@ export class ProviderCommands {
             hashCanonical(value.terminal.binding) === hashCanonical(current.binding)
           ) {
             const nextObservation = LocalModelObservationSchema.parse(value.terminal.observation);
-            const previousChoice = observation?.models.find(
-              (choice) => choice.selectionId === selection?.selectionId,
-            );
-            const selectionId = selection?.selectionId;
-            const nextChoice = nextObservation.models.find(
-              (choice) => choice.selectionId === selectionId,
-            );
-            const retainSelection =
-              selectionId &&
-              previousChoice &&
-              nextChoice &&
-              hashCanonical(previousChoice) === hashCanonical(nextChoice);
+            // Setups saved before the key existed name the model through their selected choice.
+            selectedModelKey ??=
+              observation?.models.find((choice) => choice.selectionId === selection?.selectionId)
+                ?.identity.modelKey ?? null;
+            const kept = retainedSelection(selectedModelKey, nextObservation);
             observation = nextObservation;
-            if (retainSelection && control.endpoint) {
+            observedAt = this.now();
+            availableMemoryBytes = availableMemory() ?? null;
+            if (kept && control.endpoint) {
               selection = {
-                selectionId,
+                selectionId: kept.selectionId,
                 observationHash: nextObservation.observationHash,
               };
               setupHash = hashCanonical({
@@ -1112,10 +1122,12 @@ export class ProviderCommands {
               });
             } else {
               selection = null;
+              selectedModelKey = null;
               setupHash = null;
             }
           } else if (known && live && current.kind === 'discovery') {
             observation = null;
+            observedAt = null;
             selection = null;
             setupHash = null;
           }
@@ -1143,7 +1155,10 @@ export class ProviderCommands {
             noneConnected: failedConnection ? false : control.noneConnected,
             connectionFailed: failedConnection,
             observation,
+            observedAt,
+            availableMemoryBytes,
             selection,
+            selectedModelKey,
             setupHash,
             operation: known ? null : { ...current, state: 'unknown' },
           });
@@ -1177,48 +1192,92 @@ export class ProviderCommands {
         });
       };
       if (operation.kind === 'input') {
-        runtime.handle = startLocalSecretInput(
-          { binding: operation.binding, endpoint: control.endpoint },
-          this.options.localInputHelper,
-          {
-            ...this.options.localInput,
-            schedule: this.options.schedule,
-            launch: (executable, settings) => {
-              requested = true;
-              const child =
-                this.options.localInput?.launch?.(executable, settings) ??
-                (() => {
-                  const child = spawn(executable, [], settings);
-                  return {
-                    group: child.pid ?? 0,
-                    input: child.stdin,
-                    output: child.stdio[3],
-                    onSpawn: (handler: () => void) => {
-                      child.once('spawn', handler);
-                    },
-                    onError: (handler: () => void) => {
-                      child.once('error', handler);
-                    },
-                    onClose: (
-                      handler: (code: number | null, signal: NodeJS.Signals | null) => void,
-                    ) => {
-                      child.once('close', handler);
-                    },
-                  };
-                })();
-              try {
-                own(child.group);
-                return child;
-              } catch {
-                return { ...child, input: null };
-              }
+        const launchInput = () => {
+          runtime.handle = startLocalSecretInput(
+            { binding: operation.binding, endpoint: control.endpoint },
+            this.options.localInputHelper,
+            {
+              ...this.options.localInput,
+              schedule: this.options.schedule,
+              launch: (executable, settings) => {
+                requested = true;
+                const child =
+                  this.options.localInput?.launch?.(executable, settings) ??
+                  (() => {
+                    const child = spawn(executable, [], settings);
+                    return {
+                      group: child.pid ?? 0,
+                      input: child.stdin,
+                      output: child.stdio[3],
+                      onSpawn: (handler: () => void) => {
+                        child.once('spawn', handler);
+                      },
+                      onError: (handler: () => void) => {
+                        child.once('error', handler);
+                      },
+                      onClose: (
+                        handler: (code: number | null, signal: NodeJS.Signals | null) => void,
+                      ) => {
+                        child.once('close', handler);
+                      },
+                    };
+                  })();
+                try {
+                  own(child.group);
+                  return child;
+                } catch {
+                  return { ...child, input: null };
+                }
+              },
             },
-          },
-        );
-        const handle = runtime.handle as ReturnType<typeof startLocalSecretInput>;
-        void handle.result.then(finish, () => finish(null));
+          );
+          const handle = runtime.handle as ReturnType<typeof startLocalSecretInput>;
+          void handle.result.then(finish, () => finish(null));
+        };
+        // A runtime with auth off on loopback answers without a token. Then no token window opens
+        // and the connection switches to the no-token mode. Anything else opens the window.
+        const endpoint = control.endpoint;
+        if (!endpoint) throw Error('Local endpoint is unavailable.');
+        void (this.options.localProbe ?? probeLocalWithoutToken)(endpoint)
+          .catch(() => false)
+          .then((open) => {
+            if (!open || runtime.stopped || this.closed) {
+              try {
+                if (runtime.stopped || this.closed) return finish(null);
+                this.localOperationCurrent(operationId);
+                launchInput();
+              } catch {
+                finish(null);
+              }
+              return;
+            }
+            finish(null);
+            this.store.transaction(() => {
+              const current = this.localControl();
+              if (
+                current.operation ||
+                current.endpoint !== endpoint ||
+                current.authMode !== 'token' ||
+                current.connectionRevision !== control.connectionRevision
+              )
+                return;
+              this.saveLocal({
+                ...current,
+                authMode: 'none',
+                noneConnected: true,
+                connectionFailed: false,
+                connectionRevision: current.connectionRevision + 1,
+                observation: null,
+                observedAt: null,
+                selection: null,
+                setupHash: null,
+              });
+            });
+          });
       } else {
         if (!this.localConnected(control)) throw Error('Local connection is unavailable.');
+        // Read once per observation. The read is far shorter than discovery, so it lands first.
+        void refreshAvailableMemory();
         const credentials =
           control.authMode === 'none'
             ? { authMode: 'none' as const }

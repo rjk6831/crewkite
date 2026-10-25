@@ -3737,6 +3737,22 @@ async function localControllerFixture(
     ...changedObserved,
     observationHash: hashCanonical(changedObserved),
   };
+  const otherIdentity = {
+    ...identity,
+    modelKey: 'other-model',
+    metadataHash: hashCanonical({ model: 'other-model', path: 'owned-fixture' }),
+  };
+  const otherObserved = {
+    ...observed,
+    models: [
+      {
+        ...choice,
+        identity: otherIdentity,
+        selectionId: hashCanonical({ runtime, metadataHash: otherIdentity.metadataHash }),
+      },
+    ],
+  };
+  const otherObservation = { ...otherObserved, observationHash: hashCanonical(otherObserved) };
   const secret = 'private-controller-local-canary';
   const inputPeer = `
 const fs=require('node:fs'); const mode=process.argv[1]; let pending=Buffer.alloc(0);
@@ -3745,7 +3761,7 @@ const prompt=JSON.parse(pending.subarray(4,4+pending.readUInt32BE(0)));pending=B
 const body=Buffer.from(JSON.stringify({binding:prompt.binding,outcome:'submitted',secret:${JSON.stringify(secret)}}));const header=Buffer.alloc(4);header.writeUInt32BE(body.length);
 const finish=()=>{fs.writeSync(3,Buffer.concat([header,body]));process.stdin.destroy();};if(mode==='input-hold')process.stdin.once('end',finish);else finish();});`;
   const clientPeer = `
-const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=mode==='discovery-instance-changed'?${JSON.stringify(changedObservation)}:${JSON.stringify(observation)};
+const {createInterface}=require('node:readline');const mode=process.argv[1];const observation=mode==='discovery-instance-changed'?${JSON.stringify(changedObservation)}:mode==='discovery-model-changed'?${JSON.stringify(otherObservation)}:${JSON.stringify(observation)};
 let plan;const emit=value=>process.stdout.write(JSON.stringify(value)+'\\n');
 const finish=value=>{emit(value);process.stdin.destroy();};
 createInterface({input:process.stdin}).on('line',line=>{const value=JSON.parse(line);
@@ -3867,6 +3883,8 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
           },
         } satisfies Partial<ControllerOptions>)
       : {}),
+    // Every row runs against a runtime that wants a token unless it says otherwise.
+    localProbe: async () => false,
     localInputHelper:
       authMode === 'none'
         ? undefined
@@ -4044,27 +4062,73 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
   };
 }
 
-test('Local refresh keeps an exact selected instance and clears a changed instance', async (t) => {
+test('Local reads keep the selection while its model key is loaded and clear it otherwise', async (t) => {
   const context = await localControllerFixture(t);
   const selected = context.setupState();
   assert(selected?.selection);
   assert(selected.setupHash);
+  const refresh = async (mode: string) => {
+    context.mode(mode);
+    await context.local('RefreshLocalModels', { consent: 'explicit' });
+    await context.operationDone();
+    return context.setupState();
+  };
+  // Each row is the runtime's state at the read and whether the selection survives it.
+  const rows: [label: string, step: () => Promise<unknown>, kept: boolean][] = [
+    ['same instance', () => refresh('completed'), true],
+    [
+      'instance reloaded under the same model key',
+      () => refresh('discovery-instance-changed'),
+      true,
+    ],
+    [
+      'reconnect with the token, same model loaded',
+      async () => {
+        await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
+        await context.operationDone();
+        assert.equal(context.setupState()?.observation, null);
+        return refresh('completed');
+      },
+      true,
+    ],
+    ['another model loaded in its place', () => refresh('discovery-model-changed'), false],
+  ];
+  for (const [label, step, kept] of rows) {
+    const before = Date.parse(context.clock.now());
+    await step();
+    const after = context.setupState();
+    assert(after?.observedAt, label);
+    assert(Date.parse(after.observedAt) >= before, label);
+    assert.equal(
+      after.selection?.selectionId ?? null,
+      kept ? selected.selection.selectionId : null,
+      label,
+    );
+    assert.equal(after.reason, kept ? 'qualification-pending' : 'model-selection-required', label);
+    assert.equal(after.contextTokens, kept ? context.choice.contextLength : null, label);
+  }
 
-  await context.local('RefreshLocalModels', { consent: 'explicit' });
-  assert.deepEqual(context.setupState()?.selection, selected.selection);
-  assert.equal(context.setupState()?.setupHash, selected.setupHash);
-  await context.operationDone();
-  assert.deepEqual(context.setupState()?.selection, selected.selection);
-  assert.equal(context.setupState()?.setupHash, selected.setupHash);
+  // After a restart the token is gone. The last read stays, marked by when it was read.
+  // The relaunched controller meets a runtime with auth off on loopback.
+  context.options.localProbe = async () => true;
+  const last = context.setupState();
+  const reopened = await context.reopen();
+  const cached = reopened.snapshot().localSetup;
+  assert.equal(cached?.connected, false);
+  assert.equal(cached?.observation?.observationHash, last?.observation?.observationHash);
+  assert.equal(cached?.observedAt, last?.observedAt);
 
-  context.mode('discovery-instance-changed');
-  await context.local('RefreshLocalModels', { consent: 'explicit' });
-  await context.operationDone();
-  const changed = context.setupState();
-  assert.equal(changed?.observation?.models[0].instanceReference, 'replacement-instance');
-  assert.equal(changed?.selection, null);
-  assert.equal(changed?.setupHash, null);
-  assert.equal(changed?.reason, 'model-selection-required');
+  // Connect then needs no token window and no token.
+  await reopened.execute(
+    context.command('BeginLocalConnectionInput', { consent: 'explicit' }, cached?.revision),
+    'local-owner',
+  );
+  await (reopened as unknown as { localOperation?: { done: Promise<void> } }).localOperation?.done;
+  const open = reopened.snapshot().localSetup;
+  assert.equal(open?.authMode, 'none');
+  assert.equal(open?.connected, true);
+  assert.equal(open?.secretConfigured, false);
+  assert.equal(open?.operation, null);
 });
 
 test('Local preparation freezes every authority and refuses changed effects after reopen', async (t) => {
