@@ -3,11 +3,13 @@ import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
+  copyFileSync,
   fstatSync,
   mkdirSync,
   openSync,
   readFileSync,
   realpathSync,
+  rmSync,
 } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -332,66 +334,133 @@ export const anthropicChatAccepts = [
 type TurnFile = NonNullable<ChatTurnRequest['files']>[number];
 const turnFiles = (request: ChatTurnRequest): readonly TurnFile[] => request.files ?? [];
 const utf8 = new TextDecoder('utf-8', { fatal: true });
+// The blocks travel in one stdin frame with the text. The Messages API refuses a request over
+// 32 MB and base64 adds a third, so the raw bytes of all blocks stay under 24 MiB. A file past
+// what is left goes as a path line and is never read, which also keeps a large file from
+// reaching the string limit of the runtime.
+const NATIVE_BYTES = 24 * 1024 * 1024;
 
 class UnreadableFile extends Error {}
+class ChangedFile extends Error {}
+
+/** The block a file type goes as, or null for a path line. */
+function blockKind(type: string) {
+  if (type.startsWith('image/') && anthropicChatAccepts.some((value) => value === type))
+    return 'image';
+  if (type === 'application/pdf') return 'pdf';
+  if (type.startsWith('text/')) return 'text';
+  return null;
+}
+
+/** An open regular file and its size. O_NONBLOCK keeps a FIFO from holding the turn. */
+function openStored(path: string) {
+  if (!isAbsolute(path)) throw new Error('relative');
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile()) throw new Error('not a file');
+    return { fd, size: stat.size };
+  } catch (error) {
+    closeSync(fd);
+    throw error;
+  }
+}
 
 /**
  * The user message for this turn. Each file the protocol has a block for goes as that block, read
- * now so the bytes match what the person attached. Any other file goes as a line in the text with
- * its stored path, and its folder joins the launch through --add-dir so the model's tools can
- * read it. File blocks come before the text, which is the order the API documents for images.
+ * now and checked against its hash so the bytes match what the person attached. Any other file
+ * goes as a line in the text naming a copy under `staging`, and only that folder joins the launch
+ * through --add-dir. Under allow-edits the client can write in an added folder, and a stored file
+ * is shared by every message that attached the same bytes, so the client never gets the store.
+ * A file from an earlier message always goes as a line and never refuses the turn. File blocks
+ * come before the text, which is the order the API documents for images.
  */
-function userMessage(text: string, files: readonly TurnFile[]) {
+function userMessage(text: string, files: readonly TurnFile[], staging: string) {
   const blocks: unknown[] = [];
   const lines: string[] = [];
-  const folders = new Set<string>();
-  for (const { attachment, path } of files) {
-    let bytes: Buffer;
+  let room = NATIVE_BYTES;
+  let staged = false;
+  // A copy keeps the stored file out of reach of an in-place write, which a hard link would
+  // pass through. COPYFILE_FICLONE clones on APFS and falls back to a plain copy elsewhere.
+  const stage = ({ attachment, path }: TurnFile) => {
+    const target = join(staging, attachment.id, attachment.name);
+    mkdirSync(dirname(target), { recursive: true, mode: 0o700 });
+    copyFileSync(path, target, constants.COPYFILE_FICLONE);
+    staged = true;
+    return target;
+  };
+  for (const file of files) {
+    const { attachment, path } = file;
+    const about = `${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes)`;
+    if (file.earlier) {
+      let target: string | null = null;
+      try {
+        if (isAbsolute(path)) target = stage(file);
+      } catch {}
+      lines.push(target ? `Attached earlier: ${about} at ${target}` : `Attached earlier: ${about}`);
+      continue;
+    }
+    const type = attachment.mimeType.split(';')[0].trim().toLowerCase();
+    const kind = blockKind(type);
+    let opened: ReturnType<typeof openStored>;
     try {
-      if (!isAbsolute(path)) throw new Error();
-      bytes = readFileSync(path);
+      opened = openStored(path);
     } catch {
       throw new UnreadableFile(attachment.name);
     }
-    const type = attachment.mimeType.split(';')[0].trim().toLowerCase();
-    const title = attachment.name;
-    if (type.startsWith('image/') && anthropicChatAccepts.some((value) => value === type))
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
-      });
-    else if (type === 'application/pdf')
-      blocks.push({
-        type: 'document',
-        title,
-        source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
-      });
-    else {
-      let content: string | null = null;
-      if (type.startsWith('text/'))
+    let block: unknown = null;
+    try {
+      if (kind && opened.size <= room) {
+        let bytes: Buffer;
         try {
-          content = utf8.decode(bytes);
-        } catch {}
-      if (content !== null)
-        blocks.push({
-          type: 'document',
-          title,
-          source: { type: 'text', media_type: 'text/plain', data: content },
-        });
-      else {
-        lines.push(
-          `Attached file: ${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes) at ${path}`,
-        );
-        // Stored files sit at <files folder>/<sha256>/<name>, so one folder covers them all.
-        folders.add(dirname(dirname(path)));
+          bytes = readFileSync(opened.fd);
+        } catch {
+          throw new UnreadableFile(attachment.name);
+        }
+        if (createHash('sha256').update(bytes).digest('hex') !== attachment.id)
+          throw new ChangedFile(attachment.name);
+        const title = attachment.name;
+        if (kind === 'image')
+          block = {
+            type: 'image',
+            source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
+          };
+        else if (kind === 'pdf')
+          block = {
+            type: 'document',
+            title,
+            source: { type: 'base64', media_type: type, data: bytes.toString('base64') },
+          };
+        else
+          try {
+            block = {
+              type: 'document',
+              title,
+              source: { type: 'text', media_type: 'text/plain', data: utf8.decode(bytes) },
+            };
+          } catch {}
+        if (block) room -= opened.size;
       }
+    } finally {
+      closeSync(opened.fd);
     }
+    if (block) {
+      blocks.push(block);
+      continue;
+    }
+    let target: string;
+    try {
+      target = stage(file);
+    } catch {
+      throw new UnreadableFile(attachment.name);
+    }
+    lines.push(`Attached file: ${about} at ${target}`);
   }
   const body = [text, lines.join('\n')].filter(Boolean).join('\n\n');
   return {
     content: [...blocks, { type: 'text', text: body }],
     native: blocks.length > 0,
-    folders: [...folders],
+    folders: staged ? [staging] : [],
   };
 }
 
@@ -453,12 +522,21 @@ function startTurn(
       // A failing sink must not take the native process handlers down with it.
     }
   };
+  // Copies of the files that go as path lines. The folder lives as long as the turn.
+  const staging = join(request.work.directory, 'files');
+  const unstage = () => {
+    if (!isAbsolute(staging)) return;
+    try {
+      rmSync(staging, { recursive: true, force: true });
+    } catch {}
+  };
   const refuse = (failure: ChatFailure): ChatTurnHandle => ({
     respondPermission() {},
     stop() {},
     groups: [],
     result: new Promise((resolve) =>
       queueMicrotask(() => {
+        unstage();
         send({ type: 'turn.completed', turnId, stopReason: 'error', failure });
         resolve({
           stopReason: 'error',
@@ -489,14 +567,40 @@ function startTurn(
         message: 'The selected model name cannot be passed to the Anthropic client.',
       }),
     );
+  // The work directory comes first because the path-line copies go in it.
+  const scratch = request.scratch.directory;
+  let environment: NodeJS.ProcessEnv;
+  try {
+    if (!isAbsolute(scratch) || !isAbsolute(request.work.directory)) throw new Error();
+    const temporary = join(request.work.directory, 'tmp');
+    mkdirSync(temporary, { recursive: true, mode: 0o700 });
+    environment = chatEnvironment(request.environment, temporary);
+  } catch {
+    return refuse(
+      chatFailure({
+        stage: 'launch',
+        kind: 'internal',
+        message: 'CrewKite could not prepare the working directory for this turn.',
+      }),
+    );
+  }
   // A resumed session already holds CrewKite's framing from its first message.
   const text = prior
     ? request.prompt
     : [request.systemContext, request.prompt].filter(Boolean).join('\n\n');
   let message: ReturnType<typeof userMessage>;
   try {
-    message = userMessage(text, turnFiles(request));
+    message = userMessage(text, turnFiles(request), staging);
   } catch (error) {
+    if (error instanceof ChangedFile)
+      return refuse(
+        chatFailure({
+          stage: 'prompt',
+          kind: 'attachment-rejected',
+          message: `The stored file ${clip(error.message, 255)} changed after it was attached, so it was not sent.`,
+          nextAction: 'Attach the file again, then send.',
+        }),
+      );
     if (!(error instanceof UnreadableFile)) throw error;
     return refuse(
       chatFailure({
@@ -516,22 +620,6 @@ function startTurn(
         stage: 'launch',
         kind: 'client-missing',
         message: 'The Anthropic client is missing or does not match the verified build.',
-      }),
-    );
-  }
-  const scratch = request.scratch.directory;
-  let environment: NodeJS.ProcessEnv;
-  try {
-    if (!isAbsolute(scratch) || !isAbsolute(request.work.directory)) throw new Error();
-    const temporary = join(request.work.directory, 'tmp');
-    mkdirSync(temporary, { recursive: true, mode: 0o700 });
-    environment = chatEnvironment(request.environment, temporary);
-  } catch {
-    return refuse(
-      chatFailure({
-        stage: 'launch',
-        kind: 'internal',
-        message: 'CrewKite could not prepare the working directory for this turn.',
       }),
     );
   }
@@ -1146,6 +1234,7 @@ function startTurn(
     settled = true;
     for (const cancelTimer of timers) cancelTimer();
     trace.close();
+    unstage();
     // Items cut off by a stop or an exit still close, so the thread shows what arrived.
     for (const message of messages.values())
       for (const item of message.items)
