@@ -22,7 +22,7 @@ const refusals: Record<string, string> = {
     "The project moved past this thread's base commit. Start a new thread on the current commit.",
   'git-identity-missing': 'Set a Git name and email on this machine, then accept again.',
   'scratch-unreadable':
-    'The scratch copy holds links or special files. Ask the assistant to remove them.',
+    'The scratch copy holds new links or special files, or a link from the base commit changed. Restore them, then accept again.',
   'branch-not-created': 'The branch was not created. Choose another name and try again.',
 };
 

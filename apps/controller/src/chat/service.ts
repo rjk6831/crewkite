@@ -50,6 +50,7 @@ import {
   committedFiles,
   type FileContent,
   git,
+  type KeptEntry,
   materialize,
   readCandidateFiles,
 } from '../host/source.ts';
@@ -453,14 +454,17 @@ export class ChatService {
     const scratch = this.scratchDirectory(task.id);
     let fileCount: number;
     let files: FileContent[];
+    let kept: KeptEntry[];
     try {
+      const source = committedFiles(root, base, { scratch: true });
+      kept = source.kept;
       // The Changes tab count, so the system line matches what the person reviewed.
       fileCount = scratchChanges(root, scratch, base, false).length;
-      files = readCandidateFiles(scratch, root, base);
+      files = readCandidateFiles(scratch, root, base, source);
     } catch {
       return blocked(
         'scratch-unreadable',
-        'Ask the assistant to remove links and special files from the scratch copy.',
+        'Remove new links and special files from the scratch copy, and restore any link from the base commit.',
       );
     }
     if (!fileCount) return blocked('no-changes', 'Ask for a change in this thread first.');
@@ -473,6 +477,7 @@ export class ChatService {
         repository: work,
         base,
         files,
+        kept,
         identity,
         at,
         message: payload.message?.trim()
@@ -945,7 +950,11 @@ export class ChatService {
     const directory = this.scratchDirectory(task.id);
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
-    materialize(directory, committedFiles(root, thread.base));
+    const source = committedFiles(root, thread.base, { scratch: true });
+    materialize(directory, source.files, source.links);
+    // shortcut: the skipped list stays here until the thread record has a field for it. Upgrade:
+    // store it on the thread record once the contracts carry `skipped`.
+    const _skipped = source.skipped;
     return this.deps.store.transaction(() =>
       this.putThread(task, { ...this.thread(task.id), scratchReady: true }),
     );
