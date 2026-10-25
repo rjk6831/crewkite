@@ -18,9 +18,11 @@ export function scratchChanges(
   base: string,
   patches = true,
 ): FileDiff[] {
-  const before = byPath(committedFiles(repository, base));
-  // Committed ignore rules keep generated files such as installed packages out of the diff.
-  const after = byPath(readCandidateFiles(scratch, repository, base));
+  const source = committedFiles(repository, base, { scratch: true });
+  const before = byPath(source.files);
+  // Committed ignore rules keep generated files such as installed packages out of the diff. Links
+  // and skipped entries always come from the base, so they never show as changes.
+  const after = byPath(readCandidateFiles(scratch, repository, base, source));
   const paths = [...new Set([...before.keys(), ...after.keys()])].sort();
   const files: FileDiff[] = [];
   let budget = patches ? TOTAL_PATCH_BYTES : 0;

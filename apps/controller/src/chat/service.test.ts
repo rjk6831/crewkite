@@ -4,7 +4,7 @@
 //   and turn.completed { stopReason, failure } before the result settles.
 // On stop it reports only completed items, like a native client that drops the open item.
 import assert from 'node:assert/strict';
-import { appendFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type TestContext, test } from 'node:test';
@@ -1024,11 +1024,43 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const { controller, adapter, task, run, send, read, source } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['Edited.'] }],
   ]);
+  const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
+  const identity = {
+    name: 'Fixture',
+    email: 'fixture@example.invalid',
+    at: '2026-10-15T18:00:00Z',
+  };
+  // Commit a tree on main without touching the checkout or the index.
+  const advance = (tree: string) =>
+    repo(
+      'update-ref',
+      'refs/heads/main',
+      git(source.directory, ['commit-tree', tree, '-p', 'HEAD'], 'move\n', identity)
+        .toString()
+        .trim(),
+    );
+  // The base holds a link that stays inside and a submodule the copy skips.
+  const blob = git(source.directory, ['hash-object', '-w', '--stdin'], 'net.mjs').toString().trim();
+  const vendor = git(source.directory, ['mktree'], `160000 commit ${'c'.repeat(40)}\tlib\n`)
+    .toString()
+    .trim();
+  advance(
+    git(
+      source.directory,
+      ['mktree'],
+      `${repo('ls-tree', 'HEAD')}\n120000 blob ${blob}\tNOTES.md\n040000 tree ${vendor}\tvendor\n`,
+    )
+      .toString()
+      .trim(),
+  );
   const done = turnReaches(controller, 'done');
   await send('Fix the rounding.');
   await done;
-  appendFileSync(join(adapter.requests[0].scratch.directory, 'net.mjs'), '// accepted\n');
-  const repo = (...args: string[]) => git(source.directory, args).toString('utf8').trim();
+  const scratch = adapter.requests[0].scratch.directory;
+  // The edit goes through the link. The file under the skipped submodule is never accepted.
+  appendFileSync(join(scratch, 'NOTES.md'), '// accepted\n');
+  mkdirSync(join(scratch, 'vendor', 'lib'), { recursive: true });
+  writeFileSync(join(scratch, 'vendor', 'lib', 'extra.txt'), 'local only\n');
   const checkout = () => [
     repo('rev-parse', 'HEAD'),
     repo('symbolic-ref', 'HEAD'),
@@ -1052,6 +1084,10 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   assert.equal(repo('rev-list', '--count', `${base}..${branch}`), '1');
   assert.equal(repo('diff', '--name-only', base, branch), 'net.mjs');
   assert.match(repo('show', `${branch}:net.mjs`), /\/\/ accepted$/);
+  assert.equal(
+    repo('ls-tree', '-r', branch, 'NOTES.md', 'vendor'),
+    repo('ls-tree', '-r', base, 'NOTES.md', 'vendor'),
+  );
   assert.equal(
     repo('log', '-1', '--format=%s|%an <%ae>', branch),
     `CrewKite: ${task.title}|Fixture owner <owner@example.invalid>`,

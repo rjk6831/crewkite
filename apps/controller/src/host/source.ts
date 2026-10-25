@@ -13,8 +13,10 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readlinkSync,
   realpathSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
   writeSync,
 } from 'node:fs';
@@ -36,7 +38,30 @@ export type SourceFacts = {
 };
 export type FileEntry = { path: string; mode: '100644' | '100755'; hash: string; bytes: number };
 export type FileContent = FileEntry & { content: Buffer };
+export type SkippedEntry = {
+  path: string;
+  reason: 'link-outside' | 'submodule' | 'path-encoding';
+};
+/** A link the scratch copy holds. Its target stays inside the copy through every other link. */
+export type LinkEntry = { path: string; target: string };
+/**
+ * A base entry the scratch copy holds as a link or does not hold at all. Acceptance copies it into
+ * the new tree from the base byte for byte, whatever the copy has at that path.
+ */
+export type KeptEntry = { path: Buffer; mode: string; oid: string; content: Buffer | null };
+export type CommittedSource = {
+  files: FileContent[];
+  links: LinkEntry[];
+  skipped: SkippedEntry[];
+  kept: KeptEntry[];
+};
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
+const MAX_SOURCE_FILES = 10_000;
+// A chat thread copies the whole repository, so its cap is higher. The byte limit still holds.
+const MAX_SCRATCH_FILES = 100_000;
+const MAX_LINK_EXPANSIONS = 40;
+// BOM handling off, so a name that starts with U+FEFF keeps it.
+const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
 
 export function git(
   directory: string,
@@ -321,14 +346,29 @@ function content(path: string, mode: FileEntry['mode'], bytes: Buffer): FileCont
   };
 }
 
-export function committedFiles(path: string, base: string): FileContent[] {
+/**
+ * The regular files of a commit. The older task path refuses anything else. A chat scratch copy
+ * (`scratch: true`) also holds links that stay inside it and lists the entries it cannot hold.
+ */
+export function committedFiles(path: string, base: string): FileContent[];
+export function committedFiles(
+  path: string,
+  base: string,
+  options: { scratch: true },
+): CommittedSource;
+export function committedFiles(
+  path: string,
+  base: string,
+  options?: { scratch: true },
+): FileContent[] | CommittedSource {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(base))
     throw new Error('Invalid committed source identity.');
   const output = git(path, ['ls-tree', '-rz', '--full-tree', base]);
+  if (options?.scratch) return scratchSource(path, output);
   const records = output.toString('utf8').split('\0').filter(Boolean);
   if (!Buffer.from(output.toString('utf8')).equals(output))
     throw new Error('Source paths must be UTF-8.');
-  if (records.length > 10000) throw new Error('Source exceeds the file limit.');
+  if (records.length > MAX_SOURCE_FILES) throw new Error('Source exceeds the file limit.');
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
   const selected = records.map((record) => {
@@ -338,15 +378,100 @@ export function committedFiles(path: string, base: string): FileContent[] {
     safePath(name, seen, prefixes);
     return { mode: mode as FileEntry['mode'], oid, name };
   });
-  if (!selected.length) return [];
+  const blobs = readBlobs(
+    path,
+    selected.map((file) => file.oid),
+  );
+  return selected.map(({ mode, name }, index) => content(name, mode, blobs[index]));
+}
+
+function scratchSource(path: string, output: Buffer): CommittedSource {
+  const records: Buffer[] = [];
+  for (let start = 0; start < output.length; ) {
+    const end = output.indexOf(0, start);
+    const stop = end < 0 ? output.length : end;
+    if (stop > start) records.push(output.subarray(start, stop));
+    start = stop + 1;
+  }
+  if (records.length > MAX_SCRATCH_FILES)
+    throw new Error(
+      `The base commit has ${records.length.toLocaleString('en-US')} files. A scratch copy holds at most ${MAX_SCRATCH_FILES.toLocaleString('en-US')}.`,
+    );
+  const seen = new Set<string>();
+  const prefixes = new Map<string, string>();
+  const skipped: SkippedEntry[] = [];
+  const kept: KeptEntry[] = [];
+  const regular: { mode: FileEntry['mode']; oid: string; name: string }[] = [];
+  const linked: { oid: string; name: string; raw: Buffer }[] = [];
+  // Blobs under paths the copy cannot name. The accepted tree still needs their bytes.
+  const encoded: KeptEntry[] = [];
+  for (const record of records) {
+    const tab = record.indexOf(9);
+    const match =
+      tab < 0
+        ? null
+        : /^(100644|100755|120000|160000) (blob|commit) ([a-f0-9]{40}|[a-f0-9]{64})$/.exec(
+            record.subarray(0, tab).toString('latin1'),
+          );
+    if (!match || (match[1] === '160000') !== (match[2] === 'commit'))
+      throw new Error('Source contains an unsupported mode.');
+    const [, mode, , oid] = match;
+    const raw = Buffer.from(record.subarray(tab + 1));
+    let name: string;
+    try {
+      name = utf8.decode(raw);
+    } catch {
+      skipped.push({ path: raw.toString('utf8'), reason: 'path-encoding' });
+      const entry = { path: raw, mode, oid, content: null };
+      kept.push(entry);
+      if (mode !== '160000') encoded.push(entry);
+      continue;
+    }
+    safePath(name, seen, prefixes);
+    if (mode === '160000') {
+      skipped.push({ path: name, reason: 'submodule' });
+      kept.push({ path: raw, mode, oid, content: null });
+    } else if (mode === '120000') linked.push({ oid, name, raw });
+    else regular.push({ mode: mode as FileEntry['mode'], oid, name });
+  }
+  const blobs = readBlobs(
+    path,
+    [...regular, ...linked, ...encoded].map((entry) => entry.oid),
+  );
+  const files = regular.map(({ mode, name }, index) => content(name, mode, blobs[index]));
+  encoded.forEach((entry, index) => {
+    entry.content = blobs[regular.length + linked.length + index];
+  });
+  const candidates = new Map<string, LinkEntry>();
+  linked.forEach(({ oid, name, raw }, index) => {
+    const bytes = blobs[regular.length + index];
+    kept.push({ path: raw, mode: '120000', oid, content: bytes });
+    let target: string;
+    try {
+      target = utf8.decode(bytes);
+    } catch {
+      skipped.push({ path: name, reason: 'path-encoding' });
+      return;
+    }
+    candidates.set(name, { path: name, target });
+  });
+  const inside = insideLinks([...candidates.values()]);
+  for (const name of candidates.keys())
+    if (!inside.has(name)) skipped.push({ path: name, reason: 'link-outside' });
+  skipped.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
+  return { files, links: [...inside.values()], skipped, kept };
+}
+
+function readBlobs(path: string, oids: readonly string[]): Buffer[] {
+  if (!oids.length) return [];
   let batch: Buffer;
   try {
     batch = runGit(
       path,
       ['cat-file', '--batch'],
-      `${selected.map((file) => file.oid).join('\n')}\n`,
+      `${oids.join('\n')}\n`,
       undefined,
-      MAX_SOURCE_BYTES + selected.length * 96,
+      MAX_SOURCE_BYTES + oids.length * 96,
     );
   } catch {
     throw new Error(
@@ -355,7 +480,7 @@ export function committedFiles(path: string, base: string): FileContent[] {
   }
   let offset = 0,
     total = 0;
-  const files = selected.map(({ mode, oid, name }) => {
+  const blobs = oids.map((oid) => {
     const end = batch.indexOf(10, offset);
     if (end < offset || end - offset > 96) throw Error('Invalid committed blob response.');
     const header = /^([a-f0-9]{40}|[a-f0-9]{64}) blob (0|[1-9][0-9]*)$/.exec(
@@ -372,19 +497,105 @@ export function committedFiles(path: string, base: string): FileContent[] {
       throw Error('Incomplete committed blob response.');
     const bytes = batch.subarray(offset, offset + size);
     offset += size + 1;
-    return content(name, mode, bytes);
+    return bytes;
   });
   if (offset !== batch.length) throw Error('Unexpected committed blob response.');
-  return files;
+  return blobs;
 }
 
-export function readCandidateFiles(root: string, repository: string, base: string): FileContent[] {
-  const original = committedFiles(repository, base);
+const linkKey = (path: string) => path.normalize('NFC').toLowerCase();
+
+/**
+ * The links whose targets stay inside the copy. Each target is followed the way the kernel follows
+ * it, through the other links that stay, so a `..` after a link starts where that link points. A
+ * link that fails drops out and the rest are checked again until none drops. Lookups fold case and
+ * normalization, because a case-insensitive volume reaches a link under either spelling.
+ */
+function insideLinks(links: readonly LinkEntry[]): Map<string, LinkEntry> {
+  const live = new Map(links.map((link) => [linkKey(link.path), link]));
+  for (let dropped = true; dropped; ) {
+    dropped = false;
+    for (const [key, link] of live)
+      if (!resolvesInside(link, live)) {
+        live.delete(key);
+        dropped = true;
+      }
+  }
+  return new Map([...live.values()].map((link) => [link.path, link]));
+}
+
+function plainTarget(target: string) {
+  return (
+    target.length > 0 &&
+    Buffer.byteLength(target) < 4096 &&
+    !target.includes('\0') &&
+    !isAbsolute(target)
+  );
+}
+
+function resolvesInside(link: LinkEntry, live: ReadonlyMap<string, LinkEntry>): boolean {
+  let expansions = 0;
+  const follow = (directory: readonly string[], target: string): string[] | null => {
+    if (!plainTarget(target)) return null;
+    const at = [...directory];
+    for (const part of target.split('/')) {
+      if (!part || part === '.') continue;
+      if (part === '..') {
+        if (!at.length) return null;
+        at.pop();
+        continue;
+      }
+      at.push(part);
+      const nested = live.get(linkKey(at.join('/')));
+      if (!nested) continue;
+      if (++expansions > MAX_LINK_EXPANSIONS) return null;
+      const resolved = follow(at.slice(0, -1), nested.target);
+      if (!resolved) return null;
+      at.splice(0, at.length, ...resolved);
+    }
+    return at;
+  };
+  return follow(link.path.split('/').slice(0, -1), link.target) !== null;
+}
+
+/** Base paths the copy reads from the base. A held link must still be the same link. */
+type ScratchScope = Map<string, { path: string; target: string | null }>;
+
+function scratchScope(source: CommittedSource): ScratchScope {
+  const targets = new Map(source.links.map((link) => [link.path, link.target]));
+  const scope: ScratchScope = new Map();
+  for (const entry of source.kept) {
+    let path: string;
+    try {
+      path = utf8.decode(entry.path);
+    } catch {
+      continue;
+    }
+    scope.set(linkKey(path), { path, target: targets.get(path) ?? null });
+  }
+  return scope;
+}
+
+/**
+ * The candidate files in a scratch copy. With the base's scratch source, paths the base holds as
+ * links or skips are left out, so they always come from the base.
+ */
+export function readCandidateFiles(
+  root: string,
+  repository: string,
+  base: string,
+  source?: CommittedSource,
+): FileContent[] {
+  const original = source?.files ?? committedFiles(repository, base);
+  const scope = source && scratchScope(source);
   const rules = original.filter((file) => file.path.split('/').at(-1) === '.gitignore');
-  if (!rules.length) return readFiles(root);
+  if (!rules.length) return readScratchFiles(root, undefined, scope);
   const tracked = new Set<string>();
-  for (const file of original) {
-    const parts = file.path.split('/');
+  for (const path of [
+    ...original.map((file) => file.path),
+    ...[...(scope?.values() ?? [])].map((entry) => entry.path),
+  ]) {
+    const parts = path.split('/');
     for (let end = 1; end <= parts.length; end++) tracked.add(parts.slice(0, end).join('/'));
   }
   const context = mkdtempSync(join(tmpdir(), 'crewkite-ignore-'));
@@ -395,34 +606,38 @@ export function readCandidateFiles(root: string, repository: string, base: strin
       writeFileSync(join(context, rule.path), rule.content);
     }
     // Frozen rules exclude generated files without letting new ignore rules conceal edits.
-    return readScratchFiles(root, (paths) => {
-      const requested = new Map<string, string>();
-      for (const path of paths) {
-        const name = path.replace(/\/$/, '');
-        safePath(name, new Set(), new Map());
-        if (path.endsWith('/')) mkdirSync(join(context, name), { recursive: true });
-        if (!tracked.has(name)) requested.set(name, path);
-      }
-      if (!requested.size) return new Set();
-      let output: Buffer;
-      try {
-        output = git(
-          context,
-          ['check-ignore', '--no-index', '-z', '--stdin'],
-          `${[...requested.keys()].join('\0')}\0`,
-        );
-      } catch (error) {
-        if ((error as { status?: number }).status === 1) return new Set();
-        throw error;
-      }
-      const ignored = output.toString('utf8').split('\0').filter(Boolean);
-      if (
-        !Buffer.from(output.toString('utf8')).equals(output) ||
-        ignored.some((path) => !requested.has(path))
-      )
-        throw new Error('Invalid ignored source paths.');
-      return new Set(ignored.map((path) => requested.get(path) as string));
-    });
+    return readScratchFiles(
+      root,
+      (paths) => {
+        const requested = new Map<string, string>();
+        for (const path of paths) {
+          const name = path.replace(/\/$/, '');
+          safePath(name, new Set(), new Map());
+          if (path.endsWith('/')) mkdirSync(join(context, name), { recursive: true });
+          if (!tracked.has(name)) requested.set(name, path);
+        }
+        if (!requested.size) return new Set();
+        let output: Buffer;
+        try {
+          output = git(
+            context,
+            ['check-ignore', '--no-index', '-z', '--stdin'],
+            `${[...requested.keys()].join('\0')}\0`,
+          );
+        } catch (error) {
+          if ((error as { status?: number }).status === 1) return new Set();
+          throw error;
+        }
+        const ignored = output.toString('utf8').split('\0').filter(Boolean);
+        if (
+          !Buffer.from(output.toString('utf8')).equals(output) ||
+          ignored.some((path) => !requested.has(path))
+        )
+          throw new Error('Invalid ignored source paths.');
+        return new Set(ignored.map((path) => requested.get(path) as string));
+      },
+      scope,
+    );
   } finally {
     rmSync(context, { recursive: true, force: true });
   }
@@ -432,13 +647,21 @@ export function readFiles(root: string): FileContent[] {
   return readScratchFiles(root);
 }
 
-function readScratchFiles(root: string, ignored?: (paths: string[]) => Set<string>): FileContent[] {
+function readScratchFiles(
+  root: string,
+  ignored?: (paths: string[]) => Set<string>,
+  scope?: ScratchScope,
+): FileContent[] {
   const rootState = lstatSync(root);
   if (!rootState.isDirectory() || rootState.isSymbolicLink())
     throw new Error('Scratch root is not an independent directory.');
   const files: FileContent[] = [];
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
+  const limit = scope ? MAX_SCRATCH_FILES : MAX_SOURCE_FILES;
+  const linked = new Set<string>();
+  // A copy file that would sit over or under a base path is a collision.
+  for (const { path } of scope?.values() ?? []) safePath(path, seen, prefixes);
   let total = 0;
   function visit(directory: string) {
     const entries = readdirSync(directory)
@@ -448,6 +671,16 @@ function readScratchFiles(root: string, ignored?: (paths: string[]) => Set<strin
         const file = join(directory, name);
         const path = relative(root, file).split('\\').join('/');
         return { file, path, state: lstatSync(file) };
+      })
+      .filter(({ file, path, state }) => {
+        const held = scope?.get(linkKey(path));
+        if (!held) return true;
+        if (held.target !== null) {
+          if (!state.isSymbolicLink() || readlinkSync(file) !== held.target)
+            throw new Error(`The scratch copy changed the link ${held.path}.`);
+          linked.add(held.path);
+        }
+        return false;
       });
     const excluded = ignored?.(
       entries.map(({ path, state }) => path + (state.isDirectory() ? '/' : '')),
@@ -465,7 +698,7 @@ function readScratchFiles(root: string, ignored?: (paths: string[]) => Set<strin
         const opened = fstatSync(fd);
         if (!opened.isFile() || opened.nlink !== 1 || opened.mode & 0o6000)
           throw new Error('Scratch contains an unsupported file mode.');
-        if (opened.size + total > MAX_SOURCE_BYTES || files.length >= 10000)
+        if (opened.size + total > MAX_SOURCE_BYTES || files.length >= limit)
           throw new Error('Scratch exceeds the source limit.');
         safePath(path, seen, prefixes);
         const bytes = readFileSync(fd);
@@ -478,6 +711,9 @@ function readScratchFiles(root: string, ignored?: (paths: string[]) => Set<strin
     }
   }
   visit(root);
+  for (const held of scope?.values() ?? [])
+    if (held.target !== null && !linked.has(held.path))
+      throw new Error(`The scratch copy changed the link ${held.path}.`);
   return files;
 }
 
@@ -585,7 +821,11 @@ export function applyReplacement(
   }
 }
 
-export function materialize(root: string, files: readonly FileContent[]) {
+export function materialize(
+  root: string,
+  files: readonly FileContent[],
+  links: readonly LinkEntry[] = [],
+) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   if (
     !lstatSync(root).isDirectory() ||
@@ -595,6 +835,11 @@ export function materialize(root: string, files: readonly FileContent[]) {
     throw new Error('A scratch copy needs a new empty directory.');
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
+  // Links are checked before anything is written and created last. No file sits under a link, so
+  // every write below goes through real directories only.
+  for (const link of links) safePath(link.path, seen, prefixes);
+  if (insideLinks(links).size !== links.length)
+    throw new Error('A scratch link leads outside the copy.');
   for (const file of files) {
     safePath(file.path, seen, prefixes);
     if (createHash('sha256').update(file.content).digest('hex') !== file.hash)
@@ -606,13 +851,45 @@ export function materialize(root: string, files: readonly FileContent[]) {
     });
     chmodSync(join(root, file.path), file.mode === '100755' ? 0o755 : 0o644);
   }
+  for (const link of links) {
+    mkdirSync(dirname(join(root, link.path)), { recursive: true, mode: 0o700 });
+    symlinkSync(link.target, join(root, link.path));
+  }
 }
 
-export function treeFromFiles(repository: string, files: readonly FileContent[]): string {
-  if (files.length > 10000) throw Error('Source exceeds the file limit.');
+/**
+ * Write a tree of `files` in a new repository. `kept` entries from a scratch source go in from the
+ * base unchanged, with their blobs imported and checked against the base identities.
+ */
+export function treeFromFiles(
+  repository: string,
+  files: readonly FileContent[],
+  kept?: readonly KeptEntry[],
+): string {
+  if (files.length + (kept?.length ?? 0) > (kept ? MAX_SCRATCH_FILES : MAX_SOURCE_FILES))
+    throw Error('Source exceeds the file limit.');
   const seen = new Set<string>(),
     prefixes = new Map<string, string>();
   let total = 0;
+  for (const entry of kept ?? []) {
+    if (
+      !['100644', '100755', '120000', '160000'].includes(entry.mode) ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.oid) ||
+      (entry.mode === '160000') !== (entry.content === null) ||
+      entry.path.includes(0) ||
+      !entry.path.length
+    )
+      throw Error('Source contains an unsupported kept entry.');
+    let name: string | null;
+    try {
+      name = utf8.decode(entry.path);
+    } catch {
+      name = null;
+    }
+    if (name !== null) safePath(name, seen, prefixes);
+    total += entry.content?.length ?? 0;
+    if (total > MAX_SOURCE_BYTES) throw Error('Source exceeds the byte limit.');
+  }
   for (const file of files) {
     safePath(file.path, seen, prefixes);
     if (!['100644', '100755'].includes(file.mode) || !Buffer.isBuffer(file.content))
@@ -620,15 +897,19 @@ export function treeFromFiles(repository: string, files: readonly FileContent[])
     total += file.content.length;
     if (total > MAX_SOURCE_BYTES) throw Error('Source exceeds the byte limit.');
   }
+  const blobs = [
+    ...files.map((file) => file.content),
+    ...(kept ?? []).flatMap((entry) => (entry.content ? [entry.content] : [])),
+  ];
   mkdirSync(repository, { recursive: true, mode: 0o700 });
   git(repository, ['init', '--quiet']);
   git(repository, ['read-tree', '--empty']);
-  const commands = files.flatMap((file, index) => [
-    Buffer.from(`blob\nmark :${index + 1}\ndata ${file.content.length}\n`),
-    file.content,
+  const commands = blobs.flatMap((blob, index) => [
+    Buffer.from(`blob\nmark :${index + 1}\ndata ${blob.length}\n`),
+    blob,
     Buffer.from(`\nget-mark :${index + 1}\n`),
   ]);
-  const imported = files.length
+  const imported = blobs.length
     ? git(
         repository,
         ['fast-import', '--quiet', '--done'],
@@ -639,13 +920,25 @@ export function treeFromFiles(repository: string, files: readonly FileContent[])
         .split('\n')
     : [];
   if (
-    imported.length !== files.length ||
+    imported.length !== blobs.length ||
     imported.some(
       (oid) => !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid) || oid.length !== imported[0].length,
     )
   )
     throw Error('Invalid imported blob identities.');
-  const entries = files.map((file, index) => `${file.mode} ${imported[index]}\t${file.path}\0`);
-  git(repository, ['update-index', '-z', '--index-info'], entries.join(''));
+  let next = files.length;
+  const entries = [
+    ...files.map((file, index) => Buffer.from(`${file.mode} ${imported[index]}\t${file.path}\0`)),
+    ...(kept ?? []).map((entry) => {
+      if (entry.content && imported[next++] !== entry.oid)
+        throw Error('A kept source entry changed identity.');
+      return Buffer.concat([
+        Buffer.from(`${entry.mode} ${entry.oid}\t`),
+        entry.path,
+        Buffer.from([0]),
+      ]);
+    }),
+  ];
+  git(repository, ['update-index', '-z', '--index-info'], Buffer.concat(entries));
   return git(repository, ['write-tree']).toString().trim();
 }
