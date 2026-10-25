@@ -26,6 +26,8 @@ type ObservedModel = {
   efforts: readonly string[];
   defaultEffort: string;
   hidden?: boolean;
+  /** What model/list reported the model takes, when the observation recorded it. */
+  inputModalities?: readonly string[];
 };
 
 export type ChatCatalogInput = {
@@ -69,14 +71,21 @@ function openai(input: ChatCatalogInput): Entry {
   // one it shows in its own picker before a hidden one.
   const listed =
     !models.length || models.some((value) => value.model === ready?.model && !value.hidden);
-  return entry(
-    input,
-    'openai',
-    !!ready,
-    profiles[0]?.reason,
-    models,
-    listed ? ready?.model : (models.find((value) => !value.hidden) ?? models[0]).model,
-  );
+  const fallback = listed
+    ? ready?.model
+    : (models.find((value) => !value.hidden) ?? models[0]).model;
+  // The default model's own report decides, since a thread starts on it. An observation from
+  // before the read kept modalities reports nothing.
+  const modalities = input.openAiModels?.find((value) => value.model === fallback)?.inputModalities;
+  return {
+    ...entry(input, 'openai', !!ready, profiles[0]?.reason, models, fallback),
+    accepts: modalities
+      ? [
+          ...(modalities.includes('image') ? ['image/*'] : []),
+          ...(modalities.includes('audio') ? ['audio/*'] : []),
+        ]
+      : null,
+  };
 }
 
 function anthropic(input: ChatCatalogInput): Entry {
