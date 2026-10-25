@@ -1,6 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
@@ -16,6 +16,8 @@ import {
   ChatFamilySchema,
   type ChatMessage,
   type ChatModelSelection,
+  type ChatOutputLimit,
+  ChatOutputLimitSchema,
   type ChatPermissionOption,
   type ChatPermissionPolicy,
   type ChatQueuedMessage,
@@ -99,6 +101,8 @@ import { scratchPath } from './local-tools.ts';
 import {
   adviceContext,
   challengeContext,
+  type DeltaTurn,
+  deltaPacket,
   earlierFileLine,
   earlierReach,
   familyName,
@@ -165,6 +169,8 @@ type Ending = {
   groups: readonly number[];
   /** The effort the client reported, when it differs from the one requested. */
   effort?: ChatModelSelection['effort'];
+  /** The reply used its whole output budget. */
+  outputLimit?: ChatOutputLimit;
 };
 type FileDiff = ChatChangesRead['files'][number];
 type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments' | 'files'>;
@@ -237,6 +243,19 @@ const EARLIER_FILE_LINE_BYTES = 8 * 1024;
 const PACKET_ENTRY_CHARACTERS = 8000;
 const CHECK_LINES = 5;
 const CHECK_CHARACTERS = 1500;
+// Families whose client keeps a native session between turns. Local rebuilds each turn from the
+// thread's history, so it never falls behind the thread.
+const RESUMING = new Set<ChatFamily>(['openai', 'anthropic', 'google']);
+// Tool calls listed per turn in a delta packet.
+const DELTA_TOOL_LINES = 50;
+// What the scratch copy held when a family's session last saw the thread, per changed path.
+const SeenSchema = z.object({
+  sequence: z.number().int(),
+  files: z.record(z.string(), z.string()),
+});
+// The message Continue sends after a reply stopped at the output limit.
+const CONTINUE_TEXT =
+  'Continue the reply from where it stopped. Do not repeat what you already wrote.';
 const CUT_MARKER_BYTES = 32;
 // The thread record holds at most eight queued messages, in a quarter of a 1 MiB frame.
 const QUEUE_LIMIT = 8;
@@ -682,11 +701,8 @@ export class ChatService {
   retryTurn(payload: Payload<'RetryChatTurn'>, effects: Effects): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
-    // No turn path runs Continue yet, so it refuses with a step the person can take now.
-    if (payload.mode === 'continue')
-      return blocked('continue-unavailable', 'Send a message asking for the rest of the reply.');
     const { thread, left } = this.checkedThread(task);
-    const action = payload.mode === 'retry' ? 'retry' : 'regenerate';
+    const action = payload.mode;
     if (thread.activeTurnId)
       return blocked('turn-running', `Wait for the reply or stop it, then ${action}.`);
     if (left.length) return ownershipUnknown(left, action);
@@ -695,8 +711,26 @@ export class ChatService {
     if (turn.id !== this.newestTurn(task.id)?.id)
       return blocked(
         'turn-not-latest',
-        `Only the newest turn can be ${action === 'retry' ? 'retried' : 'regenerated'}.`,
+        `Only the newest turn can be ${{ retry: 'retried', regenerate: 'regenerated', continue: 'continued' }[action]}.`,
       );
+    // Continue asks the same model for the rest of the reply. The partial reply stays in the thread,
+    // so the model reads it as the last answer before this message.
+    if (payload.mode === 'continue') {
+      if (!turn.assistantMessageId)
+        return blocked('no-reply', 'This turn has no reply to continue. Retry runs it again.');
+      return this.begin(
+        task,
+        thread,
+        {
+          text: CONTINUE_TEXT,
+          role: turn.role,
+          selection: turn.selection,
+          attachments: [],
+          files: [],
+        },
+        effects,
+      );
+    }
     if (payload.mode === 'retry' && turn.state !== 'failed' && turn.state !== 'stopped')
       return blocked('turn-not-retryable', 'This turn finished. Regenerate runs it again.');
     if (payload.mode === 'regenerate' && !turn.assistantMessageId)
@@ -1215,15 +1249,50 @@ export class ChatService {
     // Anthropic and Google read no history in a new session, so a rerun on the family that
     // answered carries the conversation before the message in a packet, as a handoff does.
     const rerun = fresh && !turn.handoffFrom;
-    const carries = !!turn.handoffFrom || rerun;
-    const session =
-      writer && !fresh
-        ? (thread.sessions.find((value) => value.family === turn.selection.family) ?? null)
+    let carries = !!turn.handoffFrom || rerun;
+    const family = turn.selection.family;
+    const pending = turn.handoffFrom ? this.pendingHandoff(task.id) : null;
+    let reason: HandoffReason = pending?.reason ?? (rerun ? 'rerun' : 'manual');
+    // A native session holds one model, so another model of the family starts a new session.
+    const kept = writer && !fresh ? thread.sessions.find((value) => value.family === family) : null;
+    let session =
+      kept && this.sessionModel(task.id, kept, turn.sequence) === turn.selection.model
+        ? kept
         : null;
-    const files = this.turnFiles(task.id, message, carries, session ? turn.selection.family : null);
+    // The thread is the source of truth. A resumed session hears what happened since it last ran,
+    // and a session that fell too far behind gives way to a new one with the full packet. Send now
+    // keeps its full packet, which tells the model what the stopped reply left behind.
+    const delta =
+      session && RESUMING.has(family) && reason !== 'steer'
+        ? this.delta(
+            turn,
+            message,
+            session,
+            root,
+            thread.base,
+            prompt,
+            turn.handoffFrom ? reason : null,
+          )
+        : null;
+    if (delta === 'over') {
+      session = null;
+      carries = true;
+      if (!turn.handoffFrom) reason = 'session';
+      this.deps.store.transaction(() =>
+        this.appendEntry(task, {
+          kind: 'chat-system',
+          author: { kind: 'system', turnId: turn.id },
+          text: `Started a new ${familyName[family]} session. The thread moved past what the old session could carry.`,
+        }),
+      );
+    }
+    const caught = delta && delta !== 'over' ? delta : null;
+    if (caught) carries = false;
+    const files =
+      caught?.files ?? this.turnFiles(task.id, message, carries, session ? family : null);
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
-    const handoff = turn.handoffFrom ? this.takeHandoff(task) : null;
+    if (turn.handoffFrom) this.takeHandoff(task);
     // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
     // the thread allows.
     const balanced = writer && thread.flightMode === 'balanced';
@@ -1234,19 +1303,20 @@ export class ChatService {
       selection: turn.selection,
       prompt: carries
         ? this.packet(turn, {
-            from: turn.handoffFrom ?? turn.selection.family,
-            reason: handoff?.reason ?? (rerun ? 'rerun' : 'manual'),
+            from: turn.handoffFrom ?? family,
+            reason,
             root,
             base: thread.base,
             history,
             prompt,
             files,
           })
-        : prompt,
+        : (caught?.prompt ?? prompt),
       files,
       systemContext: this.context(turn, project.name, directory, root, thread, history),
-      // The packet carries the transcript, so a turn with a packet sends no separate history.
-      history: carries ? [] : history,
+      // The packet carries the transcript, so a turn with a packet sends no separate history. With a
+      // delta, the history stops where the delta starts, for an adapter that has to start over.
+      history: carries ? [] : (caught?.history ?? history),
       session,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
@@ -1418,9 +1488,16 @@ export class ChatService {
       );
     live.finished = true;
     this.live.delete(turnId);
+    let seen = false;
     try {
       this.deps.store.transaction(() => {
         const end = { ...ending(result, live.items, left), effort: live.effort };
+        seen =
+          !!turn &&
+          writesScratch(turn.role) &&
+          RESUMING.has(turn.selection.family) &&
+          end.session?.family === turn.selection.family &&
+          OPEN_STATES.has(this.turn(turnId)?.state ?? 'done');
         this.settle(turnId, end);
         // Send now: the queued message picks up where this reply stopped, with its packet. A
         // review or an opinion left nothing behind in the scratch copy to carry over.
@@ -1433,6 +1510,7 @@ export class ChatService {
       // The row stays open. Startup recovery fails it with a visible reason.
       return;
     }
+    if (turn && seen) this.markSeen(turn);
     if (turn && !this.closed)
       try {
         this.deps.onTurnSettled?.(turn.selection.family, turn.taskId);
@@ -1474,14 +1552,17 @@ export class ChatService {
           failure: end.failure,
           assistantMessageId: reply?.id ?? null,
           stopReason: end.stopReason,
+          ...(end.outputLimit ? { outputLimit: end.outputLimit } : {}),
         },
         end.groups,
       ),
     );
     const thread = this.thread(task.id);
+    // The session has now seen the thread up to this turn. Later turns on other families reach it
+    // in a delta packet.
     const session =
       writesScratch(turn.role) && end.session?.family === turn.selection.family
-        ? end.session
+        ? { ...end.session, seenSequence: turn.sequence }
         : null;
     this.putThread(task, {
       ...thread,
@@ -1493,6 +1574,15 @@ export class ChatService {
       ...(end.groups.length ? { ownershipUnknown: true } : {}),
     });
     if (end.stopReason === 'limit') this.appendLimitLine(task, turn, end.failure);
+    if (end.outputLimit) {
+      const count = (value: number) => value.toLocaleString('en-US');
+      const { reasoningTokens, replyTokens, allowedTokens } = end.outputLimit;
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: turn.id },
+        text: `Reply stopped at the output limit: ${count(reasoningTokens)} reasoning and ${count(replyTokens)} reply of ${count(allowedTokens)} allowed.`,
+      });
+    }
     if (end.failure)
       this.appendEntry(task, {
         kind: 'chat-system',
@@ -1906,10 +1996,28 @@ export class ChatService {
     // A family picked in the composer starts cold too, so the switch is a manual handoff. A
     // cancelled switch says nothing about which family answered last, so the check still runs.
     if (own && !handoffFrom) handoffFrom = this.switchedFrom(task.id, selection.family);
+    const sequence = this.nextSequence(task.id);
+    // Another model of the same family starts a new native session with the full packet, through
+    // the path a family switch takes, and the thread says why. An effort change alone resumes.
+    const session = thread.sessions.find((value) => value.family === selection.family);
+    const before =
+      own && !handoffFrom && session && RESUMING.has(selection.family)
+        ? this.sessionModel(task.id, session, sequence)
+        : null;
+    if (before && before !== selection.model) {
+      handoffFrom = selection.family;
+      this.setHandoff(task.id, { from: selection.family, reason: 'model' });
+      const name = familyName[selection.family];
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: null },
+        text: `Continued on ${name} (${selection.model}) from ${name} (${before}). Reason: ${handoffReason('model')}.`,
+      });
+    }
     const turn = ChatTurnSchema.parse({
       id: this.deps.id('trn'),
       taskId: task.id,
-      sequence: this.nextSequence(task.id),
+      sequence,
       role,
       selection,
       userMessageId: messageId,
@@ -2250,6 +2358,246 @@ export class ChatService {
         "SELECT 1 FROM chat_turns WHERE task_id=? AND sequence<? AND json_extract(body,'$.userMessageId')=? AND json_extract(body,'$.state')='done' AND json_extract(body,'$.assistantMessageId') IS NOT NULL",
       )
       .get(turn.taskId, turn.sequence, turn.userMessageId);
+  }
+
+  /**
+   * The delta packet for a resumed session: the turns after its cursor, what changed in the scratch
+   * copy since then, check lines and files attached since, then the new message. Null when the
+   * session has seen every turn. 'over' when the delta does not fit the packet cap even with each
+   * message and reply cut, so the session has to give way to a new one.
+   */
+  private delta(
+    turn: ChatTurn,
+    message: ConversationEntry,
+    session: ChatSession,
+    root: string,
+    base: string,
+    prompt: string,
+    reason: HandoffReason | null,
+  ):
+    | { prompt: string; files: NonNullable<ChatTurnRequest['files']>; history: ChatHistoryEntry[] }
+    | 'over'
+    | null {
+    const { taskId } = turn;
+    const family = turn.selection.family;
+    const turns = this.turns(taskId);
+    // A session saved before the cursor existed has seen its family's last writing turn.
+    const seen =
+      session.seenSequence ?? this.writtenOn(taskId, family, turn.sequence)?.sequence ?? -1;
+    // A fixer's brief quotes the review it answers, so the review turn stays out.
+    const unseen = turns.filter(
+      (value) =>
+        value.sequence > seen &&
+        value.sequence < turn.sequence &&
+        !(turn.role === 'fixer' && value.role === 'reviewer'),
+    );
+    if (!unseen.length) return null;
+    const last = turns.find((value) => value.sequence === seen);
+    const cursors = [last?.userMessageId, last?.assistantMessageId].flatMap((id) => {
+      const entry = id ? this.findEntry(taskId, id) : undefined;
+      return entry ? [BigInt(entry.cursor)] : [];
+    });
+    const after = cursors.reduce((a, b) => (a > b ? a : b), 0n);
+    // Each message appears once. The new message goes last under its own heading.
+    const shown = new Set([turn.userMessageId]);
+    let first = BigInt(message.cursor);
+    const told: DeltaTurn[] = unseen.map((value) => {
+      const asked = shown.has(value.userMessageId)
+        ? undefined
+        : this.findEntry(taskId, value.userMessageId);
+      shown.add(value.userMessageId);
+      if (asked && BigInt(asked.cursor) < first) first = BigInt(asked.cursor);
+      return {
+        family: value.selection.family,
+        model: value.selection.model,
+        role: value.role,
+        message: asked?.text ?? null,
+        reply: value.assistantMessageId
+          ? (this.findEntry(taskId, value.assistantMessageId)?.text ?? null)
+          : null,
+        early:
+          value.state === 'done'
+            ? null
+            : endedOnLimit(value)
+              ? 'usage limit reached'
+              : value.state === 'stopped'
+                ? 'stopped by the person'
+                : 'error',
+        tools: this.toolLines(taskId, value.id),
+      };
+    });
+    const files = this.turnFiles(taskId, message, true, family, after);
+    const earlier = files.flatMap((file) =>
+      file.earlier
+        ? [
+            {
+              attachment: file.attachment,
+              came: file.came ?? '',
+              reach: earlierReach(family, file.path),
+            },
+          ]
+        : [],
+    );
+    const changes = this.deltaChanges(taskId, family, seen, root, base);
+    const checks = this.deltaChecks(taskId, after, BigInt(message.cursor));
+    const build = (clip: number | undefined, patches: readonly string[]) =>
+      deltaPacket({
+        from: reason ? turn.handoffFrom : null,
+        to: family,
+        reason,
+        turns: told,
+        changes: [...changes.lines, ...patches],
+        checks,
+        earlier,
+        prompt,
+        clip,
+      });
+    for (const clip of [undefined, PACKET_ENTRY_CHARACTERS]) {
+      const room = PACKET_BYTES - Buffer.byteLength(build(clip, []));
+      // Patches take what is left up to their share. With too little room the list stands alone.
+      const patches =
+        changes.changed.length && room > 4096
+          ? patchSections(changes.changed, Math.min(PACKET_PATCH_BYTES, room))
+          : [];
+      const text = build(clip, patches);
+      if (Buffer.byteLength(text) <= PACKET_BYTES)
+        return { prompt: text, files, history: this.history(taskId, first.toString()) };
+    }
+    return 'over';
+  }
+
+  /**
+   * What changed in the scratch copy since the family's session last saw the thread, from the
+   * record `markSeen` wrote then. Without a record for that turn, the list covers every change
+   * against the base commit.
+   */
+  private deltaChanges(
+    taskId: string,
+    family: ChatFamily,
+    seen: number,
+    root: string,
+    base: string,
+  ): { lines: string[]; changed: FileDiff[] } {
+    const now = this.scratchDiff(taskId, root, base);
+    if (now === null) return { lines: ['The scratch changes could not be read.'], changed: [] };
+    const record = this.readSeen(taskId, family);
+    if (record?.sequence !== seen)
+      return {
+        lines: ['Files changed in the scratch copy against the base commit:', ...changeList(now)],
+        changed: now,
+      };
+    const changed = now.filter((file) => record.files[file.path] !== fileDigest(file));
+    const back = Object.keys(record.files).filter(
+      (path) => !now.some((file) => file.path === path),
+    );
+    if (!changed.length && !back.length)
+      return { lines: ['No files changed in the scratch copy since then.'], changed };
+    return {
+      lines: [
+        'Files changed in the scratch copy since then, with counts against the base commit:',
+        ...(changed.length ? changeList(changed) : []),
+        ...back
+          .slice(0, PACKET_LISTED_FILES)
+          .map((path) => `${path} matches the base commit again`),
+      ],
+      changed,
+    };
+  }
+
+  /** System lines that mention checks, written after `after` and before the new message. */
+  private deltaChecks(taskId: string, after: bigint, before: bigint): string[] {
+    return this.deps.store.db
+      .prepare(
+        "SELECT body FROM conversation_entries WHERE task_id=? AND sequence>? AND sequence<? AND json_extract(body,'$.kind')='chat-system' AND json_extract(body,'$.text') LIKE '%check%' ORDER BY sequence DESC LIMIT ?",
+      )
+      .all(taskId, after, before, CHECK_LINES)
+      .reverse()
+      .map((row) =>
+        clip(ConversationEntrySchema.parse(JSON.parse(row.body as string)).text, CHECK_CHARACTERS),
+      );
+  }
+
+  /** One line per tool call of a turn: title, kind and how it ended. */
+  private toolLines(taskId: string, turnId: string): string[] {
+    const events = this.agentEvents(taskId, turnId, ['tool.started', 'tool.completed']);
+    const ended = new Map(
+      events.flatMap((event) =>
+        event.type === 'tool.completed' ? [[event.callId, event.status] as const] : [],
+      ),
+    );
+    const calls = events.flatMap((event) => (event.type === 'tool.started' ? [event] : []));
+    return [
+      ...calls
+        .slice(0, DELTA_TOOL_LINES)
+        .map(
+          (call) =>
+            `${clip(call.title, 200)} (${call.kind}): ${ended.get(call.callId) ?? 'did not finish'}`,
+        ),
+      ...(calls.length > DELTA_TOOL_LINES
+        ? [`And ${calls.length - DELTA_TOOL_LINES} more tool calls.`]
+        : []),
+    ];
+  }
+
+  /**
+   * Record what the scratch copy holds after a turn that saved its family's session, so the next
+   * delta for that family can tell what changed since. A failed write leaves the next delta
+   * listing every change against the base.
+   */
+  private markSeen(turn: ChatTurn) {
+    try {
+      const task = this.task(turn.taskId);
+      const root = task && this.deps.projectPath(task.projectId);
+      const base = this.thread(turn.taskId).base;
+      if (!root || !base) return;
+      const files = this.scratchDiff(turn.taskId, root, base);
+      if (!files) return;
+      const file = this.seenFile(turn.taskId, turn.selection.family);
+      mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+      writeFileSync(
+        file,
+        JSON.stringify({
+          sequence: turn.sequence,
+          files: Object.fromEntries(files.map((entry) => [entry.path, fileDigest(entry)])),
+        }),
+      );
+    } catch {
+      // Without the record, the next delta lists every change against the base.
+    }
+  }
+
+  private readSeen(taskId: string, family: ChatFamily): z.infer<typeof SeenSchema> | null {
+    try {
+      return SeenSchema.parse(JSON.parse(readFileSync(this.seenFile(taskId, family), 'utf8')));
+    } catch {
+      return null;
+    }
+  }
+
+  private seenFile(taskId: string, family: ChatFamily) {
+    return join(this.deps.home, 'chat', taskId, 'sessions', `${family}.json`);
+  }
+
+  /**
+   * The model a saved session runs: the model of the turn its cursor names. The client can report
+   * another spelling of the same model, so the session's own field is the fallback.
+   */
+  private sessionModel(taskId: string, session: ChatSession, before: number): string {
+    const turn =
+      session.seenSequence === undefined
+        ? this.writtenOn(taskId, session.family, before)
+        : this.turns(taskId).find((value) => value.sequence === session.seenSequence);
+    return turn?.selection.family === session.family ? turn.selection.model : session.model;
+  }
+
+  /** The newest assistant or fixer turn on a family before a sequence. */
+  private writtenOn(taskId: string, family: ChatFamily, before: number): ChatTurn | undefined {
+    const row = this.deps.store.db
+      .prepare(
+        "SELECT body FROM chat_turns WHERE task_id=? AND sequence<? AND json_extract(body,'$.selection.family')=? AND json_extract(body,'$.role') IN ('assistant','fixer') ORDER BY sequence DESC LIMIT 1",
+      )
+      .get(taskId, before, family);
+    return row ? ChatTurnSchema.parse(JSON.parse(row.body as string)) : undefined;
   }
 
   /**
@@ -2679,6 +3027,9 @@ function endedOnLimit(turn: ChatTurn): boolean {
 const clip = (text: string, characters: number) =>
   text.length > characters ? `${text.slice(0, characters).toWellFormed()} [trimmed]` : text;
 
+/** Two records of a changed file match when their counts and patch match. */
+const fileDigest = (file: FileDiff) => hashCanonical([file.additions, file.deletions, file.patch]);
+
 function changeList(files: readonly FileDiff[] | null): string[] {
   if (files === null) return ['The scratch changes could not be read.'];
   if (files.length === 0) return ['No files changed yet.'];
@@ -2782,6 +3133,7 @@ function ending(
               : 'The provider ended the turn without a reason.',
           });
   const session = ChatSessionSchema.safeParse(result.session);
+  const outputLimit = ChatOutputLimitSchema.safeParse(result.outputLimit);
   const reportedText = typeof result.assistantText === 'string' ? result.assistantText : '';
   return {
     state,
@@ -2791,6 +3143,7 @@ function ending(
     text: reportedText.trim() ? reportedText : joinText(items),
     session: session.success ? session.data : null,
     groups,
+    ...(state === 'done' && outputLimit.success ? { outputLimit: outputLimit.data } : {}),
   };
 }
 
