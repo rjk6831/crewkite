@@ -4,12 +4,14 @@
 //   and turn.completed { stopReason, failure } before the result settles.
 // On stop it reports only completed items, like a native client that drops the open item.
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   appendFileSync,
   chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   statSync,
@@ -17,11 +19,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { type TestContext, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type {
   AgentEvent,
+  ChatAttachment,
   ChatCatalogRead,
   ChatCrew,
   ChatFamily,
@@ -56,6 +59,7 @@ import {
   chatFailure,
 } from './adapter.ts';
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
+import { detectType } from './files.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
@@ -1775,4 +1779,151 @@ test('send now stops the running turn and starts the queued message with its pac
   assert.match(packet, /^OpenAI ended its last turn early\. Reason: stopped by the person\.$/m);
   assert.match(packet, /New message:\nThird\.$/);
   assert.equal(scripted.requests[2].prompt, 'Second.');
+});
+
+/** Run one service command in its own transaction, then its effects, as the controller does. */
+function act(store: Store, work: (effects: (() => void)[]) => CommandResult): CommandResult {
+  const effects: (() => void)[] = [];
+  const result = store.transaction(() => work(effects));
+  for (const effect of effects) effect();
+  return result;
+}
+
+test('a file is stored once by its hash, and its path reaches every turn that runs its message', {
+  timeout: 30000,
+}, async (t) => {
+  // Rows: the start of the bytes, the name, what a paste declared, and the type CrewKite names.
+  const zip = Buffer.from('PK\x03\x04', 'latin1');
+  const types = [
+    [Buffer.from('%PDF-1.7'), 'report', null, 'application/pdf'],
+    [Buffer.concat([zip, Buffer.alloc(26), Buffer.from('word/document.xml')]), 'a.bin', null],
+    [zip, 'sheet.xlsx', null, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
+    [zip, 'archive', null, 'application/zip'],
+    [Buffer.from('ID3\x04', 'latin1'), 'voice.bin', null, 'audio/mpeg'],
+    [Buffer.from('\x1a\x45\xdf\xa3....webm', 'latin1'), 'clip', null, 'video/webm'],
+    [Buffer.from('const a = 1;'), 'service.ts', null, 'text/x-typescript'],
+    [Buffer.from('hello'), 'paste', 'text/plain', 'text/plain'],
+    [Buffer.from('hello'), 'paste', null, 'application/octet-stream'],
+  ] as const;
+  for (const [head, name, declared, type] of types)
+    assert.equal(
+      detectType(head, name, declared),
+      type ?? 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+      name,
+    );
+
+  const rejected = chatFailure({
+    stage: 'stream',
+    kind: 'attachment-rejected',
+    message: 'The model cannot read this file.',
+  });
+  const reply = (text: string): ChatScriptStep[] => [
+    { kind: 'text', itemId: 'reply', chunks: [text] },
+  ];
+  const adapters = new Map([
+    [
+      'openai',
+      createScriptedChatAdapter({
+        family: 'openai',
+        turns: [[{ kind: 'fail', stopReason: 'error', failure: rejected }]],
+      }),
+    ],
+    [
+      'google',
+      createScriptedChatAdapter({
+        family: 'google',
+        turns: [reply('A bar chart.'), reply('A chart of sales.')],
+      }),
+    ],
+  ] as const);
+  const { store, service, taskId, read } = standalone(t, { adapters });
+  const outside = mkdtempSync(join(tmpdir(), 'crewkite-attach-'));
+  t.after(() => rmSync(outside, { recursive: true, force: true }));
+  const png = Buffer.concat([Buffer.from('89504e470d0a1a0a', 'hex'), Buffer.alloc(32, 7)]);
+  writeFileSync(join(outside, 'chart.png'), png);
+  const importing = (source: Parameters<ChatService['importAttachment']>[0]['source']) =>
+    store.transaction(() => service.importAttachment({ taskId, source }));
+  const first = importing({ path: join(outside, 'chart.png') });
+  assert.deepEqual(first.data, {
+    kind: 'chat-attachment',
+    id: createHash('sha256').update(png).digest('hex'),
+    name: 'chart.png',
+    mimeType: 'image/png',
+    bytes: png.length,
+  });
+  assert.deepEqual(importing({ path: join(outside, 'chart.png') }), first);
+  const pasted = { name: 'chart.png', mimeType: 'image/png', base64: png.toString('base64') };
+  assert.deepEqual(importing(pasted), first);
+  for (const path of [outside, join(outside, 'missing.png'), '/dev/null'])
+    assert.equal(importing({ path }).reason, 'file-refused', path);
+
+  const { kind: _, ...file } = first.data as ChatAttachment & { kind: 'chat-attachment' };
+  const ask = (files: ChatAttachment[]) =>
+    act(store, (effects) =>
+      service.sendMessage(
+        {
+          taskId,
+          text: 'What is in this chart?',
+          selection,
+          role: 'assistant',
+          attachments: [],
+          files,
+        },
+        effects,
+      ),
+    );
+  assert.equal(ask([{ ...file, id: 'f'.repeat(64) }]).reason, 'file-not-found');
+  const failed = turnReaches({ store }, 'failed');
+  assert.equal(ask([file]).outcome, 'applied');
+  const turn = await failed;
+  const [sent] = (adapters.get('openai')?.requests ?? []) as ChatTurnRequest[];
+  const path = sent.files?.[0]?.path ?? '';
+  assert.deepEqual(sent.files, [{ attachment: file, path }]);
+  assert.deepEqual(readFileSync(path), png);
+  // One folder per hash, and one copy in it.
+  assert.deepEqual(readdirSync(dirname(dirname(path))), [file.id]);
+  assert.deepEqual(readdirSync(dirname(path)), ['chart.png']);
+
+  // Try with Google takes the handoff path, and the packet names the file it carries.
+  const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
+  const retry = (mode: 'retry' | 'regenerate', turnId: string, choice?: ChatModelSelection) =>
+    act(store, (effects) =>
+      service.retryTurn(
+        { taskId, turnId, mode, ...(choice ? { selection: choice } : {}) },
+        effects,
+      ),
+    );
+  const moved = turnReaches({ store }, 'done');
+  assert.equal(retry('retry', turn.id, google).outcome, 'applied');
+  const answered = await moved;
+  const requests = (adapters.get('google')?.requests ?? []) as ChatTurnRequest[];
+  const [carried] = requests;
+  assert.match(carried.prompt, /^This thread moved from OpenAI to Google\./);
+  assert.match(carried.prompt, /^chart\.png \(image\/png, 40 bytes\)$/m);
+  assert.deepEqual(carried.files, sent.files);
+
+  // Regenerate keeps the first reply. The rerun starts a fresh session, since the old one holds
+  // the reply it replaces.
+  assert.equal(retry('retry', answered.id).reason, 'turn-not-retryable');
+  assert.equal(retry('regenerate', turn.id).reason, 'turn-not-latest');
+  const regenerated = turnReaches({ store }, 'done');
+  assert.equal(retry('regenerate', answered.id).outcome, 'applied');
+  await regenerated;
+  const again = requests[1];
+  assert.equal(again.prompt, 'What is in this chart?');
+  assert.equal(again.session, null);
+  assert.deepEqual(again.files, sent.files);
+  const thread = read();
+  assert.deepEqual(
+    thread.messages.map((message) => message.text),
+    [
+      'What is in this chart?',
+      `${rejected.message} ${rejected.nextAction}`,
+      'Continued on Google from OpenAI. Reason: switched in the composer.',
+      'A bar chart.',
+      'Regenerated',
+      'A chart of sales.',
+    ],
+  );
+  assert.ok(thread.turns.every((value) => value.userMessageId === turn.userMessageId));
 });
