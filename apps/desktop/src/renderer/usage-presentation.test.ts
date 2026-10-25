@@ -335,6 +335,18 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
           'Apple M5 Pro · 20 GPU cores · 48 GB memory, 31 GB free · 27B Q4_K_M, 15.2 GB, 8,192 context · 18.4 tok/s last turn',
       },
     },
+    {
+      claim:
+        'Local set up before but unconnected after a relaunch keeps its row and asks for Connect',
+      entry: entry('local', [], {
+        connected: false,
+        needsConnect: true,
+        models: [],
+        defaultModel: null,
+        readAt: null,
+      }),
+      expect: { bars: [], unlimited: true, needsConnect: true },
+    },
   ];
   for (const { claim, entry: family, expect } of rows) {
     const [row] = railFamilies({ families: [family] }, nowMs, { hardware, localSetup });

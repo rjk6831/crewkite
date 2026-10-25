@@ -3,12 +3,17 @@ import { test } from 'node:test';
 import { hashCanonical, sealHandoff } from './hash.ts';
 import {
   AcpApprovalTargetSchema,
+  AgentEventSchema,
   ApprovalBindingSchema,
   AttemptOutputSchema,
   CandidateEvaluationPreviewSchema,
+  ChatBranchStatusSchema,
   type ChatCatalogEntry,
+  ChatCrewChainSchema,
   ChatCrewSchema,
+  ChatFlightModeSchema,
   type ChatHandoffMode,
+  ChatTurnStatsSchema,
   CheckEventSchema,
   CheckResultSchema,
   CombinedNativeReviewJobSchema,
@@ -50,11 +55,14 @@ import {
   NativeProfileSchema,
   NativeRunSchema,
   ObservationSchema,
+  OpenChatPullRequestPayloadSchema,
   PolicySchema,
   PrepareProjectCommandRequestSchema,
   ProjectCommandPreviewSchema,
   ProjectOperationDataSchema,
+  PushChatBranchPayloadSchema,
   parseReviewTarget,
+  ReadChatBranchStatusPayloadSchema,
   ReadDataSchema,
   RemainingBudgetsSchema,
   ReviewJobSchema,
@@ -66,6 +74,7 @@ import {
   SnapshotSchema,
   SourceDetailsSchema,
   SourceSchema,
+  SteerChatMessagePayloadSchema,
   TaskConversationStateSchema,
   TaskModelCatalogSchema,
   TransportMessageSchema,
@@ -3296,7 +3305,7 @@ test('each handoff mode ranks the families by its own rule', () => {
   const rows: [ChatHandoffMode, string][] = [
     ['most-left', 'openai google anthropic local'],
     ['resets-first', 'anthropic google openai local'],
-    ['balanced', 'google anthropic openai local'],
+    ['even-spend', 'google anthropic openai local'],
     ['local-first', 'local google anthropic openai'],
   ];
   for (const [mode, order] of rows)
@@ -3322,4 +3331,109 @@ test('a crew names a builder and each role once', () => {
     ],
   ])
     assert.equal(ChatCrewSchema.safeParse({ name: 'Bad', members }).success, false);
+});
+
+test('the chat schemas accept the shapes the renderer sends and reject the ones it must not', () => {
+  const taskId = `tsk_${suffix}`;
+  const turnId = `trn_${suffix}`;
+  const branch = 'feat/wave-8';
+  const stats = {
+    tokensIn: 6097,
+    tokensOut: 120,
+    tokensPerSecond: 21.5,
+    firstTokenMs: 400,
+    turnMs: 6000,
+    contextUsed: 6097,
+    contextCapacity: 8192,
+    summaries: 2,
+  };
+  const chain = { builderTurnId: turnId, step: 'fix', reviewRounds: 1, fixes: 1 };
+  const compacted = {
+    type: 'context.compacted',
+    turnId,
+    summaries: 2,
+    coveredTurns: 5,
+    usedTokens: 6097,
+    capacityTokens: 8192,
+  };
+  const rows: [
+    string,
+    { safeParse: (input: unknown) => { success: boolean } },
+    unknown,
+    boolean,
+  ][] = [
+    ['glide is a flight mode', ChatFlightModeSchema, 'glide', true],
+    ['autopilot is not a flight mode', ChatFlightModeSchema, 'autopilot', false],
+    ['a chain on its first fix is valid', ChatCrewChainSchema, chain, true],
+    ['a third fix round is refused', ChatCrewChainSchema, { ...chain, fixes: 3 }, false],
+    [
+      'steer names a task and a message',
+      SteerChatMessagePayloadSchema,
+      { taskId, messageId: `msg_${suffix}` },
+      true,
+    ],
+    ['steer without the message is refused', SteerChatMessagePayloadSchema, { taskId }, false],
+    [
+      'a confirmed push is accepted',
+      PushChatBranchPayloadSchema,
+      { taskId, branch, confirmed: true },
+      true,
+    ],
+    [
+      'a push that was not confirmed is refused',
+      PushChatBranchPayloadSchema,
+      { taskId, branch, confirmed: false },
+      false,
+    ],
+    [
+      'a pull request with a title is accepted',
+      OpenChatPullRequestPayloadSchema,
+      { taskId, branch, title: 'Add crew' },
+      true,
+    ],
+    [
+      'an empty pull request title is refused',
+      OpenChatPullRequestPayloadSchema,
+      { taskId, branch, title: '' },
+      false,
+    ],
+    [
+      'a status read names a task and a branch',
+      ReadChatBranchStatusPayloadSchema,
+      { taskId, branch },
+      true,
+    ],
+    [
+      'a branch with upper case is refused',
+      ReadChatBranchStatusPayloadSchema,
+      { taskId, branch: 'Feat/Wave' },
+      false,
+    ],
+    [
+      'a status with no runs carries its reason',
+      ChatBranchStatusSchema,
+      { branch, runs: null, reason: 'gh is not installed', readAt: '2026-10-25T10:00:00Z' },
+      true,
+    ],
+    [
+      'a status without a read time is refused',
+      ChatBranchStatusSchema,
+      { branch, runs: null, reason: null },
+      false,
+    ],
+    [
+      'turn stats without the summaries count are refused',
+      ChatTurnStatsSchema,
+      { ...stats, summaries: undefined },
+      false,
+    ],
+    [
+      'a compaction with no summaries is refused',
+      AgentEventSchema,
+      { ...compacted, summaries: 0 },
+      false,
+    ],
+  ];
+  for (const [claim, schema, input, accepted] of rows)
+    assert.equal(schema.safeParse(input).success, accepted, claim);
 });

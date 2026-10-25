@@ -27,6 +27,40 @@ export const effortLabels: Record<ChatEffort, string> = {
   default: 'Default',
 };
 
+/**
+ * The efforts one model offers. Every place that edits a selection uses it, so labels match. A
+ * saved effort the model no longer offers stays visible so the person can see it and change it.
+ */
+export function EffortSelect({
+  efforts,
+  value,
+  label,
+  onChange,
+}: {
+  efforts: readonly ChatEffort[];
+  value: ChatEffort;
+  label?: string;
+  onChange: (effort: ChatEffort) => void;
+}) {
+  return (
+    <select
+      className="effort-select"
+      aria-label={label}
+      value={value}
+      onChange={(event) => onChange(event.target.value as ChatEffort)}
+    >
+      {!efforts.includes(value) && (
+        <option value={value}>{effortLabels[value]} (not available now)</option>
+      )}
+      {efforts.map((effort) => (
+        <option key={effort} value={effort}>
+          {effortLabels[effort]}
+        </option>
+      ))}
+    </select>
+  );
+}
+
 const left = (percent: number | null) =>
   percent === null ? 'Allowance unknown' : `${Math.floor(percent)}% left`;
 
@@ -321,21 +355,14 @@ export function ModelPicker({
         </div>
       )}
       {entry && model && model.efforts.length > 0 && selection && (
-        <label className="th-effort">
-          <span className="th-sr">Effort</span>
-          <select
+        <span className="th-effort">
+          <EffortSelect
+            label="Effort"
+            efforts={model.efforts}
             value={selection.effort}
-            onChange={(event) =>
-              onSelect({ ...selection, effort: event.target.value as ChatEffort })
-            }
-          >
-            {model.efforts.map((effort) => (
-              <option key={effort} value={effort}>
-                {effortLabels[effort]}
-              </option>
-            ))}
-          </select>
-        </label>
+            onChange={(effort) => onSelect({ ...selection, effort })}
+          />
+        </span>
       )}
     </div>
   );

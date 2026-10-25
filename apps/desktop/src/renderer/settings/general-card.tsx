@@ -1,7 +1,7 @@
-import type { ChatCatalogRead, ChatEffort, ChatModelSelection } from '@crewkite/contracts';
+import type { ChatCatalogRead, ChatModelSelection } from '@crewkite/contracts';
 import { useState } from 'react';
 import { familyName } from '../components.tsx';
-import { effortLabels } from '../thread/model-picker.tsx';
+import { EffortSelect } from '../thread/model-picker.tsx';
 import {
   type CrewPreset,
   crewRoleNames,
@@ -35,7 +35,16 @@ const autoLabel = (role: string) =>
       ? 'Same as the builder'
       : 'Another connected family';
 
-/** One select of every connected model, plus a saved pin the catalog no longer lists. */
+/** Every connected model as a pick, in catalog order. */
+export const modelChoices = (catalog: ChatCatalogRead | null): Choice[] =>
+  (catalog?.families ?? [])
+    .filter((entry) => entry.connected && entry.models.length > 0)
+    .flatMap((entry) => entry.models.map((model) => ({ entry, model })));
+
+/**
+ * One select of every connected model, plus a saved pin the catalog no longer lists. Without
+ * autoText the select has no empty choice, as for a role a crew already names.
+ */
 function ModelSelect({
   id,
   label,
@@ -48,7 +57,7 @@ function ModelSelect({
   label?: string;
   choices: Choice[];
   value: ChatModelSelection | null;
-  autoText: string;
+  autoText?: string;
   onChange: (next: ChatModelSelection | null) => void;
 }) {
   const listed = choices.findIndex(
@@ -74,7 +83,7 @@ function ModelSelect({
         );
       }}
     >
-      <option value={auto}>{autoText}</option>
+      {autoText !== undefined && <option value={auto}>{autoText}</option>}
       {value && listed < 0 && (
         <option value={saved_}>
           {familyName(value.family)} · {value.model} (not available now)
@@ -94,6 +103,53 @@ function ModelSelect({
         </optgroup>
       ))}
     </select>
+  );
+}
+
+/**
+ * A model select and, when the model offers a choice, an effort select beside it. A new model
+ * starts on its default effort.
+ */
+export function SelectionFields({
+  id,
+  label,
+  effortLabel = 'Effort',
+  choices,
+  value,
+  autoText,
+  onChange,
+}: {
+  id?: string;
+  label?: string;
+  effortLabel?: string;
+  choices: Choice[];
+  value: ChatModelSelection | null;
+  autoText?: string;
+  onChange: (next: ChatModelSelection | null) => void;
+}) {
+  const efforts =
+    choices.find(
+      ({ entry, model }) => entry.family === value?.family && model.model === value.model,
+    )?.model.efforts ?? [];
+  return (
+    <>
+      <ModelSelect
+        id={id}
+        label={label}
+        choices={choices}
+        value={value}
+        autoText={autoText}
+        onChange={onChange}
+      />
+      {value && efforts.length > 1 && (
+        <EffortSelect
+          label={effortLabel}
+          efforts={efforts}
+          value={value.effort}
+          onChange={(effort) => onChange({ ...value, effort })}
+        />
+      )}
+    </>
   );
 }
 
@@ -127,15 +183,7 @@ export function GeneralCard({
     writeCrewPresets(next);
   };
   const mode = handoffModes.find(({ id }) => id === saved.handoffMode) ?? handoffModes[0];
-  const entries = (catalog?.families ?? []).filter(
-    (entry) => entry.connected && entry.models.length > 0,
-  );
-  const choices = entries.flatMap((entry) => entry.models.map((model) => ({ entry, model })));
-  const current = saved.selection;
-  const efforts =
-    choices.find(
-      ({ entry, model }) => entry.family === current?.family && model.model === current.model,
-    )?.model.efforts ?? [];
+  const choices = modelChoices(catalog);
   return (
     <section className="st-card" aria-labelledby="settings-general">
       <header className="st-card-head">
@@ -151,31 +199,13 @@ export function GeneralCard({
             </small>
           </label>
           <div className="st-controls">
-            <ModelSelect
+            <SelectionFields
               id="settings-model"
               choices={choices}
-              value={current}
+              value={saved.selection}
               autoText="Most allowance left"
               onChange={(selection) => change({ ...saved, selection })}
             />
-            {current && efforts.length > 1 && (
-              <select
-                aria-label="Effort"
-                value={current.effort}
-                onChange={(event) =>
-                  change({
-                    ...saved,
-                    selection: { ...current, effort: event.target.value as ChatEffort },
-                  })
-                }
-              >
-                {efforts.map((effort) => (
-                  <option key={effort} value={effort}>
-                    {effortLabels[effort]}
-                  </option>
-                ))}
-              </select>
-            )}
           </div>
         </div>
         <div className="st-row">
@@ -248,13 +278,16 @@ export function GeneralCard({
                   <label htmlFor={`settings-${presetId(preset.name)}-${member.role}`}>
                     {crewRoleNames[member.role]}
                   </label>
-                  <ModelSelect
-                    id={`settings-${presetId(preset.name)}-${member.role}`}
-                    choices={choices}
-                    value={member.selection}
-                    autoText={autoLabel(member.role)}
-                    onChange={(selection) => pin(preset.name, member.role, selection)}
-                  />
+                  <span className="st-crew-pick">
+                    <SelectionFields
+                      id={`settings-${presetId(preset.name)}-${member.role}`}
+                      effortLabel={`${preset.name} ${crewRoleNames[member.role]} effort`}
+                      choices={choices}
+                      value={member.selection}
+                      autoText={autoLabel(member.role)}
+                      onChange={(selection) => pin(preset.name, member.role, selection)}
+                    />
+                  </span>
                 </div>
               ))}
             </div>

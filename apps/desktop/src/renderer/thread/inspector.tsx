@@ -4,6 +4,7 @@ import {
   type ChatFlightMode,
   type ChatHandoffMode,
   type ChatMessage,
+  type ChatModelSelection,
   type ChatPermissionPolicy,
   type ChatRole,
   type ChatThread,
@@ -17,12 +18,14 @@ import {
   type PointerEvent as ReactPointerEvent,
   type RefObject,
   useEffect,
+  useId,
   useLayoutEffect,
   useRef,
   useState,
 } from 'react';
 import { familyName } from '../components.tsx';
 import { clientFor } from '../settings/client-status.tsx';
+import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
 import {
   crewFromPreset,
   crewPresetNames,
@@ -525,12 +528,35 @@ function CrewTab({
   const [note, setNote] = useState<string | null>(null);
   const crew = thread?.crew ?? null;
   const mode = flightModes.find(({ id }) => id === thread?.flightMode) ?? flightModes[0];
+  const choices = modelChoices(catalog);
+  const idBase = useId();
+  // Builder turns run on the thread's selection, which the composer follows. Moving it in the same
+  // configure call keeps the builder row and the composer on one model.
+  function assign(role: string, selection: ChatModelSelection | null) {
+    if (!crew || !selection) return;
+    onConfigure({
+      crew: {
+        ...crew,
+        members: crew.members.map((member) =>
+          member.role === role ? { ...member, selection } : member,
+        ),
+      },
+      ...(role === 'builder' ? { selection } : {}),
+    });
+  }
   function start(name: string) {
     const preset = readCrewPresets().find((value) => value.name === name);
     if (!preset || !thread) return;
     const next = catalog && crewFromPreset(preset, catalog, thread.selection, thread.handoffMode);
     setNote(next ? null : 'Connect a provider in Settings, then start from a preset.');
-    if (next) onConfigure({ crew: next });
+    if (!next) return;
+    const builder = next.members.find((member) => member.role === 'builder')?.selection;
+    const moved =
+      builder &&
+      (builder.family !== thread.selection?.family ||
+        builder.model !== thread.selection?.model ||
+        builder.effort !== thread.selection?.effort);
+    onConfigure({ crew: next, ...(moved ? { selection: builder } : {}) });
   }
   return (
     <div className="th-facts">
@@ -545,10 +571,28 @@ function CrewTab({
           const member = crew?.members.find((value) => value.role === role);
           // The fixer is the builder again unless the crew names its own.
           const fallback = role === 'fixer' && crew ? 'The builder, with the findings' : null;
+          // A role stays read only until the catalog arrives, so its select never shows a gap.
+          const editable = member && choices.length > 0;
           return (
             <li key={role}>
-              <span className="th-crew-role">{crewRoleNames[role]}</span>
-              {member ? (
+              {editable ? (
+                <label className="th-crew-role" htmlFor={`${idBase}-${role}`}>
+                  {crewRoleNames[role]}
+                </label>
+              ) : (
+                <span className="th-crew-role">{crewRoleNames[role]}</span>
+              )}
+              {editable ? (
+                <span className="th-crew-pick">
+                  <SelectionFields
+                    id={`${idBase}-${role}`}
+                    effortLabel={`${crewRoleNames[role]} effort`}
+                    choices={choices}
+                    value={member.selection}
+                    onChange={(selection) => assign(role, selection)}
+                  />
+                </span>
+              ) : member ? (
                 <span className="th-session" title={member.selection.model}>
                   <FamilyMark family={member.selection.family} />
                   <span className="th-crew-model">{modelLine(member.selection)}</span>

@@ -1204,9 +1204,47 @@
   flex-shrink: 0;
 }
 .rail-usage-row {
+  position: relative;
   display: grid;
   gap: 3px;
   font-size: 11px;
+}
+.rail-usage-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 4px;
+  border-radius: 6px;
+}
+/* The hardware line for Local. It opens above the row on hover and on keyboard focus. */
+.rail-usage-detail {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 0;
+  right: 0;
+  z-index: 20;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 0.28);
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 120ms ease-out,
+    visibility 120ms;
+}
+.rail-usage-row:hover .rail-usage-detail,
+.rail-usage-row:focus-visible .rail-usage-detail {
+  opacity: 1;
+  visibility: visible;
+}
+@media (prefers-reduced-motion: reduce) {
+  .rail-usage-detail {
+    transition: none;
+  }
 }
 .rail-usage-label {
   display: inline-flex;

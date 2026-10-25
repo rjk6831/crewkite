@@ -131,7 +131,10 @@ function local(input: ChatCatalogInput): Entry {
     defaultModel: connected ? (selected?.identity.modelKey ?? null) : null,
     remaining: remaining(input, 'local'),
     readAt: null,
-    needsConnect: false,
+    // The Local credential lives in memory only (ADR 0025), so every launch starts unconnected.
+    // A runtime set up before keeps its rail row with Connect, so Local never drops off the rail
+    // between launches. A machine that never set one up shows nothing.
+    needsConnect: !connected && input.local.endpoint !== null,
     lastTurnStats: lastTurnStats(input, 'local'),
   };
 }

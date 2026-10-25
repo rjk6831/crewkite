@@ -7,11 +7,11 @@ import {
   ChatFamilySchema,
   type ChatFlightMode,
   type ChatHandoffMode,
-  ChatHandoffModeSchema,
   type ChatModelSelection,
   ChatModelSelectionSchema,
   type ChatPermissionPolicy,
   ChatPermissionPolicySchema,
+  ChatSavedHandoffModeSchema,
   rankFamilies,
   TaskSchema,
 } from '@crewkite/contracts';
@@ -48,15 +48,15 @@ export const handoffModes: { id: ChatHandoffMode; label: string; title: string }
       'The family whose allowance resets first, while it has any left; allowance that expires unused is lost.',
   },
   {
-    id: 'balanced',
-    label: 'Balanced',
+    id: 'even-spend',
+    label: 'Even spend',
     title:
-      'Allowance per hour until reset (percent remaining divided by hours to reset), highest first; this spends every window at the rate it can afford.',
+      'Percent remaining divided by hours until reset, highest first. Each window is spent at the rate it can afford.',
   },
   {
     id: 'local-first',
     label: 'Local first',
-    title: 'Local when it is connected, otherwise Balanced.',
+    title: 'Local when it is connected, otherwise Even spend.',
   },
 ];
 
@@ -96,7 +96,7 @@ export function readThreadDefaults(store: Store | null = browserStore()): Thread
     const saved = raw ? (JSON.parse(raw) as Record<string, unknown> | null) : null;
     const selection = ChatModelSelectionSchema.safeParse(saved?.selection);
     const policy = ChatPermissionPolicySchema.safeParse(saved?.permissionPolicy);
-    const mode = ChatHandoffModeSchema.safeParse(saved?.handoffMode);
+    const mode = ChatSavedHandoffModeSchema.safeParse(saved?.handoffMode);
     return {
       selection: selection.success ? selection.data : null,
       permissionPolicy: policy.success ? policy.data : builtIn.permissionPolicy,
@@ -222,8 +222,8 @@ export function withThreadDefaults<Input, Result extends { outcome: string; enti
   };
 }
 
-// Crew presets keep only the roles the person pinned to a model. Every other role is picked when a
-// thread starts from the preset, so a preset still works after a family disconnects.
+// Crew presets keep only the roles the person pinned to a model and effort. Every other role is
+// picked when a thread starts from the preset, so a preset still works after a family disconnects.
 const presetKey = 'crewkite-crew-presets-v1';
 
 export const crewRoleNames: Record<ChatCrewRole, string> = {
@@ -241,7 +241,7 @@ export type CrewPresetName = keyof typeof presetRoles;
 export const crewPresetNames = Object.keys(presetRoles) as CrewPresetName[];
 export type CrewPreset = {
   name: CrewPresetName;
-  /** Null picks the role's model when a thread starts from the preset. */
+  /** Null picks the role's model and effort when a thread starts from the preset. */
   members: { role: ChatCrewRole; selection: ChatModelSelection | null }[];
 };
 
@@ -274,9 +274,18 @@ export function writeCrewPresets(presets: CrewPreset[], store: Store | null = br
   } catch {}
 }
 
-const listed = (catalog: ChatCatalogRead, selection: ChatModelSelection | null) => {
+// A selection the catalog still offers, with its effort. An effort the model stopped offering
+// falls back to the model's default, so a stale pin cannot send an effort the client rejects.
+const listed = (
+  catalog: ChatCatalogRead,
+  selection: ChatModelSelection | null,
+): ChatModelSelection | null => {
   const entry = catalog.families.find(({ family }) => family === selection?.family);
-  return Boolean(entry?.connected && entry.models.some(({ model }) => model === selection?.model));
+  const model = entry?.connected && entry.models.find(({ model }) => model === selection?.model);
+  if (!selection || !model) return null;
+  return model.efforts.includes(selection.effort)
+    ? selection
+    : { ...selection, effort: model.defaultEffort };
 };
 const onDefault = (entry: ChatCatalogEntry, store: Store | null): ChatModelSelection | null => {
   const chosen = familyModel(entry, store);
@@ -286,10 +295,11 @@ const onDefault = (entry: ChatCatalogEntry, store: Store | null): ChatModelSelec
 
 /**
  * The crew a thread gets from a preset. A pinned model applies while its family is connected and
- * lists it. The builder is otherwise the thread's own selection, else the first connected family.
- * The reviewer and the challenger go to the best ranked other families under the thread's mode, so
- * a second look comes from another model. With one family connected they share it. The fixer is
- * the builder again. Null when no family is connected.
+ * lists it, with the pinned effort while the model offers it. The builder is otherwise the thread's
+ * own selection, else the first connected family. The reviewer and the challenger go to the best
+ * ranked other families under the thread's mode, so a second look comes from another model. With
+ * one family connected they share it. The fixer is the builder again. Null when no family is
+ * connected.
  */
 export function crewFromPreset(
   preset: CrewPreset,
@@ -302,12 +312,12 @@ export function crewFromPreset(
   const usable = catalog.families.filter((entry) => entry.connected && entry.models.length > 0);
   const pinned = (role: ChatCrewRole) => {
     const selection = preset.members.find((member) => member.role === role)?.selection ?? null;
-    return listed(catalog, selection) ? selection : null;
+    return listed(catalog, selection);
   };
   const first = usable[0];
   const builder =
     pinned('builder') ??
-    (listed(catalog, threadSelection) ? threadSelection : null) ??
+    listed(catalog, threadSelection) ??
     (first ? onDefault(first, store) : null);
   if (!builder) return null;
   const best = (exclude: ChatFamily[]) => {

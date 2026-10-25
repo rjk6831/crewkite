@@ -5,6 +5,7 @@ import {
   type ChatFamily,
   type ChatMessage,
   ChatMessageSchema,
+  type ChatModelSelection,
   type ChatThread,
   type ChatThreadRead,
   ChatThreadSchema,
@@ -54,12 +55,12 @@ export type ThreadAction =
   | { type: 'events'; events: ThreadEvent[] }
   | { type: 'sending'; pending: PendingMessage }
   | { type: 'dismiss'; localId: string }
-  | { type: 'configured'; patch: ThreadSettings & Partial<Pick<ChatThread, 'selection'>> };
+  | { type: 'configured'; patch: ThreadSettings };
 
 /** The thread settings the inspector and the composer change through ConfigureChatThread. */
 export type ThreadSettings = Partial<
   Pick<ChatThread, 'permissionPolicy' | 'autoHandoff' | 'handoffMode' | 'crew' | 'flightMode'>
->;
+> & { selection?: ChatModelSelection };
 
 export const initialThreadState = (taskId: string): ThreadState => ({
   taskId,

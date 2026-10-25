@@ -135,6 +135,9 @@ const toolKinds = new Map<string, ChatToolKind>([
   ['move', 'edit'],
   ['execute', 'command'],
 ]);
+// The protocol names these kinds. Both remove a file at its old path, so they stay marked after
+// they fold into edit.
+const deletingKinds = new Set(['delete', 'move']);
 const toolKind = (kind: string | null | undefined): ChatToolKind =>
   toolKinds.get(kind ?? '') ?? 'other';
 // Kinds whose result goes only to the model. A fetch arrives as other.
@@ -427,6 +430,8 @@ type Call = {
   /** Paths inside the scratch copy, relative to it. */
   paths: Set<string>;
   outside: boolean;
+  /** The agent named the call a delete or a move in any update. */
+  deletes: boolean;
   diffs: Map<string, { additions: number; deletions: number }>;
   seen: string;
   written: number;
@@ -614,6 +619,7 @@ export function googleChatAdapter(deps: {
             done: false,
             paths: new Set(),
             outside: false,
+            deletes: deletingKinds.has(update.kind ?? ''),
             diffs: new Map(),
             seen: '',
             written: 0,
@@ -622,6 +628,7 @@ export function googleChatAdapter(deps: {
           calls.set(call.id, call);
         } else {
           if (update.kind) call.kind = toolKind(update.kind);
+          if (deletingKinds.has(update.kind ?? '')) call.deletes = true;
           if (update.title?.trim()) call.title = update.title.trim();
           if (update.rawInput !== undefined) call.rawInput = update.rawInput;
         }
@@ -909,6 +916,7 @@ export function googleChatAdapter(deps: {
           ),
           detail: detail || null,
           options,
+          ...(call.deletes ? { deletes: true as const } : {}),
         });
         if (automatic) {
           if (refuses) call.denied = true;

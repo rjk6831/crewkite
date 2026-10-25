@@ -961,6 +961,7 @@ function editingAdapter(asks: readonly (ChatToolKind | null)[], input?: unknown)
             callId: ask ? 'call-1' : null,
             question: 'Go ahead?',
             detail: null,
+            ...((input as { deletes?: boolean } | undefined)?.deletes ? { deletes: true } : {}),
             options: [
               { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
               { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
@@ -1262,7 +1263,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
 
 // Each row parks a turn on one ask. Balanced answers safe asks at ask time. A policy changed
 // while the ask is open answers what it covers. Anything else waits for the person.
-test('send now and a policy change act on the running turn, and balanced answers only safe asks', {
+test('a policy change acts on the running turn, and balanced answers only safe asks', {
   timeout: 30000,
 }, async (t) => {
   const crew: ChatCrew = {
@@ -1352,7 +1353,7 @@ test('send now and a policy change act on the running turn, and balanced answers
       policy: null,
       answered: true,
     },
-    // The OpenAI adapter flags a change the client tags as a delete.
+    // The adapter marks a change the client names a delete or a move. The title says nothing.
     {
       kind: 'edit',
       input: { paths: ['net.mjs'], deletes: true },
@@ -1385,6 +1386,17 @@ test('send now and a policy change act on the running turn, and balanced answers
     const name = `${row.mode} ${row.policy} ${JSON.stringify(row.input)}`;
     const parked = turnReaches(thread, 'waiting-permission');
     const idle = settles(thread);
+    // A balanced thread has a reviewer. Its review turn starts after the builder settles, so the
+    // row ends at the crew's closing line.
+    const ended =
+      row.mode === 'balanced'
+        ? next(
+            thread,
+            (event) =>
+              event.type === 'conversation.entry' &&
+              (event.payload as { text: string }).text.startsWith('Crew '),
+          )
+        : null;
     thread.send('Go.');
     const turn = await parked;
     assert.equal(adapter.requests[0].permissionPolicy, 'ask', name);
@@ -1407,6 +1419,7 @@ test('send now and a policy change act on the running turn, and balanced answers
       for (const effect of effects) effect();
     }
     await idle;
+    if (ended) await ended;
     const resolved = agentEvents(thread).find((event) => event.type === 'permission.resolved');
     assert.equal(
       resolved?.type === 'permission.resolved' && resolved.choice,
@@ -1414,7 +1427,11 @@ test('send now and a policy change act on the running turn, and balanced answers
       name,
     );
   }
+});
 
+test('send now stops the running turn and starts the queued message with its packet', {
+  timeout: 30000,
+}, async (t) => {
   // Send now: the queued message goes first, the reply stops, and the message starts on the same
   // family with what the stopped reply left behind. The rest of the queue keeps its place.
   const scripted = createScriptedChatAdapter({

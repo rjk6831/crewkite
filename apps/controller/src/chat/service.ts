@@ -151,7 +151,12 @@ type LiveTurn = {
   /** Open permission requests: the options each one accepts and the tool call it is about. */
   permissions: Map<
     string,
-    { options: readonly ChatPermissionOption[]; callId: string | null; question: string }
+    {
+      options: readonly ChatPermissionOption[];
+      callId: string | null;
+      question: string;
+      deletes: boolean;
+    }
   >;
   /** Tool kind by call ID. A thread grant covers a kind, and only the tool event names it. */
   kinds: Map<string, ChatToolKind>;
@@ -955,6 +960,7 @@ export class ChatService {
         options: event.options,
         callId: event.callId,
         question: event.question,
+        deletes: event.deletes === true,
       });
     if (event.type === 'permission.resolved') live.permissions.delete(event.requestId);
     try {
@@ -1011,15 +1017,9 @@ export class ChatService {
     if (/\bnetwork\b/i.test(words)) return null;
     const scratch = this.scratchDirectory(live.taskId);
     if (balanced) {
-      // shortcut: the event carries no change type, so a delete is known by its words or by the
-      // flag the OpenAI adapter sets. Upgrade: a delete flag on tool.started.
-      const deletes = (call?.input as { deletes?: unknown } | undefined)?.deletes === true;
+      // A delete or move is marked by the adapter from the client's own change type.
       if (kind === 'edit')
-        return !deletes &&
-          !/\b(delete|remove|rm)\b/i.test(words) &&
-          editsInside(call?.input, scratch)
-          ? allow.id
-          : null;
+        return !open.deletes && editsInside(call?.input, scratch) ? allow.id : null;
       return kind === 'command' && readOnlyCommand(call?.input, scratch) ? allow.id : null;
     }
     if (kind === 'edit')

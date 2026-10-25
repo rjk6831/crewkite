@@ -56,8 +56,9 @@ test('saved thread defaults and crew presets survive bad storage and apply only 
   values.set('crewkite-thread-defaults-v1', '{not json');
   assert.deepEqual(readThreadDefaults(store), none);
   assert.deepEqual(readThreadDefaults(null), none);
+  // Even spend was first saved as balanced.
   values.set('crewkite-thread-defaults-v1', '{"handoffMode":"balanced"}');
-  assert.equal(readThreadDefaults(store).handoffMode, 'balanced');
+  assert.equal(readThreadDefaults(store).handoffMode, 'even-spend');
 
   writeThreadDefaults(
     {
@@ -150,4 +151,48 @@ test('saved thread defaults and crew presets survive bad storage and apply only 
     'reviewer:openai',
   ]);
   assert.equal(crewFromPreset(repinned, { families: [] }, null, 'most-left', NOW, store), null);
+});
+
+test('a preset carries each pinned effort into the crew and drops an effort the model no longer offers', () => {
+  const values = new Map<string, string>();
+  const store = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => void values.set(key, value),
+  };
+  const catalog: ChatCatalogRead = {
+    families: [entry('openai', true, []), entry('anthropic', true, [])],
+  };
+  const pin = (builder: 'low' | 'high' | 'medium', reviewer: 'low' | 'high' | 'medium') =>
+    writeCrewPresets(
+      readCrewPresets(store).map((preset) =>
+        preset.name === 'Pair'
+          ? {
+              ...preset,
+              members: [
+                {
+                  role: 'builder',
+                  selection: { family: 'openai', model: 'large-1', effort: builder },
+                },
+                {
+                  role: 'reviewer',
+                  selection: { family: 'anthropic', model: 'large-1', effort: reviewer },
+                },
+              ],
+            }
+          : preset,
+      ),
+      store,
+    );
+  const efforts = () => {
+    const pair = readCrewPresets(store).find((p) => p.name === 'Pair');
+    assert.ok(pair);
+    return crewFromPreset(pair, catalog, null, 'most-left', NOW, store)?.members.map(
+      ({ role, selection }) => `${role}:${selection.effort}`,
+    );
+  };
+  pin('high', 'high');
+  assert.deepEqual(efforts(), ['builder:high', 'reviewer:high']);
+  // The test models offer low and high only, so a saved medium becomes the default, low.
+  pin('high', 'medium');
+  assert.deepEqual(efforts(), ['builder:high', 'reviewer:low']);
 });

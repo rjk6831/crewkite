@@ -33,17 +33,25 @@ export const ChatEffortSchema = z.enum([
 /**
  * How the thread picks the next family when a limit stops a turn and automatic handoff is on.
  * most-left takes the family with the most allowance left. resets-first spends the allowance that
- * resets soonest while it lasts. balanced ranks by allowance left per hour until reset, so every
+ * resets soonest while it lasts. even-spend ranks by allowance left per hour until reset, so every
  * window is spent at the rate it can afford. local-first takes Local while it is connected, then
- * ranks the rest as balanced.
+ * ranks the rest as even-spend.
  */
 export const ChatHandoffModeSchema = z.enum([
   'most-left',
   'resets-first',
-  'balanced',
+  'even-spend',
   'local-first',
 ]);
 export type ChatHandoffMode = z.infer<typeof ChatHandoffModeSchema>;
+/**
+ * A saved mode. even-spend shipped first as balanced, the same word as a flight mode, and saved
+ * threads and settings may still hold it.
+ */
+export const ChatSavedHandoffModeSchema = z.preprocess(
+  (value) => (value === 'balanced' ? 'even-spend' : value),
+  ChatHandoffModeSchema,
+);
 
 /** The person's selection for the next turn. The controller validates it against the catalog. */
 export const ChatModelSelectionSchema = z.strictObject({
@@ -201,6 +209,8 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     question: z.string().min(1).max(4096),
     detail: z.string().max(16_384).nullable().default(null),
     options: z.array(ChatPermissionOptionSchema).min(1).max(6),
+    /** The client said the change deletes or moves a file. Balanced sends these to the person. */
+    deletes: z.literal(true).optional(),
   }),
   z.strictObject({
     type: z.literal('permission.resolved'),
@@ -306,7 +316,7 @@ export const ChatThreadSchema = z.strictObject({
   sessions: z.array(ChatSessionSchema).max(8).default([]),
   activeTurnId: ChatTurnIdSchema.nullable().default(null),
   autoHandoff: z.boolean().default(false),
-  handoffMode: ChatHandoffModeSchema.default('most-left'),
+  handoffMode: ChatSavedHandoffModeSchema.default('most-left'),
   /**
    * Messages sent while a turn was running, oldest first. Each starts its own turn, in order,
    * once the thread is free. Stopping the running turn clears them.
@@ -693,7 +703,7 @@ export function rankFamilies(
       if (
         a.percent !== null &&
         b.percent !== null &&
-        (mode === 'balanced' || mode === 'local-first')
+        (mode === 'even-spend' || mode === 'local-first')
       ) {
         const pace =
           rate({ percent: b.percent, resetsAt: b.resetsAt }) -
