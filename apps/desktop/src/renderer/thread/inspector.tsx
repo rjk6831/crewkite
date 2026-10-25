@@ -530,6 +530,8 @@ function CrewTab({
   const mode = flightModes.find(({ id }) => id === thread?.flightMode) ?? flightModes[0];
   const choices = modelChoices(catalog);
   const idBase = useId();
+  // Builder turns run on the thread's selection, which the composer follows. Moving it in the same
+  // configure call keeps the builder row and the composer on one model.
   function assign(role: string, selection: ChatModelSelection | null) {
     if (!crew || !selection) return;
     onConfigure({
@@ -539,6 +541,7 @@ function CrewTab({
           member.role === role ? { ...member, selection } : member,
         ),
       },
+      ...(role === 'builder' ? { selection } : {}),
     });
   }
   function start(name: string) {
@@ -546,7 +549,14 @@ function CrewTab({
     if (!preset || !thread) return;
     const next = catalog && crewFromPreset(preset, catalog, thread.selection, thread.handoffMode);
     setNote(next ? null : 'Connect a provider in Settings, then start from a preset.');
-    if (next) onConfigure({ crew: next });
+    if (!next) return;
+    const builder = next.members.find((member) => member.role === 'builder')?.selection;
+    const moved =
+      builder &&
+      (builder.family !== thread.selection?.family ||
+        builder.model !== thread.selection?.model ||
+        builder.effort !== thread.selection?.effort);
+    onConfigure({ crew: next, ...(moved ? { selection: builder } : {}) });
   }
   return (
     <div className="th-facts">

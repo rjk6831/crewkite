@@ -27,7 +27,10 @@ export const effortLabels: Record<ChatEffort, string> = {
   default: 'Default',
 };
 
-/** The efforts one model offers. Every place that edits a selection uses it, so labels match. */
+/**
+ * The efforts one model offers. Every place that edits a selection uses it, so labels match. A
+ * saved effort the model no longer offers stays visible so the person can see it and change it.
+ */
 export function EffortSelect({
   efforts,
   value,
@@ -46,6 +49,9 @@ export function EffortSelect({
       value={value}
       onChange={(event) => onChange(event.target.value as ChatEffort)}
     >
+      {!efforts.includes(value) && (
+        <option value={value}>{effortLabels[value]} (not available now)</option>
+      )}
       {efforts.map((effort) => (
         <option key={effort} value={effort}>
           {effortLabels[effort]}
