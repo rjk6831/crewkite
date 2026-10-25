@@ -21,7 +21,7 @@ import {
 import { type BrowserWindow, dialog, ipcMain } from 'electron';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
-import { assertSender } from './security.ts';
+import { assertSender, openExternalLink } from './security.ts';
 
 const verifications = new WeakMap<BrowserWindow, { requestId: string; abort: AbortController }>();
 const validVerificationId = (value: unknown): value is string =>
@@ -157,6 +157,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'events',
     'verify-artifact',
     'cancel-artifact-verification',
+    'open-link',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
@@ -409,6 +410,10 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       busy = false;
       activeCommand = null;
     }
+  });
+  ipcMain.handle('crewkite:open-link', (event, url: unknown) => {
+    assertSender(event, window);
+    return openExternalLink(window, url);
   });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);

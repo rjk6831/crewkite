@@ -1,6 +1,7 @@
 import { globSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { relative, resolve, sep } from 'node:path';
 import { type BrowserWindow, dialog, type IpcMainInvokeEvent, type Session, shell } from 'electron';
+import { externalLink, type OpenLinkResult } from '../shared/external-link.ts';
 
 export const rendererURL = 'app://crewkite/index.html';
 const contentTypes: Record<string, string> = {
@@ -96,6 +97,46 @@ function githubWorkLink(value: string): boolean {
       url.pathname,
     )
   );
+}
+
+const confirming = new WeakSet<BrowserWindow>();
+
+// A link in a reply opens in the person's browser. Main validates the address itself and asks
+// before opening plain http. One question at a time, so a reply full of links cannot stack dialogs.
+export async function openExternalLink(
+  window: BrowserWindow,
+  value: unknown,
+): Promise<OpenLinkResult> {
+  const target = externalLink(value);
+  if (!target) return 'refused';
+  if (!target.secure) {
+    if (confirming.has(window)) return 'declined';
+    confirming.add(window);
+    try {
+      const choice = await dialog.showMessageBox(window, {
+        type: 'warning',
+        message: 'Open a link that is not encrypted?',
+        detail: `${target.href}\n\nThis address uses http. Anything on the page, and anything you send to it, can be read on the network.`,
+        buttons: ['Cancel', 'Open in browser'],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+      });
+      if (choice.response !== 1 || window.isDestroyed()) return 'declined';
+    } finally {
+      confirming.delete(window);
+    }
+  }
+  try {
+    await shell.openExternal(target.href);
+    return 'opened';
+  } catch {
+    dialog.showErrorBox(
+      'The link could not be opened',
+      `Open this address in your browser: ${target.href}`,
+    );
+    return 'refused';
+  }
 }
 
 export function assertSender(event: IpcMainInvokeEvent, window: BrowserWindow) {

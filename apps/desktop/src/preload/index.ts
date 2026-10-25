@@ -82,6 +82,10 @@ const bridge: DesktopSource = {
       notices.delete(receive);
     };
   },
+  openLink: async (url) => {
+    const value: unknown = await ipcRenderer.invoke('crewkite:open-link', String(url));
+    return value === 'opened' || value === 'declined' ? value : 'refused';
+  },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
     await ipcRenderer.invoke('crewkite:reconnect');
