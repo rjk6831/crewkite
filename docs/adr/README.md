@@ -38,6 +38,8 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0038](0038-crew-and-flight-modes.md) | Run a crew in a thread, with flight modes and four handoff modes | Accepted |
 | [0039](0039-attachments-follow-each-client.md) | Send each attached file the way its client takes it | Accepted |
 | [0040](0040-accept-from-the-thread-base.md) | Accept from the thread's base, whatever HEAD is | Accepted |
+| [0042](0042-the-thread-is-the-source-of-truth-for-every-family.md) | Make the thread the source of truth for every family | Proposed |
+| [0043](0043-remember-the-local-token-on-this-mac.md) | Remember the Local token on this Mac | Proposed |
 
 ## Writing a new record
 
