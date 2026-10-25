@@ -19,6 +19,8 @@ import {
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
 import { type BrowserWindow, dialog, ipcMain } from 'electron';
+import { attachRequest } from '../shared/attach.ts';
+import { ComposerFiles } from './attach.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { assertSender, openExternalLink } from './security.ts';
@@ -158,6 +160,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'verify-artifact',
     'cancel-artifact-verification',
     'open-link',
+    'attach',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
@@ -416,6 +419,15 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     assertSender(event, window);
     return openExternalLink(window, url);
   });
+  const files = new ComposerFiles(window);
+  ipcMain.handle('crewkite:attach', async (event, input: unknown) => {
+    assertSender(event, window);
+    const request = attachRequest(input);
+    if (!request) throw new Error('The file request is invalid.');
+    const found = await files.find(request);
+    assertSender(event, window);
+    return found;
+  });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);
     listening = true;
@@ -435,6 +447,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   });
   window.once('closed', () => {
     verifications.get(window)?.abort.abort();
+    files.close();
     for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   });
   async function connect() {

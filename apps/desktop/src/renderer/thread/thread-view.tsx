@@ -1,11 +1,13 @@
-import type { ChatModelSelection, WorkspaceState } from '@crewkite/contracts';
+import type { ChatCatalogRead, ChatModelSelection, WorkspaceState } from '@crewkite/contracts';
 import { GitBranch, PanelRight } from 'lucide-react';
-import { useCallback, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { RerunControl, TryWith } from './cards.tsx';
 import {
   configureThread,
   handoffThread,
   resolvePermission,
+  retryTurn,
   sendMessage,
   steerMessage,
   stopTurn,
@@ -14,12 +16,21 @@ import {
 import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
 import { EmptyThread } from './empty-thread.tsx';
 import { FamilyMark } from './family-mark.tsx';
+import { tryWithChoices } from './file-fit.ts';
 import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { QueuedList } from './queued-list.tsx';
-import { lastFamily, latestContext, type ThreadSettings } from './thread-state.ts';
+import {
+  lastFamily,
+  lastReply,
+  latestContext,
+  type ThreadItem,
+  type ThreadSettings,
+  triedFamilies,
+  turnFiles,
+} from './thread-state.ts';
 import { ThreadTitle } from './thread-title.tsx';
 import type { TurnView } from './turn-fold.ts';
 import { useThread } from './use-thread.ts';
@@ -65,11 +76,21 @@ export function ThreadView({
   preview: boolean;
   connection: string;
 }) {
-  const { state, items, dispatch, error, activeTurn, reload, retry } = useThread(
-    source,
-    task.id,
-    connection,
-  );
+  const {
+    state,
+    items,
+    dispatch,
+    error,
+    activeTurn,
+    wantsHistory,
+    loadHistory,
+    hasEarlier,
+    loadEarlier,
+    earlierNote,
+    reload,
+    retry,
+  } = useThread(source, task.id, connection);
+  const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const [inspector, setInspector] = useState<{
     open: boolean;
     tab: InspectorTab;
@@ -89,19 +110,21 @@ export function ThreadView({
   // the pending bubble is only for a message that starts now.
   const waits = activeTurn !== null || !!queued?.length || !!thread?.ownershipUnknown;
   const send = useCallback(
-    async ({ text, attachments, selection }: SendInput) => {
+    async ({ text, files: added, selection }: SendInput) => {
       counter.current += 1;
       const localId = `local-${counter.current}`;
+      // The composer stores each file under the thread as it is added.
+      const files = added.flatMap((item) => (item.file ? [item.file] : []));
       if (!waits)
         dispatch({
           type: 'sending',
-          pending: { localId, text, attachments, at: new Date().toISOString() },
+          pending: { localId, text, files, at: new Date().toISOString() },
         });
       try {
         await sendMessage(source, {
           taskId: task.id,
           text,
-          attachments,
+          files,
           ...(selection ? { selection } : {}),
         });
         setNotice(null);
@@ -117,8 +140,12 @@ export function ThreadView({
     if (!activeTurn) return;
     const result = await stopTurn(source, { taskId: task.id, turnId: activeTurn });
     const cleared = result.data?.kind === 'chat-queue' ? result.data.messages : [];
-    if (cleared.length) composer.current?.restore(cleared.map((item) => item.text).join('\n\n'));
-    // The text comes back as plain messages. A queued action or attachment has to be chosen again.
+    if (cleared.length)
+      composer.current?.restore(
+        cleared.map((item) => item.text).join('\n\n'),
+        cleared.flatMap((item) => item.files),
+      );
+    // The text and files come back as one plain message. A queued action has to be chosen again.
     if (cleared.some((item) => item.role !== 'assistant' || item.attachments.length))
       setNotice('The queued text is back in the composer. Pick the action or attachments again.');
   }, [source, task.id, activeTurn]);
@@ -169,6 +196,55 @@ export function ThreadView({
       ),
     [source, task.id, dispatch],
   );
+  // Retry and Regenerate run the message that started the turn again, on the model the menu shows.
+  const rerun = useCallback(
+    async (turnId: string, mode: 'retry' | 'regenerate', selection: ChatModelSelection | null) => {
+      await retryTurn(source, {
+        taskId: task.id,
+        turnId,
+        mode,
+        ...(selection ? { selection } : {}),
+      });
+      setNotice(null);
+    },
+    [source, task.id],
+  );
+  const replyId = useMemo(() => (activeTurn ? null : lastReply(items)), [activeTurn, items]);
+  const current = thread?.selection ?? null;
+  const actions = (item: ThreadItem): ReactNode => {
+    if (item.kind !== 'turn' && item.kind !== 'failure') return null;
+    const turnId = item.kind === 'turn' ? item.turn.id : item.turnId;
+    const note = item.kind === 'turn' ? state.historyNotes[turnId] : undefined;
+    const retryable = item.kind === 'failure' || item.turn.status === 'stopped';
+    const regenerate = item.kind === 'turn' && turnId === replyId;
+    const rejected = item.kind === 'failure' && item.failure.kind === 'attachment-rejected';
+    if (!note && !retryable && !regenerate) return null;
+    const choices =
+      rejected && catalog
+        ? tryWithChoices(
+            catalog,
+            triedFamilies(state, turnId),
+            turnFiles(state, turnId).map((file) => file.mimeType),
+            thread?.handoffMode,
+          )
+        : [];
+    return (
+      <div className="th-row th-turn-actions">
+        {note && <p className="th-muted">{note}</p>}
+        {(retryable || regenerate) && !activeTurn && (
+          <RerunControl
+            label={regenerate ? 'Regenerate' : 'Retry'}
+            catalog={catalog}
+            current={current}
+            onRun={(selection) => rerun(turnId, regenerate ? 'regenerate' : 'retry', selection)}
+          />
+        )}
+        {rejected && !activeTurn && (
+          <TryWith choices={choices} onRun={(selection) => rerun(turnId, 'retry', selection)} />
+        )}
+      </div>
+    );
+  };
   // Focus inside the panel moves to the toolbar button first, so closing does not drop it.
   const closeInspector = useCallback(() => {
     if (document.activeElement?.closest('.th-inspector')) toggle.current?.focus();
@@ -244,6 +320,10 @@ export function ThreadView({
               <LimitOfferCard key={offer.turnId} source={source} taskId={task.id} offer={offer} />
             )
           }
+          actions={actions}
+          wantsHistory={wantsHistory}
+          onTurnVisible={loadHistory}
+          earlier={hasEarlier ? { onLoad: loadEarlier, note: earlierNote } : null}
           onResolve={resolve}
           onOpenChanges={openChanges}
         />
@@ -270,6 +350,7 @@ export function ThreadView({
           onConfigured={(selection) => dispatch({ type: 'configured', patch: { selection } })}
           onHandoff={handoff}
           onOpenCrew={() => setInspector({ open: true, tab: 'crew', focus: null })}
+          onCatalog={setCatalog}
         />
       </section>
       {inspector.open && (

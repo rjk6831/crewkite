@@ -1,4 +1,4 @@
-import type { ChatFailure } from '@crewkite/contracts';
+import type { ChatCatalogRead, ChatFailure, ChatModelSelection } from '@crewkite/contracts';
 import {
   Brain,
   Check,
@@ -15,7 +15,10 @@ import {
   Wrench,
 } from 'lucide-react';
 import { type ReactNode, useState } from 'react';
+import { familyName } from '../components.tsx';
 import { formatSpan } from '../usage-gauges.tsx';
+import type { TryWithChoice } from './file-fit.ts';
+import { ModelPicker } from './model-picker.tsx';
 import {
   type PermissionBlock,
   runLabel,
@@ -270,6 +273,132 @@ export function FailureLine({ failure }: { failure: ChatFailure }) {
           {failure.detail && <pre className="th-failure-detail">{failure.detail}</pre>}
         </details>
       </div>
+    </div>
+  );
+}
+
+const runFailure = (failure: unknown) =>
+  failure instanceof Error ? failure.message : 'The message was not run again.';
+
+/**
+ * Retry on a failed or stopped turn, Regenerate on the last reply. The menu starts on the thread's
+ * current model, and the run uses whatever it shows.
+ */
+export function RerunControl({
+  label,
+  catalog,
+  current,
+  onRun,
+}: {
+  label: 'Retry' | 'Regenerate';
+  catalog: ChatCatalogRead | null;
+  current: ChatModelSelection | null;
+  onRun: (selection: ChatModelSelection | null) => Promise<void>;
+}) {
+  const [picked, setPicked] = useState<ChatModelSelection | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const selection = picked ?? current;
+  async function run() {
+    setBusy(true);
+    setError(null);
+    try {
+      await onRun(selection);
+    } catch (failure) {
+      setError(runFailure(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="th-rerun">
+      <button
+        type="button"
+        className="th-pill th-outline"
+        disabled={busy}
+        onClick={() => void run()}
+      >
+        {label}
+      </button>
+      <ModelPicker
+        catalog={catalog}
+        selection={selection}
+        currentFamily={null}
+        running={false}
+        nowMs={Date.now()}
+        onOpen={() => {}}
+        onSelect={setPicked}
+        label={`Model for ${label}`}
+      />
+      {error && (
+        <p className="th-error" role="alert">
+          {error}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** The families a rejected message has not tried yet, in the order `tryWithChoices` gives. */
+export function TryWith({
+  choices,
+  onRun,
+}: {
+  choices: readonly TryWithChoice[];
+  onRun: (selection: ChatModelSelection) => Promise<void>;
+}) {
+  const [open, setOpen] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  async function run(selection: ChatModelSelection) {
+    setBusy(true);
+    setError(null);
+    try {
+      await onRun(selection);
+      setOpen(false);
+    } catch (failure) {
+      setError(runFailure(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <div className="th-try-with">
+      <button
+        type="button"
+        className="th-pill th-outline"
+        aria-expanded={open}
+        disabled={choices.length === 0}
+        title={
+          choices.length === 0 ? 'Every connected provider has tried this message.' : undefined
+        }
+        onClick={() => setOpen(!open)}
+      >
+        Try with
+        <ChevronRight size={13} className="th-chevron" aria-hidden="true" />
+      </button>
+      {open && (
+        <ul aria-label="Try with">
+          {choices.map((choice) => (
+            <li key={choice.family}>
+              <button
+                type="button"
+                className="th-try-option"
+                disabled={busy}
+                onClick={() => void run(choice.selection)}
+              >
+                <span>{familyName(choice.family)}</span>
+                <span className="th-muted">{choice.label}</span>
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {error && (
+        <p className="th-error" role="alert">
+          {error}
+        </p>
+      )}
     </div>
   );
 }
