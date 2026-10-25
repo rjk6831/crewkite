@@ -21,6 +21,7 @@ import {
 import { type BrowserWindow, dialog, ipcMain } from 'electron';
 import { attachRequest } from '../shared/attach.ts';
 import { ComposerFiles } from './attach.ts';
+import { PathGrants } from './grants.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { assertSender, openExternalLink } from './security.ts';
@@ -39,6 +40,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   let activeCommand: Command | null = null;
   let cancelling = false;
   const receipts = new CommandReceipts(controller.paths.home, controller.paths.profile);
+  const grants = new PathGrants();
   let connection: DesktopNotice = {
     kind: 'connection',
     state: 'connecting',
@@ -234,6 +236,8 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
       key: createCommandKey(),
       actor: desktopActor,
     });
+    const refused = grants.refusal(command);
+    if (refused) throw new Error(refused);
     if (
       [
         'GetWorkspaceState',
@@ -419,7 +423,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     assertSender(event, window);
     return openExternalLink(window, url);
   });
-  const files = new ComposerFiles(window);
+  const files = new ComposerFiles(window, grants);
   ipcMain.handle('crewkite:attach', async (event, input: unknown) => {
     assertSender(event, window);
     const request = attachRequest(input);

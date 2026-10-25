@@ -4,6 +4,7 @@ import type { DesktopFile } from '@crewkite/client';
 import { MAX_CHAT_PASTE_BYTES } from '@crewkite/contracts';
 import { app, type BrowserWindow, clipboard, dialog, nativeImage } from 'electron';
 import { type AttachRequest, MAX_ATTACH_FILES, MAX_THUMBNAIL_LENGTH } from '../shared/attach.ts';
+import type { PathGrants } from './grants.ts';
 
 const THUMBNAIL_PIXELS = 96;
 // A thumbnail decodes the whole picture first. Past this size the chip shows the name, which
@@ -65,16 +66,19 @@ async function clipboardImage(): Promise<Buffer | null> {
 /**
  * Finds files for one window's composer. Pasted images have no path, so they are written to a
  * private folder under the system temp path. The folder holds one message worth of images and goes
- * when the window closes.
+ * when the window closes. Every path it returns is granted to the window, so the bridge can tell
+ * a file main gave out from a path the renderer made up.
  */
 export class ComposerFiles {
   private folder: string | null = null;
   private pasted: string[] = [];
   private count = 0;
   private readonly window: BrowserWindow;
+  private readonly grants: PathGrants;
 
-  constructor(window: BrowserWindow) {
+  constructor(window: BrowserWindow, grants: PathGrants) {
     this.window = window;
+    this.grants = grants;
   }
 
   async find(request: AttachRequest): Promise<DesktopFile[]> {
@@ -88,7 +92,9 @@ export class ComposerFiles {
               properties: ['openFile', 'multiSelections'],
             })
             .then((choice) => (choice.canceled ? [] : choice.filePaths));
-    return paths.slice(0, MAX_ATTACH_FILES).flatMap((path) => describe(path) ?? []);
+    const found = paths.slice(0, MAX_ATTACH_FILES).flatMap((path) => describe(path) ?? []);
+    for (const file of found) this.grants.grant(file.path);
+    return found;
   }
 
   private async paste(): Promise<DesktopFile[]> {
@@ -102,13 +108,16 @@ export class ComposerFiles {
     // An image the composer dropped long ago has been copied or discarded by now.
     while (this.pasted.length > MAX_ATTACH_FILES) {
       const oldest = this.pasted.shift();
-      if (oldest) rmSync(oldest, { force: true });
+      if (!oldest) continue;
+      rmSync(oldest, { force: true });
+      this.grants.revoke(oldest);
     }
     const file = describe(path);
     if (!file) {
       unlinkSync(path);
       throw new Error('The pasted image could not be saved.');
     }
+    this.grants.grant(file.path);
     return [file];
   }
 
