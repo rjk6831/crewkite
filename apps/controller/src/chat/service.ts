@@ -71,9 +71,12 @@ import {
   chatFailure,
 } from './adapter.ts';
 import {
+  type DiscardOutcome,
   deleteThreadBaseRef,
   discardScratchPath,
+  readDiscardMark,
   scratchChanges,
+  writeDiscardMark,
   writeThreadBaseRef,
 } from './changes.ts';
 import { FileRefused, filesFolder, storedFile, storeFile } from './files.ts';
@@ -682,7 +685,7 @@ export class ChatService {
    * Put one path of the scratch copy back the way the thread's base has it. Changes then leaves it
    * out, so Accept carries only what is left. A system line records each discard.
    */
-  discardChange(payload: Payload<'DiscardChatChange'>): CommandResult {
+  discardChange(payload: Payload<'DiscardChatChange'>, key?: string): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
     const { thread, left } = this.checkedThread(task);
@@ -694,12 +697,29 @@ export class ChatService {
     const base = thread.base;
     if (!base || !thread.scratchReady)
       return blocked('not-changed', 'This file has no changes to discard.');
-    let outcome: ReturnType<typeof discardScratchPath>;
+    // The copy changes before the receipt commits. A crash between the two leaves the mark, and the
+    // retry of that command finds the copy already restored. Its line rolled back with the
+    // receipt, so the retry answers applied and writes it.
+    const file = join(this.deps.home, 'chat', task.id, 'discard.json');
+    const mark = key ? readDiscardMark(file) : null;
+    const retried =
+      mark && mark.key === key && mark.path === payload.path && mark.base === base
+        ? mark.done
+        : null;
+    let outcome: DiscardOutcome;
     try {
-      outcome = discardScratchPath(root, this.scratchDirectory(task.id), base, payload.path);
+      outcome = discardScratchPath(
+        root,
+        this.scratchDirectory(task.id),
+        base,
+        payload.path,
+        key ? (done) => writeDiscardMark(file, { key, path: payload.path, base, done }) : undefined,
+      );
     } catch {
       return blocked('scratch-unreadable', 'The scratch copy could not be read. Discard again.');
     }
+    if (retried && 'refused' in outcome && outcome.refused === 'not-changed')
+      outcome = { done: retried };
     if ('refused' in outcome) return blocked(outcome.refused, discardRefusals[outcome.refused]);
     const short = base.slice(0, 7);
     this.appendEntry(task, {

@@ -1325,7 +1325,7 @@ export class Controller {
       case 'RetryChatTurn':
         return this.chat().retryTurn(command.payload, effects);
       case 'DiscardChatChange':
-        return this.chat().discardChange(command.payload);
+        return this.chat().discardChange(command.payload, command.key);
       case 'RenameChatThread':
         return this.chat().renameThread(command.payload);
       case 'DeleteChatThread':
