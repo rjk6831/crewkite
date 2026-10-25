@@ -27,7 +27,15 @@ export type ChatTurnRequest = Readonly<{
    * Files the person attached to this message, stored under the controller home. Each adapter
    * sends them in its client's own content blocks or names the path. Absent means none.
    */
-  files?: readonly Readonly<{ attachment: ChatAttachment; path: string }>[];
+  files?: readonly Readonly<{
+    attachment: ChatAttachment;
+    path: string;
+    /**
+     * The file came with an earlier message and travels with a handoff. Adapters name it by path
+     * or link, and never refuse the turn over it.
+     */
+    earlier?: boolean;
+  }>[];
   /** CrewKite's framing for the model: project, scratch rules, what to do with results. */
   systemContext: string;
   /** Transcript so far, oldest first. Adapters with a resumable native session may ignore it. */
