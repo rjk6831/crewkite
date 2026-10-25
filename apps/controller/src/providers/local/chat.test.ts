@@ -8,6 +8,7 @@ import { type AgentEvent, AgentEventSchema } from '@crewkite/contracts';
 import type {
   ChatInput,
   ChatMessage,
+  FileHandle,
   GuardToolCallController,
   LLM,
   LLMPredictionStats,
@@ -155,16 +156,27 @@ function start(
   model: LoadedModelLike,
   contextLength: number,
   request: ChatTurnRequest,
-  loaded = { modelKey: 'local-fixture', fellBack: false },
+  loaded: { modelKey?: string; fellBack?: boolean; vision?: boolean } = {},
 ) {
   const events: AgentEvent[] = [];
   let handle: ChatTurnHandle | undefined;
   let disposals = 0;
+  // Each prepared image comes back as a handle naming the file and its bytes.
+  const prepared: { name: string; base64: string }[] = [];
   const adapter = localChatAdapter({
     connect: async () => ({
       model,
       contextLength,
+      modelKey: 'local-fixture',
+      fellBack: false,
+      vision: false,
       ...loaded,
+      files: {
+        prepareImageBase64: async (name, base64) => {
+          prepared.push({ name, base64 });
+          return { name, base64 } as unknown as FileHandle;
+        },
+      },
       dispose: async () => {
         disposals++;
       },
@@ -175,7 +187,7 @@ function start(
     if (event.type === 'permission.requested')
       handle?.respondPermission(event.requestId, 'allow-once');
   });
-  return { events, handle, disposals: () => disposals };
+  return { events, handle, disposals: () => disposals, prepared };
 }
 
 test('a local turn streams, reads freely, edits after permission and reports its stats', async () => {
@@ -650,6 +662,73 @@ test('a prompt larger than the context gets one line asking for a smaller first 
     assert.equal(result.stopReason, 'done');
     assert.equal(result.failure, null);
     assert.equal(result.assistantText, sentence);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('files reach a Local turn as images on a vision model and as inlined text, and anything else is refused before act', async () => {
+  const { root, home, clock, request } = fixture();
+  try {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1]);
+    const store = (name: string, mimeType: string, body: string | Buffer) => {
+      const id = createHash('sha256').update(body).digest('hex');
+      const path = join(home, 'chat', taskId, 'files', id, name);
+      mkdirSync(join(home, 'chat', taskId, 'files', id), { recursive: true });
+      writeFileSync(path, body);
+      return { attachment: { id, name, mimeType, bytes: Buffer.byteLength(body) }, path };
+    };
+    const shot = store('shot.png', 'image/png', png);
+    const notes = store('notes.md', 'text/markdown', '# Notes\nn is the count.\n');
+    const report = store('report.pdf', 'application/pdf', '%PDF-1.7 fixture');
+    const latin = store('latin.txt', 'text/plain', Buffer.from([0x63, 0x61, 0x66, 0xe9]));
+    for (const row of [
+      {
+        // The image rides on the person's message and the text file follows its words.
+        vision: true,
+        files: [shot, notes],
+        message:
+          'Rename n to count in src/a.ts.\n\nAttached file notes.md:\n# Notes\nn is the count.\n',
+        prepared: [{ name: 'shot.png', base64: png.toString('base64') }],
+        failure: null,
+      },
+      {
+        vision: false,
+        files: [shot],
+        prepared: [],
+        failure: 'Local cannot take shot.png: the loaded model local-fixture does not take images.',
+      },
+      {
+        vision: true,
+        files: [report, latin],
+        prepared: [],
+        failure:
+          'Local cannot take report.pdf: Local takes images and text files, and this file is application/pdf; latin.txt: it is not UTF-8 text.',
+      },
+    ]) {
+      const { model, calls } = fakeModel([{ steps: [{ text: 'Seen.' }], stats: {} }], clock);
+      const turn = start(model, 8192, request(0, { files: row.files }), { vision: row.vision });
+      const result = await turn.handle.result;
+      assert.deepEqual(turn.prepared, row.prepared, row.failure ?? 'accepted');
+      if (row.failure === null) {
+        const message = calls[0].chat.at(-1);
+        assert.equal(message?.content, row.message);
+        assert.deepEqual(message?.images, row.prepared);
+        assert.equal(result.stopReason, 'done');
+        continue;
+      }
+      // Refused before the model ran, so no round and no stats.
+      assert.equal(calls.length, 0, row.failure);
+      assert.deepEqual(
+        turn.events.map((event) => event.type),
+        ['turn.started', 'turn.completed'],
+      );
+      assert.equal(result.stopReason, 'error');
+      assert.equal(result.failure?.kind, 'attachment-rejected');
+      assert.equal(result.failure?.message, row.failure);
+      assert.equal(result.failure?.nextAction, 'Try another provider for these files.');
+      assert.equal(turn.disposals(), 1);
+    }
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
