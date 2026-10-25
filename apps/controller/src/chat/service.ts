@@ -79,7 +79,15 @@ import {
   writeDiscardMark,
   writeThreadBaseRef,
 } from './changes.ts';
-import { FileRefused, filesFolder, storedFile, storeFile } from './files.ts';
+import {
+  dropStaged,
+  FileRefused,
+  filesFolder,
+  placeFile,
+  type StagedFile,
+  stageFile,
+  storedFile,
+} from './files.ts';
 import {
   type ChatGitHost,
   openChatPullRequest,
@@ -249,6 +257,8 @@ const WRITING_FLAGS =
 // would rewrite before the program sees it.
 const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
 
+const NOT_STORED =
+  'CrewKite could not copy the file. Check the free disk space, then attach it again.';
 const blocked = (reason: string, next?: string): CommandResult => ({
   outcome: 'blocked',
   reason,
@@ -289,6 +299,10 @@ export class ChatService {
   private readonly deps: ChatServiceDeps;
   private readonly live = new Map<string, LiveTurn>();
   private closed = false;
+  /** The copy `importing` made, for the import command it commits next. */
+  private staged:
+    | { payload: Payload<'ImportChatAttachment'>; staged: StagedFile | CommandResult }
+    | undefined;
 
   constructor(deps: ChatServiceDeps) {
     this.deps = deps;
@@ -592,23 +606,51 @@ export class ChatService {
   }
 
   /**
-   * Store one file for the thread and journal it under its hash. The bytes land on disk before the
-   * command commits, so a rolled back import leaves a stored file no message names, and the next
-   * import of the same bytes reuses it.
+   * Copy the file of an import before `commit` opens the command's transaction, so a large file
+   * or one that downloads on open holds up no other thread. `commit` runs synchronously, and the
+   * import inside it only moves the copy into place.
+   */
+  async importing(
+    payload: Payload<'ImportChatAttachment'>,
+    commit: () => CommandResult,
+  ): Promise<CommandResult> {
+    if (!this.task(payload.taskId)) return commit();
+    let staged: StagedFile | CommandResult;
+    try {
+      staged = await stageFile(this.filesFolder(payload.taskId), payload.source);
+    } catch (error) {
+      staged =
+        error instanceof FileRefused
+          ? blocked('file-refused', error.message)
+          : blocked('file-not-stored', NOT_STORED);
+    }
+    this.staged = { payload, staged };
+    try {
+      return commit();
+    } finally {
+      this.staged = undefined;
+      if (!('outcome' in staged)) dropStaged(staged);
+    }
+  }
+
+  /**
+   * Move the copy `importing` made into place and journal it under its hash. The bytes land on
+   * disk before the command commits, so a rolled back import leaves a stored file no message
+   * names, and the next import of the same bytes reuses it.
    */
   importAttachment(payload: Payload<'ImportChatAttachment'>): CommandResult {
     const task = this.task(payload.taskId);
     if (!task) return blocked('task-not-found');
-    let file: ChatAttachment;
+    const staged = this.staged?.payload === payload ? this.staged.staged : undefined;
+    this.staged = undefined;
+    if (!staged) return blocked('file-not-stored', NOT_STORED);
+    if ('outcome' in staged) return staged;
     try {
-      file = storeFile(this.filesFolder(task.id), payload.source);
-    } catch (error) {
-      if (error instanceof FileRefused) return blocked('file-refused', error.message);
-      return blocked(
-        'file-not-stored',
-        'CrewKite could not copy the file. Check the free disk space, then attach it again.',
-      );
+      placeFile(this.filesFolder(task.id), staged);
+    } catch {
+      return blocked('file-not-stored', NOT_STORED);
     }
+    const file = staged.attachment;
     const data = { kind: 'chat-attachment', ...file } as const;
     const key = `chat-file:${task.id}:${file.id}`;
     if (!this.deps.store.receipt(key))
