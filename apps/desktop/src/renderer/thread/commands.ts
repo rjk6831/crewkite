@@ -10,6 +10,7 @@ import {
   ChatThreadReadSchema,
   type CommandResult,
   ConfigureChatThreadPayloadSchema,
+  DeleteChatThreadPayloadSchema,
   HandoffChatThreadPayloadSchema,
   OpenChatPullRequestPayloadSchema,
   PushChatBranchPayloadSchema,
@@ -18,6 +19,7 @@ import {
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
   RefreshChatModelsPayloadSchema,
+  RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
@@ -173,6 +175,12 @@ export const readBranchStatus = (
     ReadChatBranchStatusPayloadSchema.parse({ taskId, branch }),
     ChatBranchStatusSchema,
   );
+
+// A refusal throws with the controller's next step, such as "Rename is not available yet."
+export const renameThread = (source: ThreadSource, taskId: string, title: string) =>
+  run(source, 'RenameChatThread', RenameChatThreadPayloadSchema.parse({ taskId, title }));
+export const deleteThread = (source: ThreadSource, taskId: string) =>
+  run(source, 'DeleteChatThread', DeleteChatThreadPayloadSchema.parse({ taskId }));
 
 // The controller events the thread view folds. A conversation entry also reaches the workspace,
 // which still reads it. The other three are streamed output and thread state. They change many

@@ -32,6 +32,7 @@ import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
+import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
@@ -376,7 +377,7 @@ function CommandPalette({
                 (task.match?.field === 'project' ? task.match.text : task.projectId);
               return (
                 <button key={key} {...optionProps(key, false)}>
-                  <span className={`status-dot state-${task.state}`} aria-hidden="true" />
+                  <span className={`status-dot state-${task.chatActivity}`} aria-hidden="true" />
                   <span className="palette-option-text">
                     <span className="palette-option-title">
                       <Highlight
@@ -492,6 +493,11 @@ export function App() {
         : titleCase(connection);
   const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
+  // Threads deleted here leave the rail at once, before the workspace read catches up.
+  const [removed, setRemoved] = useState<ReadonlySet<string>>(() => new Set());
+  const [deleting, setDeleting] = useState<{ id: string; title: string } | null>(null);
+  const railTasks = (projectId: string) =>
+    (taskPages[projectId]?.tasks ?? []).filter(({ id }) => !removed.has(id));
   useEffect(() => {
     void workspace.selectTask(selected);
   }, [selected, workspace.selectTask]);
@@ -501,9 +507,11 @@ export function App() {
   }, [projects, taskPages, workspace.loadTasks]);
   useEffect(() => {
     if (selected) return;
-    const first = Object.values(taskPages).flatMap((page) => page.tasks)[0];
+    const first = Object.values(taskPages)
+      .flatMap((page) => page.tasks)
+      .find(({ id }) => !removed.has(id));
     if (first) setSelected(first.id);
-  }, [selected, taskPages]);
+  }, [selected, taskPages, removed]);
   const [theme, setTheme] = useState(() => readPreference('crewkite-theme') ?? 'dark');
   const [collapsed, setCollapsed] = useState(
     () => readPreference('crewkite-sidebar-collapsed-v1') === '1',
@@ -528,6 +536,28 @@ export function App() {
     setNewThread(null);
     setSelected(id);
     setPage('tasks');
+  }
+  const titles = new Map(
+    Object.values(taskPages).flatMap((page) => page.tasks.map((row) => [row.id, row.title])),
+  );
+  const attention = useThreadAttention({
+    source: workspace.source,
+    header,
+    titles,
+    openThreadId: page === 'tasks' && newThread === null ? selected : null,
+    onOpenThread: openThread,
+  });
+  // The rail moves to the thread after the deleted one, or the one before it, or the empty state.
+  function threadDeleted(id: string) {
+    const order = projects.flatMap((project) => railTasks(project.id).map((row) => row.id));
+    const rest = order.filter((value) => value !== id);
+    const next = rest[Math.min(Math.max(order.indexOf(id), 0), rest.length - 1)] ?? null;
+    setRemoved((current) => new Set(current).add(id));
+    attention.forget(id);
+    setDeleting(null);
+    if (selected !== id) return;
+    if (next) openThread(next);
+    else setSelected(null);
   }
   // Runs before the dialog opens and after it is removed, so focus goes back where it came from.
   useLayoutEffect(() => {
@@ -662,21 +692,25 @@ export function App() {
                   <Plus size={14} aria-hidden="true" />
                 </button>
               </div>
-              {(taskPages[project.id]?.tasks ?? []).map((value) => {
+              {railTasks(project.id).map((value) => {
                 const current = page === 'tasks' && newThread === null && task?.id === value.id;
-                return (
-                  <button
-                    type="button"
+                return threadSource ? (
+                  <RailThread
                     key={value.id}
-                    className={`task-link ${current ? 'active' : ''}`}
-                    aria-current={current ? 'page' : undefined}
-                    onClick={() => openThread(value.id)}
-                  >
-                    <span className={`status-dot state-${value.state}`} />
-                    <span>{value.title}</span>
-                    {value.state === 'waiting' && <span className="notification-dot" />}
-                  </button>
-                );
+                    source={threadSource}
+                    taskId={value.id}
+                    title={value.title}
+                    activity={attention.activity(
+                      value.id,
+                      value.chatActivity,
+                      taskPages[project.id].cursor,
+                    )}
+                    unseen={attention.unseen.has(value.id)}
+                    current={current}
+                    onOpen={() => openThread(value.id)}
+                    onDelete={() => setDeleting({ id: value.id, title: value.title })}
+                  />
+                ) : null;
               })}
               {project.taskCount === 0 && <p className="nav-empty">No threads yet</p>}
               {project.taskCount > 0 && !taskPages[project.id] && (
@@ -892,6 +926,15 @@ export function App() {
         </footer>
       </div>
       {about && <About preview={preview} onClose={() => setAbout(false)} />}
+      {deleting && threadSource && (
+        <DeleteThreadDialog
+          source={threadSource}
+          taskId={deleting.id}
+          title={deleting.title}
+          onDeleted={() => threadDeleted(deleting.id)}
+          onClose={() => setDeleting(null)}
+        />
+      )}
       {palette && (
         <Dialog title="Search threads and commands" onClose={() => setPalette(false)}>
           <CommandPalette

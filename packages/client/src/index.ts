@@ -40,7 +40,19 @@ export interface DesktopSource {
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;
   onNotice?(listener: (notice: DesktopNotice) => void): () => void;
+  /** Set the dock badge and post at most one system notification for a thread. */
+  threadAttention?(input: ThreadAttentionInput): Promise<void>;
+  /** A clicked thread notification asks the window to open that thread. */
+  onOpenThread?(listener: (taskId: string) => void): () => void;
 }
+export type ThreadAttentionInput = {
+  badge: number;
+  notice: {
+    taskId: string;
+    title: string;
+    kind: 'reply' | 'permission' | 'crew' | 'crew-stopped';
+  } | null;
+};
 
 export class ProtocolError extends Error {
   readonly reason: 'protocol-mismatch' | 'invalid-frame';
