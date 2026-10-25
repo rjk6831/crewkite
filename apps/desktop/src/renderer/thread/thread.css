@@ -1137,6 +1137,40 @@
 .th-changes > ul > li > button .th-chevron {
   margin-left: 0;
 }
+/* A file row: the toggle and Discard share the first line, and the rest spans both columns. */
+.th-changes > ul > li.th-file {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+}
+.th-changes > ul > li.th-file > :not(button) {
+  grid-column: 1 / -1;
+}
+.th-changes > ul > li > button.th-discard {
+  width: auto;
+  color: var(--text-dim);
+}
+.th-changes > ul > li > button.th-discard:hover:not(:disabled) {
+  color: var(--text);
+}
+.th-discard-confirm {
+  margin: 0;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+.th-discard-confirm p {
+  margin: 0 0 6px;
+  overflow-wrap: anywhere;
+}
+.th-skipped summary {
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.th-skipped ul {
+  margin-top: 6px;
+  font-size: 12px;
+}
 .th-path {
   flex: 1;
   min-width: 0;
