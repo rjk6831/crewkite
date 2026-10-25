@@ -254,7 +254,6 @@ const discardRefusals: Record<string, string> = {
   'path-blocked': 'Another entry in the scratch copy sits at this path. Discard that one first.',
   'not-changed': 'This file has no changes to discard.',
 };
-const unavailable = (action: string) => blocked('not-available', `${action} is not available yet.`);
 // The numbers are what the person looks for with ps. The next command checks them again.
 const ownershipUnknown = (groups: readonly number[], then: string) =>
   blocked('ownership-unknown', `Quit process ${groupNames(groups)}, then ${then}.`);
