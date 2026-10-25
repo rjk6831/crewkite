@@ -23,6 +23,8 @@ import {
   FIRST_READ_BACKOFF,
   initialThreadState,
   lastFamily,
+  lastReply,
+  newestTurnId,
   reduceThread,
   retryRead,
   THREAD_PAGE_SIZE,
@@ -577,39 +579,58 @@ test('the thread moves away from the family of its newest assistant turn, even o
       handoffFrom: null,
     } satisfies ChatTurn,
   });
+  const fold = (events: ThreadEvent[]) =>
+    reduceThread(initialThreadState(task), { type: 'events', events });
   const family = (events: ThreadEvent[]) => {
-    const state = reduceThread(initialThreadState(task), { type: 'events', events });
+    const state = fold(events);
     return lastFamily(state, threadItems(state));
+  };
+  // The controller reruns only the newest turn. Retry and Try with show on it alone, and
+  // Regenerate shows only when it finished with a reply.
+  const rerun = (events: ThreadEvent[]) => {
+    const state = fold(events);
+    return { newest: newestTurnId(state), regenerate: lastReply(state, threadItems(state)) };
   };
 
   // Anthropic answered, then OpenAI hit its limit before any text. That turn has no row, and the
   // controller still counts it as the family the thread is on.
-  assert.equal(
-    family([
-      user(10, 'Add the guard'),
-      record(turn, 0, 'anthropic', 'done'),
-      opened(turn, 11, 'anthropic', 'assistant'),
-      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
-      done(turn, 13),
-      record(second, 1, 'openai', 'failed'),
-      opened(second, 14, 'openai', 'assistant'),
-      on(second, 15, { type: 'turn.completed', stopReason: 'limit', failure: limit }),
-    ]),
-    'openai',
+  const limited = [
+    user(10, 'Add the guard'),
+    record(turn, 0, 'anthropic', 'done'),
+    opened(turn, 11, 'anthropic', 'assistant'),
+    agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+    done(turn, 13),
+    record(second, 1, 'openai', 'failed'),
+    opened(second, 14, 'openai', 'assistant'),
+    on(second, 15, { type: 'turn.completed', stopReason: 'limit', failure: limit }),
+  ];
+  assert.equal(family(limited), 'openai');
+  assert.deepEqual(
+    rerun(limited),
+    { newest: second, regenerate: null },
+    'a failed turn after a reply leaves the reply without Regenerate',
   );
 
   // Before any record arrives the rows decide. A second opinion borrows another family for one
   // turn, so it is never the family the thread moves away from.
-  assert.equal(
-    family([
-      opened(turn, 11, 'openai', 'assistant'),
-      agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
-      done(turn, 13),
-      opened(second, 14, 'local', 'advisor'),
-      on(second, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
-      done(second, 16),
-    ]),
-    'openai',
+  const opinion = [
+    opened(turn, 11, 'openai', 'assistant'),
+    agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' }),
+    done(turn, 13),
+    opened(second, 14, 'local', 'advisor'),
+    on(second, 15, { type: 'text.completed', itemId: 'a', text: 'Looks right.' }),
+    done(second, 16),
+  ];
+  assert.equal(family(opinion), 'openai');
+  assert.deepEqual(
+    rerun(opinion),
+    { newest: second, regenerate: second },
+    'Regenerate goes to the second opinion, the newest turn, and skips the reply before it',
+  );
+  assert.deepEqual(
+    rerun(opinion.slice(0, 5)),
+    { newest: second, regenerate: null },
+    'a newest turn still running offers no Regenerate',
   );
 });
 

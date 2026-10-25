@@ -534,15 +534,27 @@ export function turnFiles(state: ThreadState, turnId: string): readonly ChatAtta
   return state.messages.find((message) => message.id === asked)?.files ?? [];
 }
 
-/** The newest finished assistant reply, the one Regenerate offers to write again. */
-export function lastReply(items: readonly ThreadItem[]): string | null {
-  for (const item of items.toReversed()) {
-    if (item.kind !== 'turn') continue;
-    const { turn } = item;
-    if (turn.identity?.role !== 'assistant') continue;
-    return turn.ended && turn.status === 'done' ? turn.id : null;
-  }
-  return null;
+/**
+ * The newest turn of any role, the only one the controller runs again. A turn known from a read has
+ * a sequence. One seen only on the stream is newer than all of them.
+ */
+export function newestTurnId(state: ThreadState): string | null {
+  const streamed = Object.keys(state.turns).filter((id) => !state.turnMeta[id]);
+  if (streamed.length > 0) return streamed[streamed.length - 1];
+  const turns = Object.values(state.turnMeta);
+  return turns.reduce((a, b) => (b.sequence > a.sequence ? b : a), turns[0])?.id ?? null;
+}
+
+/**
+ * The turn Regenerate offers to write again: the newest turn, when it finished with a reply. A
+ * review or a second opinion after a reply is that newest turn, so the older reply gets no offer.
+ */
+export function lastReply(state: ThreadState, items: readonly ThreadItem[]): string | null {
+  const id = newestTurnId(state);
+  const item = items.find((entry) => entry.kind === 'turn' && entry.turn.id === id);
+  return item?.kind === 'turn' && item.turn.ended && item.turn.status === 'done'
+    ? item.turn.id
+    : null;
 }
 
 export type ReadClock = { now: () => number; wait: (ms: number) => Promise<void> };
