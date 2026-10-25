@@ -29,7 +29,7 @@ Unlike units never combine. Subscription windows, API credits, local hardware an
 
 The chat picker and the handoff ranking count a model-scoped window only for models whose ID carries the window's model tokens, and a provider or pool window for every model. Google writer admission keeps the exact-ID exemption in [Google quota read](providers.md#google-quota-read) and counts that pool for every other model.
 
-A chat thread picks the next provider on a limit with one of four handoff modes, set per thread. Most allowance left takes the highest percent remaining on the tightest window. Resets soonest takes the allowance that resets first while it has any left. Balanced divides percent remaining by hours until reset and takes the highest, counting any reset closer than fifteen minutes as fifteen. Local first takes Local while it is connected and ranks the rest as Balanced. Every mode skips a provider that is not connected or has no allowance left, and ranks a provider with no reading last. [ADR 0038](adr/0038-crew-and-flight-modes.md) records the modes.
+A chat thread picks the next provider on a limit with one of four handoff modes, set per thread. Most allowance left takes the highest percent remaining on the tightest window. Resets soonest takes the allowance that resets first while it has any left. Balanced divides percent remaining by hours until reset and takes the highest, counting any reset closer than fifteen minutes as fifteen. Local first takes Local while it is connected and ranks the rest as Balanced. Every mode skips a provider that is not connected or has no allowance left, and ranks a provider with no reading last, except Local under Local first. [ADR 0038](adr/0038-crew-and-flight-modes.md) records the modes.
 
 ## Routing sequence
 
