@@ -459,6 +459,9 @@ export function openAiUsageReporter(hook: OpenAiUsageHook | undefined): UsageRep
   };
 }
 
+/** The input kinds the pinned client's InputModality names. */
+export const MODALITIES = ['text', 'image', 'audio'] as const;
+
 // shortcut: the conversation catalog contract holds at most 20 models, so a read keeps 20. The
 // client sorts hidden models in among the listed ones, so with hidden models a full first page can
 // push a listed model off it. Only then does the read take one more page, and listed models come
@@ -474,13 +477,19 @@ const models = z
             supportedReasoningEfforts: z.array(z.object({ reasoningEffort: text(32) })).max(16),
             defaultReasoningEffort: text(32),
             hidden: z.boolean().nullish(),
+            // What the model takes besides text decides which files go as images or audio. A
+            // list that changed shape reads as none, so it never drops the model.
+            inputModalities: z.array(z.string().max(32)).max(16).nullish().catch(null),
           })
-          .transform(({ supportedReasoningEfforts, hidden, ...value }) => ({
+          .transform(({ supportedReasoningEfforts, hidden, inputModalities, ...value }) => ({
             ...value,
             supportedReasoningEfforts: supportedReasoningEfforts.map(
               (entry) => entry.reasoningEffort,
             ),
             ...(hidden ? { hidden: true as const } : {}),
+            ...(inputModalities
+              ? { inputModalities: MODALITIES.filter((kind) => inputModalities.includes(kind)) }
+              : {}),
           })),
       )
       .max(20),

@@ -1,9 +1,19 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+} from 'node:fs';
+import { extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   type AgentEvent,
+  type ChatAttachment,
   ChatEffortSchema,
   type ChatFailure,
   type ChatPermissionOption,
@@ -214,6 +224,35 @@ const EVIDENCE = new Set([
 ]);
 const FRAMES = 8;
 const DETAIL_LIMIT = 4096;
+// The extensions the client maps to an audio type. It turns any other audio file into text.
+const AUDIO = /^\.(wav|mp3|m4a|webm|ogg)$/i;
+const MODEL_PAGES = 5;
+
+// shortcut: ChatTurnRequest has no files field yet, so the adapter reads it through this type.
+// Upgrade: read request.files directly once chat/adapter.ts declares it.
+type TurnFile = Readonly<{ attachment: ChatAttachment; path: string }>;
+const turnFiles = (request: ChatTurnRequest): readonly TurnFile[] =>
+  (request as { files?: readonly TurnFile[] }).files ?? [];
+type Media = {
+  input: { type: 'localImage' | 'localAudio'; path: string };
+  kind: 'image' | 'audio';
+  name: string;
+};
+
+/** A regular file this process can open now. O_NONBLOCK keeps a FIFO from holding the turn. */
+function readable(path: string) {
+  if (!isAbsolute(path)) return false;
+  try {
+    const fd = openSync(path, constants.O_RDONLY | constants.O_NONBLOCK);
+    try {
+      return fstatSync(fd).isFile();
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return false;
+  }
+}
 
 // Each schema names only the fields this file reads. Optional fields fall back on their own, so
 // one renamed field never drops the rest of a frame.
@@ -282,6 +321,10 @@ const notice = z.object({
   details: maybe(z.string()),
 });
 const turnError = z.object({ message: maybe(z.string()), codexErrorInfo: z.unknown().optional() });
+const modelPage = z.object({
+  data: z.array(z.object({ model: z.string(), inputModalities: maybe(z.array(z.string())) })),
+  nextCursor: maybe(z.string().min(1).max(512)),
+});
 const errorNotice = z.object({ error: maybe(turnError), willRetry: maybe(z.boolean()) });
 const turnDone = z.object({
   turn: z.object({ id: maybe(id), status: maybe(z.string()), error: maybe(turnError) }),
@@ -366,6 +409,9 @@ class OpenAiChatTurn {
   // One line per frame in either direction: method or id and any error. Never params or results,
   // which hold the prompt and file contents.
   private readonly frames: string[] = [];
+  // Files that go as localImage or localAudio, and the path lines for every other file.
+  private readonly media: Media[] = [];
+  private readonly lines: string[] = [];
   private readonly trace: ReturnType<typeof frameTrace>;
   private usage: ChatTurnResult['usage'] = null;
   private readonly finish: (result: ChatTurnResult) => void;
@@ -388,7 +434,7 @@ class OpenAiChatTurn {
       real = realpathSync(scratch);
     } catch {}
     this.roots = [...new Set([scratch, real])];
-    const refused = this.launch(deps);
+    const refused = this.sortFiles() ?? this.launch(deps);
     this.handle = {
       respondPermission: (requestId, choice) => this.answer(requestId, choice),
       stop: () => this.stop(),
@@ -529,12 +575,72 @@ class OpenAiChatTurn {
                     }),
                   );
               }
-              this.openThread();
+              if (this.media.length) this.listModels(null, 1);
+              else this.openThread();
             },
           );
         });
       },
     );
+  }
+
+  /**
+   * Sorts the files before the client starts. The client turns a local image or audio file it
+   * cannot use into placeholder text and runs the turn anyway, so a file it would drop refuses
+   * the turn here. The client reads localImage and localAudio paths itself, outside the sandbox.
+   * Under both sandbox modes CrewKite sets, the sandbox reads the whole disk, so the model's
+   * tools can open the file a path line names in the controller home.
+   */
+  private sortFiles(): ChatFailure | null {
+    for (const { attachment, path } of turnFiles(this.request)) {
+      const name = clip(attachment.name, 255);
+      const rejected = (message: string) =>
+        chatFailure({ stage: 'prompt', kind: 'attachment-rejected', message });
+      if (!readable(path)) return rejected(`CrewKite could not read the attached file ${name}.`);
+      const type = attachment.mimeType.split(';')[0].trim().toLowerCase();
+      // SVG is markup the client cannot decode as an image.
+      if (type.startsWith('image/') && type !== 'image/svg+xml')
+        this.media.push({ input: { type: 'localImage', path }, kind: 'image', name });
+      else if (type.startsWith('audio/')) {
+        if (!AUDIO.test(extname(attachment.name)))
+          return rejected(`Codex takes audio as wav, mp3, m4a, webm or ogg, and ${name} is none.`);
+        this.media.push({ input: { type: 'localAudio', path }, kind: 'audio', name });
+      } else
+        this.lines.push(
+          `Attached file: ${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes) at ${path}`,
+        );
+    }
+    return null;
+  }
+
+  /**
+   * Finds the selected model in model/list and refuses the turn before any thread opens when it
+   * does not take an image or audio file the turn carries. Hidden models count, since a thread
+   * may run on one.
+   */
+  private listModels(cursor: string | null, page: number) {
+    const { model } = this.request.selection;
+    const params = { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) };
+    this.call('model/list', params, (reply) => {
+      if ('error' in reply)
+        return this.fail(this.providerFailure('session', 'model/list', reply.error));
+      const list = modelPage.safeParse(reply.result).data;
+      const found = list?.data.find((entry) => entry.model === model);
+      if (!found && list?.nextCursor && page < MODEL_PAGES)
+        return this.listModels(list.nextCursor, page + 1);
+      const modalities = found?.inputModalities ?? [];
+      const missing = this.media.find((file) => !modalities.includes(file.kind));
+      if (missing)
+        return this.fail(
+          chatFailure({
+            stage: 'prompt',
+            kind: 'attachment-rejected',
+            method: 'model/list',
+            message: `Codex does not report that ${clip(model, 200)} takes ${missing.kind === 'image' ? 'images' : 'audio'}, so ${missing.name} was not sent.`,
+          }),
+        );
+      this.openThread();
+    });
   }
 
   private openThread() {
@@ -610,7 +716,10 @@ class OpenAiChatTurn {
           .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.text}`)
           .join('\n\n')
       : '';
-    const text = fresh ? [systemContext, transcript, prompt].filter(Boolean).join('\n\n') : prompt;
+    const lines = this.lines.join('\n');
+    const text = (fresh ? [systemContext, transcript, prompt, lines] : [prompt, lines])
+      .filter(Boolean)
+      .join('\n\n');
     // turn/start sets the effort for this turn and the ones after it. thread/start and
     // thread/resume have no effort field, so every turn names its own and a resumed thread follows
     // the composer. Default sends none and leaves the thread's level as it is.
@@ -618,7 +727,7 @@ class OpenAiChatTurn {
       'turn/start',
       {
         threadId: this.threadId,
-        input: [{ type: 'text', text }],
+        input: [...this.media.map((file) => file.input), { type: 'text', text }],
         ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
       },
       (reply) => {
@@ -1082,6 +1191,14 @@ class OpenAiChatTurn {
       });
     if (error?.codexErrorInfo === 'unauthorized')
       return chatFailure({ ...common, kind: 'signed-out', message: 'Codex is not signed in.' });
+    // A text-only turn gets badRequest for other reasons, so only a turn that sent images or
+    // audio names the files.
+    if (error?.codexErrorInfo === 'badRequest' && this.media.length)
+      return chatFailure({
+        ...common,
+        kind: 'attachment-rejected',
+        message: 'Codex refused the attached files.',
+      });
     return chatFailure({
       ...common,
       kind: 'protocol',

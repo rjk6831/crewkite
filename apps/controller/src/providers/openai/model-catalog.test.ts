@@ -4,10 +4,12 @@ import { createHash } from 'node:crypto';
 import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
-import { NativeProfileSchema } from '@crewkite/contracts';
+import { LocalSetupSchema, NativeProfileSchema } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { buildChatCatalog } from '../../chat/catalog.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
+import { resolveAnthropicNativeProfile } from '../anthropic/profile.ts';
 import {
   matchesOpenAiModelCatalogObservation,
   startOpenAiModelCatalogObservation,
@@ -41,7 +43,7 @@ const replies = {
       ], defaultReasoningEffort: 'medium', hidden: true },
       { id: 'fixture-a', model: 'fixture-a', supportedReasoningEfforts: [
         { reasoningEffort: 'low' }, { reasoningEffort: 'high' }
-      ], defaultReasoningEffort: 'low', hidden: false },
+      ], defaultReasoningEffort: 'low', hidden: false, inputModalities: ['text', 'image', 'video'] },
     ],
     nextCursor: null,
   },
@@ -56,7 +58,7 @@ input.on('line', line => {
 input.on('close', () => process.exit(0));
 `;
 
-test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged, after owned peer closure', async () => {
+test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged, and the input kinds the composer reports, after owned peer closure', async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/openai-model-catalog-'));
   const directory = resolve(root, 'run');
@@ -143,10 +145,52 @@ test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged,
       [...errors.matchAll(/^params:(.+)$/gm)].map((match) => JSON.parse(match[1])),
       [{ limit: 20, includeHidden: true }],
     );
+    // A kind the client may add later drops out, and a model that reports none keeps none.
     assert.deepEqual(outcome.metadata?.models, [
-      { model: 'fixture-a', efforts: ['low', 'high'], defaultEffort: 'low' },
+      {
+        model: 'fixture-a',
+        efforts: ['low', 'high'],
+        defaultEffort: 'low',
+        inputModalities: ['text', 'image'],
+      },
       { model: 'fixture-b', efforts: ['medium'], defaultEffort: 'medium', hidden: true },
     ]);
+    // The composer reads what the default model takes, and the Anthropic list from its client's
+    // block types. Without an observed list the OpenAI family reports nothing.
+    const accepts = (openAiModels: Parameters<typeof buildChatCatalog>[0]['openAiModels']) =>
+      buildChatCatalog({
+        profiles: [
+          { ...profile.facts, model: 'fixture-a' },
+          resolveAnthropicNativeProfile({ HOME: root, PATH: '' }).facts,
+        ],
+        openAiModels,
+        local: LocalSetupSchema.parse({
+          revision: 0,
+          connectionRevision: 0,
+          connectorId: 'local-sdk-v1',
+          endpoint: null,
+          setupHash: null,
+          connectionHash: null,
+          secretConfigured: false,
+          operation: null,
+          generation: 'idle',
+          observation: null,
+          selection: null,
+          reason: 'unconfigured',
+        }),
+        windows: [],
+        nowMs: 0,
+      }).families.map((entry) => [entry.family, entry.accepts]);
+    assert.deepEqual(accepts(outcome.metadata?.models ?? null), [
+      ['openai', ['image/*']],
+      [
+        'anthropic',
+        ['image/jpeg', 'image/png', 'image/gif', 'image/webp', 'application/pdf', 'text/*'],
+      ],
+      ['google', null],
+      ['local', null],
+    ]);
+    assert.deepEqual(accepts(null)[0], ['openai', null]);
     assert.equal(outcome.metadata?.profileHash, hashCanonical(profile.facts));
     assert(outcome.metadata && matchesOpenAiModelCatalogObservation(profile, outcome.metadata));
     assert(

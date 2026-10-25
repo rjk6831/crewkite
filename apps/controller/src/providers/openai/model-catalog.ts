@@ -5,7 +5,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
-import { type DiscoveryMetadata, OpenAiDiscovery } from './discovery.ts';
+import { type DiscoveryMetadata, MODALITIES, OpenAiDiscovery } from './discovery.ts';
 import { type NativeLifecycle, startNativeSession } from './native-discovery.ts';
 import type { NativeProfileResolution } from './profile.ts';
 
@@ -16,12 +16,14 @@ const observedModels = z
     z.strictObject({
       ...ConversationModelCatalogEntrySchema.shape,
       hidden: z.literal(true).optional(),
+      // Lists stored before this field read as reporting nothing.
+      inputModalities: z.array(z.enum(MODALITIES)).max(MODALITIES.length).optional(),
     }),
   )
   .refine(
     (models) =>
       ConversationModelCatalogEntriesSchema.safeParse(
-        models.map(({ hidden: _hidden, ...model }) => model),
+        models.map(({ hidden: _hidden, inputModalities: _modalities, ...model }) => model),
       ).success,
     'A model list needs distinct bounded entries with supported efforts.',
   );
@@ -74,6 +76,7 @@ export function openAiModelCatalogObservation(
       efforts: model.supportedReasoningEfforts,
       defaultEffort: model.defaultReasoningEffort,
       ...(model.hidden ? { hidden: true } : {}),
+      ...(model.inputModalities ? { inputModalities: model.inputModalities } : {}),
     })),
   });
 }
