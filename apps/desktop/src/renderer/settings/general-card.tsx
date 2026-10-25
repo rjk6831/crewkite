@@ -19,7 +19,7 @@ const auto = 'auto';
 const saved_ = 'saved';
 
 type Entry = ChatCatalogRead['families'][number];
-export type Choice = { entry: Entry; model: Entry['models'][number] };
+type Choice = { entry: Entry; model: Entry['models'][number] };
 
 const presetId = (name: string) => name.toLowerCase().replace(/\s+/g, '-');
 const presetHints: Record<CrewPreset['name'], string> = {

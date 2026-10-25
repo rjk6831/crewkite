@@ -182,10 +182,13 @@ test('a preset carries each pinned effort into the crew and drops an effort the 
       ),
       store,
     );
-  const efforts = () =>
-    crewFromPreset(readCrewPresets(store)[1], catalog, null, 'most-left', NOW, store)?.members.map(
+  const efforts = () => {
+    const pair = readCrewPresets(store).find((p) => p.name === 'Pair');
+    assert.ok(pair);
+    return crewFromPreset(pair, catalog, null, 'most-left', NOW, store)?.members.map(
       ({ role, selection }) => `${role}:${selection.effort}`,
     );
+  };
   pin('high', 'high');
   assert.deepEqual(efforts(), ['builder:high', 'reviewer:high']);
   // The test models offer low and high only, so a saved medium becomes the default, low.

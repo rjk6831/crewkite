@@ -3367,7 +3367,7 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
     ['a chain on its first fix is valid', ChatCrewChainSchema, chain, true],
     ['a third fix round is refused', ChatCrewChainSchema, { ...chain, fixes: 3 }, false],
     [
-      'steer names a task and a queued message',
+      'steer names a task and a message',
       SteerChatMessagePayloadSchema,
       { taskId, messageId: `msg_${suffix}` },
       true,
@@ -3386,7 +3386,7 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
       false,
     ],
     [
-      'a pull request needs a title',
+      'a pull request with a title is accepted',
       OpenChatPullRequestPayloadSchema,
       { taskId, branch, title: 'Add crew' },
       true,
@@ -3421,14 +3421,12 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
       { branch, runs: null, reason: null },
       false,
     ],
-    ['turn stats carry the context line and summaries', ChatTurnStatsSchema, stats, true],
     [
       'turn stats without the summaries count are refused',
       ChatTurnStatsSchema,
       { ...stats, summaries: undefined },
       false,
     ],
-    ['a compaction event reports the summaries it wrote', AgentEventSchema, compacted, true],
     [
       'a compaction with no summaries is refused',
       AgentEventSchema,

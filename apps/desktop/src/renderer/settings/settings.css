@@ -271,3 +271,9 @@
 .rail-usage-value.is-unknown {
   color: var(--text-dim);
 }
+
+.st-crew-pick {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

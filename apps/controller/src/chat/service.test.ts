@@ -1387,12 +1387,15 @@ test('a policy change acts on the running turn, and balanced answers only safe a
     const idle = settles(thread);
     // A balanced thread has a reviewer. Its review turn starts after the builder settles, so the
     // row ends at the crew's closing line.
-    const ended = next(
-      thread,
-      (event) =>
-        event.type === 'conversation.entry' &&
-        (event.payload as { text: string }).text.startsWith('Crew '),
-    );
+    const ended =
+      row.mode === 'balanced'
+        ? next(
+            thread,
+            (event) =>
+              event.type === 'conversation.entry' &&
+              (event.payload as { text: string }).text.startsWith('Crew '),
+          )
+        : null;
     thread.send('Go.');
     const turn = await parked;
     assert.equal(adapter.requests[0].permissionPolicy, 'ask', name);
@@ -1415,7 +1418,7 @@ test('a policy change acts on the running turn, and balanced answers only safe a
       for (const effect of effects) effect();
     }
     await idle;
-    if (row.mode === 'balanced') await ended;
+    if (ended) await ended;
     const resolved = agentEvents(thread).find((event) => event.type === 'permission.resolved');
     assert.equal(
       resolved?.type === 'permission.resolved' && resolved.choice,
