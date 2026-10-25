@@ -1,6 +1,7 @@
 import {
   type AgentEvent,
   AgentEventSchema,
+  type ChatAttachment,
   type ChatFailure,
   type ChatFamily,
   type ChatMessage,
@@ -35,8 +36,14 @@ export type { Block, FileDiff, ToolBlock, TurnView } from './turn-fold.ts';
 export type ThreadEvent = { type: string; cursor: string; taskId: string | null; payload: unknown };
 
 type Stamped = { cursor: bigint | null; event: AgentEvent };
-type TurnRecord = { events: Stamped[]; cursors: ReadonlySet<string>; view: TurnView };
-export type PendingMessage = { localId: string; text: string; attachments: string[]; at: string };
+/** `settled` marks a finished turn rebuilt from its stored events. The stream adds nothing more. */
+type TurnRecord = {
+  events: Stamped[];
+  cursors: ReadonlySet<string>;
+  view: TurnView;
+  settled?: boolean;
+};
+export type PendingMessage = { localId: string; text: string; files: ChatAttachment[]; at: string };
 
 export type ThreadState = {
   taskId: string;
@@ -48,10 +55,19 @@ export type ThreadState = {
   pending: PendingMessage[];
   /** The log cursor of the latest read. Stream events at or below it are already in the state. */
   readCursor: bigint | null;
+  /** Whether older messages may sit behind the oldest one loaded, and whether any were paged in. */
+  older: { more: boolean; paged: boolean };
+  /** Why a finished turn's stored events could not be read, by turn. */
+  historyNotes: Record<string, string>;
 };
 
 export type ThreadAction =
   | { type: 'loaded'; read: ChatThreadRead }
+  /** A page of older messages, read with the oldest loaded cursor as `beforeCursor`. */
+  | { type: 'earlier'; read: ChatThreadRead }
+  /** Every stored event of one finished turn, oldest first. */
+  | { type: 'history'; turnId: string; events: AgentEvent[] }
+  | { type: 'history-note'; turnId: string; note: string }
   | { type: 'events'; events: ThreadEvent[] }
   | { type: 'sending'; pending: PendingMessage }
   | { type: 'dismiss'; localId: string }
@@ -71,7 +87,12 @@ export const initialThreadState = (taskId: string): ThreadState => ({
   turns: {},
   pending: [],
   readCursor: null,
+  older: { more: false, paged: false },
+  historyNotes: {},
 });
+
+/** Messages one thread read asks for. A full page may have older ones behind it. */
+export const THREAD_PAGE_SIZE = 200;
 
 const key = (cursor: bigint | null) => cursor ?? -1n;
 const parseCursor = (cursor: string) => (/^\d{1,20}$/.test(cursor) ? BigInt(cursor) : null);
@@ -82,7 +103,7 @@ function foldEvents(events: Stamped[]): TurnView {
 
 function addAgentEvent(state: ThreadState, event: AgentEvent, cursor: string | null): ThreadState {
   const existing = state.turns[event.turnId];
-  if (cursor !== null && existing?.cursors.has(cursor)) return state;
+  if (existing?.settled || (cursor !== null && existing?.cursors.has(cursor))) return state;
   const stamped: Stamped = { cursor: cursor === null ? null : parseCursor(cursor), event };
   const events = existing?.events ?? [];
   const last = events.at(-1);
@@ -116,9 +137,14 @@ function asMessage(payload: unknown): ChatMessage | null {
   return { id, taskId, at, cursor, text, author: { kind: 'user' }, attachments: [], files: [] };
 }
 
+// A replacing read keeps the messages older than its own oldest one, which came from Load earlier.
 function addMessages(state: ThreadState, incoming: ChatMessage[], replace = false): ThreadState {
   const known = new Set(state.messages.map((message) => message.id));
-  const merged = new Map((replace ? [] : state.messages).map((message) => [message.id, message]));
+  const floor = incoming.length > 0 ? BigInt(incoming[0].cursor) : null;
+  const kept = replace
+    ? state.messages.filter((message) => floor !== null && BigInt(message.cursor) < floor)
+    : state.messages;
+  const merged = new Map(kept.map((message) => [message.id, message]));
   let pending = state.pending;
   for (const message of incoming) {
     merged.set(message.id, message);
@@ -131,6 +157,15 @@ function addMessages(state: ThreadState, incoming: ChatMessage[], replace = fals
     return left < right ? -1 : left > right ? 1 : 0;
   });
   return { ...state, messages, pending };
+}
+
+// The read has no flag for older messages. A full page may have more behind it, and so does a turn
+// whose message is not loaded. A page with no messages ends the paging.
+function olderBehind(page: readonly ChatMessage[], state: ThreadState): boolean {
+  if (page.length === 0) return false;
+  if (page.length >= THREAD_PAGE_SIZE) return true;
+  const ids = new Set(state.messages.map((message) => message.id));
+  return Object.values(state.turnMeta).some((turn) => !ids.has(turn.userMessageId));
 }
 
 // A message the controller queued shows in the queued list until it starts, so its pending bubble
@@ -192,6 +227,10 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
         read.messages,
         true,
       );
+      // After Load earlier, the newest page says nothing about what is older than the paged ones.
+      const older = state.older.paged
+        ? state.older
+        : { more: olderBehind(read.messages, next), paged: false };
       // The snapshot of an unfinished turn is complete up to the read cursor, so it replaces what
       // the stream built. Events the stream delivered past that cursor before the read returned
       // are kept on top; everything at or below it is already in the snapshot.
@@ -210,8 +249,39 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
           view: { ...foldEvents(events), id: turnId },
         };
       }
-      return { ...next, turns };
+      return { ...next, turns, older };
     }
+    case 'earlier': {
+      if (action.read.thread.taskId !== state.taskId) return state;
+      const next = addMessages(state, action.read.messages);
+      return { ...next, older: { more: olderBehind(action.read.messages, next), paged: true } };
+    }
+    case 'history': {
+      const existing = state.turns[action.turnId];
+      const events = action.events
+        .filter((event) => event.turnId === action.turnId)
+        .map((event): Stamped => ({ cursor: null, event }));
+      if (existing?.settled || events.length === 0) return state;
+      // The stored log holds every event the stream delivered for this turn, so it replaces them.
+      // The cursors stay, and the record takes no more stream events.
+      const folded = { ...foldEvents(events), id: action.turnId };
+      const meta = state.turnMeta[action.turnId];
+      const view = folded.ended
+        ? folded
+        : { ...folded, ended: true, status: meta ? metaStatus(meta.state) : ('done' as const) };
+      const record: TurnRecord = {
+        events,
+        cursors: existing?.cursors ?? new Set<string>(),
+        view,
+        settled: true,
+      };
+      return { ...state, turns: { ...state.turns, [action.turnId]: record } };
+    }
+    case 'history-note':
+      return {
+        ...state,
+        historyNotes: { ...state.historyNotes, [action.turnId]: action.note },
+      };
     case 'sending':
       return { ...state, pending: [...state.pending, action.pending] };
     case 'dismiss':
@@ -227,7 +297,9 @@ export type ThreadItem =
       key: string;
       at: string;
       text: string;
+      /** Paths saved by an older version of the thread. */
       attachments: readonly string[];
+      files: readonly ChatAttachment[];
       pending: boolean;
     }
   | { kind: 'turn'; key: string; turn: TurnView }
@@ -291,6 +363,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
           at: message.at,
           text: message.text,
           attachments: message.attachments,
+          files: message.files,
           pending: false,
         },
       });
@@ -375,7 +448,8 @@ export function threadItems(state: ThreadState): ThreadItem[] {
       key: item.localId,
       at: item.at,
       text: item.text,
-      attachments: item.attachments,
+      attachments: [],
+      files: item.files,
       pending: true,
     });
   return items;
@@ -416,6 +490,58 @@ export function lastFamily(state: ThreadState, items: readonly ThreadItem[]): Ch
   for (const item of items.toReversed())
     if (item.kind === 'turn' && item.turn.identity?.role === 'assistant')
       return item.turn.identity.family;
+  return null;
+}
+
+/** The `beforeCursor` for Load earlier, or null when no older message is expected. */
+export function earlierCursor(state: ThreadState): string | null {
+  return state.loaded && state.older.more ? (state.messages[0]?.cursor ?? null) : null;
+}
+
+const settledStates: ReadonlySet<ChatTurn['state']> = new Set(['done', 'stopped', 'failed']);
+
+/**
+ * Finished turns whose cards are not in the view: the stream never delivered their start, as after
+ * a reopen or a relaunch. Each is read once from the stored events when it scrolls into view.
+ */
+export function historyWanted(state: ThreadState): ReadonlySet<string> {
+  const wanted = new Set<string>();
+  for (const turn of Object.values(state.turnMeta)) {
+    if (!settledStates.has(turn.state) || state.historyNotes[turn.id]) continue;
+    const record = state.turns[turn.id];
+    if (record?.settled || record?.events.some(({ event }) => event.type === 'turn.started'))
+      continue;
+    wanted.add(turn.id);
+  }
+  return wanted;
+}
+
+/** The families that already ran the message that started this turn. */
+export function triedFamilies(state: ThreadState, turnId: string): ChatFamily[] {
+  const asked = state.turnMeta[turnId]?.userMessageId;
+  const tried = new Set<ChatFamily>();
+  for (const turn of Object.values(state.turnMeta))
+    if (turn.id === turnId || (asked && turn.userMessageId === asked))
+      tried.add(turn.selection.family);
+  const streamed = state.turns[turnId]?.view.identity?.family;
+  if (streamed) tried.add(streamed);
+  return [...tried];
+}
+
+/** The files on the message that started this turn. */
+export function turnFiles(state: ThreadState, turnId: string): readonly ChatAttachment[] {
+  const asked = state.turnMeta[turnId]?.userMessageId;
+  return state.messages.find((message) => message.id === asked)?.files ?? [];
+}
+
+/** The newest finished assistant reply, the one Regenerate offers to write again. */
+export function lastReply(items: readonly ThreadItem[]): string | null {
+  for (const item of items.toReversed()) {
+    if (item.kind !== 'turn') continue;
+    const { turn } = item;
+    if (turn.identity?.role !== 'assistant') continue;
+    return turn.ended && turn.status === 'done' ? turn.id : null;
+  }
   return null;
 }
 

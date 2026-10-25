@@ -1,5 +1,7 @@
 import {
   AcceptChatChangesPayloadSchema,
+  type ChatAttachment,
+  ChatAttachmentSchema,
   type ChatBranchStatus,
   ChatBranchStatusSchema,
   type ChatCatalogRead,
@@ -8,17 +10,22 @@ import {
   ChatChangesReadSchema,
   type ChatThreadRead,
   ChatThreadReadSchema,
+  type ChatTurnEventsRead,
+  ChatTurnEventsReadSchema,
   type CommandResult,
   ConfigureChatThreadPayloadSchema,
   HandoffChatThreadPayloadSchema,
+  ImportChatAttachmentPayloadSchema,
   OpenChatPullRequestPayloadSchema,
   PushChatBranchPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
+  ReadChatTurnEventsPayloadSchema,
   RefreshChatModelsPayloadSchema,
   ResolveChatPermissionPayloadSchema,
+  RetryChatTurnPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -27,7 +34,7 @@ import type { DesktopCommand, DesktopSource } from '../source.ts';
 
 // The chat commands are listed in CommandSchema. The cast stays in this one file so the thread
 // view never spells a command name anywhere else.
-export type ThreadSource = Pick<DesktopSource, 'command' | 'subscribe'>;
+export type ThreadSource = Pick<DesktopSource, 'command' | 'subscribe' | 'attachFiles'>;
 // Mutations carry a revision by contract. The controller does not race chat commands on it, so
 // the thread sends zero and never has to chase the task revision while events stream.
 const CHAT_REVISION = 0;
@@ -67,12 +74,29 @@ async function read<T>(
   return schema.parse(rest);
 }
 
-export const readThread = (source: ThreadSource, taskId: string): Promise<ChatThreadRead> =>
+/** Messages per thread read. A read that fills it may have older messages behind it. */
+export const THREAD_PAGE = 200;
+export const readThread = (
+  source: ThreadSource,
+  taskId: string,
+  beforeCursor?: string,
+): Promise<ChatThreadRead> =>
   read(
     source,
     'ReadChatThread',
-    ReadChatThreadPayloadSchema.parse({ taskId, limit: 200 }),
+    ReadChatThreadPayloadSchema.parse({ taskId, limit: THREAD_PAGE, beforeCursor }),
     ChatThreadReadSchema,
+  );
+/** One page of a finished turn's stored events. Pass `nextAfterCursor` back to read on. */
+export const readTurnEvents = (
+  source: ThreadSource,
+  input: Input<typeof ReadChatTurnEventsPayloadSchema>,
+): Promise<ChatTurnEventsRead> =>
+  read(
+    source,
+    'ReadChatTurnEvents',
+    ReadChatTurnEventsPayloadSchema.parse(input),
+    ChatTurnEventsReadSchema,
   );
 export const readChanges = (source: ThreadSource, taskId: string): Promise<ChatChangesRead> =>
   read(
@@ -97,6 +121,20 @@ export const sendMessage = (
   source: ThreadSource,
   input: Input<typeof SendChatMessagePayloadSchema>,
 ) => run(source, 'SendChatMessage', SendChatMessagePayloadSchema.parse(input));
+// The controller copies the file into the thread's files folder and answers with what it stored.
+export const importAttachment = (
+  source: ThreadSource,
+  taskId: string,
+  path: string,
+): Promise<ChatAttachment> =>
+  read(
+    source,
+    'ImportChatAttachment',
+    ImportChatAttachmentPayloadSchema.parse({ taskId, source: { path } }),
+    ChatAttachmentSchema,
+  );
+export const retryTurn = (source: ThreadSource, input: Input<typeof RetryChatTurnPayloadSchema>) =>
+  run(source, 'RetryChatTurn', RetryChatTurnPayloadSchema.parse(input));
 export const resolvePermission = (
   source: ThreadSource,
   input: Input<typeof ResolveChatPermissionPayloadSchema>,

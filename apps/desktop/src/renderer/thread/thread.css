@@ -1519,3 +1519,150 @@
   gap: 4px;
   margin-top: 4px;
 }
+.th-composer.is-dropping {
+  border-color: var(--accent);
+  border-style: dashed;
+}
+.th-files {
+  margin-bottom: 8px;
+}
+.th-user .th-files,
+.th-queued-row .th-files {
+  margin-bottom: 0;
+}
+.th-user .th-files {
+  justify-content: flex-end;
+}
+.th-files li.th-file {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 3px;
+  max-width: 260px;
+  padding: 0;
+  overflow: visible;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+.th-file-body {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 100%;
+  padding: 3px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  background: var(--surface);
+}
+.th-file-name,
+.th-file-facts {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-file-name {
+  color: var(--text);
+}
+.th-file-facts {
+  color: var(--text-dim);
+}
+.th-file.is-image .th-file-body {
+  position: relative;
+  padding: 0;
+  overflow: hidden;
+  border-radius: 8px;
+}
+.th-file.is-image img {
+  display: block;
+  width: 56px;
+  height: 56px;
+  object-fit: cover;
+}
+.th-file.is-image .th-file-remove {
+  position: absolute;
+  top: 3px;
+  right: 3px;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  background: var(--surface-raised);
+}
+.th-file-note {
+  color: var(--amber);
+  font-size: 11px;
+  white-space: normal;
+}
+.th-turn-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: -8px;
+}
+.th-turn-actions > p {
+  flex-basis: 100%;
+  font-size: 12px;
+}
+.th-rerun,
+.th-try-with {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px;
+}
+.th-outline {
+  border: 1px solid var(--border-strong);
+}
+.th-try-with ul {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-try-option {
+  display: inline-flex;
+  gap: 6px;
+  padding: 5px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 12px;
+}
+.th-try-option:hover:not(:disabled) {
+  background: var(--surface-hover);
+}
+.th-rerun .th-error,
+.th-try-with .th-error {
+  flex-basis: 100%;
+}
+.th-earlier {
+  display: grid;
+  justify-items: center;
+  gap: 4px;
+}
+.th-first-run-list {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 8px;
+  margin: 16px 0 0;
+  padding: 0;
+  list-style: none;
+}
+.th-first-run-item {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 13px;
+}
+button.th-first-run-item:hover {
+  background: var(--surface-hover);
+}
