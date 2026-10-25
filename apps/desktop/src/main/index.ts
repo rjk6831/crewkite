@@ -1,5 +1,6 @@
 import { join } from 'node:path';
 import { app, BrowserWindow, protocol, session } from 'electron';
+import { installThreadAttention } from './attention.ts';
 import { installBridge } from './bridge.ts';
 import { DesktopController, prepareStateDirectory, resolveRuntime } from './runtime.ts';
 import { rendererURL, secureSession, secureWindow } from './security.ts';
@@ -60,6 +61,7 @@ async function start() {
     });
     secureWindow(window);
     await installBridge(window, controller);
+    installThreadAttention(window);
     if (closing || window.isDestroyed()) return;
     await window.loadURL(rendererURL);
     window.show();

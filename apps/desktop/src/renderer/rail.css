@@ -1,0 +1,138 @@
+/* Rail threads, their menu, title editing and the delete question. Colors come from style.css. */
+
+.rail-thread {
+  position: relative;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+}
+.rail-thread > .task-link {
+  flex: 1;
+  min-width: 0;
+  padding-right: 30px;
+}
+.rail-thread-more {
+  position: absolute;
+  top: 7px;
+  right: 2px;
+  width: 24px;
+  height: 24px;
+  opacity: 0;
+}
+.rail-thread:hover > .rail-thread-more,
+.rail-thread.active > .rail-thread-more,
+.rail-thread-more:focus-visible,
+.rail-thread-more[aria-expanded="true"] {
+  opacity: 1;
+}
+.rail-thread-edit {
+  display: flex;
+  flex: 1;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 3px 30px 3px 0;
+  padding: 5px 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  background: var(--surface-raised);
+}
+.rail-title-field,
+.th-title-field {
+  flex: 1;
+  min-width: 0;
+  border: 0;
+  outline: none;
+  background: transparent;
+  color: var(--text);
+  font: inherit;
+}
+.rail-title-field {
+  font-size: 11px;
+}
+.th-title-field {
+  max-width: 420px;
+  padding: 3px 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 5px;
+  font-size: 13px;
+  font-weight: 500;
+}
+.th-title-button {
+  max-width: 100%;
+  overflow: hidden;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  cursor: text;
+}
+.th-title-button:hover {
+  text-decoration: underline dotted var(--text-dim);
+  text-underline-offset: 3px;
+}
+.th-title-note,
+.rail-thread-note {
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.rail-thread-note {
+  flex-basis: 100%;
+  margin: 0 0 4px 10px;
+}
+.rail-menu {
+  position: absolute;
+  top: 32px;
+  right: 2px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  min-width: 120px;
+  padding: 4px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+}
+.rail-menu > button {
+  padding: 7px 10px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text);
+  font-size: 12px;
+  text-align: left;
+}
+.rail-menu > button:hover,
+.rail-menu > button:focus-visible {
+  background: var(--surface-hover);
+  outline: none;
+}
+.rail-menu > .rail-menu-danger {
+  color: var(--red);
+}
+.rail-delete {
+  display: grid;
+  gap: 10px;
+  padding: 20px 24px;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.rail-delete strong {
+  overflow-wrap: anywhere;
+}
+.rail-delete-error {
+  color: var(--red);
+}
+.rail-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}

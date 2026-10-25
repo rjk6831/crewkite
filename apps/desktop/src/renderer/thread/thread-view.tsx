@@ -20,6 +20,7 @@ import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { QueuedList } from './queued-list.tsx';
 import { lastFamily, latestContext, type ThreadSettings } from './thread-state.ts';
+import { ThreadTitle } from './thread-title.tsx';
 import type { TurnView } from './turn-fold.ts';
 import { useThread } from './use-thread.ts';
 import './thread.css';
@@ -217,9 +218,7 @@ export function ThreadView({
               <span className="th-sr">{familyName(thread.selection.family)}</span>
             </span>
           )}
-          <h1 className="th-title" title={task.title}>
-            {task.title}
-          </h1>
+          <ThreadTitle source={source} task={task} />
           <span className="th-project">{projectName}</span>
           <span className="th-badge" title={thread?.base ?? 'No base commit yet'}>
             <GitBranch size={11} aria-hidden="true" />
