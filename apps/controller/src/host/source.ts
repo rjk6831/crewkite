@@ -13,7 +13,6 @@ import {
   openSync,
   readdirSync,
   readFileSync,
-  readlinkSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -558,11 +557,10 @@ function resolvesInside(link: LinkEntry, live: ReadonlyMap<string, LinkEntry>): 
   return follow(link.path.split('/').slice(0, -1), link.target) !== null;
 }
 
-/** Base paths the copy reads from the base. A held link must still be the same link. */
-type ScratchScope = Map<string, { path: string; target: string | null }>;
+/** Base paths the copy reads from the base, by folded name. */
+type ScratchScope = Map<string, { path: string }>;
 
 function scratchScope(source: CommittedSource): ScratchScope {
-  const targets = new Map(source.links.map((link) => [link.path, link.target]));
   const scope: ScratchScope = new Map();
   for (const entry of source.kept) {
     let path: string;
@@ -571,7 +569,7 @@ function scratchScope(source: CommittedSource): ScratchScope {
     } catch {
       continue;
     }
-    scope.set(linkKey(path), { path, target: targets.get(path) ?? null });
+    scope.set(linkKey(path), { path });
   }
   return scope;
 }
@@ -659,7 +657,6 @@ function readScratchFiles(
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
   const limit = scope ? MAX_SCRATCH_FILES : MAX_SOURCE_FILES;
-  const linked = new Set<string>();
   // A copy file that would sit over or under a base path is a collision.
   for (const { path } of scope?.values() ?? []) safePath(path, seen, prefixes);
   let total = 0;
@@ -672,16 +669,9 @@ function readScratchFiles(
         const path = relative(root, file).split('\\').join('/');
         return { file, path, state: lstatSync(file) };
       })
-      .filter(({ file, path, state }) => {
-        const held = scope?.get(linkKey(path));
-        if (!held) return true;
-        if (held.target !== null) {
-          if (!state.isSymbolicLink() || readlinkSync(file) !== held.target)
-            throw new Error(`The scratch copy changed the link ${held.path}.`);
-          linked.add(held.path);
-        }
-        return false;
-      });
+      // Accept takes these paths from the base whatever the copy holds, so a held link the copy
+      // replaced or deleted is left out here and Changes reports it.
+      .filter(({ path }) => !scope?.has(linkKey(path)));
     const excluded = ignored?.(
       entries.map(({ path, state }) => path + (state.isDirectory() ? '/' : '')),
     );
@@ -711,9 +701,6 @@ function readScratchFiles(
     }
   }
   visit(root);
-  for (const held of scope?.values() ?? [])
-    if (held.target !== null && !linked.has(held.path))
-      throw new Error(`The scratch copy changed the link ${held.path}.`);
   return files;
 }
 
@@ -855,6 +842,29 @@ export function materialize(
     mkdirSync(dirname(join(root, link.path)), { recursive: true, mode: 0o700 });
     symlinkSync(link.target, join(root, link.path));
   }
+}
+
+/**
+ * Put one of the base's links back in a scratch copy. The base's links pass the checks materialize
+ * runs, and the caller has walked the real directories down to the link's folder. Every entry at
+ * that name goes first, under any spelling a case-insensitive volume would match.
+ */
+export function restoreLink(root: string, links: readonly LinkEntry[], path: string) {
+  const seen = new Set<string>();
+  const prefixes = new Map<string, string>();
+  for (const link of links) safePath(link.path, seen, prefixes);
+  const inside = insideLinks(links);
+  const link = inside.get(path);
+  if (!link || inside.size !== links.length)
+    throw new Error('A scratch link leads outside the copy.');
+  const directory = dirname(join(root, link.path));
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const key = linkKey(link.path);
+  const folder = dirname(link.path);
+  for (const name of readdirSync(directory))
+    if (linkKey(folder === '.' ? name : `${folder}/${name}`) === key)
+      rmSync(join(directory, name), { recursive: true, force: true });
+  symlinkSync(link.target, join(root, link.path));
 }
 
 /**
