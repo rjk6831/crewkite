@@ -395,6 +395,11 @@ export const LocalSetupSchema = z
      * its hash and the selection.
      */
     observedAt: TimestampSchema.nullable().optional(),
+    /**
+     * True from a reconnect until the first read on the new connection. The view labels the
+     * observation as last seen and keeps its controls off, the same as with connected false.
+     */
+    observationStale: z.literal(true).optional(),
     /** The context the selected loaded instance reports. Every Local budget is a function of it. */
     contextTokens: RevisionSchema.min(1).nullable().optional(),
     /** Memory the system reported available at the same read. Null when it could not be read. */

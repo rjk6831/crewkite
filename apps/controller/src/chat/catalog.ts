@@ -165,7 +165,10 @@ function local(input: ChatCatalogInput): Entry {
   const selected = loaded.find(
     (choice) => choice.selectionId === input.local.selection?.selectionId,
   );
-  const connected = input.local.connected === true;
+  const open = input.local.connected === true;
+  // A reconnect shows the last read until the first one on the new connection, and its models
+  // cannot be picked until then.
+  const connected = open && !input.local.observationStale;
   // Text files are inlined for any model. Images need a model the runtime says has vision.
   // shortcut: vision comes from the last connect, so it is unknown until a turn runs. Upgrade:
   // a vision field on LocalModelChoice, read with getModelInfo at discovery.
@@ -185,7 +188,7 @@ function local(input: ChatCatalogInput): Entry {
     // The Local credential lives in memory only (ADR 0025), so every launch starts unconnected.
     // A runtime set up before keeps its rail row with Connect, so Local never drops off the rail
     // between launches. A machine that never set one up shows nothing.
-    needsConnect: !connected && input.local.endpoint !== null,
+    needsConnect: !open && input.local.endpoint !== null,
     lastTurnStats: lastTurnStats(input, 'local'),
     accepts: model === undefined ? null : [...(vision ? ['image/*'] : []), ...LOCAL_TEXT_TYPES],
   };

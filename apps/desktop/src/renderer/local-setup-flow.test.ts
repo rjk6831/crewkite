@@ -162,6 +162,8 @@ test('Local connect stops its command chain when component ownership changes', a
   ];
   for (const [observed, want] of seen)
     assert.equal(lastSeen(observed, now), want, String(observed));
+  // A new connection before its first read shows the age alone.
+  assert.equal(lastSeen(at(5), now, true), 'Last seen 5 min ago.');
   const observed = (loaded: number) => ({ residentLlms: loaded }) as LocalSetup['observation'];
   const memory: [number, number, number, string | null][] = [
     [
@@ -197,9 +199,10 @@ test('Local connect stops its command chain when component ownership changes', a
     selection: null,
   });
   const picked = { selectionId: 'c'.repeat(64), observationHash: 'b'.repeat(64) };
-  assert.equal(selectionLost('Qwen', live), 'Qwen is no longer loaded. Pick a model.');
-  assert.equal(selectionLost('Qwen', { ...live, selection: picked }), null);
-  assert.equal(selectionLost('Qwen', { ...live, connected: false }), null);
+  assert.equal(selectionLost('Model A', live), 'Model A is no longer loaded. Pick a model.');
+  assert.equal(selectionLost('Model A', { ...live, selection: picked }), null);
+  assert.equal(selectionLost('Model A', { ...live, connected: false }), null);
+  assert.equal(selectionLost('Model A', { ...live, observationStale: true }), null);
   assert.equal(selectionLost(null, live), null);
   const choice = { selectionId: picked.selectionId, state: 'loaded-eligible' };
   const holding = (change: Partial<LocalSetup>) =>
@@ -249,6 +252,20 @@ test('Local connect stops its command chain when component ownership changes', a
   assert.deepEqual(await rail([up, withModels], idle), {
     result: { kind: 'connected', withoutToken: true },
     sent: ['BeginLocalConnectionInput', 'RefreshLocalModels'],
+  });
+  // While the loopback probe runs, the input operation is not yet the window. The probe can end it
+  // and connect with no token, and the last read on view waits for the fresh one.
+  const probing = setup({
+    operation: { kind: 'input', operationId: 'cmd_01K7M1N2P3Q4R5S6T7V8W9X0YZ', state: 'intent' },
+  });
+  const cached = { ...up, observation: observed(1), observationStale: true as const };
+  assert.deepEqual(await rail([probing, cached, withModels], idle), {
+    result: { kind: 'connected', withoutToken: true },
+    sent: ['BeginLocalConnectionInput', 'RefreshLocalModels'],
+  });
+  assert.deepEqual(await rail([probing, setup()], idle), {
+    result: { kind: 'settings', why: 'token' },
+    sent: ['BeginLocalConnectionInput'],
   });
   assert.deepEqual(await rail([], setup({ endpoint: null, operation: null })), {
     result: { kind: 'settings', why: 'unconfigured' },

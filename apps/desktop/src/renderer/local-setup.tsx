@@ -68,10 +68,10 @@ export function LocalSetup({
     (model) => model.selectionId === setup?.selection?.selectionId,
   );
   const now = useClock(null, 30_000);
-  // Without a live connection the observation is the last one read. It shows, labelled, and its
-  // controls stay off until a fresh read replaces it.
-  const stale = !!setup?.observation && !connectionReady;
-  const stamp = stale ? lastSeen(setup?.observedAt, now) : null;
+  // Without a live connection, or on a new one before its first read, the observation is the last
+  // one read. It shows, labelled, and its controls stay off until a fresh read replaces it.
+  const stale = !!setup?.observation && (!connectionReady || !!setup.observationStale);
+  const stamp = stale ? lastSeen(setup?.observedAt, now, connectionReady) : null;
   const [lastChoice, setLastChoice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<number | null>(null);
   const observing = useRef(false);

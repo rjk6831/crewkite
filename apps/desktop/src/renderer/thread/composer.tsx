@@ -198,9 +198,10 @@ export function Composer({
       () => {},
     );
   }, [refreshLocal, source.command, loadCatalog]);
+  const saved = localState?.setup;
   const seen =
-    localState?.setup && !localState.setup.connected
-      ? lastSeen(localState.setup.observedAt, Date.now())
+    saved && (!saved.connected || saved.observationStale)
+      ? lastSeen(saved.observedAt, Date.now(), !!saved.connected)
       : null;
   const adding = files.some((file) => file.busy);
   const canAttach = !!source.attachFiles && !blocked;

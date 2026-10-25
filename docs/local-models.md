@@ -12,11 +12,11 @@ Local connects in one of three ways, and the card shows which one it used.
 
 ## What the card shows
 
-Before a connection the card and the model picker show the last observation, labelled "Last seen 2 h ago. Not connected.", with the controls disabled. After Connect they fill from a fresh read.
+Before a connection the card and the model picker show the last observation, labelled "Last seen 2 h ago. Not connected.", with the controls disabled. A reconnect keeps that read on view, with the controls still off, until the first read on the new connection replaces it.
 
-The card reads the runtime again on the open connection, with no token: when Settings opens, when the window gains focus, every 15 seconds while Settings or the model picker is open, and on the runtime's load and unload events when the SDK reports them. Refresh on the card runs the read now. The selected model survives a reconnect when a loaded instance has the same model key. Otherwise the selection clears and the card says, for example, "Qwen is no longer loaded. Pick a model." "Model selection confirmed" appears only after a fresh read that includes the selected instance.
+The card reads the runtime again on the open connection, with no token: when Settings opens, when the window gains focus, and every 15 seconds while Settings or the model picker is open. The SDK has no load or unload event to listen to. Refresh on the card runs the read now. The selected model survives a reconnect when a loaded instance has the same model key. Otherwise the selection clears and the card says, for example, "Model A is no longer loaded. Pick a model." "Model selection confirmed" appears only after a fresh read that includes the selected instance.
 
-Local qualifies when the selected instance is loaded and its model is eligible. Other resident models do not disqualify it. The card lists every resident model with its size and context and marks the selected one. A turn binds to one instance reference, and only that instance receives it. An embedding model resident in the runtime still blocks Local.
+Local qualifies when the selected instance is loaded and its model is eligible. Other resident models do not disqualify it. The card lists every resident model with its size and context and marks the selected one. A turn binds to one instance reference, and only that instance receives it. A resident embedding model does not block Local either.
 
 The hardware card shows Available memory, read once per observation with `vm_stat` as free plus inactive plus purgeable pages times the page size. When available memory is below 4 GiB or below 10 percent of unified memory, the card adds a line such as "Low memory: 1.2 GB available with 2 models loaded. Replies may slow." It is a warning and never blocks a turn.
 

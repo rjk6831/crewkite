@@ -4084,9 +4084,20 @@ test('Local reads keep the selection while its model key is loaded and clear it 
     [
       'reconnect with the token, same model loaded',
       async () => {
+        const shown = context.setupState()?.observation?.observationHash;
         await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
         await context.operationDone();
-        assert.equal(context.setupState()?.observation, null);
+        // The last read stays on view, marked stale, and nothing can be picked from it.
+        const between = context.setupState();
+        assert.equal(between?.observation?.observationHash, shown);
+        assert.equal(between?.observationStale, true);
+        assert.equal(between?.selection, null);
+        assert.equal(between?.reason, 'discovery-required');
+        const pick = await context.local('SelectLocalModel', {
+          selectionId: selected.selection?.selectionId,
+          observationHash: shown,
+        });
+        assert.equal(pick.reason, 'local-selection-stale');
         return refresh('completed');
       },
       true,
@@ -4129,6 +4140,8 @@ test('Local reads keep the selection while its model key is loaded and clear it 
   assert.equal(open?.connected, true);
   assert.equal(open?.secretConfigured, false);
   assert.equal(open?.operation, null);
+  assert.equal(open?.observation?.observationHash, last?.observation?.observationHash);
+  assert.equal(open?.observationStale, true);
 });
 
 test('Local preparation freezes every authority and refuses changed effects after reopen', async (t) => {

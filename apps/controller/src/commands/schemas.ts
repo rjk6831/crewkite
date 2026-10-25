@@ -556,6 +556,8 @@ export const LocalControlSchema = z.strictObject({
   selectedModelKey: z.string().min(1).max(200).nullable().default(null),
   // When the observation was read and the memory available at that read.
   observedAt: TimestampSchema.nullable().default(null),
+  // A reconnect keeps the last observation on view until the first read on the new connection.
+  observationStale: z.boolean().default(false),
   availableMemoryBytes: RevisionSchema.nullable().default(null),
   setupHash: HashSchema.nullable(),
   operation: z

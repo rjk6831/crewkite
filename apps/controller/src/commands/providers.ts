@@ -772,7 +772,7 @@ export class ProviderCommands {
               ? 'connection-unavailable'
               : !connected
                 ? 'connection-required'
-                : !control.observation
+                : !control.observation || control.observationStale
                   ? 'discovery-required'
                   : !control.selection
                     ? 'model-selection-required'
@@ -811,6 +811,7 @@ export class ProviderCommands {
       generation: generation === 'generation-unknown' ? 'unknown' : generation ? 'active' : 'idle',
       observation: control.observation,
       observedAt: control.observedAt,
+      ...(control.observationStale ? { observationStale: true as const } : {}),
       contextTokens: choice?.contextLength ?? null,
       availableMemoryBytes: control.availableMemoryBytes,
       selection: control.selection,
@@ -848,6 +849,7 @@ export class ProviderCommands {
         connectionFailed: false,
         observation: null,
         observedAt: null,
+        observationStale: false,
         selection: null,
         selectedModelKey: null,
         setupHash: null,
@@ -910,6 +912,7 @@ export class ProviderCommands {
         connectionRevision: control.connectionRevision + 1,
         observation: null,
         observedAt: null,
+        observationStale: false,
         selection: null,
         selectedModelKey: null,
         setupHash: null,
@@ -924,6 +927,7 @@ export class ProviderCommands {
       );
       if (
         !control.observation ||
+        control.observationStale ||
         command.payload.observationHash !== control.observation.observationHash ||
         !picked
       )
@@ -946,12 +950,12 @@ export class ProviderCommands {
     }
     if (command.command === 'BeginLocalConnectionInput' && control.authMode === 'none') {
       this.revokeLocalSecret();
+      // The last read stays on view, marked stale, until the first read on this connection.
       this.saveLocal({
         ...control,
         noneConnected: true,
         connectionFailed: false,
-        observation: null,
-        observedAt: null,
+        observationStale: !!control.observation,
         selection: null,
         setupHash: null,
       });
@@ -981,8 +985,7 @@ export class ProviderCommands {
     this.saveLocal({
       ...control,
       connectionFailed: false,
-      observation: kind === 'discovery' ? control.observation : null,
-      observedAt: kind === 'discovery' ? control.observedAt : null,
+      observationStale: kind === 'input' ? !!control.observation : control.observationStale,
       selection: kind === 'discovery' ? control.selection : null,
       setupHash: kind === 'discovery' ? control.setupHash : null,
       operation: {
@@ -1077,7 +1080,7 @@ export class ProviderCommands {
               ) &&
             !this.store.localGenerationBlocker();
           let observation = control.observation;
-          let { observedAt, availableMemoryBytes, selectedModelKey } = control;
+          let { observedAt, observationStale, availableMemoryBytes, selectedModelKey } = control;
           let selection = control.selection;
           let setupHash = control.setupHash;
           if (known && live && value && 'kind' in value && value.kind === 'ready') {
@@ -1105,6 +1108,7 @@ export class ProviderCommands {
             const kept = retainedSelection(selectedModelKey, nextObservation);
             observation = nextObservation;
             observedAt = this.now();
+            observationStale = false;
             availableMemoryBytes = availableMemory() ?? null;
             if (kept && control.endpoint) {
               selection = {
@@ -1128,6 +1132,7 @@ export class ProviderCommands {
           } else if (known && live && current.kind === 'discovery') {
             observation = null;
             observedAt = null;
+            observationStale = false;
             selection = null;
             setupHash = null;
           }
@@ -1156,6 +1161,7 @@ export class ProviderCommands {
             connectionFailed: failedConnection,
             observation,
             observedAt,
+            observationStale,
             availableMemoryBytes,
             selection,
             selectedModelKey,
@@ -1267,8 +1273,7 @@ export class ProviderCommands {
                 noneConnected: true,
                 connectionFailed: false,
                 connectionRevision: current.connectionRevision + 1,
-                observation: null,
-                observedAt: null,
+                observationStale: !!current.observation,
                 selection: null,
                 setupHash: null,
               });

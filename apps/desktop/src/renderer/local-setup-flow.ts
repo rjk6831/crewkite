@@ -31,8 +31,15 @@ export const REOBSERVE_MS = 15_000;
 
 export const WITHOUT_TOKEN = 'Connected without a token. The runtime has auth off on loopback.';
 
-/** The label on a cached observation. Null when nothing says when it was read. */
-export function lastSeen(observedAt: string | null | undefined, now: number): string | null {
+/**
+ * The label on a cached observation. Null when nothing says when it was read. `connected` is a new
+ * connection whose first read has not landed, so only the age shows.
+ */
+export function lastSeen(
+  observedAt: string | null | undefined,
+  now: number,
+  connected = false,
+): string | null {
   if (!observedAt) return null;
   const minutes = Math.max(0, Math.floor((now - Date.parse(observedAt)) / 60_000));
   const age =
@@ -43,7 +50,7 @@ export function lastSeen(observedAt: string | null | undefined, now: number): st
         : minutes < 1440
           ? `${Math.floor(minutes / 60)} h ago`
           : `${Math.floor(minutes / 1440)} d ago`;
-  return `Last seen ${age}. Not connected.`;
+  return connected ? `Last seen ${age}.` : `Last seen ${age}. Not connected.`;
 }
 
 const GIB = 1024 ** 3;
@@ -76,11 +83,16 @@ export function lowMemory(
 export function selectionLost(
   previous: string | null,
   setup:
-    | Pick<LocalSetup, 'connected' | 'selection' | 'operation' | 'observation'>
+    | Pick<LocalSetup, 'connected' | 'selection' | 'operation' | 'observation' | 'observationStale'>
     | null
     | undefined,
 ): string | null {
-  return previous && setup?.connected && !setup.operation && setup.observation && !setup.selection
+  return previous &&
+    setup?.connected &&
+    !setup.operation &&
+    setup.observation &&
+    !setup.observationStale &&
+    !setup.selection
     ? `${previous} is no longer loaded. Pick a model.`
     : null;
 }
@@ -149,14 +161,22 @@ export async function connectInPlace({
     if (!active()) return { kind: 'stopped' };
     const now = await read();
     if (!active() || !now) return { kind: 'stopped' };
-    if (now.operation?.kind === 'input') return { kind: 'settings', why: 'token' };
+    // The controller probes loopback before it opens the token window, so an input operation is
+    // the window only once it is owned. The probe can still end it and connect with no token.
+    if (now.operation?.kind === 'input' && now.operation.state === 'owned')
+      return { kind: 'settings', why: 'token' };
+    if (now.operation?.state === 'unknown')
+      return {
+        kind: 'blocked',
+        message: now.reason ? setupReasons[now.reason] : 'Local did not connect.',
+      };
     if (now.operation) continue;
     if (!now.connected)
       return {
         kind: 'blocked',
         message: now.reason ? setupReasons[now.reason] : 'Local did not connect.',
       };
-    if (now.observation && (discovered || !setup.connected))
+    if (now.observation && !now.observationStale && (discovered || !setup.connected))
       return { kind: 'connected', withoutToken: !now.secretConfigured };
     if (!discovered) {
       discovered = true;
@@ -242,7 +262,7 @@ export async function waitForLocalReadiness({
     if (!active()) return 'stopped';
     const setup = await read();
     if (!active() || !setup || setup.endpoint !== endpoint) return 'stopped';
-    if (setup.observation && !setup.operation) return 'ready';
+    if (setup.observation && !setup.observationStale && !setup.operation) return 'ready';
     if (setup.operation) continue;
     if (!setup.connected) return 'stopped';
     if (!discoveryRequested) {

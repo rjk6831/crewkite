@@ -21,7 +21,7 @@ Local had a third problem. [ADR 0013](0013-macos-first-local-optional.md) says "
 
 This record also amends the resident clause of ADR 0013 and leaves that record's text as it is. One generation at a time stays. The one-resident rule goes, and these rules replace it:
 
-- Local qualifies when the selected instance is loaded and its model is eligible, whatever else is resident. Other resident language models do not disqualify it. An embedding model resident in the runtime still does.
+- Local qualifies when the selected instance is loaded and its model is eligible, whatever else is resident. Other resident models do not disqualify it, embedding models included.
 - A turn binds to one instance reference, so a second loaded model cannot receive it.
 - Memory pressure is a warning on the Local card and never a gate.
 - No context size is fixed anywhere in code, as a floor, a ceiling or a special case. The loaded instance reports its context when CrewKite connects and at each re-observation. The repo map budget, the rolling summary trigger and the reply budget all derive from that number. An instance that reports 8,192, 131,072 or 1,048,576 qualifies the same way and gets budgets sized for its own window. [Local models](../local-models.md) gives the rule.
@@ -38,10 +38,10 @@ On Local, the one-resident rule protected against a memory problem I had not mea
 
 ## Consequences
 
-- Threads from before the cursor existed have no value for it. The first return to a family on such a thread starts a new session with the full packet.
+- Threads from before the cursor existed have no value for it. On such a thread the family's newest writing turn stands in for the cursor, and the first return sends the delta from there.
 - A return after other families ran costs a larger first request than a plain resume. The delta is bounded by the packet cap.
 - A thread can show a "Started a new session" line on a long thread. That is the visible cost of the cap.
 - A resume warning is no longer visible in the message text. It is in the turn trace.
 - Proposed ADR 0025 repeats the one-resident profile in its consequences. Accepting this record supersedes that sentence, and 0025 gets a dated amendment then.
-- The file-proposal profile for Local writers still carries its own fixed context and output limits. This record does not change it.
+- The file-proposal profile for Local writers still carries its own fixed output limits. Its context now comes from the bound instance, the same as chat.
 - The cursor, delta, model-change and Local rules have fixture coverage and no live run on record until the next live check.
