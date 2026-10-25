@@ -11,6 +11,7 @@ import {
   type Observation,
 } from '@crewkite/contracts';
 import {
+  anthropicChatAccepts,
   anthropicChatEfforts,
   anthropicChatModels,
   anthropicDefaultChatModel,
@@ -87,14 +88,19 @@ function anthropic(input: ChatCatalogInput): Entry {
     ? anthropicChatModels.map((model) => chatModel(model, anthropicChatEfforts, 'default'))
     : [];
   const reported = anthropicChatModels.find((model) => model === input.anthropicModel);
-  return entry(
-    input,
-    'anthropic',
-    !!ready,
-    profiles[0]?.reason,
-    models,
-    reported ?? anthropicDefaultChatModel,
-  );
+  return {
+    ...entry(
+      input,
+      'anthropic',
+      !!ready,
+      profiles[0]?.reason,
+      models,
+      reported ?? anthropicDefaultChatModel,
+    ),
+    // The client's input protocol fixes these types for every model, so they hold wherever the
+    // client is installed.
+    accepts: profiles.length ? [...anthropicChatAccepts] : null,
+  };
 }
 
 function google(input: ChatCatalogInput): Entry {

@@ -4,11 +4,15 @@
 // argv: --print --output-format stream-json --input-format stream-json --verbose
 //   --include-partial-messages --permission-prompt-tool stdio --setting-sources ''
 //   --settings {"disableAllHooks":true} --permission-mode default|acceptEdits --model M
-//   [--effort E] [--resume S]. With no setting sources neither the scratch copy's own .claude
+//   [--effort E] [--resume S] [--add-dir F]. With no setting sources neither the scratch copy's own .claude
 //   settings nor the user file load, so no allow rule answers an ask before CrewKite sees it.
 //
 // stdin, one JSON object per line:
-//   {"type":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]}}
+//   {"type":"user","message":{"role":"user","content":[{"type":"text","text":"..."}]}}, with an
+//     image block {"type":"image","source":{"type":"base64","media_type":"image/png","data":...}}
+//     or a document block {"type":"document","title":N,"source":{"type":"base64",
+//     "media_type":"application/pdf","data":...}} or {"source":{"type":"text",
+//     "media_type":"text/plain","data":...}} before the text for each attached file
 //   {"type":"control_response","response":{"subtype":"success","request_id":"req-1",
 //     "response":{"behavior":"allow","updatedInput":{...}}}}
 // stdout, one JSON object per line:
@@ -25,6 +29,9 @@
 //     "seven_day":{"utilization":0.4,"resetsAt":<unix seconds>}}}}
 //   {"type":"result","subtype":"success","is_error":false,"session_id":"...",
 //     "modelUsage":{"<model>":{"contextWindow":200000}}}
+//   An API refusal: {"type":"assistant","message":{...,"content":[{"type":"text","text":"API
+//     Error: 400 ..."}]},"error":"invalid_request","api_error_status":400}, then a result with
+//     "is_error":true
 //
 // Assumptions the adapter makes and a live client should settle:
 // - A streamed message comes back as one assistant frame per content block, sharing message.id.
@@ -36,10 +43,10 @@
 // - SIGINT to the group ends a running turn. A failed resume exits non-zero without a result.
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import test from 'node:test';
+import { after, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
   type AgentEvent,
@@ -50,6 +57,7 @@ import {
   type ChatSession,
   type ChatToolKind,
 } from '@crewkite/contracts';
+import type { ChatTurnRequest } from '../../chat/adapter.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import { anthropicChatAdapter } from './chat.ts';
@@ -125,12 +133,30 @@ function delta(index: number, type: string, field: string, text: string) {
   return { type: 'content_block_delta', index, delta: { type, [field]: text } };
 }
 
+// Stored files as the controller lays them out: <files folder>/<sha256>/<name>.
+const stored = mkdtempSync(join(tmpdir(), 'crewkite-chat-files-'));
+after(() => rmSync(stored, { recursive: true }));
+const folder = join(stored, 'chat', 'tsk_00000000000000000000000001', 'files');
+function file(name: string, mimeType: string, bytes: Buffer) {
+  const id = createHash('sha256').update(bytes).digest('hex');
+  const path = join(folder, id, name);
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, bytes);
+  return { attachment: { id, name, mimeType, bytes: bytes.length }, path };
+}
+type File = ReturnType<typeof file>;
+const png = file('screen.png', 'image/png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]));
+const pdf = file('spec.pdf', 'application/pdf', Buffer.from('%PDF-1.7 spec'));
+const notes = file('notes.md', 'text/markdown; charset=utf-8', Buffer.from('# Notes\nShip it.'));
+const sheet = file('plan.xlsx', 'application/vnd.ms-excel', Buffer.from('PK sheet'));
+
 function run(
   script: Step[] | ((scratch: string) => Step[]),
   session: ChatSession | null = null,
   permissionGrants: ChatToolKind[] = [],
   permissionPolicy: ChatPermissionPolicy = 'ask',
   effort: ChatEffort = 'default',
+  files: File[] = [],
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
   mkdirSync(join(root, 'scratch'));
@@ -154,34 +180,33 @@ function run(
     } as typeof write;
     return child;
   };
+  const request: ChatTurnRequest & { files: File[] } = {
+    turnId,
+    taskId: 'tsk_00000000000000000000000001',
+    role: 'assistant',
+    selection: { family: 'anthropic', model, effort },
+    prompt,
+    systemContext,
+    history: [],
+    session,
+    scratch: { directory: join(root, 'scratch'), base: 'a'.repeat(40), projectName: 'demo' },
+    work: { directory: join(root, 'work'), home: root },
+    permissionPolicy,
+    permissionGrants,
+    deadlineMs: 60_000,
+    environment: { HOME: root, PATH: '/usr/bin:/bin' },
+    now: () => Date.parse('2026-10-23T00:00:00.000Z'),
+    files,
+  };
   const handle = anthropicChatAdapter({
     launch: () => ({ executable: fixture, sha256 }),
     spawn,
     onUsage: (reading) => usage.push(reading),
-  }).startTurn(
-    {
-      turnId,
-      taskId: 'tsk_00000000000000000000000001',
-      role: 'assistant',
-      selection: { family: 'anthropic', model, effort },
-      prompt,
-      systemContext,
-      history: [],
-      session,
-      scratch: { directory: join(root, 'scratch'), base: 'a'.repeat(40), projectName: 'demo' },
-      work: { directory: join(root, 'work'), home: root },
-      permissionPolicy,
-      permissionGrants,
-      deadlineMs: 60_000,
-      environment: { HOME: root, PATH: '/usr/bin:/bin' },
-      now: () => Date.parse('2026-10-23T00:00:00.000Z'),
-    },
-    (event) => {
-      events.push(AgentEventSchema.parse(event));
-      waiting.get(event.type)?.(event);
-      waiting.delete(event.type);
-    },
-  );
+  }).startTurn(request, (event) => {
+    events.push(AgentEventSchema.parse(event));
+    waiting.get(event.type)?.(event);
+    waiting.delete(event.type);
+  });
   const next = <T extends AgentEvent['type']>(type: T) =>
     new Promise<Extract<AgentEvent, { type: T }>>((resolve) =>
       waiting.set(type, resolve as (event: AgentEvent) => void),
@@ -395,6 +420,43 @@ test('a client that exits without a result is reported with its last stderr line
   );
 });
 
+test('a file the API refuses or CrewKite cannot read fails the turn as attachment-rejected, and a refusal with no file block keeps its mapping', async (t) => {
+  const refusal =
+    'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Could not process image"}}';
+  const refused: Step[] = [
+    'read',
+    { out: init() },
+    {
+      out: {
+        ...reply('msg_4', [{ type: 'text', text: refusal }]),
+        error: 'invalid_request',
+        api_error_status: 400,
+      },
+    },
+    { out: { ...done(), is_error: true, result: refusal, terminal_reason: 'api_error' } },
+    'drain',
+  ];
+  const missing = { ...png, path: join(folder, 'gone', 'screen.png') };
+  const rows = [
+    { files: [png], kind: 'attachment-rejected', provider: refusal, spawned: true },
+    // A path line sends nothing the API reads as a file, so the refusal is about something else.
+    { files: [sheet], kind: 'protocol', provider: refusal, spawned: true },
+    { files: [], kind: 'protocol', provider: refusal, spawned: true },
+    { files: [missing], kind: 'attachment-rejected', provider: null, spawned: false },
+  ];
+  for (const row of rows) {
+    const turn = run(refused, null, [], 'ask', 'default', row.files);
+    t.after(turn.cleanup);
+    const { stopReason, failure } = await turn.handle.result;
+    assert.equal(stopReason, 'error');
+    assert.equal(failure?.kind, row.kind, JSON.stringify(row.files));
+    assert.equal(failure?.providerMessage, row.provider);
+    assert.equal(turn.launched.argv.length > 0, row.spawned);
+    if (!row.spawned)
+      assert.equal(failure?.message, 'CrewKite could not read the attached file screen.png.');
+  }
+});
+
 test('a rate limit frame reports each window it can read, per-response readings first', async (t) => {
   const window = (windowId: string, value: number, resetsAt: string) => ({
     windowId,
@@ -449,7 +511,7 @@ test('a rate limit frame reports each window it can read, per-response readings 
   }
 });
 
-test('a new session gets the framing, a saved one is resumed with the prompt alone, and the badge shows the effort the turn runs at', async (t) => {
+test('a new session gets the framing, a saved one is resumed with the prompt alone, files go as blocks or path lines, and the badge shows the effort the turn runs at', async (t) => {
   const saved = 'a3d9c0e2-5b47-4f18-8c6a-2e9d7b1f4a30';
   const base = [
     '--print',
@@ -499,9 +561,42 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
       effort: 'minimal' as const,
       reported: null,
     },
+    {
+      // Images, PDFs and UTF-8 text go as blocks in file order before the text. A spreadsheet
+      // has no block, so its path goes in the text and its folder joins the launch.
+      session: null,
+      argv: [...base, '--add-dir', folder],
+      text: `${systemContext}\n\n${prompt}`,
+      id: fresh,
+      files: [png, sheet, pdf, notes],
+      content: [
+        {
+          type: 'image',
+          source: { type: 'base64', media_type: 'image/png', data: 'iVBORwECAw==' },
+        },
+        {
+          type: 'document',
+          title: 'spec.pdf',
+          source: {
+            type: 'base64',
+            media_type: 'application/pdf',
+            data: Buffer.from('%PDF-1.7 spec').toString('base64'),
+          },
+        },
+        {
+          type: 'document',
+          title: 'notes.md',
+          source: { type: 'text', media_type: 'text/plain', data: '# Notes\nShip it.' },
+        },
+        {
+          type: 'text',
+          text: `${systemContext}\n\n${prompt}\n\nAttached file: plan.xlsx (application/vnd.ms-excel, 8 bytes) at ${sheet.path}`,
+        },
+      ],
+    },
   ];
   for (const row of rows) {
-    const turn = run(streamed(row.id, row.reported), row.session, [], 'ask', row.effort);
+    const turn = run(streamed(row.id, row.reported), row.session, [], 'ask', row.effort, row.files);
     t.after(turn.cleanup);
     const result = await turn.handle.result;
     assert.deepEqual(turn.launched.argv, row.argv);
@@ -509,7 +604,7 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     assert.equal(started?.effort, row.badge ?? 'default', JSON.stringify(row));
     assert.deepEqual(JSON.parse(turn.launched.input[0] ?? ''), {
       type: 'user',
-      message: { role: 'user', content: [{ type: 'text', text: row.text }] },
+      message: { role: 'user', content: row.content ?? [{ type: 'text', text: row.text }] },
     });
     assert.equal(result.session?.sessionId, row.id);
   }
