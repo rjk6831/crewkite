@@ -854,6 +854,42 @@ export class Store {
     if (result.changes !== 1) throw new Error('Native phase ownership does not match its closure.');
   }
 
+  /**
+   * Remove a task with its conversation, chat rows and events. Anything else that still refers to
+   * it, such as a run, an approval or a project command, keeps the task: the call changes nothing
+   * and returns false.
+   */
+  removeTask(taskId: string): boolean {
+    if (!this.transactionEvents) throw new Error('Task removal requires a transaction.');
+    const referenced = this.db
+      .prepare("SELECT 1 FROM entities WHERE kind!='task' AND json_extract(body,'$.taskId')=?")
+      .get(taskId);
+    if (referenced) return false;
+    this.db.exec('SAVEPOINT remove_task');
+    try {
+      for (const statement of [
+        'DELETE FROM activity_output WHERE cursor IN (SELECT cursor FROM events WHERE task_id=?)',
+        'DELETE FROM events WHERE task_id=?',
+        'DELETE FROM conversation_entries WHERE task_id=?',
+        'DELETE FROM task_conversations WHERE task_id=?',
+        'DELETE FROM chat_turns WHERE task_id=?',
+        'DELETE FROM chat_threads WHERE task_id=?',
+        "DELETE FROM entities WHERE kind='task' AND id=?",
+      ])
+        this.db.prepare(statement).run(taskId);
+      this.db.exec('RELEASE remove_task');
+    } catch (error) {
+      this.db.exec('ROLLBACK TO remove_task; RELEASE remove_task');
+      // Every other table that names a task holds a foreign key, so SQLite finds the rest.
+      if (error instanceof Error && error.message.includes('FOREIGN KEY')) return false;
+      throw error;
+    }
+    // Events this transaction wrote for the task are gone with it, so nobody hears them.
+    this.transactionEvents = this.transactionEvents.filter((event) => event.taskId !== taskId);
+    this.workspaceDirty = true;
+    return true;
+  }
+
   subscribe(listener: (event: Event) => void): () => void {
     this.listeners.add(listener);
     return () => this.listeners.delete(listener);

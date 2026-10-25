@@ -1,5 +1,5 @@
 import type { ChatChangesRead } from '@crewkite/contracts';
-import { committedFiles, type FileContent, readCandidateFiles } from '../host/source.ts';
+import { committedFiles, type FileContent, git, readCandidateFiles } from '../host/source.ts';
 
 type FileDiff = ChatChangesRead['files'][number];
 type Op = { op: ' ' | '-' | '+'; line: string };
@@ -171,4 +171,20 @@ function hunks(ops: readonly Op[]): string[] {
     index = stop;
   }
   return out;
+}
+
+/**
+ * Remove the ref that keeps the thread's base commit. A missing ref is already gone.
+ * shortcut: a stand-in with the signature the per-file discard work exports. Upgrade: keep that
+ * version when the two meet.
+ */
+export function deleteThreadBaseRef(repository: string, taskId: string) {
+  const ref = `refs/crewkite/threads/${taskId}`;
+  let current: string;
+  try {
+    current = git(repository, ['rev-parse', '--verify', '--quiet', ref]).toString('utf8').trim();
+  } catch {
+    return;
+  }
+  git(repository, ['update-ref', '--no-deref', '-d', ref, current]);
 }
