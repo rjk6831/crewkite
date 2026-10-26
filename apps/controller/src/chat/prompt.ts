@@ -8,7 +8,7 @@ import {
   statSync,
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { ChatAttachment, ChatFamily } from '@crewkite/contracts';
+import type { ChatAttachment, ChatFamily, ChatRole } from '@crewkite/contracts';
 import { anthropicInstructionFile } from '../providers/anthropic/instructions.ts';
 import { googleInstructionFile } from '../providers/google/instructions.ts';
 import type { ChatHistoryEntry } from './adapter.ts';
@@ -21,11 +21,15 @@ export const familyName: Record<ChatFamily, string> = {
 };
 
 // rerun: Retry or Regenerate on the family that already answered the message, in a new session.
-export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun';
+// model: the person picked another model of the same family, which starts a new native session.
+// session: the turns since the family last ran do not fit its session, so a new one starts.
+export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model' | 'session';
 
 export function handoffReason(reason: HandoffReason): string {
   if (reason === 'rerun') return 'the person asked for the reply again';
   if (reason === 'steer') return 'the person sent a new message during the reply';
+  if (reason === 'model') return 'model changed in the composer';
+  if (reason === 'session') return 'the thread moved past what the old session could carry';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
@@ -301,8 +305,8 @@ export function handoffPacket(input: {
   prompt: string;
   /** Instruction files at the scratch root. The next provider reads them from the copy. */
   instructions?: readonly string[];
-  /** Files the conversation carried. The request for the new message sends each of them again. */
-  attachments?: readonly Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>[];
+  /** Files from earlier messages that travel with this request. The new message's own files are not here. */
+  earlier?: readonly EarlierFile[];
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -323,13 +327,16 @@ export function handoffPacket(input: {
         : 'No files changed yet.';
   // Send now stops a reply and starts the next message on the same family. The packet then tells
   // the model what the stopped reply left behind. A rerun starts a new session, since the old one
-  // holds the reply it replaces.
+  // holds the reply it replaces. A model change or a session that fell too far behind starts a new
+  // session on the same family, and nothing was stopped.
   const opening =
     input.reason === 'rerun'
       ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-      : input.from === input.to
-        ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-        : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+      : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
+        ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+        : input.from === input.to
+          ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+          : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
@@ -338,15 +345,135 @@ export function handoffPacket(input: {
     ...(input.instructions?.length
       ? [`Project instructions: ${input.instructions.join(', ')}`]
       : []),
-    ...(input.attachments?.length
-      ? [
-          `Files the person attached in this thread. They come with the new message:\n${input.attachments
-            .map((file) => `${file.name} (${file.mimeType}, ${byteSize(file.bytes)})`)
-            .join('\n')}`,
-        ]
-      : []),
-    `New message:\n${input.prompt}`,
-  ].join('\n\n');
+    earlierFilesSection(input.earlier ?? []),
+    newMessageBlock(input.prompt),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+/** A file from an earlier message, and how this request reaches it. */
+export type EarlierFile = {
+  attachment: Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>;
+  /** A short quote of the message the file came with. */
+  came: string;
+  /** What the family does with it: `Path: <path>`, or the link or note the adapter sends. */
+  reach: string;
+};
+
+/**
+ * How an earlier file reaches a family. Anthropic's adapter swaps the stored path for its staged
+ * copy. Google gets a link block after the text. Local reads no file by path.
+ */
+export function earlierReach(family: ChatFamily, path: string): string {
+  if (family === 'google') return 'sent as a file link below';
+  return family === 'local' ? 'not sent to Local' : `Path: ${path}`;
+}
+
+/** The message text under its heading. The request carries it once. */
+export function newMessageBlock(text: string): string {
+  return `New message from the person:\n${text}`;
+}
+
+/** One line for a file: name, type, size, then the tail. */
+export function attachedLine(
+  file: Pick<ChatAttachment, 'name' | 'mimeType' | 'bytes'>,
+  tail: string,
+): string {
+  return `${file.name}, ${file.mimeType}, ${byteSize(file.bytes)}, ${tail}`;
+}
+
+/** The files of the new message, one line each, or nothing. Adapters add it directly under the text. */
+export function attachedSection(lines: readonly string[]): string {
+  return lines.length ? `Files attached to this message:\n${lines.join('\n')}` : '';
+}
+
+export function earlierFileLine(file: EarlierFile): string {
+  return attachedLine(file.attachment, `came with "${file.came}", ${file.reach}`);
+}
+
+/** Files from before the new message, listed once, or nothing. The packet and the delta packet both use it. */
+export function earlierFilesSection(files: readonly EarlierFile[]): string {
+  return files.length
+    ? [
+        'Files attached earlier in this thread. They are not part of the new message.',
+        ...files.map(earlierFileLine),
+      ].join('\n')
+    : '';
+}
+
+/** A turn the resumed session has not seen, as the delta packet tells it. */
+export type DeltaTurn = Readonly<{
+  family: ChatFamily;
+  model: string;
+  role: ChatRole;
+  /** The person's message, or null when an earlier turn in the packet or the new message carries it. */
+  message: string | null;
+  reply: string | null;
+  /** Why the turn ended early, or null when it finished. */
+  early: string | null;
+  tools: readonly string[];
+}>;
+
+const roleVerb: Record<ChatRole, string> = {
+  assistant: 'answered',
+  fixer: 'fixed the review findings',
+  reviewer: 'reviewed the changes',
+  advisor: 'gave a second opinion',
+  challenger: 'challenged the last answer',
+};
+
+/**
+ * A resumed session already holds the turns its family ran. The delta packet tells it what the
+ * thread did since then: the other turns, what changed in the scratch copy, check results and
+ * files. Replies keep their full text for the last three and 600 characters before that, the
+ * same rule as the handoff packet. `clip` caps each message and reply when the packet must shrink.
+ */
+export function deltaPacket(input: {
+  from: ChatFamily | null;
+  to: ChatFamily;
+  reason: HandoffReason | null;
+  turns: readonly DeltaTurn[];
+  changes: readonly string[];
+  checks: readonly string[];
+  earlier: readonly EarlierFile[];
+  prompt: string;
+  clip?: number;
+}): string {
+  const cut = (text: string, characters: number) =>
+    text.length > characters ? `${text.slice(0, characters).toWellFormed()} [trimmed]` : text;
+  const capped = (text: string) => (input.clip === undefined ? text : cut(text, input.clip));
+  const replies = input.turns.flatMap((turn, index) => (turn.reply ? [index] : []));
+  const full = new Set(replies.slice(-3));
+  const turns = input.turns.map((turn, index) => {
+    const reply = turn.reply && (full.has(index) ? turn.reply : cut(turn.reply, 600));
+    return [
+      ...(turn.message === null ? [] : [`Person:\n${capped(turn.message)}`]),
+      `${familyName[turn.family]} (${turn.model}) ${roleVerb[turn.role]}:\n${reply ? capped(reply) : 'No reply.'}`,
+      ...(turn.early ? [`The turn ended early. Reason: ${turn.early}.`] : []),
+      ...(turn.tools.length
+        ? [`Tool activity:\n${turn.tools.map((line) => `- ${line}`).join('\n')}`]
+        : []),
+    ].join('\n\n');
+  });
+  const to = familyName[input.to];
+  const opening =
+    input.from && input.from !== input.to && input.reason
+      ? `This thread moved from ${familyName[input.from]} to ${to}. Reason: ${handoffReason(input.reason)}. This session holds the thread up to its last turn on ${to}.`
+      : `Other providers took turns in this thread since its last turn on ${to}.`;
+  return [
+    opening,
+    'Earlier work is in the same scratch copy. Read files before you change them.',
+    `Turns since then, oldest first:\n\n${turns.join('\n\n')}`,
+    input.changes.join('\n'),
+    input.checks.length
+      ? `System lines since then that mention checks:\n${input.checks.join('\n')}`
+      : '',
+    earlierFilesSection(input.earlier),
+    newMessageBlock(input.prompt),
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 /** "812 bytes", "12.4 KiB", "3.0 MiB". */

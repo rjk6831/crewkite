@@ -10,6 +10,7 @@ import {
 import { ArrowRightLeft, Check, ChevronDown, ChevronRight } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { REOBSERVE_MS } from '../local-setup-flow.ts';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import { FamilyMark } from './family-mark.tsx';
@@ -132,6 +133,8 @@ export function ModelPicker({
   onHandoff,
   handoffMode = 'most-left',
   label: menuLabel = 'Provider and model',
+  localSeen = null,
+  onObserve,
 }: {
   catalog: ChatCatalogRead | null;
   selection: ChatModelSelection | null;
@@ -145,6 +148,10 @@ export function ModelPicker({
   /** The thread's mode, so the suggested provider is the one an automatic handoff would pick. */
   handoffMode?: ChatHandoffMode;
   label?: string;
+  /** `Last seen 2 h ago. Not connected.` for Local, when only a cached observation exists. */
+  localSeen?: string | null;
+  /** Reads the Local runtime again. Runs when the menu opens and every 15 seconds while it is open. */
+  onObserve?: () => void;
 }) {
   const [open, setOpen] = useState(false);
   // Families whose legacy models are shown. Every opening starts with them folded away.
@@ -179,6 +186,12 @@ export function ModelPicker({
       element?.removeEventListener('focusout', leave);
     };
   }, [open]);
+  useEffect(() => {
+    if (!open || !onObserve) return;
+    onObserve();
+    const timer = window.setInterval(onObserve, REOBSERVE_MS);
+    return () => window.clearInterval(timer);
+  }, [open, onObserve]);
   // Focus lands on the chosen model, so the arrow keys work as soon as the menu opens.
   useEffect(() => {
     if (!open) return;
@@ -303,9 +316,11 @@ export function ModelPicker({
                   <span>
                     {family.connected
                       ? allowance(family, nowMs)
-                      : family.needsConnect
-                        ? 'Connect in Settings'
-                        : 'Not connected'}
+                      : family.family === 'local' && localSeen
+                        ? localSeen
+                        : family.needsConnect
+                          ? 'Connect in Settings'
+                          : 'Not connected'}
                   </span>
                 </div>
                 {family.models.filter((model) => !model.hidden).map(item)}

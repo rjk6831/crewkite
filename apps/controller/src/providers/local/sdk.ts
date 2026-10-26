@@ -16,7 +16,6 @@ import { z } from 'zod';
 import type { Schedule } from '../../host/worker.ts';
 import {
   CLEANUP_MS,
-  CONTEXT_TOKENS,
   type ConfigurationDetail,
   LOCAL_CODING_SAMPLING,
   type LocalDiscoveryStart,
@@ -96,7 +95,7 @@ const infoSchema = z.object({
   sizeBytes: z.number().int().positive().safe(),
   format: z.enum(['gguf', 'safetensors']),
   deviceIdentifier: z.null(),
-  contextLength: z.literal(CONTEXT_TOKENS),
+  contextLength: z.number().int().positive().safe(),
 });
 const identifier = (bytes: number) =>
   z
@@ -273,6 +272,12 @@ export async function discoverLocalModels(
       }
       const instances = new Set<string>();
       const matched = new Set<string>();
+      const residents: {
+        modelKey: string;
+        instanceReference: string;
+        sizeBytes: number;
+        contextLength: number;
+      }[] = [];
       for (const model of models) {
         reason = 'transport';
         const rawInfo = await model.getModelInfo();
@@ -287,6 +292,12 @@ export async function discoverLocalModels(
         )
           throw new Error();
         instances.add(info.instanceReference);
+        residents.push({
+          modelKey: info.modelKey,
+          instanceReference: info.instanceReference,
+          sizeBytes: info.sizeBytes,
+          contextLength: info.contextLength,
+        });
         const identity = metadataIdentity(info);
         let choice = choices.get(identity.metadataHash);
         const variant = inventory.find((value) => value.modelKey === info.selectedVariant);
@@ -352,9 +363,8 @@ export async function discoverLocalModels(
           choice.reasons.push('unsupported-format');
         if (info.deviceIdentifier !== null && !choice.reasons.includes('remote-model'))
           choice.reasons.push('remote-model');
-        if (models.length !== 1) choice.reasons.push('multiple-resident-models');
-        if (embeddings.length) choice.reasons.push('resident-embedding');
-        if (info.contextLength !== CONTEXT_TOKENS) choice.reasons.push('context');
+        // Other residents, embeddings included, and the context size never disqualify a choice.
+        // A turn binds one instance reference, and every budget follows the context it reports.
         reason = 'transport';
         const state = await model.getInstanceProcessingState();
         guard();
@@ -408,6 +418,9 @@ export async function discoverLocalModels(
         ),
         residentLlms: models.length,
         embeddingInstances: embeddings.length,
+        residents: residents.sort((left, right) =>
+          left.instanceReference.localeCompare(right.instanceReference),
+        ),
       };
       reason = 'limit';
       if (Buffer.byteLength(JSON.stringify(value)) + 128 > 131072) throw new Error();
@@ -492,12 +505,14 @@ function configurationField<T>(
   configurationValue(entry ? entry.value : defaultValue, check, schema, matches);
 }
 
-function sameModel(plan: LocalStart, value: unknown) {
+/** Returns the context the instance reports. Once read, a later read must report the same. */
+function sameModel(plan: LocalStart, value: unknown, contextLength?: number) {
   const info = infoSchema.parse(value);
   if (
     info.modelKey !== plan.binding.modelKey ||
     info.instanceReference !== plan.binding.instanceReference ||
-    info.sizeBytes !== plan.binding.modelSizeBytes
+    info.sizeBytes !== plan.binding.modelSizeBytes ||
+    (contextLength !== undefined && info.contextLength !== contextLength)
   )
     throw new Error();
   if ('version' in plan.binding) {
@@ -508,6 +523,7 @@ function sameModel(plan: LocalStart, value: unknown) {
     )
       throw new Error();
   } else if (info.format !== 'gguf') throw new Error();
+  return info.contextLength;
 }
 
 /** A lost client cannot prove that the externally owned runtime stopped generating. */
@@ -616,19 +632,19 @@ export function startLocalPrediction(
       };
       await runtimeMatches();
       guard();
-      const models = await client.llm.listLoaded();
+      // The attempt binds one instance reference. Whatever else is resident stays out of it.
+      const bound = (values: LoadedModel[]) =>
+        values.filter((value) => value.instanceReference === plan.binding.instanceReference);
+      const models = bound(await client.llm.listLoaded());
       guard();
-      const embeddings = await client.embedding.listLoaded();
-      guard();
-      if (models.length !== 1 || embeddings.length !== 0) throw new Error();
+      if (models.length !== 1) throw new Error();
       const model = models[0];
       if (
         model.modelKey !== plan.binding.modelKey ||
-        model.instanceReference !== plan.binding.instanceReference ||
         model.sizeBytes !== plan.binding.modelSizeBytes
       )
         throw new Error();
-      sameModel(plan, await model.getModelInfo());
+      const contextLength = sameModel(plan, await model.getModelInfo());
       guard();
       const state = await model.getInstanceProcessingState();
       guard();
@@ -661,11 +677,11 @@ export function startLocalPrediction(
         guard();
         if (!tokens.length || tokens.some((token) => !Number.isSafeInteger(token) || token < 0))
           throw new Error();
-        if (tokens.length + outputTokens <= CONTEXT_TOKENS) break;
+        if (tokens.length + outputTokens <= contextLength) break;
       }
-      if (tokens.length + outputTokens > CONTEXT_TOKENS) throw new Error();
+      if (tokens.length + outputTokens > contextLength) throw new Error();
       promptTokens = tokens.length;
-      sameModel(plan, await model.getModelInfo());
+      sameModel(plan, await model.getModelInfo(), contextLength);
       guard();
       stage = 'ownership';
       await options.onSubmitted?.();
@@ -673,17 +689,10 @@ export function startLocalPrediction(
       if ('version' in plan.binding) {
         stage = 'identity';
         await runtimeMatches();
-        const currentModels = await client.llm.listLoaded();
+        const currentModels = bound(await client.llm.listLoaded());
         guard();
-        const currentEmbeddings = await client.embedding.listLoaded();
-        guard();
-        if (
-          currentModels.length !== 1 ||
-          currentEmbeddings.length !== 0 ||
-          currentModels[0].instanceReference !== model.instanceReference
-        )
-          throw new Error();
-        sameModel(plan, await model.getModelInfo());
+        if (currentModels.length !== 1) throw new Error();
+        sameModel(plan, await model.getModelInfo(), contextLength);
         guard();
       }
       // Mark uncertainty before the SDK can open its prediction channel.
@@ -711,7 +720,7 @@ export function startLocalPrediction(
       if (settled) return;
       if (remaining() <= 0) return fail('deadline');
       stage = 'identity';
-      sameModel(plan, terminal.modelInfo);
+      sameModel(plan, terminal.modelInfo, contextLength);
       stage = 'configuration';
       configurationField(
         terminal.loadConfig,
@@ -719,7 +728,7 @@ export function startLocalPrediction(
         'llm.load.contextLength',
         'context-length',
         z.number().int().positive().safe(),
-        (value) => value === CONTEXT_TOKENS,
+        (value) => value === contextLength,
       );
       configurationField(
         terminal.predictionConfig,
@@ -888,7 +897,7 @@ export function startLocalPrediction(
           reasoningBytes: Buffer.byteLength(terminal.reasoningContent),
           nonReasoningBytes: Buffer.byteLength(terminal.nonReasoningContent),
         },
-        contextLength: CONTEXT_TOKENS,
+        contextLength,
         maxTokens: outputTokens,
         contextOverflowPolicy: 'stopAtLimit',
         draftModel: '',
@@ -896,7 +905,7 @@ export function startLocalPrediction(
       });
       if (
         proof.promptTokens === null ||
-        proof.promptTokens + outputTokens > CONTEXT_TOKENS ||
+        proof.promptTokens + outputTokens > contextLength ||
         (proof.predictedTokens !== null && proof.predictedTokens > outputTokens)
       )
         throw new Error();

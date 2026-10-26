@@ -12,6 +12,7 @@ import {
 } from '@crewkite/contracts';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { desktopFiles, droppedPaths, MAX_ATTACH_FILES } from '../shared/attach.ts';
+import { attachmentTarget } from '../shared/open-file.ts';
 import { TASK_ID_PATTERN, threadAttention } from '../shared/thread-notice.ts';
 
 const events = new Set<Parameters<DesktopSource['subscribe']>[0]>();
@@ -126,6 +127,16 @@ const bridge: DesktopSource = {
     return value === 'opened' || value === 'declined' ? value : 'refused';
   },
   attachFiles,
+  openAttachment: async (input) => {
+    const target = attachmentTarget(input);
+    if (!target) throw new Error('The file request is invalid.');
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:open-attachment', target);
+      return value === 'cancelled' ? 'cancelled' : 'done';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
     await ipcRenderer.invoke('crewkite:reconnect');

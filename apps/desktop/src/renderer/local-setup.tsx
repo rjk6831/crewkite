@@ -1,36 +1,21 @@
-import {
-  LocalEndpointSchema,
-  type LocalSetup as LocalSetupState,
-  type Snapshot,
-} from '@crewkite/contracts';
-import { useEffect, useId, useRef, useState } from 'react';
+import { LocalEndpointSchema, type WorkspaceState } from '@crewkite/contracts';
+import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
-import { connectLocalFlow, waitForLocalReadiness } from './local-setup-flow.ts';
+import { ExternalLink } from './external-link.tsx';
+import {
+  connectLocalFlow,
+  lastSeen,
+  lowMemory,
+  REOBSERVE_MS,
+  selectionConfirmed,
+  selectionLost,
+  setupReasons,
+  WITHOUT_TOKEN,
+  waitForLocalReadiness,
+} from './local-setup-flow.ts';
+import { useClock } from './settings/use-catalog.ts';
 import type { DesktopCommand, Workspace } from './source.ts';
 
-const setupReasons: Record<NonNullable<LocalSetupState['reason']>, string> = {
-  unconfigured: 'Configure a loopback endpoint first.',
-  'connection-required': 'Connect through the native input window.',
-  'connection-unavailable':
-    'Local connection failed. Confirm the server authentication setting matches this connection.',
-  'input-active': 'The native connection input window is open.',
-  'input-unknown': 'Connection input ownership is unknown. Reconnect before continuing.',
-  'discovery-required': 'Read the connected runtime to find its loaded model.',
-  'discovery-active': 'The controller is reading model metadata.',
-  'discovery-unknown': 'Model discovery ownership is unknown. Reconnect before continuing.',
-  'model-selection-required': 'Choose an observed model.',
-  'model-unloaded':
-    'The selected model is installed and unloaded. Load it in the Local app, then refresh.',
-  'model-incompatible':
-    'The selected model does not meet this profile. Inspect its observed reasons.',
-  'selection-stale': 'The selected model changed. Refresh and choose from the current observation.',
-  'generation-active':
-    'A Local generation is active. Stop its task before changing this connection.',
-  'generation-unknown': 'Local generation ownership is unknown. Connection changes remain blocked.',
-  'capability-unavailable': 'The native Local connection input is unavailable.',
-  'setup-unavailable': 'The Local setup is unavailable. Reconnect to recover current status.',
-  'qualification-pending': 'Connected. The loaded model is eligible for chat.',
-};
 export const localModelStates = {
   'installed-unloaded': 'Installed and unloaded',
   'loaded-eligible': 'Loaded and eligible',
@@ -43,7 +28,7 @@ const modelReasons = {
   'multiple-resident-models': 'More than one language model is loaded',
   'resident-embedding': 'Embedding model is resident',
   busy: 'Model is busy',
-  context: 'Loaded context length is not 8192 tokens',
+  context: 'Loaded context length is not usable',
   draft: 'Draft model is configured',
   'not-downloaded': 'Model is not downloaded',
 };
@@ -53,7 +38,7 @@ export function LocalSetup({
   snapshot,
   workspace,
 }: {
-  snapshot: Pick<Snapshot, 'localSetup'>;
+  snapshot: Pick<WorkspaceState, 'localSetup' | 'localHardware'>;
   workspace: Workspace;
 }) {
   const setup = snapshot.localSetup;
@@ -82,6 +67,63 @@ export function LocalSetup({
   const currentChoice = models?.find(
     (model) => model.selectionId === setup?.selection?.selectionId,
   );
+  const now = useClock(null, 30_000);
+  // Without a live connection, or on a new one before its first read, the observation is the last
+  // one read. It shows, labelled, and its controls stay off until a fresh read replaces it.
+  const stale = !!setup?.observation && (!connectionReady || !!setup.observationStale);
+  const stamp = stale ? lastSeen(setup?.observedAt, now, connectionReady) : null;
+  const [lastChoice, setLastChoice] = useState<string | null>(null);
+  const [confirming, setConfirming] = useState<number | null>(null);
+  const observing = useRef(false);
+  useEffect(() => {
+    if (currentChoice) setLastChoice(currentChoice.identity.displayName);
+  }, [currentChoice]);
+  const lost = selectionLost(lastChoice, setup);
+  const confirmed = confirming !== null && selectionConfirmed(setup, confirming);
+  const memory = lowMemory(setup, snapshot.localHardware);
+  const residents = setup?.observation?.residents ?? [];
+  // A read on the open connection needs no token. It asks the controller to read the runtime and
+  // waits for the read to end, so the card shows what the runtime holds now.
+  const { source, preview, refresh } = workspace;
+  const reobserve = useCallback(async (): Promise<string | null> => {
+    if (!source || preview || observing.current) return null;
+    observing.current = true;
+    try {
+      const fresh = (await refresh()).localSetup;
+      if (!fresh?.connected || fresh.operation || fresh.generation !== 'idle') return null;
+      const result = await source.command({
+        command: 'RefreshLocalModels',
+        expectedRevision: fresh.revision,
+        payload: { consent: 'explicit' },
+      });
+      if (!applied(result.outcome))
+        return result.next ?? result.reason ?? 'The runtime could not be read.';
+      for (let step = 0; step < 20 && mounted.current; step++) {
+        if (!(await refresh()).localSetup?.operation) break;
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
+      }
+      return null;
+    } catch {
+      return 'The runtime could not be read. Reconnect and try again.';
+    } finally {
+      observing.current = false;
+    }
+  }, [source, preview, refresh]);
+  // When Settings opens, when the window comes back, and every 15 seconds while it stays open.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `requested` is read when a read starts
+  useEffect(() => {
+    if (!connectionReady) return;
+    const read = () => {
+      if (!requested && !pollAbort.current) void reobserve();
+    };
+    read();
+    const timer = window.setInterval(read, REOBSERVE_MS);
+    window.addEventListener('focus', read);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener('focus', read);
+    };
+  }, [connectionReady, reobserve]);
   useEffect(() => {
     if (!endpointEdited) setEndpoint(setup?.endpoint ?? '');
   }, [setup?.endpoint, endpointEdited]);
@@ -130,7 +172,7 @@ export function LocalSetup({
           }, 1000);
           control.signal.addEventListener('abort', stopped, { once: true });
         }),
-      read: async () => (await workspace.refresh()).localSetup,
+      read: async () => (await refresh()).localSetup,
       discover: async (current) => {
         const result = await workspace.command({
           command: 'RefreshLocalModels',
@@ -170,16 +212,27 @@ export function LocalSetup({
     try {
       const result = await workspace.command(command);
       if (!mounted.current) return;
-      setMessage(
-        applied(result.outcome)
-          ? command.command === 'BeginLocalConnectionInput' ||
-            command.command === 'RefreshLocalModels'
+      const done = applied(result.outcome);
+      const said =
+        command.command === 'SelectLocalModel'
+          ? 'Reading the runtime to confirm the selection.'
+          : command.command === 'BeginLocalConnectionInput' ||
+              command.command === 'RefreshLocalModels'
             ? `${name} requested. Watch the saved status.`
             : command.command === 'CancelLocalConnectionInput'
               ? 'Cancellation requested. Refresh saved status until ownership is settled.'
-              : `${name} confirmed.`
-          : (result.next ?? result.reason ?? `${name} was not confirmed.`),
-      );
+              : `${name} confirmed.`;
+      setMessage(done ? said : (result.next ?? result.reason ?? `${name} was not confirmed.`));
+      if (done && command.command === 'SelectLocalModel') {
+        // The command only saved the choice. It counts once a read made after it still holds the
+        // instance.
+        setConfirming(Date.now());
+        void reobserve().then((problem) => problem && mounted.current && setMessage(problem));
+      }
+      if (done && command.command === 'DisconnectLocal') {
+        setLastChoice(null);
+        setConfirming(null);
+      }
       if (applied(result.outcome) && command.command === 'ConfigureLocal') setEndpointEdited(false);
     } catch {
       if (mounted.current)
@@ -243,6 +296,26 @@ export function LocalSetup({
             ? 'Inspect the saved connection and model state.'
             : 'Local setup is unavailable. Reconnect to recover current status.'}
       </p>
+      {stamp && (
+        <p className="notice" role="status">
+          {stamp}
+        </p>
+      )}
+      {connectionReady && !setup?.secretConfigured && (
+        <p className="notice" role="status">
+          {WITHOUT_TOKEN}
+        </p>
+      )}
+      {lost && (
+        <p className="notice" role="status">
+          {lost}
+        </p>
+      )}
+      {confirmed && (
+        <p className="notice" role="status">
+          Model selection confirmed
+        </p>
+      )}
       {message && (
         <p className="notice" role="status">
           {message}
@@ -326,6 +399,16 @@ export function LocalSetup({
           Disconnect Local
         </button>
       </div>
+      <p className="muted small">
+        With a token: Connect opens a window for the runtime token. CrewKite keeps it in memory
+        only, so it asks again after a restart.
+      </p>
+      <p className="muted small">
+        Without a token: when the runtime has auth off on loopback, Connect finishes with no prompt.{' '}
+        <ExternalLink href="https://github.com/rjk6831/crewkite/blob/main/docs/local-models.md">
+          Local models
+        </ExternalLink>
+      </p>
       {setup?.operation && (
         <div className="button-row">
           <p className="muted small" role="status">
@@ -375,13 +458,36 @@ export function LocalSetup({
             {setup.observation.residentLlms} resident language models ·{' '}
             {setup.observation.embeddingInstances} embedding instances
           </p>
+          {memory && (
+            <p className="notice" role="status">
+              {memory}
+            </p>
+          )}
+          {residents.length > 0 && (
+            <ul className="muted small" aria-label="Loaded models">
+              {residents.map((resident) => {
+                const name =
+                  models?.find((model) => model.identity.modelKey === resident.modelKey)?.identity
+                    .displayName ?? resident.modelKey;
+                const selected =
+                  !!currentChoice && currentChoice.instanceReference === resident.instanceReference;
+                return (
+                  <li key={resident.instanceReference}>
+                    {name} · {(resident.sizeBytes / 1024 ** 3).toFixed(1)} GB ·{' '}
+                    {resident.contextLength?.toLocaleString('en-US') ?? 'unknown'} context
+                    {selected ? ' · selected' : ''}
+                  </li>
+                );
+              })}
+            </ul>
+          )}
           {models?.length ? (
             <>
               <label>
                 Observed Local model
                 <select
                   value={choiceId ?? ''}
-                  disabled={blocked}
+                  disabled={blocked || stale}
                   onChange={(event) => {
                     const next = models.find((model) => model.selectionId === event.target.value);
                     setChoiceId(next?.selectionId ?? null);
@@ -442,11 +548,7 @@ export function LocalSetup({
                     </p>
                     <code>{model.identity.modelKey}</code>
                     {model.reasons.map((reason) => (
-                      <p key={reason}>
-                        {reason === 'multiple-resident-models'
-                          ? `${modelReasons[reason]} (${setup.observation?.residentLlms ?? 0}). Keep one language model loaded for this connection.`
-                          : modelReasons[reason]}
-                      </p>
+                      <p key={reason}>{modelReasons[reason]}</p>
                     ))}
                     <code>Metadata {model.identity.metadataHash}</code>
                   </div>
@@ -462,18 +564,17 @@ export function LocalSetup({
         Model loading and unloading stay in the Local app. Local lead and orchestrator roles remain
         unqualified.
       </p>
-      {pollTimedOut && (
-        <button
-          className="button secondary"
-          type="button"
-          disabled={!connected || busy || polling || !setup?.endpoint}
-          onClick={() => {
-            if (setup?.endpoint) startPolling(setup.endpoint);
-          }}
-        >
-          Refresh
-        </button>
-      )}
+      <button
+        className="button secondary"
+        type="button"
+        disabled={!connected || busy || polling || !connectionReady || workspace.retryAvailable}
+        onClick={() => {
+          if (pollTimedOut && setup?.endpoint) startPolling(setup.endpoint);
+          else void reobserve().then((problem) => mounted.current && setMessage(problem));
+        }}
+      >
+        Refresh
+      </button>
     </section>
   );
 }

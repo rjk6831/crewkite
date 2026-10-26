@@ -90,5 +90,58 @@ test('the catalog reports the file types each client said it takes, and null bef
       catalog.families.find((entry) => entry.family === family)?.accepts;
     assert.deepEqual(accepts('google'), google, label);
     assert.deepEqual(accepts('local'), local, label);
+    assert.deepEqual(
+      catalog.families.map((entry) => [entry.family, entry.unlisted]),
+      [
+        ['openai', 'path'],
+        ['anthropic', 'path'],
+        ['google', 'path'],
+        ['local', 'none'],
+      ],
+      label,
+    );
+  }
+  // Delivery per file: native when the client lists the type, else what the family does with an
+  // unlisted file, and no answer while the client has reported nothing.
+  const matches = (accepts: readonly string[], type: string) =>
+    accepts.some(
+      (value) => value === '*/*' || value === type || value === `${type.split('/')[0]}/*`,
+    );
+  for (const [label, input, family, type, want] of [
+    [
+      'a listed type',
+      { googlePrompt: { ...none, image: true }, local: localSetup(false) },
+      'google',
+      'image/png',
+      'native',
+    ],
+    [
+      'any type embedded',
+      { googlePrompt: { ...none, embeddedContext: true }, local: localSetup(false) },
+      'google',
+      'video/mp4',
+      'native',
+    ],
+    [
+      'an unlisted type reaches Google by link',
+      { googlePrompt: { ...none, image: true }, local: localSetup(false) },
+      'google',
+      'video/mp4',
+      'path',
+    ],
+    ['Local inlines text', { local: localSetup(true) }, 'local', 'text/plain', 'native'],
+    ['Local takes no video', { local: localSetup(true) }, 'local', 'video/mp4', 'none'],
+    ['nothing reported yet', { local: localSetup(false) }, 'google', 'video/mp4', null],
+  ] as const) {
+    const catalog = buildChatCatalog({
+      profiles: [],
+      openAiModels: null,
+      windows: [],
+      nowMs: Date.parse('2026-10-25T12:00:00.000Z'),
+      ...(input as Pick<ChatCatalogInput, 'local'>),
+    });
+    const entry = catalog.families.find((value) => value.family === family);
+    const got = !entry?.accepts ? null : matches(entry.accepts, type) ? 'native' : entry.unlisted;
+    assert.equal(got, want, label);
   }
 });

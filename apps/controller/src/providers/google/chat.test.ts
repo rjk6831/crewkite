@@ -39,6 +39,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { type AgentEvent, AgentEventSchema } from '@crewkite/contracts';
 import type { AcpChatPeerCase } from '../../../../../packages/testkit/src/providers/acp-peer.ts';
 import type { ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
+import { byteSize } from '../../chat/prompt.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import type { AcpLifecycle, AcpSpawn } from './acp/client.ts';
@@ -349,8 +350,8 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       }),
     );
     assert.deepEqual(
-      of(lost.events, 'provider.notice').map((event) => [event.level, event.message]),
-      [['warning', 'Previous session could not be resumed; started a new one.']],
+      of(lost.events, 'provider.notice').map((event) => [event.level, event.message, event.trace]),
+      [['warning', 'Previous session could not be resumed; started a new one.', true]],
     );
     assert.deepEqual(methods(lost.frames).slice(0, 3), [
       'initialize',
@@ -845,6 +846,12 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
         },
       ],
       capabilities: declared,
+      sent: [
+        'sent as an image block below',
+        'sent as an audio block below',
+        'sent as an embedded resource below',
+        'sent as an embedded resource below',
+      ],
     },
     {
       // An inline form past the frame limit goes as a link, and the turn says so.
@@ -940,11 +947,19 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
         const [prompt] = withMethod(turn.frames, 'session/prompt');
         assert(prompt?.params, row.scenario);
         const [text, ...rest] = prompt.params.prompt as unknown[];
+        // The text lists the files of this message, one line each, and nothing for an earlier file.
+        const own = files.filter((file) => !('earlier' in file));
+        const tails: readonly string[] =
+          (row as { sent?: readonly string[] }).sent ?? own.map(() => 'sent as a file link below');
+        const lines = own.map(
+          ({ attachment }, index) =>
+            `${attachment.name}, ${attachment.mimeType}, ${byteSize(attachment.bytes)}, ${tails[index]}`,
+        );
         assert.deepEqual(
           text,
           {
             type: 'text',
-            text: 'You are working in a scratch copy of demo.\n\nWhat does this project do?',
+            text: `You are working in a scratch copy of demo.\n\nWhat does this project do?${lines.length ? `\n\nFiles attached to this message:\n${lines.join('\n')}` : ''}`,
           },
           row.scenario,
         );

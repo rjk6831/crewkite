@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { arch, platform } from 'node:os';
+import { arch, freemem, platform } from 'node:os';
 import { z } from 'zod';
 
 // On Apple Silicon the GPU core count is only in the system report, so the controller reads it
@@ -109,4 +109,54 @@ export function startGpuProbe() {
  */
 export function gpuFacts(): GpuFacts | null | undefined {
   return facts;
+}
+
+// `os.freemem` on macOS counts only pages nobody holds, so a Mac with gigabytes in the file cache
+// reads as nearly full. vm_stat splits the pages out. Inactive and purgeable pages are ones the
+// system hands back on demand, so they count as available beside the free ones.
+const VM_STAT = '/usr/bin/vm_stat';
+const VM_STAT_MS = 2000;
+const VM_STAT_BYTES = 16 * 1024;
+
+/** (free + inactive + purgeable) pages times the page size, from `vm_stat` output. */
+export function readVmStat(text: string): number | null {
+  const pageSize = /page size of (\d+) bytes/.exec(text)?.[1];
+  const pages = (label: string) =>
+    new RegExp(`^Pages ${label}:\\s+(\\d+)\\.?\\s*$`, 'm').exec(text)?.[1];
+  const counts = [pages('free'), pages('inactive'), pages('purgeable')];
+  if (!pageSize || counts.some((count) => count === undefined)) return null;
+  const bytes = counts.reduce((sum, count) => sum + Number(count), 0) * Number(pageSize);
+  return Number.isSafeInteger(bytes) ? bytes : null;
+}
+
+/** Available memory from vm_stat on macOS and `os.freemem` elsewhere. Null when unreadable. */
+export async function probeAvailableMemory(
+  run: ReportRun = runReport,
+  host = { platform: platform() },
+  free: () => number = freemem,
+): Promise<number | null> {
+  if (host.platform !== 'darwin') {
+    const bytes = free();
+    return Number.isSafeInteger(bytes) && bytes >= 0 ? bytes : null;
+  }
+  try {
+    return readVmStat(await run(VM_STAT, [], { timeoutMs: VM_STAT_MS, maxBytes: VM_STAT_BYTES }));
+  } catch {
+    return null;
+  }
+}
+
+let memory: number | null | undefined;
+
+/** Reads available memory again. The controller calls it at launch and at every Local read. */
+export function refreshAvailableMemory() {
+  return probeAvailableMemory().then((value) => {
+    memory = value;
+    return value;
+  });
+}
+
+/** The last reading. Undefined until the first one answers, and always in tests. */
+export function availableMemory(): number | null | undefined {
+  return memory;
 }

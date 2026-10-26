@@ -27,6 +27,7 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
+import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
@@ -586,32 +587,27 @@ class OpenAiChatTurn {
    * the turn here. The client reads localImage and localAudio paths itself, outside the sandbox.
    * Under both sandbox modes CrewKite sets, the sandbox reads the whole disk, so the model's
    * tools can open the file a path line names in the controller home. A file from an earlier
-   * message always goes as a path line and never refuses the turn.
+   * message always goes as a path line in the packet and never refuses the turn.
    */
   private sortFiles(): ChatFailure | null {
     for (const { attachment, path, earlier } of turnFiles(this.request)) {
-      if (earlier) {
-        this.lines.push(
-          `Attached earlier: ${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes) at ${path}`,
-        );
-        continue;
-      }
+      // The packet lists an earlier file with its path.
+      if (earlier) continue;
       const name = clip(attachment.name, 255);
       const rejected = (message: string) =>
         chatFailure({ stage: 'prompt', kind: 'attachment-rejected', message });
       if (!readable(path)) return rejected(`CrewKite could not read the attached file ${name}.`);
       const type = attachment.mimeType.split(';')[0].trim().toLowerCase();
       // SVG is markup the client cannot decode as an image.
-      if (type.startsWith('image/') && type !== 'image/svg+xml')
+      if (type.startsWith('image/') && type !== 'image/svg+xml') {
         this.media.push({ input: { type: 'localImage', path }, kind: 'image', name });
-      else if (type.startsWith('audio/')) {
+        this.lines.push(attachedLine(attachment, 'sent as an image input above'));
+      } else if (type.startsWith('audio/')) {
         if (!AUDIO.test(extname(attachment.name)))
           return rejected(`Codex takes audio as wav, mp3, m4a, webm or ogg, and ${name} is none.`);
         this.media.push({ input: { type: 'localAudio', path }, kind: 'audio', name });
-      } else
-        this.lines.push(
-          `Attached file: ${attachment.name} (${attachment.mimeType}, ${attachment.bytes} bytes) at ${path}`,
-        );
+        this.lines.push(attachedLine(attachment, 'sent as an audio input above'));
+      } else this.lines.push(attachedLine(attachment, `Path: ${path}`));
     }
     return null;
   }
@@ -693,6 +689,7 @@ class OpenAiChatTurn {
       this.notice(
         'warning',
         'Codex could not resume the earlier thread. A new thread starts with the transcript so far.',
+        true,
       );
       start(true);
     });
@@ -719,7 +716,7 @@ class OpenAiChatTurn {
           .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.text}`)
           .join('\n\n')
       : '';
-    const lines = this.lines.join('\n');
+    const lines = attachedSection(this.lines);
     const text = (fresh ? [systemContext, transcript, prompt, lines] : [prompt, lines])
       .filter(Boolean)
       .join('\n\n');
@@ -951,13 +948,13 @@ class OpenAiChatTurn {
       case 'configWarning': {
         const value = notice.safeParse(params).data;
         const text = [value?.message ?? value?.summary, value?.details].filter(Boolean).join(' ');
-        if (text) this.notice('warning', text);
+        if (text) this.notice('warning', text, true);
         return;
       }
       case 'error': {
         const value = errorNotice.safeParse(params).data;
         if (value?.willRetry) {
-          this.notice('warning', value.error?.message || 'Codex is retrying the request.');
+          this.notice('warning', value.error?.message || 'Codex is retrying the request.', true);
           return;
         }
         this.terminal ??= value?.error ?? null;
@@ -1225,12 +1222,14 @@ class OpenAiChatTurn {
     this.notice('warning', 'Codex sent a line CrewKite could not read.');
   }
 
-  private notice(level: 'info' | 'warning', message: string) {
+  /** `trace` marks what the client says about its own state. The view keeps it in the turn trace. */
+  private notice(level: 'info' | 'warning', message: string, trace = false) {
     this.send({
       type: 'provider.notice',
       turnId: this.request.turnId,
       level,
       message: clip(message, 4096),
+      ...(trace ? { trace: true as const } : {}),
     });
   }
 

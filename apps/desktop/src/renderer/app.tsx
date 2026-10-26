@@ -1,4 +1,4 @@
-import type { TaskPage, TaskSummary } from '@crewkite/contracts';
+import { ProjectSchema, type TaskPage, type TaskSummary } from '@crewkite/contracts';
 import {
   AlertTriangle,
   ArrowRight,
@@ -532,6 +532,20 @@ export function App() {
     setNewThread(projectId ?? task?.projectId ?? projects[0]?.id ?? '');
     setPage('tasks');
   }
+  // A project the person just added is selected in the rail, and its New thread opens with the
+  // cursor in the message box.
+  const [addedProject, setAddedProject] = useState<string | null>(null);
+  async function addProject() {
+    const result = await workspace.pickProject().catch(() => null);
+    const project = ProjectSchema.safeParse(result?.entity);
+    if (
+      !project.success ||
+      (result?.outcome !== 'applied' && result?.outcome !== 'already-applied')
+    )
+      return;
+    setAddedProject(project.data.id);
+    startThread(project.data.id);
+  }
   function openThread(id: string) {
     setNewThread(null);
     setSelected(id);
@@ -667,7 +681,7 @@ export function App() {
               type="button"
               className="add-task"
               disabled={workspace.pending || connection !== 'connected'}
-              onClick={() => void workspace.pickProject().catch(() => {})}
+              onClick={() => void addProject()}
             >
               <Folder size={14} />
               Add project
@@ -675,7 +689,14 @@ export function App() {
           )}
           {projects.map((project) => (
             <div key={project.id} className="project-group">
-              <div className="project-name">
+              <div
+                className={
+                  project.id === (newThread ?? task?.projectId)
+                    ? 'project-name is-selected'
+                    : 'project-name'
+                }
+                aria-current={project.id === (newThread ?? task?.projectId) ? 'true' : undefined}
+              >
                 <ChevronRight size={12} className="expanded" />
                 <Folder size={15} />
                 <span className="project-title" title={project.name}>
@@ -759,6 +780,7 @@ export function App() {
             source={threadSource}
             header={header}
             onOpenSettings={() => setPage('settings')}
+            refresh={workspace.refresh}
           />
         )}
         <div className="nav-bottom">
@@ -890,9 +912,10 @@ export function App() {
             onProject={setNewThread}
             onCreated={openThread}
             onOpenSettings={() => setPage('settings')}
-            onAddProject={
-              workspace.canPickProject ? () => void workspace.pickProject().catch(() => {}) : null
-            }
+            onAddProject={workspace.canPickProject ? () => void addProject() : null}
+            focusComposer={addedProject === newThread}
+            localSetup={header?.localSetup}
+            refresh={workspace.refresh}
             blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
           />
         ) : selected && !snapshot ? (
@@ -906,13 +929,14 @@ export function App() {
             header={header}
             preview={preview}
             connection={connection}
+            refresh={workspace.refresh}
           />
         ) : (
           <WorkspaceEmpty
             projects={projects}
             canAddProject={workspace.canPickProject}
             busy={workspace.pending || connection !== 'connected'}
-            onAddProject={() => void workspace.pickProject().catch(() => {})}
+            onAddProject={() => void addProject()}
             onNewThread={() => startThread()}
           />
         )}

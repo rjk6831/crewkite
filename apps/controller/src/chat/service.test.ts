@@ -825,7 +825,7 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${thread.turns[2].id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];
   assert.match(request.prompt, /moved from OpenAI to Google\. Reason: usage limit reached\./);
-  assert.match(request.prompt, /New message:\nFix the rounding\./);
+  assert.match(request.prompt, /New message from the person:\nFix the rounding\./);
   assert.match(request.prompt, /^net\.mjs \+1 -0$/m);
   assert.match(request.prompt, /^\+\/\/ half done$/m);
   assert.match(
@@ -915,6 +915,68 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.match(
     off.adapters.get('local')?.requests[0]?.prompt ?? '',
     /^This thread moved from Google to Local\. Reason: switched in the composer\.$/m,
+  );
+  // Back on Google after Local and Anthropic, the session resumes and hears exactly those two
+  // turns. Nothing changed in the scratch copy since Google last ran.
+  const answer = (text: string, choice: ChatModelSelection) => {
+    const done = turnReaches(off, 'done');
+    off.send(text, choice);
+    return done;
+  };
+  const seen = off.read().turns.find((turn) => turn.selection.family === 'google') as ChatTurn;
+  await answer('Then the tests.', pick('anthropic'));
+  await answer('Back to you.', pick('google'));
+  const google = off.adapters.get('google')?.requests ?? [];
+  const back = google[1];
+  assert.equal(back.session?.sessionId, `session-${seen.id}`);
+  assert.match(
+    back.prompt,
+    /^This thread moved from Anthropic to Google\. Reason: switched in the composer\. This session holds the thread up to its last turn on Google\.$/m,
+  );
+  assert.deepEqual(back.prompt.match(/^Person:\n.+$/gm), [
+    'Person:\nKeep going.',
+    'Person:\nThen the tests.',
+  ]);
+  assert.match(back.prompt, /^Local \(local-model\) answered:\nNot chosen\.$/m);
+  assert.match(back.prompt, /^Anthropic \(anthropic-model\) answered:\nNot chosen\.$/m);
+  assert.match(back.prompt, /^No files changed in the scratch copy since then\.$/m);
+  assert.doesNotMatch(back.prompt, /Go on\.|Fix the rounding\./);
+  assert.match(back.prompt, /New message from the person:\nBack to you\.$/);
+
+  // A delta past the 96 KiB cap, even with each message cut, gives way to a new session with the
+  // full packet, and the thread says so.
+  const long = '\u20ac'.repeat(9000);
+  for (let index = 0; index < 5; index++) await answer(`${index} ${long}`, pick('anthropic'));
+  await answer('Still there?', pick('google'));
+  const fresh = google[2];
+  assert.equal(fresh.session, null);
+  assert.match(
+    fresh.prompt,
+    /^This thread moved from Anthropic to Google\. Reason: switched in the composer\.$/m,
+  );
+  assert.ok(Buffer.byteLength(fresh.prompt) <= 96 * 1024);
+  assert.equal(
+    off.read().messages.at(-2)?.text,
+    'Started a new Google session. The thread moved past what the old session could carry.',
+  );
+
+  // The same family at another effort resumes its session. Another model starts a new session
+  // with the full packet, and the thread says why.
+  await answer('Think harder.', { ...pick('google'), effort: 'high' });
+  assert.equal(google[3].session?.sessionId, `session-${off.read().turns.at(-2)?.id}`);
+  assert.equal(google[3].prompt, 'Think harder.');
+  await answer('Try the new model.', { ...pick('google'), model: 'google-model-2' });
+  assert.equal(google[4].session, null);
+  assert.match(
+    google[4].prompt,
+    /^This thread continues on Google in a new session\. Reason: model changed in the composer\.$/m,
+  );
+  assert.match(google[4].prompt, /^Person:\nThink harder\.$/m);
+  const changed = off.read();
+  assert.equal(changed.turns.at(-1)?.handoffFrom, 'google');
+  assert.equal(
+    changed.messages.at(-2)?.text,
+    'Continued on Google (google-model-2) from Google (google-model). Reason: model changed in the composer.',
   );
 });
 
@@ -1862,7 +1924,7 @@ test('send now stops the running turn and starts the queued message with its pac
   const packet = scripted.requests[1].prompt;
   assert.match(packet, /^The last reply on OpenAI was stopped before it finished\./m);
   assert.match(packet, /^OpenAI ended its last turn early\. Reason: stopped by the person\.$/m);
-  assert.match(packet, /New message:\nThird\.$/);
+  assert.match(packet, /New message from the person:\nThird\.$/);
   assert.equal(scripted.requests[2].prompt, 'Second.');
 });
 
@@ -1986,7 +2048,7 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   assert.deepEqual(readdirSync(dirname(dirname(path))), [file.id]);
   assert.deepEqual(readdirSync(dirname(path)), ['chart.png']);
 
-  // Try with Google takes the handoff path, and the packet names the file it carries.
+  // Try with Google takes the handoff path, and the file travels in the request's files.
   const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
   const retry = (mode: 'retry' | 'regenerate', turnId: string, choice?: ChatModelSelection) =>
     act(store, (effects) =>
@@ -2001,7 +2063,8 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   const requests = (adapters.get('google')?.requests ?? []) as ChatTurnRequest[];
   const [carried] = requests;
   assert.match(carried.prompt, /^This thread moved from OpenAI to Google\./);
-  assert.match(carried.prompt, /^chart\.png \(image\/png, 40 bytes\)$/m);
+  // The adapter lists the file of the message itself under the text, so the packet holds no line for it.
+  assert.doesNotMatch(carried.prompt, /chart\.png/);
   assert.deepEqual(carried.files, sent.files);
 
   // Regenerate keeps the first reply. The rerun starts a fresh session, since the old one holds
@@ -2013,7 +2076,7 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   await regenerated;
   const again = requests[1];
   assert.match(again.prompt, /^This message runs again on Google in a new session\./);
-  assert.match(again.prompt, /New message:\nWhat is in this chart\?$/);
+  assert.match(again.prompt, /New message from the person:\nWhat is in this chart\?$/);
   assert.equal(again.session, null);
   assert.deepEqual(again.files, sent.files);
   const thread = read();
@@ -2066,7 +2129,7 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
       assert.deepEqual(request.history, [], family);
       assert.match(request.prompt, /^This message runs again on .+ in a new session\./, family);
       assert.match(request.prompt, /^Person:\nFirst\.\n\nAssistant:\nOne\.$/m, family);
-      assert.match(request.prompt, /New message:\nSecond\.$/, family);
+      assert.match(request.prompt, /New message from the person:\nSecond\.$/, family);
       assert.doesNotMatch(request.prompt, /Two\./, family);
     }
   }
@@ -2125,6 +2188,62 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
   assert.deepEqual(names(families.get('openai')?.requests[2] as ScriptedChatRequest), [
     'n33.txt earlier',
   ]);
+  // The handoff packet lists the earlier files once, ahead of the message, and not the file the
+  // message itself carries.
+  const sentToGoogle = families.get('google')?.requests[0] as unknown as ChatTurnRequest;
+  const packetText = sentToGoogle.prompt;
+  assert.equal(
+    packetText.match(
+      /^n\d+\.txt, text\/plain, .*came with "Read these\.", sent as a file link below$/gm,
+    )?.length,
+    32,
+  );
+  assert.ok(
+    packetText.indexOf('Files attached earlier in this thread.') <
+      packetText.indexOf('New message from the person:'),
+  );
+  assert.doesNotMatch(packetText, /^n33\.txt/m);
+  // A Local reply that stops at its output limit writes the counts, and Continue asks the same
+  // model for the rest in a new message. The partial reply stays in the thread.
+  const local = { family: 'local', model: 'local-model', effort: 'default' } as const;
+  const limited = createScriptedChatAdapter({
+    family: 'local',
+    turns: [reply('Partial.'), reply('The rest.')],
+  });
+  const outputLimit = { reasoningTokens: 3900, replyTokens: 700, allowedTokens: 4600 };
+  const capped = {
+    ...limited,
+    startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+      const handle = limited.startTurn(request, emit);
+      const first = limited.requests.length === 1;
+      return {
+        ...handle,
+        result: handle.result.then((result) => (first ? { ...result, outputLimit } : result)),
+      };
+    },
+  };
+  const cont = standalone(t, { adapters: new Map([['local', capped]]) });
+  const stoppedAtLimit = turnReaches({ store: cont.store }, 'done');
+  cont.send('Write the guide.', local);
+  const partial = await stoppedAtLimit;
+  assert.deepEqual(partial.outputLimit, outputLimit);
+  const continued = turnReaches({ store: cont.store }, 'done');
+  const resume = (effects: (() => void)[]) =>
+    cont.service.retryTurn({ taskId: cont.taskId, turnId: partial.id, mode: 'continue' }, effects);
+  assert.equal(act(cont.store, resume).outcome, 'applied');
+  await continued;
+  assert.deepEqual(
+    cont.read().messages.map((entry) => entry.text),
+    [
+      'Write the guide.',
+      'Partial.',
+      'Reply stopped at the output limit: 3,900 reasoning and 700 reply of 4,600 allowed.',
+      'Continue the reply from where it stopped. Do not repeat what you already wrote.',
+      'The rest.',
+    ],
+  );
+  assert.deepEqual(limited.requests[1].selection, local);
+  assert.deepEqual(limited.requests[1].history.at(-1), { role: 'assistant', text: 'Partial.' });
 });
 
 test('rename sets the thread title, and delete removes the thread, its scratch copy and files for good', {

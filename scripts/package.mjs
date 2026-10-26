@@ -613,7 +613,21 @@ export async function packageDesktop() {
   );
   const fromDesktop = createRequire(join(checkout, 'apps/desktop/package.json'));
   const reactDom = fromDesktop.resolve('react-dom/package.json');
-  const fromLowlight = createRequire(fromDesktop.resolve('lowlight/package.json'));
+  // Some packages keep package.json out of their exports. Their main entry still resolves, so the
+  // manifest is the nearest package.json above it that carries the package's name.
+  const manifestOf = (locator, name) => {
+    try {
+      return locator.resolve(`${name}/package.json`);
+    } catch (error) {
+      if (error?.code !== 'ERR_PACKAGE_PATH_NOT_EXPORTED') throw error;
+    }
+    for (let directory = dirname(locator.resolve(name)); ; directory = dirname(directory)) {
+      const candidate = join(directory, 'package.json');
+      if (existsSync(candidate) && json(candidate).name === name) return candidate;
+      if (dirname(directory) === directory) throw new Error(`No manifest found for ${name}.`);
+    }
+  };
+  const fromLowlight = createRequire(manifestOf(fromDesktop, 'lowlight'));
   for (const [name, locator, file = 'LICENSE'] of [
     ['react', fromDesktop],
     ['react-dom', fromDesktop],
@@ -628,7 +642,7 @@ export async function packageDesktop() {
     ['zod', contracts],
     ['rolldown', createRequire(fromDesktop.resolve('vite/package.json'))],
   ]) {
-    const manifestPath = locator.resolve(`${name}/package.json`);
+    const manifestPath = manifestOf(locator, name);
     const manifest = json(manifestPath);
     notice(
       name,

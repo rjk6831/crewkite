@@ -2,7 +2,7 @@ import type { ChatCatalogRead, ChatModelSelection, WorkspaceState } from '@crewk
 import { GitBranch, PanelRight } from 'lucide-react';
 import { type ReactNode, useCallback, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
-import { RerunControl, TryWith } from './cards.tsx';
+import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
 import {
   configureThread,
   handoffThread,
@@ -21,6 +21,7 @@ import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
+import { outputLimitLine } from './output-limit.ts';
 import { QueuedList } from './queued-list.tsx';
 import {
   lastFamily,
@@ -69,6 +70,7 @@ export function ThreadView({
   header,
   preview,
   connection,
+  refresh,
 }: {
   source: ThreadSource;
   task: ThreadTask;
@@ -76,6 +78,7 @@ export function ThreadView({
   header: WorkspaceState | null;
   preview: boolean;
   connection: string;
+  refresh?: () => Promise<WorkspaceState>;
 }) {
   const {
     state,
@@ -199,7 +202,11 @@ export function ThreadView({
   );
   // Retry and Regenerate run the message that started the turn again, on the model the menu shows.
   const rerun = useCallback(
-    async (turnId: string, mode: 'retry' | 'regenerate', selection: ChatModelSelection | null) => {
+    async (
+      turnId: string,
+      mode: 'retry' | 'regenerate' | 'continue',
+      selection: ChatModelSelection | null,
+    ) => {
       await retryTurn(source, {
         taskId: task.id,
         turnId,
@@ -216,6 +223,11 @@ export function ThreadView({
   );
   const newestId = useMemo(() => newestTurnId(state), [state]);
   const current = thread?.selection ?? null;
+  // The line is shown here unless the controller wrote the same line into the thread.
+  const limitLine = (limit: Parameters<typeof outputLimitLine>[0]) => {
+    const line = outputLimitLine(limit);
+    return state.messages.some((message) => message.text === line) ? null : line;
+  };
   const actions = (item: ThreadItem): ReactNode => {
     if (item.kind !== 'turn' && item.kind !== 'failure') return null;
     const turnId = item.kind === 'turn' ? item.turn.id : item.turnId;
@@ -226,7 +238,8 @@ export function ThreadView({
     const regenerate = item.kind === 'turn' && turnId === replyId;
     const rejected =
       newest && item.kind === 'failure' && item.failure.kind === 'attachment-rejected';
-    if (!note && !retryable && !regenerate) return null;
+    const limit = item.kind === 'turn' && newest && item.turn.ended ? item.turn.outputLimit : null;
+    if (!note && !retryable && !regenerate && !limit) return null;
     const choices =
       rejected && catalog
         ? tryWithChoices(
@@ -245,6 +258,12 @@ export function ThreadView({
             catalog={catalog}
             current={current}
             onRun={(selection) => rerun(turnId, regenerate ? 'regenerate' : 'retry', selection)}
+          />
+        )}
+        {limit && !activeTurn && (
+          <OutputLimitControl
+            line={limitLine(limit)}
+            onContinue={() => rerun(turnId, 'continue', null)}
           />
         )}
         {rejected && !activeTurn && (
@@ -331,6 +350,7 @@ export function ThreadView({
           actions={actions}
           wantsHistory={wantsHistory}
           onTurnVisible={loadHistory}
+          taskId={task.id}
           earlier={hasEarlier ? { onLoad: loadEarlier, note: earlierNote } : null}
           onResolve={resolve}
           onOpenChanges={openChanges}
@@ -359,6 +379,7 @@ export function ThreadView({
           onHandoff={handoff}
           onOpenCrew={() => setInspector({ open: true, tab: 'crew', focus: null })}
           onCatalog={setCatalog}
+          localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
         />
       </section>
       {inspector.open && (

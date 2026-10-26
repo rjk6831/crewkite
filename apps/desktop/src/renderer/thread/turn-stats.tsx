@@ -1,5 +1,6 @@
-import type { ChatTurnStats } from '@crewkite/contracts';
+import type { ChatOutputLimit, ChatTurnStats } from '@crewkite/contracts';
 import { FoldVertical } from 'lucide-react';
+import { statsSplit } from './output-limit.ts';
 import type { CompactedBlock, TurnView } from './turn-fold.ts';
 import './turn-stats.css';
 
@@ -11,10 +12,12 @@ function duration(ms: number) {
   return `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
 }
 
-export function statsLine(stats: ChatTurnStats) {
+export function statsLine(stats: ChatTurnStats, limit: ChatOutputLimit | null = null) {
   const parts: string[] = [];
   if (stats.contextUsed !== null && stats.contextCapacity !== null)
     parts.push(`Context ${count(stats.contextUsed)} of ${count(stats.contextCapacity)}`);
+  const split = statsSplit(stats, limit);
+  if (split) parts.push(split);
   if (stats.summaries > 0)
     parts.push(`${count(stats.summaries)} ${stats.summaries === 1 ? 'summary' : 'summaries'}`);
   if (stats.tokensPerSecond !== null) parts.push(`${Math.round(stats.tokensPerSecond)} tok/s`);
@@ -62,7 +65,7 @@ export function TurnStats({ turn }: { turn: TurnView }) {
       ))}
       {turn.ended && turn.stats && (
         <p className="th-turn-stats" title={statsDetail(turn.stats) || undefined}>
-          {statsLine(turn.stats)}
+          {statsLine(turn.stats, turn.outputLimit)}
         </p>
       )}
     </>

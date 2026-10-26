@@ -265,7 +265,7 @@ export const LocalModelChoiceSchema = z
           choice.reasons.length === 0
         : choice.state === 'loaded-eligible'
           ? choice.instanceReference !== null &&
-            choice.contextLength === 8192 &&
+            choice.contextLength !== null &&
             ['gguf', 'safetensors'].includes(choice.identity.format) &&
             choice.reasons.length === 0
           : choice.reasons.length > 0,
@@ -281,6 +281,21 @@ export const LocalModelObservationSchema = z
     models: z.array(LocalModelChoiceSchema).max(64),
     residentLlms: RevisionSchema.max(8),
     embeddingInstances: RevisionSchema.max(8),
+    /**
+     * Every loaded language model instance with the size and context the runtime reports. Other
+     * residents do not disqualify the selected one. Missing on observations saved before it.
+     */
+    residents: z
+      .array(
+        z.strictObject({
+          modelKey: localText(200),
+          instanceReference: localText(200),
+          sizeBytes: RevisionSchema.min(1),
+          contextLength: RevisionSchema.min(1).nullable(),
+        }),
+      )
+      .max(8)
+      .optional(),
   })
   .refine((value) => {
     const handles = value.models.flatMap((model) =>
@@ -290,8 +305,9 @@ export const LocalModelObservationSchema = z
       new Set(value.models.map((model) => model.selectionId)).size === value.models.length &&
       new Set(handles).size === handles.length &&
       handles.length <= value.residentLlms &&
+      (value.residents === undefined || value.residents.length === value.residentLlms) &&
       (!value.models.some((model) => model.state === 'loaded-eligible') ||
-        (value.residentLlms === 1 && value.embeddingInstances === 0)) &&
+        value.residentLlms >= 1) &&
       localProjectionFits(value)
     );
   }, 'Local discovery needs distinct choices within its handle and byte bounds.');
@@ -373,6 +389,21 @@ export const LocalSetupSchema = z
     operation: LocalOperationSchema.nullable(),
     generation: z.enum(['idle', 'active', 'unknown']),
     observation: LocalModelObservationSchema.nullable(),
+    /**
+     * When the observation was read. With connected false the view labels it as last seen and
+     * disables its controls. Kept outside the observation so a fresh read of the same models keeps
+     * its hash and the selection.
+     */
+    observedAt: TimestampSchema.nullable().optional(),
+    /**
+     * True from a reconnect until the first read on the new connection. The view labels the
+     * observation as last seen and keeps its controls off, the same as with connected false.
+     */
+    observationStale: z.literal(true).optional(),
+    /** The context the selected loaded instance reports. Every Local budget is a function of it. */
+    contextTokens: RevisionSchema.min(1).nullable().optional(),
+    /** Memory the system reported available at the same read. Null when it could not be read. */
+    availableMemoryBytes: RevisionSchema.nullable().optional(),
     selection: LocalModelSelectionSchema.nullable(),
     reason: z
       .enum([
@@ -467,7 +498,8 @@ export const LocalNativeProfileSchema = z
     model: label,
     modelBinding: LocalModelBindingSchema.nullable(),
     billing: z.literal('local'),
-    contextLength: z.literal(8192),
+    /** The context the bound instance reports. Null until a model is bound. */
+    contextLength: RevisionSchema.min(1).nullable(),
     maximumOutputTokens: z.union([z.literal(2048), z.literal(4096)]),
     qualifiedAt: z.iso.date().nullable(),
     maximumTaskMs: z.literal(300000),
@@ -493,6 +525,10 @@ export const LocalNativeProfileSchema = z
   .refine(
     (profile) => !profile.modelBinding || profile.model === profile.modelBinding.modelKey,
     'A Local profile must name its bound model.',
+  )
+  .refine(
+    (profile) => !profile.modelBinding || profile.contextLength !== null,
+    'A bound Local profile carries the context its instance reports.',
   );
 const acpIdentifier = label.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),

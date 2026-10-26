@@ -134,7 +134,18 @@ function asMessage(payload: unknown): ChatMessage | null {
   if (!entry.success || !['user-message', 'guidance', 'answer'].includes(entry.data.kind))
     return null;
   const { id, taskId, at, cursor, text } = entry.data;
-  return { id, taskId, at, cursor, text, author: { kind: 'user' }, attachments: [], files: [] };
+  // The stored entry names the files, so the chips stay when it replaces the pending message.
+  const sent = entry.data.kind === 'user-message' ? entry.data : null;
+  return {
+    id,
+    taskId,
+    at,
+    cursor,
+    text,
+    author: { kind: 'user' },
+    attachments: sent?.attachments ?? [],
+    files: sent?.files ?? [],
+  };
 }
 
 // A replacing read keeps the messages older than its own oldest one, which came from Load earlier.
@@ -422,7 +433,17 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     // Live events of a finished turn are gone after a reload. The turn row keeps its stats, and
     // their summary count stands in for the rolling summary cards.
     const stats = base.stats ?? meta?.stats ?? null;
-    const turn: TurnView = { ...base, identity, status, blocks, failure, ended, stats };
+    const outputLimit = base.outputLimit ?? meta?.outputLimit ?? null;
+    const turn: TurnView = {
+      ...base,
+      identity,
+      status,
+      blocks,
+      failure,
+      ended,
+      stats,
+      outputLimit,
+    };
     const asked = meta && byId.get(meta.userMessageId);
     const firstCursor = record?.events[0]?.cursor ?? null;
     const order =

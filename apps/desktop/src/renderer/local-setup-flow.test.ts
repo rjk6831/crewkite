@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import type { LocalSetup } from '@crewkite/contracts';
-import { connectLocalFlow, waitForLocalReadiness } from './local-setup-flow.ts';
+import {
+  connectInPlace,
+  connectLocalFlow,
+  lastSeen,
+  lowMemory,
+  selectionConfirmed,
+  selectionLost,
+  WITHOUT_TOKEN,
+  waitForLocalReadiness,
+} from './local-setup-flow.ts';
 
 const setup = (change: Partial<LocalSetup> = {}): LocalSetup => ({
   revision: 1,
@@ -137,4 +146,134 @@ test('Local connect stops its command chain when component ownership changes', a
   configured.resolve({ outcome: 'applied', revision: 2 });
   assert.deepEqual(await connecting, { kind: 'stopped' });
   assert.deepEqual(commands, ['ConfigureLocal']);
+
+  // The cached observation is labelled with its age, and the low memory line follows the two
+  // thresholds. A selection that no longer matches a loaded model says so by name, and a selection
+  // counts as confirmed only from a read made after the request that still holds the instance.
+  const gib = 1024 ** 3;
+  const now = Date.parse('2026-10-26T12:00:00.000Z');
+  const at = (minutes: number) => new Date(now - minutes * 60_000).toISOString();
+  const seen: [string | null | undefined, string | null][] = [
+    [at(120), 'Last seen 2 h ago. Not connected.'],
+    [at(5), 'Last seen 5 min ago. Not connected.'],
+    [at(0), 'Last seen just now. Not connected.'],
+    [at(3000), 'Last seen 2 d ago. Not connected.'],
+    [null, null],
+  ];
+  for (const [observed, want] of seen)
+    assert.equal(lastSeen(observed, now), want, String(observed));
+  // A new connection before its first read shows the age alone.
+  assert.equal(lastSeen(at(5), now, true), 'Last seen 5 min ago.');
+  const observed = (loaded: number) => ({ residentLlms: loaded }) as LocalSetup['observation'];
+  const memory: [number, number, number, string | null][] = [
+    [
+      1.2 * gib,
+      48 * gib,
+      2,
+      'Low memory: 1.2 GB available with 2 models loaded. Replies may slow.',
+    ],
+    [3 * gib, 128 * gib, 1, 'Low memory: 3.0 GB available with 1 model loaded. Replies may slow.'],
+    [6 * gib, 48 * gib, 2, null],
+    [
+      4.5 * gib,
+      64 * gib,
+      2,
+      'Low memory: 4.5 GB available with 2 models loaded. Replies may slow.',
+    ],
+    [60 * gib, 512 * gib, 2, null],
+    [1 * gib, 8 * gib, 0, null],
+  ];
+  for (const [free, total, loaded, want] of memory)
+    assert.equal(
+      lowMemory(
+        { availableMemoryBytes: free, observation: observed(loaded) },
+        { totalMemoryBytes: total, availableMemoryBytes: null },
+      ),
+      want,
+      `${free / gib} of ${total / gib}`,
+    );
+  const live = setup({
+    connected: true,
+    operation: null,
+    observation: observed(1),
+    selection: null,
+  });
+  const picked = { selectionId: 'c'.repeat(64), observationHash: 'b'.repeat(64) };
+  assert.equal(selectionLost('Model A', live), 'Model A is no longer loaded. Pick a model.');
+  assert.equal(selectionLost('Model A', { ...live, selection: picked }), null);
+  assert.equal(selectionLost('Model A', { ...live, connected: false }), null);
+  assert.equal(selectionLost('Model A', { ...live, observationStale: true }), null);
+  assert.equal(selectionLost(null, live), null);
+  const choice = { selectionId: picked.selectionId, state: 'loaded-eligible' };
+  const holding = (change: Partial<LocalSetup>) =>
+    setup({
+      connected: true,
+      operation: null,
+      selection: picked,
+      observation: { models: [choice] } as unknown as LocalSetup['observation'],
+      observedAt: at(0),
+      ...change,
+    });
+  assert.equal(selectionConfirmed(holding({}), now - 1000), true);
+  assert.equal(selectionConfirmed(holding({ observedAt: at(1) }), now - 1000), false);
+  assert.equal(selectionConfirmed(holding({ observedAt: null }), now - 1000), false);
+  assert.equal(selectionConfirmed(holding({ connected: false }), now - 1000), false);
+  assert.equal(
+    selectionConfirmed(
+      holding({ observation: { models: [{ ...choice, state: 'installed-unloaded' }] } as never }),
+      now - 1000,
+    ),
+    false,
+  );
+
+  // The rail connects in place. A runtime that wants a token shows the input operation, which is
+  // the token window, and only then does Settings open. Auth off connects with no prompt.
+  const rail = async (reads: LocalSetup[], start: LocalSetup) => {
+    const sent: string[] = [];
+    const result = await connectInPlace({
+      setup: start,
+      command: async (input) => {
+        sent.push(input.command);
+        return { outcome: 'applied', revision: 2 };
+      },
+      read: async () => reads.shift(),
+      wait: async () => {},
+      active: () => true,
+    });
+    return { result, sent };
+  };
+  const idle = setup({ operation: null, reason: 'connection-required' });
+  const up = setup({ connected: true, operation: null, secretConfigured: false });
+  const withModels = { ...up, observation: observed(1) };
+  assert.deepEqual(await rail([setup()], idle), {
+    result: { kind: 'settings', why: 'token' },
+    sent: ['BeginLocalConnectionInput'],
+  });
+  assert.deepEqual(await rail([up, withModels], idle), {
+    result: { kind: 'connected', withoutToken: true },
+    sent: ['BeginLocalConnectionInput', 'RefreshLocalModels'],
+  });
+  // While the loopback probe runs, the input operation is not yet the window. The probe can end it
+  // and connect with no token, and the last read on view waits for the fresh one.
+  const probing = setup({
+    operation: { kind: 'input', operationId: 'cmd_01K7M1N2P3Q4R5S6T7V8W9X0YZ', state: 'intent' },
+  });
+  const cached = { ...up, observation: observed(1), observationStale: true as const };
+  assert.deepEqual(await rail([probing, cached, withModels], idle), {
+    result: { kind: 'connected', withoutToken: true },
+    sent: ['BeginLocalConnectionInput', 'RefreshLocalModels'],
+  });
+  assert.deepEqual(await rail([probing, setup()], idle), {
+    result: { kind: 'settings', why: 'token' },
+    sent: ['BeginLocalConnectionInput'],
+  });
+  assert.deepEqual(await rail([], setup({ endpoint: null, operation: null })), {
+    result: { kind: 'settings', why: 'unconfigured' },
+    sent: [],
+  });
+  assert.equal(
+    (await rail([setup({ operation: null, reason: 'connection-unavailable' })], idle)).result.kind,
+    'blocked',
+  );
+  assert.match(WITHOUT_TOKEN, /^Connected without a token./);
 });

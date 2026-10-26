@@ -10,11 +10,13 @@ import {
   ChatAttachmentSchema,
   ChatBranchStatusSchema,
   type ChatCatalogEntry,
+  ChatCatalogEntrySchema,
   ChatCrewChainSchema,
   ChatCrewSchema,
   ChatFlightModeSchema,
   type ChatHandoffMode,
   ChatQueuedMessageSchema,
+  ChatSessionSchema,
   ChatTurnEventsReadSchema,
   ChatTurnStatsSchema,
   CheckEventSchema,
@@ -71,6 +73,7 @@ import {
   ReadChatBranchStatusPayloadSchema,
   ReadDataSchema,
   RemainingBudgetsSchema,
+  RetryChatTurnPayloadSchema,
   ReviewJobSchema,
   RoleSchema,
   RouteSchema,
@@ -1440,6 +1443,13 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       reason: 'not-configured',
     }).success,
   );
+  // The context comes from the bound instance, at whatever size it reports.
+  for (const change of [
+    { contextLength: 16384 },
+    { contextLength: 1_048_576 },
+    { available: false, modelBinding: null, reason: 'not-configured', contextLength: null },
+  ])
+    assert(NativeProfileSchema.safeParse({ ...localProfile, ...change }).success);
   for (const change of [
     { family: 'openai' },
     { billing: 'included' },
@@ -1451,7 +1461,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { modelBinding: { ...localModel, modelSizeBytes: 0 } },
     { modelBinding: { ...localModel, setupHash: 'invalid' } },
     { modelBinding: { ...localModel, quantization: 'other' } },
-    { contextLength: 16384 },
+    { contextLength: 0 },
+    { contextLength: null },
     { maximumOutputTokens: 2049 },
     { maximumOutputTokens: 8192 },
     { maximumSubmissions: 2 },
@@ -1578,6 +1589,13 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     reason: 'connection-required',
   };
   assert.deepEqual(LocalSetupSchema.parse(localSetup), localSetup);
+  const observedSetup = {
+    ...localSetup,
+    observedAt: '2026-10-26T10:00:00.000Z',
+    contextTokens: 1_048_576,
+    availableMemoryBytes: 1_288_490_189,
+  };
+  assert.deepEqual(LocalSetupSchema.parse(observedSetup), observedSetup);
   assert(LocalSetupSchema.safeParse({ ...localSetup, authMode: 'none', connected: true }).success);
   for (const change of [
     { authMode: 'none', secretConfigured: true },
@@ -1748,6 +1766,24 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     LocalModelObservationSchema.safeParse({ ...observation, models: eightHandles, residentLlms: 8 })
       .success,
   );
+  // The selected instance qualifies whatever else is resident, at whatever context it reports.
+  const resident = (index: number, contextLength: number) => ({
+    modelKey: `observed-model-${index}`,
+    instanceReference: `observed-${index}`,
+    sizeBytes: 17,
+    contextLength,
+  });
+  for (const change of [
+    { residentLlms: 2 },
+    { residentLlms: 2, residents: [resident(0, 8192), resident(1, 32768)] },
+    { models: [{ ...observedChoice, contextLength: 32768 }] },
+    { models: [{ ...observedChoice, contextLength: 1_048_576 }] },
+    { embeddingInstances: 1 },
+  ])
+    assert.deepEqual(LocalModelObservationSchema.parse({ ...observation, ...change }), {
+      ...observation,
+      ...change,
+    });
   for (const change of [
     { models: [observedChoice, observedChoice] },
     {
@@ -1773,8 +1809,8 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     },
     { residentLlms: 9 },
     { residentLlms: 0 },
-    { residentLlms: 2 },
-    { embeddingInstances: 1 },
+    { residents: [resident(0, 8192), resident(1, 8192)] },
+    { residentLlms: 2, residents: [resident(0, 0), resident(1, 8192)] },
     { embeddingInstances: 9 },
     { runtime: { ...observation.runtime, build: -1 } },
     { runtime: { ...observation.runtime, executable: '/arbitrary/runtime' } },
@@ -1793,7 +1829,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { models: [{ ...observedChoice, reasons: ['raw diagnostic'] }] },
     { models: [{ ...observedChoice, reasons: ['busy', 'busy'] }] },
     { models: [{ ...observedChoice, state: 'loaded-eligible', instanceReference: null }] },
-    { models: [{ ...observedChoice, contextLength: 32768 }] },
+    { models: [{ ...observedChoice, contextLength: null }] },
     { models: [{ ...observedChoice, identity: { ...observedIdentity, format: 'unsupported' } }] },
     { models: [{ ...observedChoice, state: 'incompatible', reasons: [] }] },
     { models: [{ ...observedChoice, state: 'installed-unloaded' }] },
@@ -3371,6 +3407,12 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
     source: { name: 'paste.png', mimeType: 'image/png', base64 },
   });
   const delta = { type: 'text.delta', turnId, itemId: 'item-1', text: 'Done.' };
+  const session = {
+    family: 'anthropic',
+    sessionId: 'session-1',
+    model: 'large-1',
+    updatedAt: '2026-10-26T10:00:00Z',
+  };
   const rows: [
     string,
     { safeParse: (input: unknown) => { success: boolean } },
@@ -3453,6 +3495,59 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
     ],
     ['glide is a flight mode', ChatFlightModeSchema, 'glide', true],
     ['autopilot is not a flight mode', ChatFlightModeSchema, 'autopilot', false],
+    [
+      'a reply stopped at the output limit carries its counts',
+      AgentEventSchema,
+      {
+        type: 'turn.completed',
+        turnId,
+        stopReason: 'done',
+        outputLimit: { reasoningTokens: 3900, replyTokens: 700, allowedTokens: 4600 },
+      },
+      true,
+    ],
+    [
+      'an output limit with no allowance is refused',
+      AgentEventSchema,
+      {
+        type: 'turn.completed',
+        turnId,
+        stopReason: 'done',
+        outputLimit: { reasoningTokens: 0, replyTokens: 0, allowedTokens: 0 },
+      },
+      false,
+    ],
+    [
+      'a client notice can go to the turn trace',
+      AgentEventSchema,
+      { type: 'provider.notice', turnId, level: 'info', message: 'Resumed.', trace: true },
+      true,
+    ],
+    [
+      'continue names the turn that stopped',
+      RetryChatTurnPayloadSchema,
+      { taskId, turnId, mode: 'continue' },
+      true,
+    ],
+    [
+      'a session records the newest turn it has seen',
+      ChatSessionSchema,
+      { ...session, seenSequence: 3 },
+      true,
+    ],
+    ['a saved session without a cursor still parses', ChatSessionSchema, session, true],
+    [
+      'an unlisted file reaches a family by path or not at all',
+      ChatCatalogEntrySchema,
+      { family: 'local', connected: true, models: [], unlisted: 'native' },
+      false,
+    ],
+    [
+      'a family that sends unlisted files as paths says so',
+      ChatCatalogEntrySchema,
+      { family: 'anthropic', connected: true, models: [], unlisted: 'path' },
+      true,
+    ],
     ['a chain on its first fix is valid', ChatCrewChainSchema, chain, true],
     ['a third fix round is refused', ChatCrewChainSchema, { ...chain, fixes: 3 }, false],
     [
@@ -3514,6 +3609,18 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
       'turn stats without the summaries count are refused',
       ChatTurnStatsSchema,
       { ...stats, summaries: undefined },
+      false,
+    ],
+    [
+      'turn stats may split output into reasoning and reply',
+      ChatTurnStatsSchema,
+      { ...stats, reasoningTokens: 90, replyTokens: 30 },
+      true,
+    ],
+    [
+      'a negative reasoning count is refused',
+      ChatTurnStatsSchema,
+      { ...stats, reasoningTokens: -1, replyTokens: 30 },
       false,
     ],
     [

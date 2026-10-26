@@ -333,7 +333,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         unlimited: true,
         read: null,
         detail:
-          'Apple M5 Pro · 20 GPU cores · 48 GB memory, 31 GB free · 27B Q4_K_M, 15.2 GB, 8,192 context · 18.4 tok/s last turn',
+          'Apple M5 Pro · 20 GPU cores · 48 GB memory, 31 GB available · 27B Q4_K_M, 15.2 GB, 8,192 context · 18.4 tok/s last turn',
       },
     },
     {

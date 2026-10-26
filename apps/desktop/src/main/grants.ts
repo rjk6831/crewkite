@@ -1,4 +1,6 @@
+import { dirname, join, resolve } from 'node:path';
 import type { Command } from '@crewkite/contracts';
+import type { AttachmentTarget } from '../shared/open-file.ts';
 
 /**
  * The file paths main handed one window: picker choices, saved clipboard images and files the
@@ -24,4 +26,20 @@ export class PathGrants {
       ? null
       : 'This window did not choose that file. Attach it again.';
   }
+}
+
+/**
+ * Where the controller stored one attached file: `<home>/chat/<task>/files/<sha256>/<name>`. Null
+ * for anything that would resolve outside that thread's files folder, so a name the page made up
+ * cannot reach another folder.
+ */
+export function storedAttachmentPath(
+  home: string,
+  target: Pick<AttachmentTarget, 'taskId' | 'id' | 'name'>,
+): string | null {
+  const folder = resolve(join(home, 'chat', target.taskId, 'files'));
+  const path = resolve(folder, target.id, target.name);
+  return dirname(path) === join(folder, target.id) && dirname(dirname(path)) === folder
+    ? path
+    : null;
 }

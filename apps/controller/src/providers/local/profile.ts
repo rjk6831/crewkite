@@ -13,7 +13,6 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { localConfiguredConnectionHash } from './connection.ts';
 
-export const CONTEXT_TOKENS = 8192;
 const LEGACY_OUTPUT_TOKENS = 2048;
 export const MAX_CONTENT_BYTES = 65_536;
 const MAX_TESTS = 2;
@@ -163,11 +162,7 @@ export const ProofSchema = z
     ]),
     promptTokens: count,
     predictedTokens: count,
-    renderedPromptTokens: z
-      .number()
-      .int()
-      .positive()
-      .max(CONTEXT_TOKENS - LEGACY_OUTPUT_TOKENS),
+    renderedPromptTokens: z.number().int().positive().safe(),
     outputBytes: z.number().int().nonnegative().safe(),
     structured: z
       .strictObject({
@@ -176,7 +171,8 @@ export const ProofSchema = z
         nonReasoningBytes: z.number().int().nonnegative().max(MAX_STREAM_BYTES),
       })
       .optional(),
-    contextLength: z.literal(CONTEXT_TOKENS),
+    // The context the bound instance reported when the attempt started.
+    contextLength: z.number().int().positive().safe(),
     maxTokens: LocalNativeProfileSchema.shape.maximumOutputTokens,
     contextOverflowPolicy: z.literal('stopAtLimit'),
     draftModel: z.literal(''),

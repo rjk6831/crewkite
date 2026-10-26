@@ -17,6 +17,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import type { Schedule } from '../../host/worker.ts';
 import {
@@ -357,7 +358,10 @@ function promptBlocks(
 ) {
   const blocks: PromptBlock[] = [{ type: 'text', text }];
   const linked: string[] = [];
-  let bytes = Buffer.byteLength(JSON.stringify(blocks));
+  const lines: string[] = [];
+  // The lines for this message's files join the text block last, so their size is held back now.
+  let bytes =
+    Buffer.byteLength(JSON.stringify(blocks)) + files.filter((file) => !file.earlier).length * 1024;
   const fits = (block: PromptBlock) => bytes + Buffer.byteLength(JSON.stringify(block)) + 1;
   for (const { attachment, path, earlier } of files) {
     const { mimeType, name } = attachment;
@@ -420,7 +424,19 @@ function promptBlocks(
     if (block === link && kind) linked.push(name);
     bytes = fits(block);
     blocks.push(block);
+    // The packet lists an earlier file already.
+    if (!earlier)
+      lines.push(
+        attachedLine(
+          attachment,
+          block === link
+            ? 'sent as a file link below'
+            : `sent as ${block.type === 'resource' ? 'an embedded resource' : `an ${block.type} block`} below`,
+        ),
+      );
   }
+  const section = attachedSection(lines);
+  if (section) blocks[0] = { type: 'text', text: `${text}\n\n${section}` };
   return { blocks, linked, attached: files.some((file) => !file.earlier) };
 }
 
@@ -661,8 +677,16 @@ export function googleChatAdapter(deps: {
         }));
       }
 
-      const notice = (message: string, level: 'info' | 'warning' = 'info') =>
-        send({ type: 'provider.notice', turnId, level, message: clip(message, 4000) });
+      // `trace` marks what the client says about its session or settings. The view keeps it in the
+      // turn trace.
+      const notice = (message: string, level: 'info' | 'warning' = 'info', trace = false) =>
+        send({
+          type: 'provider.notice',
+          turnId,
+          level,
+          message: clip(message, 4000),
+          ...(trace ? { trace: true as const } : {}),
+        });
       // One notice per turn for a frame CrewKite acts on and could not read. Every frame is in
       // the trace already, so later ones add nothing the trace lacks.
       const unreadable = (message: string) => {
@@ -1129,7 +1153,7 @@ export function googleChatAdapter(deps: {
             }
           }
           if (prior && !resumed)
-            notice('Previous session could not be resumed; started a new one.', 'warning');
+            notice('Previous session could not be resumed; started a new one.', 'warning', true);
           if (!resumed && !cancelled) {
             phase = 'setup';
             sessionId = newSession.parse(
@@ -1162,7 +1186,12 @@ export function googleChatAdapter(deps: {
             if (setup.thoughtLevel && effort !== 'default') {
               if (setup.thoughtLevel.supported.includes(effort))
                 await set(setup.thoughtLevel.optionId, effort);
-              else notice(`The Google client has no ${effort} thought level; using its default.`);
+              else
+                notice(
+                  `The Google client has no ${effort} thought level; using its default.`,
+                  'info',
+                  true,
+                );
             }
           }
           if (launch?.reviewMode) await set(launch.reviewMode.configId, launch.reviewMode.valueId);

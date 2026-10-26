@@ -53,6 +53,19 @@ const quiet = (turn: TurnView) => {
   return !last || (last.kind === 'tool' ? last.status !== 'running' : 'done' in last && last.done);
 };
 
+function TurnTrace({ blocks }: { blocks: TurnView['blocks'] }) {
+  const notes = blocks.filter((block) => block.kind === 'notice' && block.trace);
+  if (notes.length === 0) return null;
+  return (
+    <details className="th-trace">
+      <summary>Client notes ({notes.length})</summary>
+      {notes.map((block) => (
+        <p key={block.id}>{block.kind === 'notice' ? block.message : ''}</p>
+      ))}
+    </details>
+  );
+}
+
 const TurnRow = memo(function TurnRow({
   turn,
   onResolve,
@@ -70,6 +83,8 @@ const TurnRow = memo(function TurnRow({
         </header>
       )}
       {viewBlocks(turn.blocks, turn.ended).map((block): ReactNode => {
+        // A client note is not part of the reply. It waits in the trace below.
+        if (block.kind === 'notice' && block.trace) return null;
         switch (block.kind) {
           case 'text':
             return (
@@ -102,6 +117,7 @@ const TurnRow = memo(function TurnRow({
             return null;
         }
       })}
+      <TurnTrace blocks={turn.blocks} />
       {turn.status === 'stopped' && <p className="th-stopped">Stopped.</p>}
       <TurnStats turn={turn} />
       {quiet(turn) && (
@@ -115,20 +131,31 @@ const TurnRow = memo(function TurnRow({
   );
 });
 
-function UserRow({ item }: { item: Extract<ThreadItem, { kind: 'user' }> }) {
+function UserRow({
+  item,
+  taskId,
+}: {
+  item: Extract<ThreadItem, { kind: 'user' }>;
+  taskId?: string;
+}) {
   return (
     <div className={item.pending ? 'th-row th-user is-pending' : 'th-row th-user'}>
       {item.attachments.length > 0 && <AttachmentChips paths={item.attachments} />}
-      <FileChips files={item.files.map(chipOf)} />
+      <FileChips files={item.files.map(chipOf)} taskId={taskId} />
       <div className="th-bubble">{item.text}</div>
     </div>
   );
 }
 
-function Row({ item, onResolve, onOpenChanges }: { item: ThreadItem } & TurnHandlers) {
+function Row({
+  item,
+  taskId,
+  onResolve,
+  onOpenChanges,
+}: { item: ThreadItem; taskId?: string } & TurnHandlers) {
   switch (item.kind) {
     case 'user':
-      return <UserRow item={item} />;
+      return <UserRow item={item} taskId={taskId} />;
     case 'turn':
       return <TurnRow turn={item.turn} onResolve={onResolve} onOpenChanges={onOpenChanges} />;
     case 'failure':
@@ -156,6 +183,7 @@ export function MessageList({
   wantsHistory,
   onTurnVisible,
   earlier,
+  taskId,
   onResolve,
   onOpenChanges,
 }: {
@@ -170,6 +198,8 @@ export function MessageList({
   onTurnVisible?: (turnId: string) => void;
   /** Shown at the top while older messages may exist. */
   earlier?: { onLoad: () => Promise<void>; note: string | null } | null;
+  /** The thread the rows belong to, so a stored file can open. */
+  taskId?: string;
 } & TurnHandlers) {
   const scroller = useRef<HTMLDivElement>(null);
   const column = useRef<HTMLDivElement>(null);
@@ -271,7 +301,12 @@ export function MessageList({
             {items.map((item) => (
               // One wrapper for every row, so a control that appears below it keeps the row mounted.
               <Fragment key={item.key}>
-                <Row item={item} onResolve={onResolve} onOpenChanges={onOpenChanges} />
+                <Row
+                  item={item}
+                  taskId={taskId}
+                  onResolve={onResolve}
+                  onOpenChanges={onOpenChanges}
+                />
                 {actions?.(item)}
               </Fragment>
             ))}

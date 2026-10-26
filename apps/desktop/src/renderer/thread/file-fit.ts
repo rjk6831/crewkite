@@ -27,6 +27,52 @@ export function acceptsType(accepts: readonly string[] | null, mimeType: string)
   });
 }
 
+export type Delivery = NonNullable<ChatCatalogEntry['unlisted']> | 'native';
+
+/**
+ * How the selected family receives a file: `native` when its client lists the type, otherwise the
+ * `unlisted` state the catalog reports (a path line, or nothing at all). Null when the client
+ * reported nothing, which says nothing about the file.
+ */
+export function deliveryOf(
+  entry: Pick<ChatCatalogEntry, 'accepts' | 'unlisted'>,
+  mimeType: string,
+): Delivery | null {
+  const listed = acceptsType(entry.accepts, mimeType);
+  return listed === null ? null : listed ? 'native' : (entry.unlisted ?? null);
+}
+
+// What the family does with a file of this kind, in words the hover can finish.
+const takenAs = (mimeType: string) => {
+  const [kind] = essence(mimeType).split('/');
+  if (kind === 'image') return 'as an image';
+  if (kind === 'audio') return 'as audio';
+  if (essence(mimeType) === 'application/pdf') return 'as a document';
+  return kind === 'text' ? 'as text' : 'as it is';
+};
+
+/**
+ * The hover line for a chip. Family and kind come from the catalog entry and the file. Only a file
+ * the family cannot receive at all also gets `warn`, the line under the chip.
+ */
+export function deliveryNote(
+  family: string,
+  delivery: Delivery,
+  mimeType: string,
+): { title: string; warn: boolean } {
+  if (delivery === 'native')
+    return { title: `${family} takes this file ${takenAs(mimeType)}.`, warn: false };
+  if (delivery === 'path')
+    return {
+      title: `Sent as a file path. ${family} can open it with its tools.`,
+      warn: false,
+    };
+  return {
+    title: `${family} cannot take this file. The turn will stop and offer another provider.`,
+    warn: true,
+  };
+}
+
 /** True only when the client reported patterns and every file matches one of them. */
 export const takesEvery = (
   entry: Pick<ChatCatalogEntry, 'accepts'>,

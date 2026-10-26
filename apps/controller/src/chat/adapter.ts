@@ -4,6 +4,7 @@ import type {
   ChatFailure,
   ChatFamily,
   ChatModelSelection,
+  ChatOutputLimit,
   ChatPermissionPolicy,
   ChatRole,
   ChatSession,
@@ -35,6 +36,8 @@ export type ChatTurnRequest = Readonly<{
      * or link, and never refuse the turn over it.
      */
     earlier?: boolean;
+    /** For an earlier file: a short quote of the message it came with. */
+    came?: string;
   }>[];
   /** CrewKite's framing for the model: project, scratch rules, what to do with results. */
   systemContext: string;
@@ -68,6 +71,8 @@ export type ChatTurnResult = Readonly<{
   usage: { usedTokens: number; capacityTokens: number | null } | null;
   /** Paths the adapter believes it changed in scratch. The controller recomputes the real diff. */
   changedPaths: readonly string[];
+  /** Set when the reply stopped at the output limit. The stop reason stays done. */
+  outputLimit?: ChatOutputLimit;
 }>;
 
 export type ChatTurnHandle = Readonly<{

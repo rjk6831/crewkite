@@ -60,7 +60,7 @@ import { AcpClientPinSchema, AcpSetupProofSchema } from '../providers/google/acp
 import type { AcpWriterCompletion, startGoogleAcpWriter } from '../providers/google/acp/writer.ts';
 import type { CapturedContext } from '../providers/google/native-extension/connector.ts';
 import type { startGoogleWriter } from '../providers/google/native-writer.ts';
-import { type GpuFacts, gpuFacts } from '../providers/local/hardware.ts';
+import { availableMemory, type GpuFacts, gpuFacts } from '../providers/local/hardware.ts';
 import type { LocalStart } from '../providers/local/profile.ts';
 import type { startLocalReplacement } from '../providers/local/replacement.ts';
 import { ReplacementPathSchema, type startReplacement } from '../providers/openai/replacement.ts';
@@ -89,7 +89,11 @@ export const localHardwareStatus = (
   const architecture = arch();
   const operatingSystem = platform();
   const totalMemory = totalmem();
-  const availableMemory = freemem();
+  // vm_stat gives the macOS figure. Until its first reading answers, a Mac shows unknown, since
+  // freemem there leaves out the file cache the system gives back on demand.
+  const reading = availableMemory();
+  const available =
+    reading !== undefined ? reading : operatingSystem === 'darwin' ? null : freemem();
   return LocalHardwareStatusSchema.parse({
     cpuModel,
     logicalCores: processors.length > 0 && processors.length <= 4096 ? processors.length : null,
@@ -97,12 +101,13 @@ export const localHardwareStatus = (
     platform: /^[A-Za-z0-9._-]{1,32}$/.test(operatingSystem) ? operatingSystem : null,
     totalMemoryBytes: Number.isSafeInteger(totalMemory) && totalMemory > 0 ? totalMemory : null,
     availableMemoryBytes:
-      Number.isSafeInteger(availableMemory) &&
-      availableMemory >= 0 &&
+      available !== null &&
+      Number.isSafeInteger(available) &&
+      available >= 0 &&
       Number.isSafeInteger(totalMemory) &&
       totalMemory > 0 &&
-      availableMemory <= totalMemory
-        ? availableMemory
+      available <= totalMemory
+        ? available
         : null,
     // Left out off Apple Silicon and until the launch probe has answered.
     ...(gpu ? gpu : {}),
@@ -546,6 +551,14 @@ export const LocalControlSchema = z.strictObject({
   endpoint: LocalEndpointSchema.nullable(),
   observation: LocalModelObservationSchema.nullable(),
   selection: LocalModelSelectionSchema.nullable(),
+  // The selected model's key outlives a reconnect, which clears the observation, so the next read
+  // can select the same model again when an instance of it is loaded.
+  selectedModelKey: z.string().min(1).max(200).nullable().default(null),
+  // When the observation was read and the memory available at that read.
+  observedAt: TimestampSchema.nullable().default(null),
+  // A reconnect keeps the last observation on view until the first read on the new connection.
+  observationStale: z.boolean().default(false),
+  availableMemoryBytes: RevisionSchema.nullable().default(null),
   setupHash: HashSchema.nullable(),
   operation: z
     .strictObject({

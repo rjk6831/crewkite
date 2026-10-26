@@ -3,6 +3,7 @@ import type {
   ChatEffort,
   ChatFailure,
   ChatFamily,
+  ChatOutputLimit,
   ChatPermissionOption,
   ChatRole,
   ChatToolKind,
@@ -46,6 +47,8 @@ export type NoticeBlock = {
   id: string;
   level: 'info' | 'warning';
   message: string;
+  /** The client said it about itself. It is not model output and belongs to the turn trace. */
+  trace: boolean;
 };
 /** The adapter folded earlier turns into a rolling summary to fit the model's context. */
 export type CompactedBlock = {
@@ -78,6 +81,8 @@ export type TurnView = {
   blocks: Block[];
   context: { used: number; capacity: number | null } | null;
   stats: ChatTurnStats | null;
+  /** Set when the reply stopped at its output limit. */
+  outputLimit: ChatOutputLimit | null;
   failure: ChatFailure | null;
 };
 
@@ -89,6 +94,7 @@ export const blankTurn = (id: string): TurnView => ({
   blocks: [],
   context: null,
   stats: null,
+  outputLimit: null,
   failure: null,
 });
 
@@ -128,7 +134,7 @@ function finish(view: TurnView, event: Extract<AgentEvent, { type: 'turn.complet
     if (block.kind === 'tool' && block.status === 'running') return { ...block, status: 'stopped' };
     return block;
   });
-  return { ...view, blocks, ended: true, status, failure };
+  return { ...view, blocks, ended: true, status, failure, outputLimit: event.outputLimit ?? null };
 }
 
 /** Two or more finished reads and searches in a row, shown as one line that opens into the cards. */
@@ -302,6 +308,7 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
           id: `notice:${view.blocks.length}`,
           level: event.level,
           message: event.message,
+          trace: event.trace === true,
         },
       ]);
     case 'turn.stats':

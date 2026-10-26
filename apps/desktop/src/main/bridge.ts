@@ -1,6 +1,15 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fsyncSync, openSync, writeFileSync } from 'node:fs';
-import { dirname } from 'node:path';
+import {
+  closeSync,
+  constants,
+  copyFileSync,
+  fsyncSync,
+  openSync,
+  realpathSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { dirname, extname, relative, sep } from 'node:path';
 import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
 import {
   ArtifactSchema,
@@ -18,10 +27,11 @@ import {
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
-import { type BrowserWindow, dialog, ipcMain } from 'electron';
+import { type BrowserWindow, dialog, ipcMain, shell } from 'electron';
 import { attachRequest } from '../shared/attach.ts';
+import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
-import { PathGrants } from './grants.ts';
+import { PathGrants, storedAttachmentPath } from './grants.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { assertSender, openExternalLink } from './security.ts';
@@ -163,6 +173,7 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'cancel-artifact-verification',
     'open-link',
     'attach',
+    'open-attachment',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
@@ -431,6 +442,48 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     const found = await files.find(request);
     assertSender(event, window);
     return found;
+  });
+  // A stored attachment, named by thread, hash and name. Main builds the path under the controller
+  // home and refuses a link that leaves the thread's files folder.
+  ipcMain.handle('crewkite:open-attachment', async (event, input: unknown) => {
+    assertSender(event, window);
+    const target = attachmentTarget(input);
+    const path = target && storedAttachmentPath(controller.paths.home, target);
+    if (!target || !path) throw new Error('That file is not one this thread stored.');
+    let real: string;
+    try {
+      real = realpathSync(path);
+      const inside = relative(realpathSync(dirname(dirname(path))), real);
+      if (inside.startsWith(`..${sep}`) || inside === '..' || !statSync(real).isFile())
+        throw new Error('outside');
+    } catch {
+      throw new Error('The stored file is missing.');
+    }
+    if (target.action === 'reveal') {
+      shell.showItemInFolder(real);
+      return 'done';
+    }
+    if (target.action === 'save') {
+      const choice = await dialog.showSaveDialog(window, {
+        title: 'Save a copy',
+        defaultPath: target.name,
+      });
+      assertSender(event, window);
+      if (choice.canceled || !choice.filePath) return 'cancelled';
+      if (choice.filePath === real) throw new Error('Choose a different place to save the copy.');
+      copyFileSync(real, choice.filePath);
+      return 'done';
+    }
+    // Opening a file hands it to the system, which would run a script or an app. Only a picture or
+    // a PDF opens, whatever the page says its type is.
+    if (!PREVIEW_EXTENSIONS.has(extname(target.name).toLowerCase()))
+      throw new Error('Only a picture or a PDF opens here. Use Save as for other files.');
+    if (process.platform === 'darwin') window.previewFile(real, target.name);
+    else {
+      const failed = await shell.openPath(real);
+      if (failed) throw new Error('The system could not open this file.');
+    }
+    return 'done';
   });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);
