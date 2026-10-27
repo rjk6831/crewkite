@@ -552,7 +552,11 @@ test('Local generation binds its loopback authentication mode and loaded instanc
         [true, false, 131072],
         label,
       );
-    else assert.equal(choice.state, 'installed-unloaded', label);
+    else {
+      // The download list reports vision for every model, and only the loaded instance a window.
+      assert.equal(choice.vision, info.vision, label);
+      assert.equal(choice.state, 'installed-unloaded', label);
+    }
   }
   {
     // A loaded instance that is generating shows as busy and still qualifies: the turn waits.

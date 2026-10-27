@@ -126,7 +126,10 @@ const metadataSchema = z.object({
     .optional(),
   selectedVariant: identifier(200).optional(),
   // Capability flags the runtime reports. They describe the model and stay out of its identity.
-  vision: z.boolean().optional(),
+  // The download list reports vision for every model. Only a loaded instance reports
+  // contextLength, and maxContextLength on this list is the most the model takes, never the
+  // window it runs with.
+  vision: z.boolean().optional().catch(undefined),
   trainedForToolUse: z.boolean().optional(),
   maxContextLength: z.number().int().positive().safe().optional(),
   variants: z

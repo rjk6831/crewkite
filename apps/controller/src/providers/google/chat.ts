@@ -30,7 +30,7 @@ import {
   chatAcpLimits,
   startAcpProcess,
 } from './acp/client.ts';
-import type { AcpClientIdentity } from './acp/profile.ts';
+import { ACP_SESSION_MODELS, type AcpClientIdentity } from './acp/profile.ts';
 
 // One chat turn on the published ACP agent. The connection, process ownership and stop
 // handling come from acp/client.ts. This file translates between the protocol and AgentEvents.
@@ -167,6 +167,10 @@ const optionKinds = new Map<string, { kind: ChatPermissionOption['kind']; label:
 ]);
 const optionOrder = [...optionKinds.keys()];
 
+// What the client says when the backend answers 404 for a model: its ModelNotFoundError carries
+// the server text, or "Model not found" when that is empty.
+const modelWords =
+  /model[\s\S]{0,40}not[ _-]?found|ModelNotFound|unrecognized[ _]model|unknown model/i;
 const limitWords = /quota|rate.?limit|exhaust|too many requests|\b429\b/i;
 const limitSignals = new Set(['quota', 'rate-limit', 'resource-exhausted']);
 const exitSites = new Set([
@@ -246,6 +250,10 @@ function cardTitle(kind: ChatToolKind, place: string | null, input: unknown): st
   const command = kind === 'command' ? words(['command', 'commandline', 'cmd']) : null;
   return command ? `Run ${clip(command.split(/\r?\n/)[0], 120)}` : null;
 }
+
+/** One line for a model ID the client does not serve to this account, typed IDs included. */
+const modelRefusal = (model: string) =>
+  `Google does not serve the model ${clip(model, 120)} to this account.`;
 
 class TurnFailure extends Error {
   readonly failure: ChatFailure;
@@ -447,6 +455,7 @@ function failureFor(
   stderr: AcpStderrSummary | null,
   now: number,
   attached = false,
+  model: string | null = null,
 ): ChatFailure {
   if (error instanceof TurnFailure) return error.failure;
   if (!(error instanceof AcpError))
@@ -466,6 +475,8 @@ function failureFor(
   };
   if (diagnostic?.site === 'rpc-error') {
     const detail = `${fault?.message ?? ''} ${JSON.stringify(fault?.data ?? '')}`;
+    if (model !== null && modelWords.test(detail))
+      return chatFailure({ ...base, kind: 'model-unavailable', message: modelRefusal(model) });
     if (
       limitWords.test(detail) ||
       stderr?.signals.some((signal) => limitSignals.has(signal.kind)) ||
@@ -587,19 +598,12 @@ export function googleChatAdapter(deps: {
       let early: ChatFailure | null = null;
       try {
         launch = deps.launch(request);
-        if (
-          launch.configuration &&
-          !launch.configuration.model.supported.includes(request.selection.model)
-        )
-          early = chatFailure({
-            stage: 'launch',
-            kind: 'model-unavailable',
-            message: `The Google client does not offer the model ${clip(request.selection.model, 100)}.`,
-          });
+        // A model outside the client's list may be one the person typed, so the client decides
+        // when the turn sets it, and the refusal reads the same as for a listed model.
         // Every policy keeps edits inside the scratch copy, and only the asking mode lets
         // CrewKite see an edit before it lands. Without it the client would edit on its own
         // under allow-all too, so no policy starts a turn.
-        else if (!launch.reviewMode)
+        if (!launch.reviewMode)
           early = chatFailure({
             stage: 'launch',
             kind: 'client-missing',
@@ -1179,9 +1183,39 @@ export function googleChatAdapter(deps: {
                 }),
               );
           };
+          // The client answers an ID it does not serve with a JSON-RPC error here, or with a
+          // value other than the one sent. Both read as the same refusal.
+          const setModel = async (name: string, optionId: string) => {
+            const refuse = () =>
+              new TurnFailure(
+                chatFailure({
+                  stage,
+                  kind: 'model-unavailable',
+                  method:
+                    optionId === ACP_SESSION_MODELS
+                      ? 'session/set_model'
+                      : 'session/set_config_option',
+                  message: modelRefusal(name),
+                }),
+              );
+            try {
+              if (optionId === ACP_SESSION_MODELS)
+                await live.request('session/set_model', { sessionId: id, modelId: name });
+              else await set(optionId, name);
+            } catch (error) {
+              if (
+                error instanceof TurnFailure ||
+                (error instanceof AcpError &&
+                  error.diagnostic?.site === 'rpc-error' &&
+                  error.reason !== 'authentication')
+              )
+                throw refuse();
+              throw error;
+            }
+          };
           const setup = launch?.configuration;
           if (setup) {
-            await set(setup.model.optionId, request.selection.model);
+            await setModel(request.selection.model, setup.model.optionId);
             const effort = request.selection.effort;
             if (setup.thoughtLevel && effort !== 'default') {
               if (setup.thoughtLevel.supported.includes(effort))
@@ -1308,6 +1342,7 @@ export function googleChatAdapter(deps: {
             outcome.stderrSummary,
             now(),
             attached,
+            request.selection.model,
           );
           return { stopReason: failure.kind === 'usage-limit' ? 'limit' : 'error', failure };
         };
