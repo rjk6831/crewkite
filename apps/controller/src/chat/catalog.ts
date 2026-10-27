@@ -16,6 +16,7 @@ import {
   anthropicChatModels,
   anthropicDefaultChatModel,
 } from '../providers/anthropic/chat.ts';
+import type { AnthropicLiveModel } from '../providers/anthropic/models.ts';
 import type { GooglePromptCapabilities } from '../providers/google/chat.ts';
 import { LOCAL_TEXT_TYPES } from '../providers/local/chat.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
@@ -30,6 +31,8 @@ type ObservedModel = {
   hidden?: boolean;
   /** What model/list reported the model takes, when the observation recorded it. */
   inputModalities?: readonly string[];
+  /** When the client says the model retires, in Unix seconds. */
+  retirementAt?: number;
 };
 
 export type ChatCatalogInput = {
@@ -38,6 +41,8 @@ export type ChatCatalogInput = {
   openAiModels: readonly ObservedModel[] | null;
   /** The model the Anthropic client named in its last usage read, or null. */
   anthropicModel?: string | null;
+  /** The client's picker rows from the last successful read, or null when none has been read. */
+  anthropicModels?: readonly AnthropicLiveModel[] | null;
   /** What the Google client's last initialize declared in this controller's life, or null. */
   googlePrompt?: GooglePromptCapabilities | null;
   local: LocalSetup;
@@ -83,7 +88,12 @@ function openai(input: ChatCatalogInput): Entry {
   const profiles = input.profiles.filter((profile) => profile.family === 'openai');
   const ready = profiles.find((profile) => profile.available);
   const models = (input.openAiModels ?? []).map((value) =>
-    chatModel(value.model, value.efforts, value.defaultEffort, value.model, value.hidden),
+    chatModel(value.model, value.efforts, value.defaultEffort, {
+      hidden: value.hidden,
+      label: value.retirementAt
+        ? `${value.model}, retires ${new Date(value.retirementAt * 1000).toISOString().slice(0, 10)}`
+        : value.model,
+    }),
   );
   // The profile pins a model the client may no longer list. Default to one it does list, and to
   // one it shows in its own picker before a hidden one.
@@ -110,11 +120,28 @@ function anthropic(input: ChatCatalogInput): Entry {
   const profiles = input.profiles.filter((profile) => profile.family === 'anthropic');
   const ready = profiles.find((profile) => profile.available);
   // The pinned profiles say whether the client is here. A chat turn can use every model the
-  // client offers, which is more than the profiles pin.
-  const models = profiles.length
-    ? anthropicChatModels.map((model) => chatModel(model, anthropicChatEfforts, 'default'))
-    : [];
-  const reported = anthropicChatModels.find((model) => model === input.anthropicModel);
+  // client offers, which is more than the profiles pin. The client's own picker rows come first.
+  // The shipped list stands in only while no read has succeeded, and it is marked known.
+  const rows = input.anthropicModels ?? [];
+  // The default row repeats the model one of the alias rows resolves to.
+  const live = rows.filter(
+    (row) =>
+      row.value !== 'default' || !rows.some((other) => other !== row && other.model === row.model),
+  );
+  const models = !profiles.length
+    ? []
+    : live.length
+      ? live.map((row) =>
+          chatModel(row.model, row.efforts.length ? ['default', ...row.efforts] : [], 'default', {
+            label: row.label,
+            source: 'live',
+          }),
+        )
+      : anthropicChatModels.map((model) =>
+          chatModel(model, anthropicChatEfforts, 'default', { source: 'known' }),
+        );
+  const reported = models.find((model) => model.model === input.anthropicModel)?.model;
+  const standard = rows.find((row) => row.value === 'default')?.model;
   return {
     ...entry(
       input,
@@ -122,7 +149,9 @@ function anthropic(input: ChatCatalogInput): Entry {
       !!ready,
       profiles[0]?.reason,
       models,
-      reported ?? anthropicDefaultChatModel,
+      reported ??
+        (models.some((model) => model.model === standard) ? standard : undefined) ??
+        (live.length ? models[0]?.model : anthropicDefaultChatModel),
     ),
     // The client's input protocol fixes these types for every model, so they hold wherever the
     // client is installed.
@@ -135,7 +164,9 @@ function google(input: ChatCatalogInput): Entry {
   const configuration = profile && 'configOptions' in profile ? profile.configOptions : null;
   const thought = configuration?.thoughtLevel;
   const models = (configuration?.model.supported ?? []).map((model) =>
-    chatModel(model, thought?.supported ?? [], thought?.currentValue ?? 'default'),
+    chatModel(model, thought?.supported ?? [], thought?.currentValue ?? 'default', {
+      source: 'live',
+    }),
   );
   // The agent declares its prompt blocks at each initialize. An embedded resource can carry any
   // file, so that flag covers every type.
@@ -169,20 +200,23 @@ function local(input: ChatCatalogInput): Entry {
   // A reconnect shows the last read until the first one on the new connection, and its models
   // cannot be picked until then.
   const connected = open && !input.local.observationStale;
-  // Text files are inlined for any model. Images need a model the runtime says has vision.
-  // A turn's connect reports the flag for its model. Before any turn the discovery has it on the
-  // cached choice, so the answer is there before Local connects.
+  // Text files are inlined for any model. Images need a model the runtime says has vision. The
+  // download list reports it for every model, and the last connect covers an observation from
+  // before it did.
   const picked = selected ?? loaded[0];
   const model = picked?.identity.modelKey;
   const vision =
     model !== undefined &&
-    (input.localVision?.modelKey === model ? input.localVision.vision : picked?.vision === true);
+    (picked?.vision ?? (input.localVision?.modelKey === model && input.localVision.vision));
   return {
     family: 'local',
     connected,
     reason: connected ? null : (input.local.reason ?? 'connection-required'),
     models: loaded.map((choice) =>
-      chatModel(choice.identity.modelKey, [], 'default', choice.identity.displayName),
+      chatModel(choice.identity.modelKey, [], 'default', {
+        label: choice.identity.displayName,
+        source: 'live',
+      }),
     ),
     defaultModel: connected ? (selected?.identity.modelKey ?? null) : null,
     remaining: remaining(input, 'local'),
@@ -226,8 +260,14 @@ function chatModel(
   model: string,
   efforts: readonly string[],
   preferred: string,
-  label = model,
-  hidden = false,
+  {
+    label = model,
+    hidden = false,
+    source = 'live',
+  }: Pick<Model, 'source'> & {
+    label?: string;
+    hidden?: boolean;
+  } = {},
 ): Model {
   const known = [
     ...new Set(
@@ -245,6 +285,7 @@ function chatModel(
     efforts: list,
     defaultEffort: wanted.success && list.includes(wanted.data) ? wanted.data : list[0],
     ...(hidden ? { hidden } : {}),
+    source,
   };
 }
 

@@ -70,6 +70,7 @@ import type { ChatTurnRequest } from '../../chat/adapter.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import { anthropicChatAdapter } from './chat.ts';
+import { readAnthropicModels } from './models.ts';
 
 type Spawn = NonNullable<Parameters<typeof anthropicChatAdapter>[0]['spawn']>;
 type Step = 'read' | 'hold' | 'drain' | { out: unknown } | { err: string } | { exit: number };
@@ -430,7 +431,7 @@ test('a client that exits without a result is reported with its last stderr line
   );
 });
 
-test('a file the API refuses or CrewKite cannot read fails the turn as attachment-rejected, and a refusal with no file block keeps its mapping', async (t) => {
+test('a file the API refuses or CrewKite cannot read fails the turn as attachment-rejected, a refusal with no file block keeps its mapping, and a model the account is not served is one line with no session kept', async (t) => {
   const refusal =
     'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","message":"Could not process image"}}';
   const refused: Step[] = [
@@ -450,13 +451,50 @@ test('a file the API refuses or CrewKite cannot read fails the turn as attachmen
   // Stored under the hash of other bytes, as after a write through a link to the store.
   const changed = file('changed.png', 'image/png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 9]));
   writeFileSync(changed.path, Buffer.from([0x89, 0x50, 0x4e, 0x47, 8]));
+  // The API answers 404 for a model it does not know, and the result frame keeps subtype success.
+  const unknown = "There's an issue with the selected model (claude-sonnet-5-5). It may not exist.";
+  const notServed = `Anthropic does not serve the model ${model} to this account.`;
   const rows: Array<{
     files: File[];
     kind: string;
     provider: string | null;
     spawned: boolean;
     message?: string;
+    script?: Step[];
   }> = [
+    {
+      files: [],
+      kind: 'model-unavailable',
+      provider: unknown,
+      spawned: true,
+      message: notServed,
+      script: [
+        'read',
+        { out: init() },
+        {
+          out: {
+            ...reply('msg_5', [{ type: 'text', text: unknown }]),
+            error: 'model_not_found',
+            api_error_status: 404,
+          },
+        },
+        { out: { ...done(), is_error: true, api_error_status: 404, result: unknown } },
+        'drain',
+      ],
+    },
+    // A client that exits on the unknown ID before any result frame leaves only the stderr marker.
+    {
+      files: [],
+      kind: 'model-unavailable',
+      provider: null,
+      spawned: true,
+      message: notServed,
+      script: [
+        'read',
+        { err: '[claude-code:unrecognized_model] {"model":"claude-sonnet-5-5"}\n' },
+        { exit: 1 },
+      ],
+    },
     { files: [png], kind: 'attachment-rejected', provider: refusal, spawned: true },
     // A path line sends nothing the API reads as a file, so the refusal is about something else.
     { files: [sheet], kind: 'protocol', provider: refusal, spawned: true },
@@ -487,10 +525,11 @@ test('a file the API refuses or CrewKite cannot read fails the turn as attachmen
     },
   ];
   for (const row of rows) {
-    const turn = run(refused, null, [], 'ask', 'default', row.files);
+    const turn = run(row.script ?? refused, null, [], 'ask', 'default', row.files);
     t.after(turn.cleanup);
-    const { stopReason, failure } = await turn.handle.result;
+    const { stopReason, failure, session } = await turn.handle.result;
     assert.equal(stopReason, 'error');
+    if (row.kind === 'model-unavailable') assert.equal(session, null);
     assert.equal(failure?.kind, row.kind, JSON.stringify(row.files));
     assert.equal(failure?.providerMessage, row.provider);
     assert.equal(turn.launched.argv.length > 0, row.spawned);
@@ -734,4 +773,73 @@ test('an unknown event goes to the turn trace and never the thread, routine syst
   );
   assert.equal(result.stopReason, 'done');
   assert.equal(result.assistantText, 'Still here.');
+});
+
+test('the model read sends one initialize request and no prompt, keeps the picker rows it can read, and gives null when the client answers none', async (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'crewkite-models-'));
+  t.after(() => rmSync(root, { recursive: true }));
+  const read = async (steps: Step[]) => {
+    const sent: string[] = [];
+    let argv: string[] = [];
+    const models = await readAnthropicModels({
+      executable: fixture,
+      sha256,
+      environment: { HOME: root, PATH: '/usr/bin:/bin' },
+      directory: join(root, 'models'),
+      timeoutMs: 20_000,
+      spawn: (executable, args, options) => {
+        argv = args;
+        const child = spawnCheckChild(
+          process.execPath,
+          [executable, JSON.stringify(steps), ...args],
+          options,
+        ) as ReturnType<Spawn>;
+        const write = child.stdin.write;
+        child.stdin.write = function (this: unknown, ...args: unknown[]) {
+          sent.push(String(args[0]));
+          return Reflect.apply(write, this, args);
+        } as typeof write;
+        return child;
+      },
+    });
+    return { models, sent, argv };
+  };
+  const answer = (models: unknown[]): Step[] => [
+    'read',
+    {
+      out: {
+        type: 'control_response',
+        response: { subtype: 'success', request_id: 'models', response: { models } },
+      },
+    },
+    'drain',
+  ];
+  const live = await read(
+    answer([
+      { value: 'default', resolvedModel: 'claude-sonnet-5-5', displayName: 'Default' },
+      {
+        value: 'opus',
+        resolvedModel: 'claude-opus-5-5',
+        displayName: 'Opus 5.5',
+        supportsEffort: true,
+        supportedEffortLevels: ['low', 'high', 'max'],
+      },
+      // A row without a value cannot be passed to --model, so it drops out.
+      { displayName: 'Broken' },
+      { value: 'haiku', supportsEffort: false, supportedEffortLevels: ['low'] },
+    ]),
+  );
+  assert.deepEqual(live.models, [
+    { value: 'default', model: 'claude-sonnet-5-5', label: 'Default', efforts: [] },
+    { value: 'opus', model: 'claude-opus-5-5', label: 'Opus 5.5', efforts: ['low', 'high', 'max'] },
+    { value: 'haiku', model: 'haiku', label: 'haiku', efforts: [] },
+  ]);
+  assert.deepEqual(
+    live.sent.map((line) => JSON.parse(line)),
+    [{ type: 'control_request', request_id: 'models', request: { subtype: 'initialize' } }],
+  );
+  assert(!live.argv.includes('--model') && !live.argv.includes('--resume'));
+  // A client that exits without answering, and one that answers with no rows, both read as none.
+  assert.equal((await read(['read', { exit: 1 }])).models, null);
+  assert.equal((await read(answer([]))).models, null);
 });

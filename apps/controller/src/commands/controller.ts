@@ -49,6 +49,7 @@ import type { GitIdentity } from '../host/publication.ts';
 import { inspectSourceDetails, projectRoot } from '../host/source.ts';
 import { groupAbsent, type OwnedCommand, type OwnedWorker, type Schedule } from '../host/worker.ts';
 import { anthropicChatAdapter } from '../providers/anthropic/chat.ts';
+import { type AnthropicLiveModel, readAnthropicModels } from '../providers/anthropic/models.ts';
 import type { NativeConnectionChecks } from '../providers/anthropic/native-connection.ts';
 import type { AnthropicUsageRefresh } from '../providers/anthropic/usage-refresh.ts';
 import type { AcpInstallDependencies } from '../providers/google/acp/install.ts';
@@ -395,12 +396,57 @@ export class Controller {
   private googlePrompt: GooglePromptCapabilities | null = null;
   private localVision: { modelKey: string; vision: boolean } | null = null;
 
+  // The Anthropic client's picker rows, read in the background. A read that fails leaves the last
+  // rows in place, or none, and the catalog then shows the shipped list as known.
+  private anthropicModelRows: readonly AnthropicLiveModel[] | null = null;
+  private anthropicModelRead = { at: Number.NEGATIVE_INFINITY, busy: false };
+
+  /** Starts a picker read when the last one is old. A catalog read never waits for it. */
+  private refreshAnthropicModels(profiles: NativeProfileResolution[]) {
+    const read = this.anthropicModelRead;
+    const client = profiles.find(
+      (value) =>
+        ['anthropic-file-v1', 'anthropic-file-compact-v1'].includes(value.facts.id) &&
+        value.facts.available,
+    )?.client;
+    const now = Date.parse(this.now());
+    // Ten minutes after a read, one minute after a miss.
+    if (
+      !client ||
+      this.closed ||
+      read.busy ||
+      now - read.at < (this.anthropicModelRows ? 600_000 : 60_000)
+    )
+      return;
+    read.busy = true;
+    read.at = now;
+    const directory = join(this.home, 'native', 'chat-models-anthropic');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    readAnthropicModels({
+      executable: client.executable,
+      sha256: client.sha256,
+      environment: this.chatEnvironment('anthropic'),
+      directory,
+      spawn: this.options.nativeSpawn as Parameters<typeof readAnthropicModels>[0]['spawn'],
+      schedule: this.options.schedule,
+    })
+      .then((rows) => {
+        if (rows && !this.closed) this.anthropicModelRows = rows;
+      })
+      .catch(() => {})
+      .finally(() => {
+        read.busy = false;
+      });
+  }
+
   private chatCatalog(): ChatCatalogRead {
     const profiles = this.resolveProfiles();
+    this.refreshAnthropicModels(profiles);
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
       anthropicModel: this.anthropicUsage().clientModel(),
+      anthropicModels: this.anthropicModelRows,
       googlePrompt: this.googlePrompt,
       local: this.localSetup(),
       localVision: this.localVision,
@@ -619,8 +665,10 @@ export class Controller {
     if (selection) {
       const models = families.find((entry) => entry.family === selection.family)?.models ?? [];
       const model = models.find((entry) => entry.model === selection.model);
-      // An empty list means no catalog was observed. The adapter then reports a bad model.
-      if (models.length && !model) return null;
+      // An empty list means no catalog was observed. The adapter then reports a bad model. A
+      // cloud family also takes an ID the list does not hold, since the person can type one and
+      // the client rejects it on the first turn. A Local model has to be on this computer.
+      if (models.length && !model && selection.family === 'local') return null;
       if (model && selection.effort !== 'default' && !model.efforts.includes(selection.effort))
         return null;
       return selection;

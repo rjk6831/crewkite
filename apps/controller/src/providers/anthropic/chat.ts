@@ -40,7 +40,7 @@ import { armOwnedCleanup } from './native-discovery.ts';
 // so the user message goes in on stdin, permission asks come back as control requests, and the
 // answers go out on the same stdin while the turn runs.
 
-type Spawn = (
+export type Spawn = (
   executable: string,
   args: string[],
   options: {
@@ -76,6 +76,9 @@ const TRACE_LIMITS = { lines: 5000, bytes: 256 * 1024 };
 const id = z.string().min(1).max(200);
 // Session IDs and models go into argv, so neither may start with a dash or carry whitespace.
 const sessionId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/);
+// The client writes this marker to stderr for a model ID the API does not know. The result frame
+// says the same with a 404, and its subtype stays success, so neither is read from the subtype.
+const UNRECOGNIZED_MODEL = /\bunrecognized_model\b/;
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,199}$/;
 const tokens = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const usage = z.object({
@@ -178,6 +181,7 @@ const result = z.object({
   result: loose(z.string()),
   errors: loose(z.array(z.unknown())),
   api_error: loose(z.string()),
+  api_error_status: loose(z.number().int()),
   usage: loose(usage),
   modelUsage: loose(
     z.record(z.string(), z.object({ contextWindow: loose(z.number().int().positive()) }).catch({})),
@@ -270,7 +274,7 @@ const options: ChatPermissionOption[] = [
 // Copied from startReplacement in replacement.ts. The profile verified this build when it
 // resolved, and hashing again right before spawn keeps a binary replaced since then from
 // running under the old identity.
-function verifiedExecutable(path: string, sha256: string) {
+export function verifiedExecutable(path: string, sha256: string) {
   if (!isAbsolute(path) || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('identity');
   const executable = realpathSync(path);
   const fd = openSync(executable, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -292,7 +296,7 @@ function verifiedExecutable(path: string, sha256: string) {
 // would strip the tools a chat turn needs. Updates stay off so the verified build is the one
 // that runs, and nothing else from the controller's environment, keys included, reaches the
 // client.
-function chatEnvironment(source: NodeJS.ProcessEnv, temporary: string): NodeJS.ProcessEnv {
+export function chatEnvironment(source: NodeJS.ProcessEnv, temporary: string): NodeJS.ProcessEnv {
   if (!source.HOME || !isAbsolute(source.HOME)) throw new Error('environment');
   return {
     HOME: source.HOME,
@@ -688,6 +692,15 @@ function startTurn(
     resolveResult = resolve;
   });
 
+  // A model the API does not know fails on the first request. The line names the model the
+  // person picked, which the init frame echoes back unchanged.
+  const modelRefusal = (base: Pick<ChatFailure, 'stage' | 'providerMessage' | 'method'>) =>
+    chatFailure({
+      ...base,
+      kind: 'model-unavailable',
+      message: `Anthropic does not serve the model ${clip(request.selection.model, 120)} to this account.`,
+      nextAction: 'Pick another model or type a different model ID.',
+    });
   const decide = (stopReason: Outcome['stopReason'], failure: ChatFailure | null = null) => {
     outcome ??= { stopReason, failure };
   };
@@ -928,7 +941,7 @@ function startTurn(
       };
     else if (data.error === 'authentication_failed' || data.error === 'oauth_org_not_allowed')
       apiError = { kind: 'signed-out', resetsAt: null };
-    else if (data.error === 'model_not_found')
+    else if (data.error === 'model_not_found' || data.api_error_status === 404)
       apiError = { kind: 'model-unavailable', resetsAt: null };
     // A turn without file blocks gets the same answer for other reasons, such as a prompt over
     // the context window, so only a turn that sent blocks names the files.
@@ -1186,15 +1199,12 @@ function startTurn(
               message: 'The Anthropic client is not signed in.',
             }),
           );
-        else if (apiError?.kind === 'model-unavailable')
-          decide(
-            'error',
-            chatFailure({
-              ...base,
-              kind: 'model-unavailable',
-              message: 'The Anthropic client cannot use the selected model.',
-            }),
-          );
+        else if (
+          apiError?.kind === 'model-unavailable' ||
+          data.api_error_status === 404 ||
+          UNRECOGNIZED_MODEL.test(stderr)
+        )
+          decide('error', modelRefusal(base));
         else
           decide(
             'error',
@@ -1268,20 +1278,22 @@ function startTurn(
     const signedOut = SIGNED_OUT.test(stderr);
     const { stopReason, failure }: Outcome = outcome ?? {
       stopReason: 'error',
-      failure: chatFailure({
-        stage: started ? 'stream' : 'session',
-        kind: signedOut ? 'signed-out' : 'client-exit',
-        message: signedOut
-          ? 'The Anthropic client is not signed in.'
-          : 'The Anthropic client exited before it finished the turn.',
-        providerMessage:
-          stderr
-            .split('\n')
-            .filter((line) => line.trim())
-            .at(-1)
-            ?.trim() ?? null,
-        code: exitCode,
-      }),
+      failure: UNRECOGNIZED_MODEL.test(stderr)
+        ? modelRefusal({ stage: 'session' as const, providerMessage: null, method: null })
+        : chatFailure({
+            stage: started ? 'stream' : 'session',
+            kind: signedOut ? 'signed-out' : 'client-exit',
+            message: signedOut
+              ? 'The Anthropic client is not signed in.'
+              : 'The Anthropic client exited before it finished the turn.',
+            providerMessage:
+              stderr
+                .split('\n')
+                .filter((line) => line.trim())
+                .at(-1)
+                ?.trim() ?? null,
+            code: exitCode,
+          }),
     };
     send({ type: 'turn.completed', turnId, stopReason, failure });
     const at = now();
@@ -1289,16 +1301,18 @@ function startTurn(
       stopReason,
       failure,
       assistantText: texts.join('\n\n'),
-      session: session
-        ? {
-            family: 'anthropic',
-            sessionId: session,
-            model,
-            updatedAt: new Date(Number.isFinite(at) ? at : Date.now()).toISOString(),
-          }
-        : request.session?.family === 'anthropic'
-          ? request.session
-          : null,
+      // A refused model leaves no session to resume, since the next try may name another model.
+      session:
+        session && failure?.kind !== 'model-unavailable'
+          ? {
+              family: 'anthropic',
+              sessionId: session,
+              model,
+              updatedAt: new Date(Number.isFinite(at) ? at : Date.now()).toISOString(),
+            }
+          : request.session?.family === 'anthropic'
+            ? request.session
+            : null,
       usage: usageSeen,
       changedPaths: [...changed],
     });

@@ -83,6 +83,18 @@ test('the catalog reports the file types each client said it takes, and null bef
       ['image/*', ...text],
     ],
     [
+      'a Local model whose download list reports vision, with no connect reading',
+      { local: localSetup(true, true) },
+      null,
+      ['image/*', ...text],
+    ],
+    [
+      'a Local model whose download list reports none, over a connect reading that says vision',
+      { local: localSetup(true, false), localVision: { modelKey: 'fixture-model', vision: true } },
+      null,
+      text,
+    ],
+    [
       'no blocks, and vision reported for a model no longer loaded',
       {
         googlePrompt: none,
