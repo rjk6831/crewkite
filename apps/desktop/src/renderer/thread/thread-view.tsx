@@ -4,10 +4,12 @@ import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } fro
 import { familyName } from '../components.tsx';
 import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
 import {
+  cancelPlan,
   configureThread,
   handoffThread,
   resolvePermission,
   retryTurn,
+  runPlan,
   sendMessage,
   steerMessage,
   stopTurn,
@@ -22,6 +24,7 @@ import { limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { outputLimitLine } from './output-limit.ts';
+import { PlanCard } from './plan-card.tsx';
 import { QueuedList } from './queued-list.tsx';
 import {
   announcements,
@@ -235,6 +238,27 @@ export function ThreadView({
     },
     [source, task.id],
   );
+  // The plan card reads thread.plan. Each button is one command, and the controller answers with
+  // the plan's new state on its chat.thread event.
+  const plan = thread?.plan ?? null;
+  const planned = plan && thread && (
+    <PlanCard
+      plan={plan}
+      flight={thread.flightMode}
+      onRun={async (input) => {
+        await runPlan(source, { taskId: task.id, planId: plan.planId, ...input });
+        setNotice(null);
+      }}
+      onCancel={async () => {
+        await cancelPlan(source, { taskId: task.id, planId: plan.planId });
+        setNotice(null);
+      }}
+      onStop={async () => {
+        if (activeTurn) await stop();
+        else await cancelPlan(source, { taskId: task.id, planId: plan.planId });
+      }}
+    />
+  );
   const replyId = useMemo(
     () => (activeTurn ? null : lastReply(state, items)),
     [activeTurn, state, items],
@@ -361,8 +385,18 @@ export function ThreadView({
           items={items}
           empty={empty}
           footer={
-            offer && (
-              <LimitOfferCard key={offer.turnId} source={source} taskId={task.id} offer={offer} />
+            (planned || offer) && (
+              <>
+                {planned}
+                {offer && (
+                  <LimitOfferCard
+                    key={offer.turnId}
+                    source={source}
+                    taskId={task.id}
+                    offer={offer}
+                  />
+                )}
+              </>
             )
           }
           actions={actions}
