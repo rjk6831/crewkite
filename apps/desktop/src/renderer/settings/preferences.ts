@@ -236,7 +236,7 @@ export const crewRoleNames: Record<ChatCrewRole, string> = {
 const presetRoles = {
   Solo: ['builder'],
   Pair: ['builder', 'reviewer'],
-  'Full crew': ['builder', 'reviewer', 'challenger', 'fixer'],
+  'Full crew': ['builder', 'reviewer', 'challenger', 'fixer', 'orchestrator'],
 } as const satisfies Record<string, readonly ChatCrewRole[]>;
 export type CrewPresetName = keyof typeof presetRoles;
 export const crewPresetNames = Object.keys(presetRoles) as CrewPresetName[];
@@ -299,8 +299,8 @@ const onDefault = (entry: ChatCatalogEntry, store: Store | null): ChatModelSelec
  * lists it, with the pinned effort while the model offers it. The builder is otherwise the thread's
  * own selection, else the first connected family. The reviewer and the challenger go to the best
  * ranked other families under the thread's mode, so a second look comes from another model. With
- * one family connected they share it. The fixer is the builder again. Null when no family is
- * connected.
+ * one family connected they share it. The fixer is the builder again, and so is the orchestrator
+ * unless a model is pinned for it. Null when no family is connected.
  */
 export function crewFromPreset(
   preset: CrewPreset,
@@ -333,8 +333,10 @@ export function crewFromPreset(
       role === 'builder'
         ? builder
         : (pinned(role) ??
-          (role === 'fixer' ? builder : (best(taken) ?? best([builder.family]) ?? builder)));
-    if (role !== 'fixer') taken.push(selection.family);
+          (role === 'fixer' || role === 'orchestrator'
+            ? builder
+            : (best(taken) ?? best([builder.family]) ?? builder)));
+    if (role !== 'fixer' && role !== 'orchestrator') taken.push(selection.family);
     members.push({ role, selection });
   }
   return { name: preset.name, members };

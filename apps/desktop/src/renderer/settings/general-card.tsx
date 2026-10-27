@@ -25,13 +25,13 @@ const presetId = (name: string) => name.toLowerCase().replace(/\s+/g, '-');
 const presetHints: Record<CrewPreset['name'], string> = {
   Solo: 'The builder only. Nothing runs after a reply.',
   Pair: 'A builder and a reviewer on another family.',
-  'Full crew': 'Builder, reviewer, challenger and fixer.',
+  'Full crew': 'Builder, reviewer, challenger and fixer, with an orchestrator that plans the work.',
 };
-// The fixer is the builder again unless the person pins another model.
+// The fixer and the orchestrator are the builder's model unless the person pins another.
 const autoLabel = (role: string) =>
   role === 'builder'
     ? "The thread's model"
-    : role === 'fixer'
+    : role === 'fixer' || role === 'orchestrator'
       ? 'Same as the builder'
       : 'Another connected family';
 
