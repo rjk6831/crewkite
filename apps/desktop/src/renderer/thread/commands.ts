@@ -183,6 +183,16 @@ export const cancelPlan = (source: ThreadSource, input: { taskId: string; planId
     planId: nonEmpty(input.planId, 'The plan'),
   });
 
+/** A read-only question to one family. The reply arrives as a side reply with the ask badge. */
+export const askFamily = (
+  source: ThreadSource,
+  input: { taskId: string; family: string; model?: string; question: string },
+) =>
+  run(source, 'AskChatFamily', {
+    ...input,
+    question: nonEmpty(input.question.trim(), 'The question'),
+  });
+
 export type Acceptance =
   | { accepted: true; branch: string; commit: string; fileCount: number; note: string | null }
   | { accepted: false; reason: string; next: string | null };
