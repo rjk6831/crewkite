@@ -421,6 +421,8 @@ const roleVerb: Record<ChatRole, string> = {
   reviewer: 'reviewed the changes',
   advisor: 'gave a second opinion',
   challenger: 'challenged the last answer',
+  orchestrator: 'proposed a plan',
+  ask: 'answered a side question',
 };
 
 /**

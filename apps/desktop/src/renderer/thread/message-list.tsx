@@ -24,6 +24,8 @@ const roleLabels = {
   advisor: 'Advisor',
   challenger: 'Challenger',
   fixer: 'Fixer',
+  orchestrator: 'Orchestrator',
+  ask: 'Ask',
 } as const;
 
 /**

@@ -9,7 +9,7 @@ import { type KeyboardEvent, useEffect, useRef, useState } from 'react';
 import { sendMessage, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 
-export type RoleAction = Exclude<ChatRole, 'assistant' | 'fixer'>;
+export type RoleAction = Exclude<ChatRole, 'assistant' | 'fixer' | 'orchestrator' | 'ask'>;
 export const roleActions: Record<RoleAction, { label: string; prompt: string }> = {
   reviewer: { label: 'Review changes', prompt: 'Review the current changes.' },
   advisor: { label: 'Second opinion', prompt: 'Give a second opinion on the last answer.' },

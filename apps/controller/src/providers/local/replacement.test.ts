@@ -276,11 +276,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
   assert.deepEqual(localPlan({ ...plan, authMode: 'token' }), { ...plan, authMode: 'token' });
   assert.deepEqual(localPlan(plan), plan);
   assert.equal(canonicalJson(localPlan(plan)), canonicalJson(plan));
-  for (const maximumOutputTokens of [2048, 4096] as const) {
+  // The output cap is a computed number. The context bound applies where the plan meets its
+  // bound instance.
+  for (const maximumOutputTokens of [2048, 2049, 4096]) {
     const explicit: LocalStart = { ...plan, maximumOutputTokens };
     assert.deepEqual(localPlan(explicit), explicit);
   }
-  for (const maximumOutputTokens of [0, 2049, 8192, false])
+  for (const maximumOutputTokens of [0, -1, 1.5, false])
     assert.throws(() => localPlan({ ...plan, maximumOutputTokens }));
   assert.equal(localClientOptions(plan).apiToken, plan.token);
   assert.throws(() => localPlan({ ...plan, authMode: 'none' }));

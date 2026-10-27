@@ -13,9 +13,19 @@ const timestamp = z.iso.datetime();
 export const ChatTurnIdSchema = id('trn');
 export const ChatFamilySchema = z.enum(['openai', 'anthropic', 'google', 'local']);
 // A reviewer reads the changes. An advisor gives a second opinion on the last answer. A
-// challenger argues against the assumptions the last answer rests on. Those three read only. A
-// fixer is the builder again, run with a review's findings, and writes like the assistant.
-export const ChatRoleSchema = z.enum(['assistant', 'reviewer', 'advisor', 'challenger', 'fixer']);
+// challenger argues against the assumptions the last answer rests on. An orchestrator proposes a
+// plan of slices for the controller to assign. An ask turn answers a side question on another
+// family and posts beside the thread. Those five read only. A fixer is the builder again, run
+// with a review's findings, and writes like the assistant.
+export const ChatRoleSchema = z.enum([
+  'assistant',
+  'reviewer',
+  'advisor',
+  'challenger',
+  'fixer',
+  'orchestrator',
+  'ask',
+]);
 /** Roles whose turns edit the scratch copy. Every other role runs read only. */
 export const writesScratch = (role: z.infer<typeof ChatRoleSchema>) =>
   role === 'assistant' || role === 'fixer';
@@ -64,9 +74,17 @@ export type ChatModelSelection = z.infer<typeof ChatModelSelectionSchema>;
 /**
  * Who runs each step of the chain after a builder turn. The builder answers the person, the
  * reviewer reads the changes, the fixer is the builder again with the findings, and the challenger
- * argues against the assumptions. Builder is required; a crew without a reviewer has no chain.
+ * argues against the assumptions. An orchestrator, when the crew has one, proposes a plan in place
+ * of the single builder turn, and the controller assigns each slice. Builder is required; a crew
+ * without a reviewer has no chain.
  */
-export const ChatCrewRoleSchema = z.enum(['builder', 'reviewer', 'challenger', 'fixer']);
+export const ChatCrewRoleSchema = z.enum([
+  'builder',
+  'reviewer',
+  'challenger',
+  'fixer',
+  'orchestrator',
+]);
 export type ChatCrewRole = z.infer<typeof ChatCrewRoleSchema>;
 export const ChatCrewSchema = z
   .strictObject({
@@ -74,7 +92,7 @@ export const ChatCrewSchema = z
     members: z
       .array(z.strictObject({ role: ChatCrewRoleSchema, selection: ChatModelSelectionSchema }))
       .min(1)
-      .max(4),
+      .max(5),
   })
   .refine(
     (crew) => new Set(crew.members.map((member) => member.role)).size === crew.members.length,
@@ -106,6 +124,144 @@ export const ChatCrewChainSchema = z.strictObject({
   reason: z.string().min(1).max(400).nullable().default(null),
 });
 export type ChatCrewChain = z.infer<typeof ChatCrewChainSchema>;
+
+const utf8Bytes = (value: string) => new TextEncoder().encode(value).byteLength;
+/** A string of at most `max` UTF-8 bytes. */
+const bytes = (max: number) =>
+  z
+    .string()
+    .max(max)
+    .refine((value) => utf8Bytes(value) <= max, `Text exceeds ${max} bytes.`);
+/** A path inside the scratch copy: relative, forward slashes, no empty, `.` or `..` part. */
+const scratchPath = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (path) =>
+      path.isWellFormed() &&
+      !/\p{Cc}/u.test(path) &&
+      !path.startsWith('/') &&
+      !/^[a-z]:/i.test(path) &&
+      !path.includes('\\') &&
+      !path
+        .split('/')
+        .some((part) => !part || part === '.' || part === '..' || part.toLowerCase() === '.git'),
+    'A plan names files by their path inside the scratch copy.',
+  );
+
+export const MAX_PLAN_SLICES = 8;
+export const ChatPlanSliceIdSchema = z.number().int().min(1).max(MAX_PLAN_SLICES);
+export const ChatPlanDifficultySchema = z.enum(['easy', 'medium', 'hard']);
+/** One slice of an orchestrator plan. The controller assigns it; `hint` only breaks ties. */
+export const ChatPlanSliceSchema = z.strictObject({
+  id: ChatPlanSliceIdSchema,
+  title: z.string().min(1).max(120),
+  brief: z.string().min(1).max(4000),
+  files: z.array(scratchPath).max(40),
+  depends: z.array(ChatPlanSliceIdSchema).max(MAX_PLAN_SLICES - 1),
+  difficulty: ChatPlanDifficultySchema,
+  hint: z
+    .strictObject({
+      family: ChatFamilySchema.optional(),
+      role: z.enum(['builder', 'fixer']).optional(),
+    })
+    .optional(),
+  readOnly: z.boolean(),
+});
+export type ChatPlanSlice = z.infer<typeof ChatPlanSliceSchema>;
+
+/**
+ * Slice ids in an order where each slice follows every slice it depends on, or null when the
+ * dependencies name a missing slice, the slice itself or a cycle. Ties keep plan order.
+ */
+export function planOrder(
+  slices: readonly Pick<ChatPlanSlice, 'id' | 'depends'>[],
+): number[] | null {
+  const ids = new Set(slices.map((slice) => slice.id));
+  if (slices.some((slice) => slice.depends.some((dep) => dep === slice.id || !ids.has(dep))))
+    return null;
+  const order: number[] = [];
+  const placed = new Set<number>();
+  while (order.length < slices.length) {
+    const next = slices.find(
+      (slice) => !placed.has(slice.id) && slice.depends.every((dep) => placed.has(dep)),
+    );
+    if (!next) return null;
+    placed.add(next.id);
+    order.push(next.id);
+  }
+  return order;
+}
+
+/**
+ * The plan an orchestrator turn returns in a fenced `json` block tagged `plan`. It proposes; the
+ * controller validates it with this schema, assigns each slice and runs it.
+ */
+export const ChatPlanSchema = z
+  .strictObject({
+    planId: z.string().regex(/^[A-Za-z0-9._-]{1,64}$/),
+    goal: z.string().min(1).max(2000),
+    slices: z.array(ChatPlanSliceSchema).min(1).max(MAX_PLAN_SLICES),
+  })
+  .superRefine((plan, context) => {
+    if (new Set(plan.slices.map((slice) => slice.id)).size !== plan.slices.length)
+      context.addIssue({ code: 'custom', message: 'Each slice needs its own id.' });
+    else if (
+      plan.slices.some((slice) => new Set(slice.depends).size !== slice.depends.length) ||
+      !planOrder(plan.slices)
+    )
+      context.addIssue({
+        code: 'custom',
+        message:
+          'Slice dependencies must name other slices of the plan, once each, without a cycle.',
+      });
+  });
+export type ChatPlan = z.infer<typeof ChatPlanSchema>;
+
+export const ChatPlanSliceStatusSchema = z.enum(['queued', 'running', 'done', 'failed', 'not-run']);
+export type ChatPlanSliceStatus = z.infer<typeof ChatPlanSliceStatusSchema>;
+/** Where the controller sent a slice and why, in the words of the system line. */
+export const ChatPlanAssignmentSchema = z.strictObject({
+  family: ChatFamilySchema,
+  model: short,
+  reason: z.string().min(1).max(400),
+});
+export type ChatPlanAssignment = z.infer<typeof ChatPlanAssignmentSchema>;
+/**
+ * The plan card. It travels on the thread record, so it carries titles and status and leaves the
+ * briefs in the orchestrator's reply. `candidates` are the ranked families a person can pick from
+ * before the slice runs. proposed waits for Run plan; running, finished and stopped follow it.
+ */
+export const ChatPlanStateSchema = z
+  .strictObject({
+    planId: ChatPlanSchema.shape.planId,
+    orchestratorTurnId: ChatTurnIdSchema,
+    goal: ChatPlanSchema.shape.goal,
+    phase: z.enum(['proposed', 'running', 'finished', 'stopped']),
+    slices: z
+      .array(
+        z.strictObject({
+          id: ChatPlanSliceIdSchema,
+          title: ChatPlanSliceSchema.shape.title,
+          difficulty: ChatPlanDifficultySchema,
+          depends: ChatPlanSliceSchema.shape.depends,
+          readOnly: z.boolean(),
+          status: ChatPlanSliceStatusSchema,
+          assignment: ChatPlanAssignmentSchema.nullable(),
+          candidates: z.array(ChatPlanAssignmentSchema).max(4),
+          /** The builder turn that ran the slice. Null until it starts. */
+          turnId: ChatTurnIdSchema.nullable(),
+        }),
+      )
+      .min(1)
+      .max(MAX_PLAN_SLICES),
+  })
+  .refine(
+    (state) => new Set(state.slices.map((slice) => slice.id)).size === state.slices.length,
+    'Each slice on the card needs its own id.',
+  );
+export type ChatPlanState = z.infer<typeof ChatPlanStateSchema>;
 
 export const ChatToolKindSchema = z.enum(['read', 'search', 'edit', 'command', 'other']);
 
@@ -344,17 +500,24 @@ export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
 /** Files on one message. Saved threads hold path strings in `attachments`, which still parse. */
 const files = z.array(ChatAttachmentSchema).max(32).default([]);
 const legacyAttachments = z.array(z.string().min(1).max(4096)).max(32).default([]);
+/** Message text. It may be empty when the message carries at least one file. */
+const messageText = z.string().max(65_536);
+const textOrFiles = (message: { text: string; files: readonly unknown[] }) =>
+  message.text.length > 0 || message.files.length > 0;
+const TEXT_OR_FILES = 'A message needs text or at least one file.';
 
 /** A message waiting for the running turn to finish. The composer can still take it back. */
-export const ChatQueuedMessageSchema = z.strictObject({
-  id: id('msg'),
-  at: timestamp,
-  text: z.string().min(1).max(65_536),
-  role: ChatRoleSchema.default('assistant'),
-  selection: ChatModelSelectionSchema.optional(),
-  attachments: legacyAttachments,
-  files,
-});
+export const ChatQueuedMessageSchema = z
+  .strictObject({
+    id: id('msg'),
+    at: timestamp,
+    text: messageText,
+    role: ChatRoleSchema.default('assistant'),
+    selection: ChatModelSelectionSchema.optional(),
+    attachments: legacyAttachments,
+    files,
+  })
+  .refine(textOrFiles, TEXT_OR_FILES);
 export type ChatQueuedMessage = z.infer<typeof ChatQueuedMessageSchema>;
 
 export const ChatThreadSchema = z.strictObject({
@@ -426,6 +589,13 @@ export const ChatThreadSchema = z.strictObject({
     )
     .max(64)
     .optional(),
+  /**
+   * How many entries the scratch copy skipped in all. `skipped` keeps the first 64, so this is
+   * the number the first turn's line and the Changes tab state. Missing on threads saved before it.
+   */
+  skippedTotal: z.number().int().nonnegative().max(100_000).optional(),
+  /** The plan card of the last orchestrator turn. Null or missing when no plan was proposed. */
+  plan: ChatPlanStateSchema.nullable().optional(),
 });
 export type ChatThread = z.infer<typeof ChatThreadSchema>;
 
@@ -434,14 +604,16 @@ export const ChatThreadActivitySchema = z.enum(['idle', 'running', 'waiting', 'f
 export type ChatThreadActivity = z.infer<typeof ChatThreadActivitySchema>;
 
 // Command payloads, listed in CommandSchema.
-export const SendChatMessagePayloadSchema = z.strictObject({
-  taskId: id('tsk'),
-  text: z.string().min(1).max(65_536),
-  selection: ChatModelSelectionSchema.optional(),
-  role: ChatRoleSchema.default('assistant'),
-  attachments: legacyAttachments,
-  files,
-});
+export const SendChatMessagePayloadSchema = z
+  .strictObject({
+    taskId: id('tsk'),
+    text: messageText,
+    selection: ChatModelSelectionSchema.optional(),
+    role: ChatRoleSchema.default('assistant'),
+    attachments: legacyAttachments,
+    files,
+  })
+  .refine(textOrFiles, TEXT_OR_FILES);
 export const ResolveChatPermissionPayloadSchema = z.strictObject({
   taskId: id('tsk'),
   turnId: ChatTurnIdSchema,
@@ -645,6 +817,11 @@ export const ChatThreadReadSchema = z.strictObject({
   liveEvents: z.array(AgentEventSchema).max(5000),
   /** The event log cursor this read reflects. A view drops stream events at or below it. */
   cursor: z.string().regex(/^(0|[1-9][0-9]{0,19})$/),
+  /**
+   * True when messages older than the oldest one in this read exist, so Load earlier has
+   * something to load. The controller always sets it; reads from before it leave it out.
+   */
+  more: z.boolean().optional(),
 });
 export type ChatThreadRead = z.infer<typeof ChatThreadReadSchema>;
 
@@ -678,6 +855,88 @@ export const ChatChangesReadSchema = z.strictObject({
   files: z.array(ChatFileDiffSchema).max(2000),
 });
 export type ChatChangesRead = z.infer<typeof ChatChangesReadSchema>;
+
+// Results of the read-only thread tools. A cloud client reaches them through the controller's
+// one MCP server; Local calls the same reads as native functions. Every result is bounded here so
+// a large thread cannot flood a model's context.
+const sequence = z.number().int().nonnegative();
+const traceEntry = z.strictObject({
+  kind: ChatToolKindSchema,
+  title: z.string().min(1).max(500),
+  /** The file path or command the action named. */
+  target: z.string().max(500).nullable(),
+  outcome: z.enum(['ok', 'error', 'denied', 'running']),
+});
+export const MAX_THREAD_TURNS = 50;
+export const ThreadTurnsArgsSchema = z.strictObject({
+  /** Only turns with a higher sequence. */
+  since: sequence.optional(),
+  family: ChatFamilySchema.optional(),
+  limit: z.number().int().min(1).max(MAX_THREAD_TURNS).default(MAX_THREAD_TURNS),
+});
+export const ThreadTurnsResultSchema = z.strictObject({
+  turns: z
+    .array(
+      z.strictObject({
+        id: ChatTurnIdSchema,
+        sequence,
+        family: ChatFamilySchema,
+        model: short,
+        role: ChatRoleSchema,
+        status: ChatTurnStateSchema,
+        startedAt: timestamp,
+        endedAt: timestamp.nullable(),
+        /** The first 300 characters of the reply. */
+        reply: z.string().max(300),
+        changedFiles: z.number().int().nonnegative(),
+      }),
+    )
+    .max(MAX_THREAD_TURNS),
+});
+export const ThreadTurnArgsSchema = z.strictObject({ id: ChatTurnIdSchema });
+export const ThreadTurnResultSchema = z.strictObject({
+  id: ChatTurnIdSchema,
+  /** At most 32 KiB. `truncated` says the reply was cut. */
+  reply: bytes(32_768),
+  truncated: z.boolean(),
+  trace: z.array(traceEntry).max(200),
+  files: z.array(z.string().min(1).max(4096)).max(200),
+});
+export const ThreadDiffArgsSchema = z.strictObject({
+  /** Changes made after this turn sequence. Missing means against the thread's base. */
+  since: sequence.optional(),
+  path: z.string().min(1).max(4096).optional(),
+  /** The `more` value of the previous call. */
+  cursor: z.string().min(1).max(200).optional(),
+});
+export const ThreadDiffResultSchema = z.strictObject({
+  /** Unified diff, at most 64 KiB per call. */
+  diff: bytes(65_536),
+  /** Pass as `cursor` to read on. Null once the diff is complete. */
+  more: z.string().min(1).max(200).nullable(),
+});
+export const ThreadChecksResultSchema = z.strictObject({
+  lines: z.array(z.string().max(500)).max(64),
+});
+export const ThreadLiveResultSchema = z.discriminatedUnion('state', [
+  z.strictObject({ state: z.literal('none') }),
+  z.strictObject({
+    state: z.literal('running'),
+    turnId: ChatTurnIdSchema,
+    family: ChatFamilySchema,
+    model: short,
+    role: ChatRoleSchema,
+    elapsedMs: z.number().int().nonnegative(),
+    /** The last 8 KiB of the reply so far. */
+    text: bytes(8192),
+    trace: z.array(traceEntry).max(200),
+  }),
+]);
+export type ThreadTurnsResult = z.infer<typeof ThreadTurnsResultSchema>;
+export type ThreadTurnResult = z.infer<typeof ThreadTurnResultSchema>;
+export type ThreadDiffResult = z.infer<typeof ThreadDiffResultSchema>;
+export type ThreadChecksResult = z.infer<typeof ThreadChecksResultSchema>;
+export type ThreadLiveResult = z.infer<typeof ThreadLiveResultSchema>;
 
 /**
  * How one file reaches one family. native: the client takes the type in its own block. path: the

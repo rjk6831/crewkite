@@ -231,6 +231,7 @@ export const crewRoleNames: Record<ChatCrewRole, string> = {
   reviewer: 'Reviewer',
   challenger: 'Challenger',
   fixer: 'Fixer',
+  orchestrator: 'Orchestrator',
 };
 const presetRoles = {
   Solo: ['builder'],
