@@ -119,6 +119,9 @@ const metadataSchema = z.object({
   format: identifier(64),
   sizeBytes: z.number().int().positive().safe(),
   deviceIdentifier: identifier(200).nullable(),
+  // The download list reports it for every model. Only a loaded instance reports contextLength,
+  // and maxContextLength on this list is the most the model takes, never the window it runs with.
+  vision: z.boolean().optional().catch(undefined),
   quantization: z
     .object({ name: identifier(64), bits: z.number().int().min(1).max(64) })
     .optional(),
@@ -265,6 +268,7 @@ export async function discoverLocalModels(
           identity,
           instanceReference: null,
           contextLength: null,
+          ...(value.vision === undefined ? {} : { vision: value.vision }),
           state: reasons.length ? 'incompatible' : 'installed-unloaded',
           reasons,
           qualification: 'unqualified',

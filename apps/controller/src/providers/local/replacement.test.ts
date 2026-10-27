@@ -512,6 +512,8 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     const { observation } = discovery;
     const choice = observation.models.find((model) => model.identity.modelKey === info.modelKey);
     assert(choice, label);
+    // The download list reports vision for every model, and only the loaded instance a window.
+    assert.equal(choice.vision, info.vision, label);
     selectionId ??= choice.selectionId;
     assert.equal(choice.selectionId, selectionId, label);
     assert.deepEqual(

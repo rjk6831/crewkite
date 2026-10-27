@@ -643,6 +643,7 @@ export const acpChatPeerCases = [
   'chat-quota',
   'chat-error',
   'chat-refusal',
+  'chat-model-missing',
   'chat-max-tokens',
   'chat-unknown',
   'chat-attach',
@@ -797,6 +798,8 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
         id: promptId,
         error: { code: -32603, message: 'Internal error: boom' },
       });
+    else if (scenario === 'chat-model-missing')
+      emit({ jsonrpc: '2.0', id: promptId, error: { code: -32603, message: 'Model not found' } });
     else if (scenario === 'chat-refusal') terminal('refusal');
     else if (scenario === 'chat-max-tokens') {
       chunk('agent_message_chunk', 'cut off');
@@ -854,9 +857,21 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
       } else if (message.method === 'session/set_config_option') {
         const option = config.find((v) => v.id === message.params.configId);
         assert(option);
-        assert(option.options.some((v) => v.value === message.params.value));
-        option.currentValue = message.params.value;
-        result(message.id, { configOptions: config });
+        // This case plays a client that rejects an ID outside its list.
+        if (
+          scenario === 'chat-model-missing' &&
+          !option.options.some((v) => v.value === message.params.value)
+        )
+          emit({
+            jsonrpc: '2.0',
+            id: message.id,
+            error: { code: -32602, message: 'Invalid params' },
+          });
+        else {
+          assert(option.options.some((v) => v.value === message.params.value));
+          option.currentValue = message.params.value;
+          result(message.id, { configOptions: config });
+        }
       } else if (message.method === 'session/prompt') {
         assert.equal(message.params.sessionId, session);
         promptId = message.id;

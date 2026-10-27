@@ -791,7 +791,7 @@ test('stop sends a cancel, keeps the partial text, declines a parked permission 
   }
 });
 
-test('the end of a prompt becomes a stop reason, a quota error carries its reset time, and files go as the blocks the agent declared', async () => {
+test('the end of a prompt becomes a stop reason, a quota error carries its reset time, files go as the blocks the agent declared, and a model the client does not serve is one line', async () => {
   type Stored = ReturnType<typeof stored>;
   const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 1]);
   const link = ({ attachment, path }: Stored) => ({
@@ -924,6 +924,31 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
       failure: { kind: 'model-unavailable', method: 'session/prompt', code: null, resetsAt: null },
     },
     {
+      // The backend's 404 on the first prompt, for a model on the client's list.
+      scenario: 'chat-model-missing',
+      stopReason: 'error',
+      failure: {
+        kind: 'model-unavailable',
+        method: 'session/prompt',
+        code: -32603,
+        resetsAt: null,
+      },
+      line: 'Google does not serve the model fixture-model to this account.',
+    },
+    {
+      // A typed ID outside the client's list is refused when the turn sets it, same line.
+      scenario: 'chat-model-missing',
+      model: 'fixture-typed',
+      stopReason: 'error',
+      failure: {
+        kind: 'model-unavailable',
+        method: 'session/set_config_option',
+        code: null,
+        resetsAt: null,
+      },
+      line: 'Google does not serve the model fixture-typed to this account.',
+    },
+    {
       scenario: 'chat-quota',
       stopReason: 'limit',
       failure: {
@@ -942,7 +967,12 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
     const f = rig(row.scenario);
     try {
       const files = row.files?.(f) ?? [];
-      const turn = await run(f, request(f, { files }));
+      const model = (row as { model?: string }).model ?? 'fixture-model';
+      const turn = await run(
+        f,
+        request(f, { files, selection: { family: 'google', model, effort: 'default' } }),
+      );
+      if ('line' in row) assert.equal(turn.result.failure?.message, row.line, row.scenario);
       if (row.blocks) {
         const [prompt] = withMethod(turn.frames, 'session/prompt');
         assert(prompt?.params, row.scenario);
