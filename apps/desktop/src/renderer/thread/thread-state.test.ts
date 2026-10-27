@@ -10,7 +10,10 @@ import type {
   ChatCatalogRead,
   ChatFailure,
   ChatFamily,
+  ChatFlightMode,
   ChatMessage,
+  ChatPlanSliceStatus,
+  ChatPlanState,
   ChatRole,
   ChatThread,
   ChatThreadRead,
@@ -21,6 +24,7 @@ import { adjacentThread, canSend, shortcutFor } from './composer-rules.ts';
 import { acceptsType, deliveryNote, deliveryOf, tryWithChoices } from './file-fit.ts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
 import { outputLimitLine, outputSplit, statsSplit } from './output-limit.ts';
+import { planCard, planOverrides } from './plan-card.ts';
 import {
   announcements,
   earlierCursor,
@@ -1569,4 +1573,102 @@ test('each shortcut asks for its action only where it applies, and Send needs te
     ],
     [false, false, true, true, false, false],
   );
+});
+
+test('the plan card offers what the flight mode allows and sends only the picks that differ', () => {
+  const where = (family: 'anthropic' | 'local' | 'google', reason: string) => ({
+    family,
+    model: `${family}-model`,
+    reason,
+  });
+  const slice = (
+    id: number,
+    status: ChatPlanSliceStatus,
+    depends: number[] = [],
+  ): ChatPlanState['slices'][number] => ({
+    id,
+    title: `Slice ${id}`,
+    difficulty: 'easy',
+    depends,
+    readOnly: false,
+    status,
+    assignment: where('local', 'Local first.'),
+    candidates: [where('local', 'Local first.'), where('google', 'Next ranked.')],
+    turnId: null,
+  });
+  const plan = (phase: ChatPlanState['phase'], slices: ChatPlanState['slices']): ChatPlanState => ({
+    planId: 'p1',
+    orchestratorTurnId: 't1',
+    goal: 'Split the work',
+    phase,
+    slices,
+  });
+  const queued = [slice(1, 'queued'), slice(2, 'queued', [1])];
+  const shape = (card: ReturnType<typeof planCard>) => ({
+    runPlan: card.runPlan,
+    cancel: card.cancel,
+    stop: card.stop,
+    run: card.rows.map((row) => row.canRun),
+    picker: card.rows.map((row) => row.picker !== null),
+  });
+  const rows: [string, ChatPlanState, ChatFlightMode, ReturnType<typeof shape>][] = [
+    [
+      'Manual runs a slice whose dependencies are done and offers Run plan',
+      plan('proposed', [slice(1, 'done'), slice(2, 'queued', [1]), slice(3, 'queued', [2])]),
+      'manual',
+      {
+        runPlan: true,
+        cancel: false,
+        stop: false,
+        run: [false, true, false],
+        picker: [false, false, false],
+      },
+    ],
+    [
+      'Balanced shows a picker per waiting slice, Run plan and Cancel, and no per-slice Run',
+      plan('proposed', queued),
+      'balanced',
+      { runPlan: true, cancel: true, stop: false, run: [false, false], picker: [true, true] },
+    ],
+    [
+      'Glide shows status and Stop only',
+      plan('proposed', queued),
+      'glide',
+      { runPlan: false, cancel: false, stop: true, run: [false, false], picker: [false, false] },
+    ],
+    [
+      'a running plan offers Stop and no Run',
+      plan('running', [slice(1, 'running'), slice(2, 'queued', [1])]),
+      'manual',
+      { runPlan: false, cancel: false, stop: true, run: [false, false], picker: [false, false] },
+    ],
+    [
+      'a stopped plan lets a failed slice run again in any mode',
+      plan('stopped', [slice(1, 'failed'), slice(2, 'not-run', [1])]),
+      'glide',
+      { runPlan: true, cancel: false, stop: false, run: [true, false], picker: [false, false] },
+    ],
+    [
+      'a finished plan offers nothing',
+      plan('finished', [slice(1, 'done'), slice(2, 'done', [1])]),
+      'manual',
+      { runPlan: false, cancel: false, stop: false, run: [false, false], picker: [false, false] },
+    ],
+  ];
+  for (const [claim, state, flight, want] of rows)
+    assert.deepEqual(shape(planCard(state, flight)), want, claim);
+
+  const waits = planCard(plan('proposed', queued), 'manual').rows[1];
+  assert.equal(waits?.waitsOn, 'Runs after slice 1');
+  assert.equal(
+    planCard(plan('running', [slice(1, 'running')]), 'glide').summary,
+    'Running: 0 of 1 slices done.',
+  );
+
+  const balanced = plan('proposed', queued);
+  assert.deepEqual(planOverrides(balanced, {}), [], 'no pick sends no override');
+  assert.deepEqual(planOverrides(balanced, { 1: 0 }), [], 'the assigned pick is not an override');
+  assert.deepEqual(planOverrides(balanced, { 2: 1 }), [
+    { sliceId: 2, family: 'google', model: 'google-model' },
+  ]);
 });
