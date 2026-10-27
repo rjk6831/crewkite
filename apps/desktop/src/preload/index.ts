@@ -1,4 +1,4 @@
-import type { DesktopSource } from '@crewkite/client';
+import type { DesktopSource, LocalTokenStatus } from '@crewkite/client';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
@@ -81,6 +81,19 @@ const attachFiles: NonNullable<DesktopSource['attachFiles']> = async (input) => 
   const unnamed = input.from === 'paste' && paths.length < files.length;
   return unnamed ? [...found, ...(await findFiles({ from: 'clipboard' }))] : found;
 };
+const tokenStatus = async (channel: string): Promise<LocalTokenStatus> => {
+  try {
+    const value: unknown = await ipcRenderer.invoke(channel);
+    const found = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+    return {
+      available: found.available === true,
+      remembered: found.remembered === true,
+      ...(typeof found.reason === 'string' ? { reason: found.reason.slice(0, 200) } : {}),
+    };
+  } catch (failure) {
+    throw plain(failure);
+  }
+};
 const bridge: DesktopSource = {
   verifyArtifact: async (input) =>
     ArtifactVerificationSchema.parse(
@@ -147,6 +160,9 @@ const bridge: DesktopSource = {
     if (!attention) throw new Error('The thread notice is invalid.');
     await ipcRenderer.invoke('crewkite:thread-attention', attention);
   },
+  localTokenStatus: () => tokenStatus('crewkite:local-token-status'),
+  rememberLocalToken: () => tokenStatus('crewkite:local-token-remember'),
+  forgetLocalToken: () => tokenStatus('crewkite:local-token-forget'),
   onOpenThread(listener) {
     openThread.add(listener);
     return () => {
