@@ -958,6 +958,12 @@ export const ChatCatalogEntrySchema = z.strictObject({
         defaultEffort: ChatEffortSchema,
         /** The client lists it only on request, as with an older model kept for old threads. */
         hidden: z.boolean().optional(),
+        /**
+         * Where the entry came from. live: the client listed it on this account just now. known:
+         * CrewKite ships it and the client could not confirm it. typed: the person entered the ID.
+         * Missing reads as live.
+         */
+        source: z.enum(['live', 'known', 'typed']).optional(),
       }),
     )
     .max(64),
