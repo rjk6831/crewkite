@@ -24,7 +24,7 @@ export function SettingsPage({
   workspace: Workspace;
   header: WorkspaceState;
   theme: string;
-  onTheme: (theme: 'dark' | 'light') => void;
+  onTheme: (theme: 'system' | 'dark' | 'light') => void;
 }) {
   const { catalog, error, modelRead } = useCatalog(workspace.source, header);
   const actions = useProviderActions(workspace);

@@ -160,7 +160,7 @@ export function GeneralCard({
 }: {
   catalog: ChatCatalogRead | null;
   theme: string;
-  onTheme: (theme: 'dark' | 'light') => void;
+  onTheme: (theme: 'system' | 'dark' | 'light') => void;
 }) {
   const [saved, setSaved] = useState<ThreadDefaults>(() => readThreadDefaults());
   const change = (next: ThreadDefaults) => {
@@ -299,7 +299,7 @@ export function GeneralCard({
           </span>
           <div className="st-controls">
             <fieldset className="st-segment" aria-labelledby="settings-theme">
-              {(['dark', 'light'] as const).map((name) => (
+              {(['light', 'dark', 'system'] as const).map((name) => (
                 <label key={name} className={theme === name ? 'is-on' : undefined}>
                   <input
                     type="radio"
@@ -308,7 +308,7 @@ export function GeneralCard({
                     checked={theme === name}
                     onChange={() => onTheme(name)}
                   />
-                  {name === 'dark' ? 'Dark' : 'Light'}
+                  {name === 'dark' ? 'Dark' : name === 'light' ? 'Light' : 'System'}
                 </label>
               ))}
             </fieldset>

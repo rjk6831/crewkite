@@ -54,6 +54,29 @@ function writePreference(key: string, value: string) {
   } catch {}
 }
 
+// Light, Dark or System. System follows the operating system and is the default. The key is new
+// because the old one held a theme the app wrote on first launch, not a choice.
+type ThemeMode = 'system' | 'dark' | 'light';
+const THEME_KEY = 'crewkite-theme-mode';
+function readThemeMode(): ThemeMode {
+  const saved = readPreference(THEME_KEY);
+  return saved === 'dark' || saved === 'light' ? saved : 'system';
+}
+const prefersDark = () =>
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-color-scheme: dark)').matches;
+function useSystemTheme() {
+  const [dark, setDark] = useState(prefersDark);
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia('(prefers-color-scheme: dark)');
+    const change = () => setDark(query.matches);
+    query.addEventListener('change', change);
+    return () => query.removeEventListener('change', change);
+  }, []);
+  return dark ? 'dark' : 'light';
+}
+
 type PaletteCommand = {
   id: string;
   label: string;
@@ -512,7 +535,9 @@ export function App() {
       .find(({ id }) => !removed.has(id));
     if (first) setSelected(first.id);
   }, [selected, taskPages, removed]);
-  const [theme, setTheme] = useState(() => readPreference('crewkite-theme') ?? 'dark');
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readThemeMode);
+  const systemTheme = useSystemTheme();
+  const theme = themeMode === 'system' ? systemTheme : themeMode;
   const [collapsed, setCollapsed] = useState(
     () => readPreference('crewkite-sidebar-collapsed-v1') === '1',
   );
@@ -588,8 +613,10 @@ export function App() {
   }, [palette]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    writePreference('crewkite-theme', theme);
   }, [theme]);
+  useEffect(() => {
+    writePreference(THEME_KEY, themeMode);
+  }, [themeMode]);
   useEffect(() => {
     writePreference('crewkite-sidebar-collapsed-v1', collapsed ? '1' : '0');
   }, [collapsed]);
@@ -821,7 +848,7 @@ export function App() {
             <button
               type="button"
               className="icon-button"
-              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              onClick={() => setThemeMode(theme === 'dark' ? 'light' : 'dark')}
               aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
               data-tooltip={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
             >
@@ -898,7 +925,12 @@ export function App() {
             </button>
           </div>
         ) : page === 'settings' ? (
-          <SettingsPage workspace={workspace} header={header} theme={theme} onTheme={setTheme} />
+          <SettingsPage
+            workspace={workspace}
+            header={header}
+            theme={themeMode}
+            onTheme={setThemeMode}
+          />
         ) : !threadSource ? (
           <div className="loading-workspace" role="alert">
             <p>The desktop bridge is unavailable.</p>
