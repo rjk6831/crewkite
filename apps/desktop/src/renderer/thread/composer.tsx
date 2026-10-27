@@ -175,6 +175,11 @@ export function Composer({
     blocked,
     onOpenCatalog: loadCatalog,
     onNote: setNote,
+    question: text.trim(),
+    onAsked: () => {
+      setText('');
+      drafts.delete(draftKey);
+    },
   });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: the box resizes when its text changes
@@ -387,6 +392,20 @@ export function Composer({
                 </button>
               );
             })}
+            <button
+              type="button"
+              className="th-pill"
+              aria-expanded={roles.role === 'ask'}
+              aria-controls={roles.role === 'ask' ? 'th-role-row' : undefined}
+              disabled={roles.why('ask') !== null}
+              title={
+                roles.why('ask') ??
+                'Ask one family a read-only question. The answer posts beside the thread.'
+              }
+              onClick={() => roles.toggle('ask')}
+            >
+              {roles.askLabel}
+            </button>
           </div>
         )}
         {roles.row}
