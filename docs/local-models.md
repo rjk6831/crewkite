@@ -6,7 +6,7 @@ A local model on a laptop usually runs with a small context window. At a few tho
 
 Local connects in one of three ways, and the card shows which one it used.
 
-- With a token. The token lives in CrewKite's memory only, as [ADR 0025](adr/0025-use-an-explicit-memory-only-local-credential.md) describes. Settings asks for it in the native input window. After a relaunch it is gone, and Connect asks again. [ADR 0043](adr/0043-remember-the-local-token-on-this-mac.md) proposes an opt-in way to keep it on this Mac. It is not built.
+- With a token. The token lives in CrewKite's memory only, as [ADR 0025](adr/0025-use-an-explicit-memory-only-local-credential.md) describes. Settings asks for it in the native input window. After a relaunch it is gone, and Connect asks again. [ADR 0043](adr/0043-remember-the-local-token-on-this-device.md) proposes an opt-in way to keep it on this Mac. It is not built.
 - With no token. CrewKite probes the loopback address once per connect. When 127.0.0.1 answers without a token, it connects with none and the card reads "Connected without a token. The runtime has auth off on loopback."
 - From the rail. Connect in the left rail connects in place with the saved host, port and authentication mode. It opens Settings only when the runtime asks for a token that CrewKite does not hold, and then Settings opens on the Local card with the token window already up.
 

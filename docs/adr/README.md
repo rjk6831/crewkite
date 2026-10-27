@@ -39,7 +39,9 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0039](0039-attachments-follow-each-client.md) | Send each attached file the way its client takes it | Accepted |
 | [0040](0040-accept-from-the-thread-base.md) | Accept from the thread's base, whatever HEAD is | Accepted |
 | [0042](0042-the-thread-is-the-source-of-truth-for-every-family.md) | Make the thread the source of truth for every family | Proposed |
-| [0043](0043-remember-the-local-token-on-this-mac.md) | Remember the Local token on this Mac | Proposed |
+| [0043](0043-remember-the-local-token-on-this-device.md) | Remember the Local token on this device | Accepted |
+| [0044](0044-thread-tools-over-one-controller-owned-mcp-server.md) | Thread tools over one controller-owned MCP server | Proposed |
+| [0045](0045-the-orchestrator-proposes-and-the-controller-assigns.md) | The orchestrator proposes and the controller assigns | Proposed |
 
 ## Writing a new record
 
