@@ -18,12 +18,17 @@ const observedModels = z
       hidden: z.literal(true).optional(),
       // Lists stored before this field read as reporting nothing.
       inputModalities: z.array(z.enum(MODALITIES)).max(MODALITIES.length).optional(),
+      // When the client says the model retires, in Unix seconds.
+      retirementAt: z.number().int().positive().safe().optional(),
     }),
   )
   .refine(
     (models) =>
       ConversationModelCatalogEntriesSchema.safeParse(
-        models.map(({ hidden: _hidden, inputModalities: _modalities, ...model }) => model),
+        models.map(
+          ({ hidden: _hidden, inputModalities: _modalities, retirementAt: _retires, ...model }) =>
+            model,
+        ),
       ).success,
     'A model list needs distinct bounded entries with supported efforts.',
   );
@@ -77,6 +82,7 @@ export function openAiModelCatalogObservation(
       defaultEffort: model.defaultReasoningEffort,
       ...(model.hidden ? { hidden: true } : {}),
       ...(model.inputModalities ? { inputModalities: model.inputModalities } : {}),
+      ...(model.retirementAt ? { retirementAt: model.retirementAt } : {}),
     })),
   });
 }

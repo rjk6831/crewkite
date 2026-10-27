@@ -40,7 +40,7 @@ const replies = {
     data: [
       { id: 'fixture-b', model: 'fixture-b', supportedReasoningEfforts: [
         { reasoningEffort: 'medium' }
-      ], defaultReasoningEffort: 'medium', hidden: true },
+      ], defaultReasoningEffort: 'medium', hidden: true, upgradeInfo: { retirementAt: 1798761600 } },
       { id: 'fixture-a', model: 'fixture-a', supportedReasoningEfforts: [
         { reasoningEffort: 'low' }, { reasoningEffort: 'high' }
       ], defaultReasoningEffort: 'low', hidden: false, inputModalities: ['text', 'image', 'video'] },
@@ -58,7 +58,7 @@ input.on('line', line => {
 input.on('close', () => process.exit(0));
 `;
 
-test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged, and the input kinds the composer reports, after owned peer closure', async () => {
+test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged with their retirement date, and the input kinds the composer reports, and every list names its source, after owned peer closure', async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/openai-model-catalog-'));
   const directory = resolve(root, 'run');
@@ -153,17 +153,27 @@ test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged,
         defaultEffort: 'low',
         inputModalities: ['text', 'image'],
       },
-      { model: 'fixture-b', efforts: ['medium'], defaultEffort: 'medium', hidden: true },
+      {
+        model: 'fixture-b',
+        efforts: ['medium'],
+        defaultEffort: 'medium',
+        hidden: true,
+        retirementAt: 1798761600,
+      },
     ]);
     // The composer reads what the default model takes, and the Anthropic list from its client's
     // block types. Without an observed list the OpenAI family reports nothing.
-    const accepts = (openAiModels: Parameters<typeof buildChatCatalog>[0]['openAiModels']) =>
+    const catalog = (
+      openAiModels: Parameters<typeof buildChatCatalog>[0]['openAiModels'],
+      anthropicModels?: Parameters<typeof buildChatCatalog>[0]['anthropicModels'],
+    ) =>
       buildChatCatalog({
         profiles: [
           { ...profile.facts, model: 'fixture-a' },
           resolveAnthropicNativeProfile({ HOME: root, PATH: '' }).facts,
         ],
         openAiModels,
+        anthropicModels,
         local: LocalSetupSchema.parse({
           revision: 0,
           connectionRevision: 0,
@@ -180,7 +190,9 @@ test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged,
         }),
         windows: [],
         nowMs: 0,
-      }).families.map((entry) => [entry.family, entry.accepts]);
+      }).families;
+    const accepts = (openAiModels: Parameters<typeof buildChatCatalog>[0]['openAiModels']) =>
+      catalog(openAiModels).map((entry) => [entry.family, entry.accepts]);
     assert.deepEqual(accepts(outcome.metadata?.models ?? null), [
       ['openai', ['image/*']],
       [
@@ -191,6 +203,62 @@ test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged,
       ['local', null],
     ]);
     assert.deepEqual(accepts(null)[0], ['openai', null]);
+    // The picker marks hidden models and shows the retirement date, and every entry says where it
+    // came from. Anthropic shows the shipped four as known until a read brings the client's rows,
+    // which then replace them, and the default row folds into the model it resolves to.
+    const models = (family: string, list: ReturnType<typeof catalog>) =>
+      list
+        .find((entry) => entry.family === family)
+        ?.models.map(({ model, label, hidden, source, efforts }) => ({
+          model,
+          label,
+          hidden,
+          source,
+          efforts,
+        }));
+    assert.deepEqual(models('openai', catalog(outcome.metadata?.models ?? null)), [
+      {
+        model: 'fixture-a',
+        label: 'fixture-a',
+        hidden: undefined,
+        source: 'live',
+        efforts: ['low', 'high'],
+      },
+      {
+        model: 'fixture-b',
+        label: 'fixture-b, retires 2027-01-01',
+        hidden: true,
+        source: 'live',
+        efforts: ['medium'],
+      },
+    ]);
+    assert.deepEqual(
+      models('anthropic', catalog(null))?.map((entry) => [entry.model, entry.source]),
+      [
+        ['claude-fable-5-1', 'known'],
+        ['claude-opus-5-5', 'known'],
+        ['claude-sonnet-5-5', 'known'],
+        ['claude-haiku-5-5', 'known'],
+      ],
+    );
+    const rows = [
+      { value: 'default', model: 'claude-sonnet-5-5', label: 'Default', efforts: [] },
+      {
+        value: 'sonnet',
+        model: 'claude-sonnet-5-5',
+        label: 'Sonnet 5.5',
+        efforts: ['low', 'high'],
+      },
+      { value: 'haiku', model: 'claude-haiku-5-5', label: 'Haiku 5.5', efforts: [] },
+    ];
+    const live = catalog(null, rows).find((entry) => entry.family === 'anthropic');
+    assert.deepEqual(
+      live?.models.map((entry) => [entry.model, entry.label, entry.source, entry.efforts]),
+      [
+        ['claude-sonnet-5-5', 'Sonnet 5.5', 'live', ['default', 'low', 'high']],
+        ['claude-haiku-5-5', 'Haiku 5.5', 'live', ['default']],
+      ],
+    );
     assert.equal(outcome.metadata?.profileHash, hashCanonical(profile.facts));
     assert(outcome.metadata && matchesOpenAiModelCatalogObservation(profile, outcome.metadata));
     assert(
