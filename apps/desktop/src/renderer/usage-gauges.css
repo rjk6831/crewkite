@@ -241,6 +241,16 @@
   stroke-width: 11;
   transition: stroke-dasharray 160ms ease-out;
 }
+/* A reading more than 60 minutes old: the same arc as dots. The color still follows the percent. */
+.usage-gauge-fill.is-dotted {
+  stroke-dasharray: 0.01 16;
+  stroke-linecap: round;
+  transition: none;
+}
+.usage-gauge-lines .usage-gauge-age {
+  color: var(--text-dim);
+  font-size: 11px;
+}
 /* Amounts without a total have no scale. A hairline frame keeps the dial from reading as empty. */
 .usage-gauge.is-unscaled .usage-gauge-track {
   stroke: var(--border-strong);
