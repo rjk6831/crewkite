@@ -8,8 +8,11 @@ import {
   type Window,
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
+import { formatSize } from './format-size.ts';
 import {
   anthropicUsageCard,
+  gaugeAge,
+  gaugeHue,
   nativeUsageClients,
   projectUsagePresentation,
   railFamilies,
@@ -203,15 +206,40 @@ test('native usage gauges show the remaining percent without inventing freshness
     rows.every(
       (row) =>
         row.state === 'reported' &&
-        row.observedAt === null &&
+        row.observedAt === DEMO_TIME &&
         row.resetsAt === DEMO_TIME &&
         row.reserve === undefined,
     ),
   );
   assert(card.tags?.includes('Current scope'));
-  // The age sentence sits in each reading's Details. The read time is CrewKite's, not the report's.
-  assert(rows.every((row) => row.note?.startsWith('Age unknown.') && row.note.includes(scopeHash)));
+  // The report has no time of its own, so the reading ages from the time CrewKite received it.
+  assert(
+    rows.every((row) => row.note?.startsWith('Read when CrewKite') && row.note.includes(scopeHash)),
+  );
   assert(rows.every((row) => row.readAt === DEMO_TIME));
+  // Decision 14: one color rule for every family, and an age label that never greys the fill.
+  const hues: [number, number][] = [
+    [100, 120],
+    [97, 117],
+    [70, 90],
+    [40, 60],
+    [14, 21],
+    [0, 0],
+  ];
+  for (const [percent, hue] of hues) assert.equal(gaugeHue(percent), hue, `${percent} percent`);
+  const readAt = (minutes: number) => new Date(nowMs - minutes * 60_000).toISOString();
+  const ages: [string | null, string, boolean][] = [
+    [readAt(4), 'read 4 min ago', false],
+    [readAt(60), 'read 1 h ago', false],
+    [readAt(61), 'read 1 h ago', true],
+    [readAt(120), 'read 2 h ago', true],
+    [readAt(0), 'read just now', false],
+    [null, 'age unknown', false],
+    ['not a time', 'age unknown', false],
+    [new Date(nowMs + 600_000).toISOString(), 'age unknown', false],
+  ];
+  for (const [given, label, dotted] of ages)
+    assert.deepEqual(gaugeAge(given, nowMs), { label, dotted }, `${given}`);
   const repeated = anthropicUsageCard({
     usageReaders: [
       {
@@ -296,7 +324,12 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     contextCapacity: 8192,
     summaries: 2,
   };
-  const rows: { claim: string; entry: Entry; expect: Record<string, unknown> }[] = [
+  const rows: {
+    claim: string;
+    entry: Entry;
+    setup?: LocalSetup;
+    expect: Record<string, unknown>;
+  }[] = [
     {
       claim: 'Anthropic five-hour and weekly get a bar each, and another model pool does not count',
       entry: entry('anthropic', [
@@ -346,16 +379,51 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         defaultModel: null,
         readAt: null,
       }),
-      expect: { bars: [], unlimited: true, needsConnect: true },
+      expect: { bars: [], unlimited: true, needsConnect: true, setUp: false },
+    },
+    {
+      claim: 'Local with no endpoint stays on the rail and reads Set up',
+      entry: entry('local', [], {
+        connected: false,
+        needsConnect: false,
+        models: [],
+        defaultModel: null,
+        readAt: null,
+      }),
+      setup: { endpoint: null } as unknown as LocalSetup,
+      expect: { bars: [], unlimited: false, needsConnect: false, setUp: true },
     },
   ];
-  for (const { claim, entry: family, expect } of rows) {
-    const [row] = railFamilies({ families: [family] }, nowMs, { hardware, localSetup });
+  for (const { claim, entry: family, setup, expect } of rows) {
+    const [row] = railFamilies({ families: [family] }, nowMs, {
+      hardware,
+      localSetup: setup ?? localSetup,
+    });
     const view = { ...row, bars: row.bars.map((bar) => bar.text) };
     for (const [key, value] of Object.entries(expect))
       assert.deepEqual(view[key as keyof typeof view], value, `${claim}: ${key}`);
   }
-  // An unconnected family that reads no usage stays off the rail.
+  // An unconnected family that reads no usage stays off the rail. Local does not, even when the
+  // catalog has no entry for it.
   const hidden = entry('google', [], { connected: false });
-  assert.deepEqual(railFamilies({ families: [hidden] }, nowMs), []);
+  assert.deepEqual(
+    railFamilies({ families: [hidden] }, nowMs).map(({ family }) => family),
+    ['local'],
+  );
+  assert.deepEqual(
+    railFamilies({ families: [hidden] }, nowMs, {
+      localSetup: { endpoint: null } as LocalSetup,
+    }).map(({ family, setUp }) => [family, setUp]),
+    [['local', true]],
+  );
+  // One formatter prints every size.
+  const sizes: [number, string][] = [
+    [812, '812 B'],
+    [4.5 * 1024 ** 2, '4.5 MB'],
+    [24_167_253_484, '22.5 GB'],
+    [48 * 1024 ** 3, '48 GB'],
+    [1024 ** 2 - 1, '1 MB'],
+    [150 * 1024 ** 2, '150 MB'],
+  ];
+  for (const [bytes, text] of sizes) assert.equal(formatSize(bytes), text, `${bytes}`);
 });

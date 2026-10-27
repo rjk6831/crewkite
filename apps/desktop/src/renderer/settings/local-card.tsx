@@ -5,7 +5,7 @@ import { LocalSetup } from '../local-setup.tsx';
 import { localFacts } from '../usage-presentation.ts';
 import { type CardProps, type CatalogEntry, ProviderCard } from './provider-card.tsx';
 
-const gib = (bytes: number | null | undefined) =>
+const sizeText = (bytes: number | null | undefined) =>
   bytes === null || bytes === undefined ? 'Unknown' : formatSize(bytes);
 
 function Hardware({ header, entry }: { header: WorkspaceState; entry: CatalogEntry | undefined }) {
@@ -15,8 +15,8 @@ function Hardware({ header, entry }: { header: WorkspaceState; entry: CatalogEnt
     hardware?.totalMemoryBytes == null
       ? 'Unknown'
       : hardware.availableMemoryBytes === null
-        ? `${gib(hardware.totalMemoryBytes)} total, available unknown`
-        : `${gib(hardware.availableMemoryBytes)} available of ${gib(hardware.totalMemoryBytes)}`;
+        ? `${sizeText(hardware.totalMemoryBytes)} total, available unknown`
+        : `${sizeText(hardware.availableMemoryBytes)} available of ${sizeText(hardware.totalMemoryBytes)}`;
   return (
     <section className="st-block" aria-label="Local hardware">
       <div className="st-subhead">

@@ -14,6 +14,7 @@ import {
   windowAppliesTo,
 } from '@crewkite/contracts';
 
+import { formatSize } from './format-size.ts';
 import type { UsageCard, UsageReading } from './usage-gauges.tsx';
 
 type Reserve = Policy['reserves'][number];
@@ -299,12 +300,14 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     label: primaryLabels.get(window.windowId) ?? window.windowId,
     remaining: window.remaining,
     state: 'reported',
-    observedAt: null,
+    // The report carries no observation time of its own. The time CrewKite received it is the
+    // newest the reading can be, so the gauge ages from there.
+    observedAt: reading?.receivedAt ?? null,
     resetsAt: window.resetsAt,
     source: 'client',
     confidence: 'reported',
     readAt: reading?.receivedAt ?? null,
-    note: `Age unknown. The report gives no observation time or cache age. Report scope ${scope}.`,
+    note: `Read when CrewKite received the report. The report gives no observation time or cache age. Report scope ${scope}.`,
   }));
   const primary = [...primaryLabels.keys()].flatMap((id) =>
     rows.filter((row) => row.windowId === id),
@@ -314,7 +317,7 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     title: 'Anthropic native quota',
     scope: 'Native local usage report',
     tags: [matching ? 'Current scope' : 'Earlier or unknown scope'],
-    // The footer says when the report was read, and each reading's Details says its age is unknown.
+    // Each gauge says how long ago CrewKite read the report. Details say the report has no time of its own.
     notice: reading ? undefined : 'Refresh Anthropic quota to read the native report.',
     primary,
     auxiliary: rows.filter((row) => !primary.includes(row)),
@@ -330,6 +333,43 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
       : [],
     emptyText: 'No subscription allowance was reported. Coding allowance remains unknown.',
   };
+}
+
+/**
+ * The ring color for a percent remaining, one rule for every family: hue 120 at 100 percent, 60 at
+ * 40 percent and 0 at 0 percent, linear within each stretch. Age never changes it.
+ */
+export function gaugeHue(percentRemaining: number): number {
+  const percent = Math.min(100, Math.max(0, percentRemaining));
+  return percent >= 40 ? 60 + (percent - 40) : (percent * 60) / 40;
+}
+export const gaugeColor = (percentRemaining: number) =>
+  `hsl(${Math.round(gaugeHue(percentRemaining))} 72% 46%)`;
+
+/** A ring past this many minutes without a read is drawn dotted. */
+export const GAUGE_DOTTED_AFTER_MIN = 60;
+
+/**
+ * How old a gauge reading is, as the label under the gauge: "read 4 min ago", "read 2 h ago" or
+ * "age unknown". A time that cannot be read, or that lies more than a minute ahead of the clock,
+ * is unknown. `dotted` is true once the read is more than 60 minutes old.
+ */
+export function gaugeAge(
+  readAt: string | null | undefined,
+  nowMs: number,
+): { label: string; dotted: boolean } {
+  const at = readAt ? Date.parse(readAt) : Number.NaN;
+  if (!Number.isFinite(at) || at - nowMs > 60_000) return { label: 'age unknown', dotted: false };
+  const minutes = Math.floor(Math.max(0, nowMs - at) / 60_000);
+  const label =
+    minutes < 1
+      ? 'read just now'
+      : minutes < 60
+        ? `read ${minutes} min ago`
+        : minutes < 1440
+          ? `read ${Math.floor(minutes / 60)} h ago`
+          : `read ${Math.floor(minutes / 1440)} d ago`;
+  return { label, dotted: minutes > GAUGE_DOTTED_AFTER_MIN };
 }
 
 /** How long ago CrewKite read a report, in minutes and then hours. */
@@ -353,6 +393,8 @@ export type RailFamily = {
   resetPassed: boolean;
   /** Usage reads, but chat waits for Connect in Settings. */
   needsConnect: boolean;
+  /** Local with no endpoint saved. The row reads "Set up" and opens the Local card. */
+  setUp: boolean;
   read: string | null;
   /** The hardware and model line for Local, with every unknown part left out. */
   detail: string | null;
@@ -377,12 +419,21 @@ export function railFamilies(
     localSetup?: LocalSetup | null;
   } = {},
 ): RailFamily[] {
+  if (!catalog) return [];
   const modelFor = options.modelFor ?? ((entry) => entry.defaultModel);
-  return (catalog?.families ?? [])
-    .filter((entry) => entry.connected || entry.needsConnect === true)
+  // Local is on the rail whatever its state, so a machine that never set it up can start there.
+  const entries = catalog.families.some(({ family }) => family === 'local')
+    ? catalog.families
+    : [...catalog.families, localPlaceholder];
+  return entries
+    .filter((entry) => entry.family === 'local' || entry.connected || entry.needsConnect === true)
     .map((entry) => {
       const model = modelFor(entry);
-      const unlimited = entry.family === 'local' && entry.remaining.length === 0;
+      const setUp =
+        entry.family === 'local' &&
+        !entry.connected &&
+        (options.localSetup ? options.localSetup.endpoint === null : entry.needsConnect !== true);
+      const unlimited = entry.family === 'local' && entry.remaining.length === 0 && !setUp;
       const reported = entry.remaining.map((window) => window.windowId);
       const applies = entry.remaining.filter((window) => windowAppliesTo(window, model, reported));
       const period = (label: keyof typeof barNames) =>
@@ -394,20 +445,21 @@ export function railFamilies(
         applies.some((window) => window.label.toLowerCase() === label),
       );
       const tightest = tightestAllowance(entry, model);
-      const bars: RailBar[] = unlimited
-        ? []
-        : both
-          ? (['five-hour', 'weekly'] as const).map((label) => {
-              const { percent } = period(label);
-              return { text: `${barNames[label]} ${percentText(percent)}`, percent };
-            })
-          : [
-              {
-                text:
-                  tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
-                percent: tightest.percent,
-              },
-            ];
+      const bars: RailBar[] =
+        unlimited || setUp
+          ? []
+          : both
+            ? (['five-hour', 'weekly'] as const).map((label) => {
+                const { percent } = period(label);
+                return { text: `${barNames[label]} ${percentText(percent)}`, percent };
+              })
+            : [
+                {
+                  text:
+                    tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
+                  percent: tightest.percent,
+                },
+              ];
       const until = tightest.resetsAt ? Date.parse(tightest.resetsAt) - nowMs : null;
       return {
         family: entry.family,
@@ -415,7 +467,8 @@ export function railFamilies(
         unlimited,
         resetsIn: until !== null && until > 0 ? until : null,
         resetPassed: until !== null && until <= 0,
-        needsConnect: !entry.connected,
+        needsConnect: !entry.connected && !setUp,
+        setUp,
         read: readAgo(entry.readAt, nowMs),
         detail:
           entry.family === 'local'
@@ -425,7 +478,17 @@ export function railFamilies(
     });
 }
 
-const gigabytes = (bytes: number) => `${Math.round(bytes / 1024 ** 3)} GB`;
+// A catalog that predates Local, or one read before it, still gets a Local row.
+const localPlaceholder: ChatCatalogEntry = {
+  family: 'local',
+  connected: false,
+  reason: 'not-configured',
+  models: [],
+  defaultModel: null,
+  remaining: [],
+  readAt: null,
+  accepts: null,
+};
 
 /**
  * What the machine and the loaded model report, for the Local card rows and the rail hover. A
@@ -450,11 +513,11 @@ export function localFacts(
     memory:
       total === null
         ? null
-        : `${gigabytes(total)} memory${free === null ? '' : `, ${gigabytes(free)} available`}`,
+        : `${formatSize(total)} memory${free === null ? '' : `, ${formatSize(free)} available`}`,
     model: choice
       ? [
           name,
-          `${(choice.identity.sizeBytes / 1024 ** 3).toFixed(1)} GB`,
+          formatSize(choice.identity.sizeBytes),
           choice.contextLength === null
             ? null
             : `${choice.contextLength.toLocaleString('en-US')} context`,
