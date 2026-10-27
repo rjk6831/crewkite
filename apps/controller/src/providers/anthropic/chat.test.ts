@@ -3,7 +3,8 @@
 //
 // argv: --print --output-format stream-json --input-format stream-json --verbose
 //   --include-partial-messages --permission-prompt-tool stdio --setting-sources ''
-//   --settings {"disableAllHooks":true} --permission-mode default|acceptEdits --model M
+//   --settings {"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}
+//   --permission-mode default|acceptEdits --model M
 //   [--effort E] [--resume S] [--add-dir F]. With no setting sources neither the scratch copy's own .claude
 //   settings nor the user file load, so no allow rule answers an ask before CrewKite sees it.
 //
@@ -567,7 +568,7 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     '--setting-sources',
     '',
     '--settings',
-    '{"disableAllHooks":true}',
+    '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
     '--permission-mode',
     'default',
     '--model',

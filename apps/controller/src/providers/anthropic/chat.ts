@@ -491,10 +491,12 @@ function chatArguments(request: ChatTurnRequest, resume: string | null, folders:
     // Settings files carry allow rules that answer before CrewKite is asked, in the scratch
     // copy's own file and in the person's user file. No source loads; hooks stay off too. The
     // usage read runs the same way and signs in fine, so sign-in does not depend on settings.
+    // Empty commit and pr attribution keep a trailer or a generated-with line out of any commit
+    // or pull request text the model writes.
     '--setting-sources',
     '',
     '--settings',
-    '{"disableAllHooks":true}',
+    '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
     '--permission-mode',
     request.permissionPolicy === 'ask' ? 'default' : 'acceptEdits',
     // Review and advice turns read only.
