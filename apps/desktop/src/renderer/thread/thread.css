@@ -248,6 +248,16 @@
   border-radius: 4px;
   color: var(--text-muted);
 }
+/* An Ask reply answers a side question. It sits apart from the build, set in from the column. */
+.th-assistant.is-side {
+  margin-left: 20px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  font-size: 13px;
+}
+.th-assistant.is-side .th-role {
+  color: var(--accent);
+}
 .th-notice {
   color: var(--text-dim);
   font-size: 12px;

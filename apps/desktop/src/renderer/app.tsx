@@ -36,6 +36,7 @@ import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
+import { adjacentThread, isMacPlatform, shortcutFor } from './thread/composer-rules.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { OpeningThread, ThreadView } from './thread/thread-view.tsx';
@@ -560,8 +561,11 @@ export function App() {
     titles,
     openThreadId: page === 'tasks' && newThread === null ? selected : null,
     onOpenThread: openThread,
+    onRemoved: (id) => removedRef.current(id),
   });
   // The rail moves to the thread after the deleted one, or the one before it, or the empty state.
+  // A thread removed elsewhere, such as from the command line, leaves the rail the same way.
+  const removedRef = useRef<(id: string) => void>(() => {});
   function threadDeleted(id: string) {
     const order = projects.flatMap((project) => railTasks(project.id).map((row) => row.id));
     const rest = order.filter((value) => value !== id);
@@ -573,6 +577,9 @@ export function App() {
     if (next) openThread(next);
     else setSelected(null);
   }
+  removedRef.current = (id) => {
+    if (!removed.has(id)) threadDeleted(id);
+  };
   // Runs before the dialog opens and after it is removed, so focus goes back where it came from.
   useLayoutEffect(() => {
     if (palette) {
@@ -602,6 +609,49 @@ export function App() {
           (dialog) => !dialog.querySelector('.palette'),
         );
         if (!other) setPalette((open) => !open);
+      }
+    };
+    window.addEventListener('keydown', keydown);
+    return () => window.removeEventListener('keydown', keydown);
+  }, []);
+  // Window shortcuts: Command N, Command comma and Command Option Up and Down. Escape and Up belong
+  // to the composer. The handler reads the latest rail through a ref and is added once.
+  const keys = useRef({
+    open: (_id: string) => {},
+    start: () => {},
+    settings: () => {},
+    order: [] as string[],
+    current: null as string | null,
+  });
+  keys.current = {
+    open: openThread,
+    start: () => startThread(),
+    settings: () => setPage('settings'),
+    order: projects.flatMap((project) => railTasks(project.id).map((row) => row.id)),
+    current: page === 'tasks' && newThread === null ? (task?.id ?? null) : null,
+  };
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      const action = shortcutFor(event, {
+        mac: isMacPlatform(),
+        composerFocused: false,
+        composerEmpty: false,
+        running: false,
+        selecting: false,
+        dialogOpen: document.querySelector('dialog[open]') !== null,
+      });
+      if (!action || action === 'stop-turn' || action === 'edit-last') return;
+      event.preventDefault();
+      const latest = keys.current;
+      if (action === 'new-thread') latest.start();
+      else if (action === 'open-settings') latest.settings();
+      else {
+        const next = adjacentThread(
+          latest.order,
+          latest.current,
+          action === 'next-thread' ? 1 : -1,
+        );
+        if (next && next !== latest.current) latest.open(next);
       }
     };
     window.addEventListener('keydown', keydown);
