@@ -8,6 +8,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
+import { localProposalBudget } from './budget.ts';
 
 export const LocalEndpointSchema = z
   .string()
@@ -58,7 +59,7 @@ export function resolveLocalConnection(
       modelBinding: null,
       billing: 'local',
       contextLength: null,
-      maximumOutputTokens: 4096,
+      maximumOutputTokens: 2048,
       qualifiedAt: null,
       maximumTaskMs: 300000,
       maximumFileBytes: 65536,
@@ -78,8 +79,7 @@ export function resolveLocalConnection(
   const { observation, selectionId } = configuration.data;
   const { connectionRevision } = configuration.data;
   const authMode = configuration.data.authMode ?? 'token';
-  const connected =
-    authMode === 'none' ? capability.connected === true : capability.secretConfigured;
+  const connected = capability.connected ?? capability.secretConfigured;
   const connectionHash = localConfiguredConnectionHash(endpoint.data, connectionRevision, authMode);
   const { observationHash, ...observed } = observation;
   if (
@@ -98,6 +98,10 @@ export function resolveLocalConnection(
   const choice = observation.models.find((model) => model.selectionId === selectionId);
   if (choice?.state !== 'loaded-eligible' || !choice.instanceReference || !choice.contextLength)
     return unavailable('model-setup-unavailable');
+  // The proposal's output cap follows the context this instance reports. A context too small to
+  // leave the smallest reply after the margin cannot take a proposal.
+  const budget = localProposalBudget(choice.contextLength);
+  if (!budget) return unavailable('model-setup-unavailable');
   const binding = LocalModelBindingSchema.safeParse({
     version: 2,
     identityKind: 'runtime-metadata',
@@ -121,6 +125,8 @@ export function resolveLocalConnection(
       model: binding.data.modelKey,
       modelBinding: binding.data,
       contextLength: choice.contextLength,
+      maximumOutputTokens: budget.outputTokens,
+      ...(budget.reasoningTokens === null ? {} : { reasoningBudgetTokens: budget.reasoningTokens }),
       available: connected,
       reason: connected ? 'qualification-pending' : 'connection-unavailable',
     }),

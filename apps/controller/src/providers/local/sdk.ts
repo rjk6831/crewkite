@@ -1,4 +1,5 @@
 import {
+  LOCAL_REPLY_MARGIN,
   type LocalModelChoiceSchema,
   LocalModelObservationSchema,
   LocalRuntimeIdentitySchema,
@@ -26,6 +27,7 @@ import {
   localDiscoveryPlan,
   localOutputTokens,
   localPlan,
+  localReasoningTokens,
   localStructuredOutput,
   MAX_STREAM_BYTES,
   ProofSchema,
@@ -537,7 +539,9 @@ export function startLocalPrediction(
   } = {},
 ) {
   const plan = localPlan(value);
-  const outputTokens = localOutputTokens(plan);
+  // Both caps follow the context the instance reports, which is read before the prompt is built.
+  let outputTokens = 0;
+  let reasoningTokens = 0;
   const now = options.now ?? (() => performance.now());
   const began = now();
   if (!Number.isFinite(began)) throw new Error('The Local clock is invalid.');
@@ -645,6 +649,8 @@ export function startLocalPrediction(
       )
         throw new Error();
       const contextLength = sameModel(plan, await model.getModelInfo());
+      outputTokens = localOutputTokens(plan, contextLength);
+      reasoningTokens = localReasoningTokens(plan, contextLength);
       guard();
       const state = await model.getInstanceProcessingState();
       guard();
@@ -677,9 +683,9 @@ export function startLocalPrediction(
         guard();
         if (!tokens.length || tokens.some((token) => !Number.isSafeInteger(token) || token < 0))
           throw new Error();
-        if (tokens.length + outputTokens <= contextLength) break;
+        if (tokens.length + outputTokens + LOCAL_REPLY_MARGIN <= contextLength) break;
       }
-      if (tokens.length + outputTokens > contextLength) throw new Error();
+      if (tokens.length + outputTokens + LOCAL_REPLY_MARGIN > contextLength) throw new Error();
       promptTokens = tokens.length;
       sameModel(plan, await model.getModelInfo(), contextLength);
       guard();
@@ -701,7 +707,7 @@ export function startLocalPrediction(
       const structured = localStructuredOutput(plan.binding);
       const responseOptions: LLMRespondOpts = {
         maxTokens: outputTokens,
-        reasoningBudget: 1536,
+        reasoningBudget: reasoningTokens,
         ...LOCAL_CODING_SAMPLING,
         enableThinking: true,
         contextOverflowPolicy: 'stopAtLimit',
@@ -782,7 +788,7 @@ export function startLocalPrediction(
         'llm.prediction.reasoning.budgetTokens',
         'reasoning-budget',
         z.object({ checked: z.boolean(), value: z.number().int().positive().safe() }),
-        (value) => value.checked && value.value === 1536,
+        (value) => value.checked && value.value === reasoningTokens,
       );
       // Engine protocol removes prediction-time draft keys. Its loaded configuration owns drafting.
       // SDK 2.1 defines absent load selectors as false and the absent draft model as empty.
