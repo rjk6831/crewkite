@@ -1,9 +1,10 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, protocol, session } from 'electron';
+import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
 import { installThreadAttention } from './attention.ts';
 import { installBridge } from './bridge.ts';
 import { DesktopController, prepareStateDirectory, resolveRuntime } from './runtime.ts';
 import { rendererURL, secureSession, secureWindow } from './security.ts';
+import { BoundsStore, clampBounds, MINIMUM_SIZE } from './window-bounds.ts';
 
 let ownedController: DesktopController | null = null;
 async function start() {
@@ -40,11 +41,16 @@ async function start() {
     app.on('window-all-closed', () => app.quit());
     await app.whenReady();
     secureSession(session.defaultSession, join(app.getAppPath(), 'out/renderer'));
+    const bounds = new BoundsStore(paths.profile);
     window = new BrowserWindow({
-      width: 1440,
-      height: 900,
-      minWidth: 1080,
-      minHeight: 700,
+      ...clampBounds(
+        bounds.load(),
+        screen.getAllDisplays().map((display) => display.workArea),
+      ),
+      minWidth: MINIMUM_SIZE.width,
+      minHeight: MINIMUM_SIZE.height,
+      // The page paints its own theme after load. This color keeps the first frame from flashing.
+      backgroundColor: nativeTheme.shouldUseDarkColors ? '#151718' : '#f7f8f5',
       show: false,
       autoHideMenuBar: true,
       webPreferences: {
@@ -60,6 +66,20 @@ async function start() {
       },
     });
     secureWindow(window);
+    // Move and resize fire many times a second, so the file is written once the window settles.
+    let settle: NodeJS.Timeout | undefined;
+    const remember = (target: BrowserWindow) => {
+      clearTimeout(settle);
+      settle = setTimeout(() => {
+        if (!target.isDestroyed()) bounds.save(target.getNormalBounds());
+      }, 400);
+    };
+    window.on('move', () => window && remember(window));
+    window.on('resize', () => window && remember(window));
+    window.on('close', () => {
+      clearTimeout(settle);
+      if (window && !window.isDestroyed()) bounds.save(window.getNormalBounds());
+    });
     await installBridge(window, controller);
     installThreadAttention(window);
     if (closing || window.isDestroyed()) return;
