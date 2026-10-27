@@ -18,6 +18,7 @@ import type {
 } from '@lmstudio/sdk';
 import type { ChatHistoryEntry, ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
 import { byteSize } from '../../chat/prompt.ts';
+import { localSliceFits } from './budget.ts';
 import { type LoadedModelLike, localChatAdapter, parseTextToolCalls } from './chat.ts';
 
 // Frames assumed from @lmstudio/sdk 2.1.0, `LLMDynamicHandle.act` and `internalAct` in
@@ -672,6 +673,25 @@ test('the reply budget follows the reported context: compact when short, refuse 
     // count one token each, a summary section one, and each message eight more for its role
     // markers. R is the context less the prompt less a 256 token margin, and a turn needs R of at
     // least the larger of 2,048 and 30% of the context.
+    // The orchestrator's fit rule: room is 8,192 less the 256 margin, the 2,458 token reply floor,
+    // the 1,474 token outline share and 300 for the summary, which leaves 3,704 tokens of files.
+    for (const [files, context, image, fits] of [
+      [[{ path: 'a.ts', bytes: 11_112 }], 8192, false, true],
+      [[{ path: 'a.ts', bytes: 11_113 }], 8192, false, false],
+      [
+        [
+          { path: 'a.ts', bytes: 5_000 },
+          { path: 'b.ts', bytes: 6_113 },
+        ],
+        8192,
+        false,
+        false,
+      ],
+      [[{ path: 'a.ts', bytes: 10 }], 8192, true, false],
+      [[{ path: 'a.ts', bytes: 10 }], 2048, false, false],
+      [[{ path: 'a.ts', bytes: 300_000 }], 1_048_576, false, true],
+    ] as const)
+      assert.equal(localSliceFits(files, context, image), fits, JSON.stringify([files, context]));
     const prompt = 'Rename n to count in src/a.ts.';
     const floor = (context: number) => Math.max(2048, Math.ceil(context * 0.3));
     const framing = 1 + 8 + 1;

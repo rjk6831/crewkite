@@ -721,15 +721,17 @@ export class Controller {
         const control = this.localControl();
         if (!control.endpoint || !this.localConnected(control))
           throw Error('Local is not connected. Open Settings, load a model and connect Local.');
-        const secret = this.localSecret?.secret.toString('utf8') ?? null;
-        if (control.authMode !== 'none' && !secret) throw Error('The Local token is unavailable.');
+        // The probe at connect decided whether a token exists. The saved mode does not.
+        const secret = this.localSecretMatches(control)
+          ? (this.localSecret?.secret.toString('utf8') ?? null)
+          : null;
         const connection = await connectLocalModel({
           endpoint: control.endpoint,
-          token: control.authMode === 'none' ? null : secret,
+          token: secret,
           model: request.selection.model,
         });
         this.localVision = { modelKey: connection.modelKey, vision: connection.vision };
-        return connection;
+        return { ...connection, connectedWithoutToken: secret === null };
       },
     });
     return new Map<ChatFamily, ChatAdapter>([
@@ -767,6 +769,9 @@ export class Controller {
       ].includes(command.command)
     )
       return this.taskOperations().execute(command as TaskOperationCommand);
+    // Before any receipt path: the token must not reach a journal row.
+    if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
+      return this.localTokenCommand(command);
     if (command.command === 'GetArtifactRange' || command.command === 'GetTaskActivityPage') {
       const reading = this.readOutput(command);
       this.outputReads.add(reading);

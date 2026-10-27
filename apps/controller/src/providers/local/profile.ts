@@ -6,6 +6,7 @@ import {
   LocalModelObservationSchema,
   LocalNativeProfileSchema,
   LocalObservedModelBindingSchema,
+  localReplyFloor,
   NativeTargetPathSchema,
   RevisionSchema,
 } from '@crewkite/contracts';
@@ -13,7 +14,6 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { localConfiguredConnectionHash } from './connection.ts';
 
-const LEGACY_OUTPUT_TOKENS = 2048;
 export const MAX_CONTENT_BYTES = 65_536;
 const MAX_TESTS = 2;
 const MAX_TEST_BYTES = 12_288;
@@ -46,11 +46,20 @@ const legacyBinding = z.strictObject({
 });
 const observedBinding = LocalObservedModelBindingSchema.extend(attemptBinding);
 export const BindingSchema = z.union([legacyBinding, observedBinding]);
+// `authMode` names the credential. `savedMode` names the saved connection mode when it differs
+// from the credential: a runtime probed open under a saved token mode, or asking for a token under
+// a saved none mode. The connection identity hashes the saved mode.
 const tokenAuthentication = {
   authMode: z.literal('token').optional(),
+  savedMode: z.enum(['token', 'none']).optional(),
   token: text(4096).refine((value) => value.trim().length > 0),
 };
-const noAuthentication = { authMode: z.literal('none') };
+const noAuthentication = {
+  authMode: z.literal('none'),
+  savedMode: z.enum(['token', 'none']).optional(),
+};
+const savedMode = (plan: { authMode?: 'token' | 'none'; savedMode?: 'token' | 'none' }) =>
+  plan.savedMode ?? plan.authMode ?? 'token';
 const taskText = text(8192).refine((value) => value.length > 0);
 const StartTaskSchema = z
   .strictObject({
@@ -70,6 +79,7 @@ const startShape = {
   endpoint: endpointSchema,
   original: text(MAX_CONTENT_BYTES),
   maximumOutputTokens: LocalNativeProfileSchema.shape.maximumOutputTokens.optional(),
+  reasoningBudgetTokens: LocalNativeProfileSchema.shape.reasoningBudgetTokens,
   task: StartTaskSchema,
   tests: z
     .array(z.strictObject({ path: NativeTargetPathSchema, content: text(MAX_TEST_BYTES) }))
@@ -127,7 +137,7 @@ export function localDiscoveryPlan(value: unknown): LocalDiscoveryStart {
   const plan = DiscoveryStartSchema.parse(value);
   if (
     plan.binding.connectionHash !==
-    localConfiguredConnectionHash(plan.endpoint, plan.binding.connectionRevision, plan.authMode)
+    localConfiguredConnectionHash(plan.endpoint, plan.binding.connectionRevision, savedMode(plan))
   )
     throw new Error('The Local discovery connection identity does not match.');
   return Object.freeze({ ...plan, binding: Object.freeze(plan.binding) });
@@ -289,20 +299,29 @@ export function localPlan(value: unknown): LocalStart {
     throw new Error('The Local authentication mode needs an observed model binding.');
   if (
     'version' in plan.binding &&
-    ((plan.binding.authMode ?? 'token') !== (plan.authMode ?? 'token') ||
+    ((plan.binding.authMode ?? 'token') !== savedMode(plan) ||
       plan.binding.connectionHash !==
         localConfiguredConnectionHash(
           plan.endpoint,
           plan.binding.connectionRevision,
-          plan.authMode,
+          savedMode(plan),
         ))
   )
     throw new Error('The Local connection identity does not match.');
   return Object.freeze({ ...plan, binding: Object.freeze(plan.binding) });
 }
 
-export function localOutputTokens(plan: LocalStart) {
-  return plan.maximumOutputTokens ?? LEGACY_OUTPUT_TOKENS;
+/**
+ * The output cap of a file proposal. The profile computes it from the context the bound instance
+ * reports; a plan without one takes the smallest reply the rule allows for that context.
+ */
+export function localOutputTokens(plan: LocalStart, contextLength: number) {
+  return plan.maximumOutputTokens ?? localReplyFloor(contextLength);
+}
+
+/** Half the output cap, the reasoning share the rule allows. */
+export function localReasoningTokens(plan: LocalStart, contextLength: number) {
+  return plan.reasoningBudgetTokens ?? Math.floor(localOutputTokens(plan, contextLength) / 2);
 }
 
 // Committed tests beside the target that import it define the contract a candidate must pass.

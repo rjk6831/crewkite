@@ -1637,6 +1637,18 @@ export type TaskOperationsRequest = z.input<typeof TaskOperationsRequestSchema>;
 const actor = z.strictObject({ id: label, kind: z.enum(['desktop', 'cli', 'controller']) });
 const envelope = { protocol: z.literal(1), key: CommandIdSchema, actor };
 const mutation = { ...envelope, expectedRevision: RevisionSchema };
+/** The Local runtime token, one line of text as the input window accepts it. */
+export const LocalTokenSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      value.trim().length > 0 &&
+      !/[\0\n\r\v\f\u0085\u2028\u2029]/u.test(value) &&
+      new TextEncoder().encode(value).length <= 4096,
+  );
 const read = <T extends string, S extends z.ZodType>(command: T, payload: S) =>
   z.strictObject({ ...envelope, command: z.literal(command), payload });
 export const TaskActivityRequestSchema = z.strictObject({
@@ -2485,6 +2497,10 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('BeginLocalConnectionInput', z.strictObject({ consent: z.literal('explicit') })),
   mutate('CancelLocalConnectionInput', z.strictObject({ operationId: CommandIdSchema })),
   mutate('DisconnectLocal', empty),
+  // The remembered token travels on these two and no other path. They carry no expected
+  // revision, so no desktop or controller record of a command ever holds the value.
+  read('SupplyLocalToken', z.strictObject({ token: LocalTokenSchema })),
+  read('ReadLocalToken', empty),
   read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
   read(
     'GetTaskConversation',
@@ -3521,6 +3537,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
   ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
   ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
+  z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
     branch: AcceptChatChangesPayloadSchema.shape.branch,

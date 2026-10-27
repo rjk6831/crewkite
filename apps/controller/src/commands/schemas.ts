@@ -542,9 +542,11 @@ const LocalOperationBindingSchema = z.strictObject({
   connectionHash: HashSchema,
   connectionRevision: RevisionSchema,
 });
-export const LocalControlSchema = z.strictObject({
+const LocalControlFields = z.strictObject({
   authMode: LocalAuthModeSchema.default('token'),
-  noneConnected: z.boolean().default(false),
+  // What the probe at the last connect found: true when the runtime answered without a token,
+  // false when it wanted one. It never changes `authMode`. Missing until a connect has probed.
+  connectedWithoutToken: z.boolean().optional(),
   connectionFailed: z.boolean().default(false),
   revision: RevisionSchema,
   connectionRevision: RevisionSchema,
@@ -572,6 +574,14 @@ export const LocalControlSchema = z.strictObject({
     .refine((operation) => operation.binding.version === (operation.kind === 'input' ? 2 : 1))
     .nullable(),
 });
+// Saved setups from before the probe kept its answer in `noneConnected`.
+export const LocalControlSchema = z.preprocess((value) => {
+  if (!value || typeof value !== 'object' || !('noneConnected' in value)) return value;
+  const { noneConnected, ...rest } = value as Record<string, unknown>;
+  return noneConnected === true && !('connectedWithoutToken' in rest)
+    ? { ...rest, connectedWithoutToken: true }
+    : rest;
+}, LocalControlFields);
 export type LocalControl = z.infer<typeof LocalControlSchema>;
 export type LocalOperationRuntime = {
   operationId: string;
@@ -583,6 +593,8 @@ export type LocalSecretCell = {
   connectionRevision: number;
   connectionHash: string;
   secret: Buffer;
+  /** Handed in by the desktop for the next connect. The first connect that uses it clears this. */
+  supplied?: boolean;
 };
 export const LocalPreparedSchema = z.strictObject({
   version: z.literal(1),
