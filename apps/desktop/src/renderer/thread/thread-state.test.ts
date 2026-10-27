@@ -17,15 +17,20 @@ import type {
   ChatTurn,
   ChatTurnStats,
 } from '@crewkite/contracts';
+import { adjacentThread, canSend, shortcutFor } from './composer-rules.ts';
 import { acceptsType, deliveryNote, deliveryOf, tryWithChoices } from './file-fit.ts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
 import { outputLimitLine, outputSplit, statsSplit } from './output-limit.ts';
 import {
+  announcements,
   earlierCursor,
   FIRST_READ_BACKOFF,
   initialThreadState,
+  type LiveSignals,
   lastFamily,
   lastReply,
+  lastUserMessage,
+  liveSignals,
   newestTurnId,
   reduceThread,
   retryRead,
@@ -35,7 +40,7 @@ import {
   TRY_AGAIN_AFTER_MS,
   threadItems,
 } from './thread-state.ts';
-import { type Block, runLabel, type ToolBlock, viewBlocks } from './turn-fold.ts';
+import { type Block, replySource, runLabel, type ToolBlock, viewBlocks } from './turn-fold.ts';
 
 const id = (prefix: string, n: number) => `${prefix}_0${String(n).padStart(25, '0')}`;
 const task = id('tsk', 1);
@@ -240,6 +245,21 @@ test('text deltas accumulate into one assistant message that the completed text 
   ).blocks;
   assert.equal(completed.length, 1);
   assert.equal(completed[0].kind === 'text' && completed[0].text, 'The guard is in.');
+  // Copy reply takes the Markdown the model wrote, text blocks only, in order.
+  const markdown = '| a |\n| - |\n| 1 |';
+  assert.equal(
+    replySource(
+      turnOf(
+        run([
+          started(10),
+          agent(11, { type: 'text.completed', itemId: 'a', text: 'First.' }),
+          agent(12, { type: 'tool.started', callId: 'c1', kind: 'read', title: 'Read net.mjs' }),
+          agent(13, { type: 'text.completed', itemId: 'b', text: markdown }),
+        ]),
+      ).blocks,
+    ),
+    `First.\n\n${markdown}`,
+  );
 });
 
 test('a permission request holds the turn until its resolution arrives', () => {
@@ -262,6 +282,49 @@ test('a permission request holds the turn until its resolution arrives', () => {
   assert.equal(resolved.status, 'running');
   const card = resolved.blocks[0];
   assert.equal(card.kind === 'permission' && card.choice, 'once');
+
+  // The live region says a request once, and a reply when this view watched it finish. The first
+  // view of a thread says nothing, and neither does a turn that Load earlier brings in done.
+  const signals = (events: ThreadEvent[]) => liveSignals(run(events));
+  const done = agent(13, { type: 'turn.completed', stopReason: 'done', failure: null });
+  const reply = agent(12, { type: 'text.completed', itemId: 'a', text: 'Done.' });
+  const waiting = signals([started(10), request]);
+  const answered = signals([
+    started(10),
+    request,
+    agent(12, { type: 'permission.resolved', requestId: 'p1', choice: 'once' }),
+  ]);
+  const finished = signals([started(10), request, reply, done]);
+  const older = signals([
+    on(id('trn', 7), 5, {
+      type: 'turn.started',
+      family: 'openai',
+      model: 'large-1',
+      effort: 'default',
+      role: 'reviewer',
+    }),
+    on(id('trn', 7), 6, { type: 'text.completed', itemId: 'a', text: 'Looks fine.' }),
+    on(id('trn', 7), 7, { type: 'turn.completed', stopReason: 'done', failure: null }),
+    started(10),
+    reply,
+    done,
+  ]);
+  const rows: [string, LiveSignals | null, LiveSignals, string[]][] = [
+    ['a first view is the baseline', null, finished, []],
+    [
+      'a new request is said once',
+      signals([started(10)]),
+      waiting,
+      ['Permission requested: Run the tests?'],
+    ],
+    ['the same request is not said again', waiting, waiting, []],
+    ['an answered request says nothing', waiting, answered, []],
+    ['a reply watched running says it finished', waiting, finished, ['Reply finished.']],
+    ['a reply already announced stays quiet', finished, finished, []],
+    ['an older turn paged in says nothing', finished, older, []],
+  ];
+  for (const [claim, before, after, want] of rows)
+    assert.deepEqual(announcements(before, after), want, claim);
 });
 
 test('a failed turn adds a system line with the cause and the next action', () => {
@@ -383,6 +446,40 @@ test('a message the controller queued leaves no pending bubble', () => {
   });
   assert.equal(userItem(stored)?.pending, false);
   assert.deepEqual(userItem(stored)?.files, [file]);
+
+  // A message of files alone has empty text, and its stored entry replaces the pending one.
+  const bare = reduceThread(initialThreadState(task), {
+    type: 'sending',
+    pending: { localId: 'local-3', text: '', files: [file], at: stamp },
+  });
+  assert.deepEqual([userItem(bare)?.text, userItem(bare)?.pending], ['', true]);
+  const bareStored = reduceThread(bare, {
+    type: 'events',
+    events: [
+      {
+        type: 'conversation.entry',
+        cursor: '31',
+        taskId: task,
+        payload: {
+          kind: 'user-message',
+          id: id('msg', 31),
+          taskId: task,
+          revision: 1,
+          cursor: '31',
+          at: stamp,
+          author: { kind: 'user' },
+          text: '',
+          files: [file],
+        },
+      },
+    ],
+  });
+  assert.equal(threadItems(bareStored).filter((row) => row.kind === 'user').length, 1);
+  assert.deepEqual([userItem(bareStored)?.text, userItem(bareStored)?.pending], ['', false]);
+  assert.deepEqual(userItem(bareStored)?.files, [file]);
+  // Up in an empty composer loads this message back, files and all.
+  assert.deepEqual(lastUserMessage(bareStored), { text: '', files: [file] });
+  assert.equal(lastUserMessage(initialThreadState(task)), null);
 });
 
 test('the limit offer shows only while the newest turn is the one that hit a limit', () => {
@@ -1143,12 +1240,17 @@ test('Load earlier pages older messages in by the oldest cursor until a page say
     failure: null,
     handoffFrom: null,
   });
-  const read = (messages: ChatMessage[], turns: ChatTurn[] = []): ChatThreadRead => ({
+  const read = (
+    messages: ChatMessage[],
+    turns: ChatTurn[] = [],
+    more?: boolean,
+  ): ChatThreadRead => ({
     thread,
     turns,
     messages,
     liveEvents: [],
     cursor: '9000',
+    ...(more === undefined ? {} : { more }),
   });
   const cursors = (state: ReturnType<typeof initialThreadState>) =>
     state.messages.map((item) => Number(item.cursor));
@@ -1158,7 +1260,31 @@ test('Load earlier pages older messages in by the oldest cursor until a page say
     pages: ChatMessage[][];
     want: string | null;
     count: number;
+    /** The `more` the older pages carry. */
+    pageMore?: boolean;
   }[] = [
+    {
+      name: 'the controller says there is nothing older, so a full page shows no button',
+      first: read(page(500, THREAD_PAGE_SIZE), [], false),
+      pages: [],
+      want: null,
+      count: THREAD_PAGE_SIZE,
+    },
+    {
+      name: 'the controller says there is more, so a short page shows the button',
+      first: read(page(500, 3), [], true),
+      pages: [],
+      want: '500',
+      count: 3,
+    },
+    {
+      name: 'an older page that says no more ends the paging although it is full',
+      first: read(page(500, THREAD_PAGE_SIZE), [], true),
+      pages: [page(100, THREAD_PAGE_SIZE)],
+      pageMore: false,
+      want: null,
+      count: 2 * THREAD_PAGE_SIZE,
+    },
     {
       name: 'a short thread has nothing older',
       first: read(page(1, 3)),
@@ -1202,10 +1328,13 @@ test('Load earlier pages older messages in by the oldest cursor until a page say
       count: 3,
     },
   ];
-  for (const { name, first, pages, want, count } of rows) {
+  for (const { name, first, pages, want, count, pageMore } of rows) {
     let state = reduceThread(initialThreadState(task), { type: 'loaded', read: first });
     for (const messages of pages)
-      state = reduceThread(state, { type: 'earlier', read: read(messages, first.turns) });
+      state = reduceThread(state, {
+        type: 'earlier',
+        read: read(messages, first.turns, pageMore),
+      });
     assert.equal(earlierCursor(state), want, name);
     assert.equal(state.messages.length, count, name);
     assert.deepEqual(
@@ -1352,4 +1481,92 @@ test('an output limit and a model change reach the view with the numbers and the
   // The view shows the line the controller stored, which already names both models.
   const line = items.find((row) => row.kind === 'system');
   assert.equal(line?.kind === 'system' && line.text, note.text);
+});
+
+test('each shortcut asks for its action only where it applies, and Send needs text or a file', () => {
+  const key = (
+    name: string,
+    held: Partial<Record<'meta' | 'ctrl' | 'alt' | 'shift', true>> = {},
+  ) => ({
+    key: name,
+    metaKey: !!held.meta,
+    ctrlKey: !!held.ctrl,
+    altKey: !!held.alt,
+    shiftKey: !!held.shift,
+  });
+  const typing = {
+    mac: true,
+    composerFocused: true,
+    composerEmpty: false,
+    running: true,
+    selecting: false,
+    dialogOpen: false,
+  };
+  const rows: [string, ReturnType<typeof key>, Partial<typeof typing>, string | null][] = [
+    ['Escape stops a running turn from the composer', key('Escape'), {}, 'stop-turn'],
+    ['Escape does nothing when no turn runs', key('Escape'), { running: false }, null],
+    [
+      'Escape keeps a selection from being lost to a stop',
+      key('Escape'),
+      { selecting: true },
+      null,
+    ],
+    ['Escape outside the composer does nothing', key('Escape'), { composerFocused: false }, null],
+    [
+      'Command N starts a thread',
+      key('n', { meta: true }),
+      { composerFocused: false },
+      'new-thread',
+    ],
+    ['Command comma opens Settings', key(',', { meta: true }), {}, 'open-settings'],
+    [
+      'Up in an empty composer loads the last message',
+      key('ArrowUp'),
+      { composerEmpty: true },
+      'edit-last',
+    ],
+    ['Up in a composer with text moves the caret', key('ArrowUp'), {}, null],
+    [
+      'Command Option Up goes to the thread above',
+      key('ArrowUp', { meta: true, alt: true }),
+      {},
+      'previous-thread',
+    ],
+    [
+      'Command Option Down goes to the thread below',
+      key('ArrowDown', { meta: true, alt: true }),
+      {},
+      'next-thread',
+    ],
+    ['Control N is the caret on a Mac', key('n', { ctrl: true }), {}, null],
+    ['Control N starts a thread elsewhere', key('n', { ctrl: true }), { mac: false }, 'new-thread'],
+    ['a dialog holds the window shortcuts', key('n', { meta: true }), { dialogOpen: true }, null],
+    ['Command Shift N is not ours', key('n', { meta: true, shift: true }), {}, null],
+  ];
+  for (const [claim, event, change, want] of rows)
+    assert.equal(shortcutFor(event, { ...typing, ...change }), want, claim);
+  assert.equal(shortcutFor({ ...key('Escape'), isComposing: true }, typing), null);
+
+  const order = ['a', 'b', 'c'];
+  assert.deepEqual(
+    [adjacentThread(order, 'b', -1), adjacentThread(order, 'b', 1), adjacentThread(order, 'a', -1)],
+    ['a', 'c', 'a'],
+  );
+  assert.deepEqual(
+    [adjacentThread(order, 'c', 1), adjacentThread(order, null, 1), adjacentThread([], 'a', 1)],
+    ['c', 'a', null],
+  );
+
+  const send = { text: '', files: 0, blocked: null, adding: false };
+  assert.deepEqual(
+    [
+      canSend(send),
+      canSend({ ...send, text: '  ' }),
+      canSend({ ...send, files: 1 }),
+      canSend({ ...send, text: 'Go' }),
+      canSend({ ...send, files: 1, adding: true }),
+      canSend({ ...send, files: 1, blocked: 'Reconnect to the controller to send.' }),
+    ],
+    [false, false, true, true, false, false],
+  );
 });

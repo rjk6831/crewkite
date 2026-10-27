@@ -9,6 +9,7 @@ import {
   type NoticeMemory,
   noticeTitle,
   type RailEvent,
+  removedThread,
   shownActivity,
   threadNotices,
 } from './rail-activity.ts';
@@ -40,12 +41,15 @@ export function useThreadAttention({
   titles,
   openThreadId,
   onOpenThread,
+  onRemoved,
 }: {
   source: DesktopSource | undefined;
   header: WorkspaceState | null;
   titles: ReadonlyMap<string, string>;
   openThreadId: string | null;
   onOpenThread: (taskId: string) => void;
+  /** A thread was deleted, here or elsewhere. The rail drops it. */
+  onRemoved: (taskId: string) => void;
 }) {
   const [live, setLive] = useState<LiveActivity>(() => new Map());
   const [unseen, setUnseen] = useState<ReadonlySet<string>>(() => new Set());
@@ -58,6 +62,8 @@ export function useThreadAttention({
   unseenRef.current = unseen;
   const openRef = useRef(onOpenThread);
   openRef.current = onOpenThread;
+  const removedRef = useRef(onRemoved);
+  removedRef.current = onRemoved;
   const sentBadge = useRef(0);
   // Events up to the first workspace read happened before this window could show them.
   const memory = useRef<NoticeMemory | null>(null);
@@ -107,6 +113,8 @@ export function useThreadAttention({
     };
     const stop = source.subscribe((event) => {
       if (event.type === 'chat.turn') setLive((current) => foldActivity(current, event));
+      const gone = removedThread(event);
+      if (gone) removedRef.current(gone);
       if (!noticeEvent(event)) return;
       batch.push(event);
       timer ??= setTimeout(flush, NOTICE_BATCH_MS);

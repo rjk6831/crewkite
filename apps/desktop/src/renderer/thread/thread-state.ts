@@ -18,6 +18,7 @@ import {
   applyEvent,
   blankTurn,
   isStop,
+  roleLabels,
   type TurnIdentity,
   type TurnStatus,
   type TurnView,
@@ -170,9 +171,15 @@ function addMessages(state: ThreadState, incoming: ChatMessage[], replace = fals
   return { ...state, messages, pending };
 }
 
-// The read has no flag for older messages. A full page may have more behind it, and so does a turn
-// whose message is not loaded. A page with no messages ends the paging.
-function olderBehind(page: readonly ChatMessage[], state: ThreadState): boolean {
+// The controller says whether older messages exist. A read from before it did says nothing, and
+// then a full page may have more behind it, and so does a turn whose message is not loaded. A page
+// with no messages ends the paging.
+function olderBehind(
+  page: readonly ChatMessage[],
+  state: ThreadState,
+  more: boolean | undefined,
+): boolean {
+  if (more !== undefined) return more;
   if (page.length === 0) return false;
   if (page.length >= THREAD_PAGE_SIZE) return true;
   const ids = new Set(state.messages.map((message) => message.id));
@@ -241,7 +248,7 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
       // After Load earlier, the newest page says nothing about what is older than the paged ones.
       const older = state.older.paged
         ? state.older
-        : { more: olderBehind(read.messages, next), paged: false };
+        : { more: olderBehind(read.messages, next, read.more), paged: false };
       // The snapshot of an unfinished turn is complete up to the read cursor, so it replaces what
       // the stream built. Events the stream delivered past that cursor before the read returned
       // are kept on top; everything at or below it is already in the snapshot.
@@ -265,7 +272,10 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
     case 'earlier': {
       if (action.read.thread.taskId !== state.taskId) return state;
       const next = addMessages(state, action.read.messages);
-      return { ...next, older: { more: olderBehind(action.read.messages, next), paged: true } };
+      return {
+        ...next,
+        older: { more: olderBehind(action.read.messages, next, action.read.more), paged: true },
+      };
     }
     case 'history': {
       const existing = state.turns[action.turnId];
@@ -610,4 +620,64 @@ export async function retryRead<T>(
       if (options.active?.() === false) throw failure;
     }
   }
+}
+
+/** The text and files of the newest message the person sent, for Up in an empty composer. */
+export function lastUserMessage(
+  state: Pick<ThreadState, 'messages'>,
+): { text: string; files: readonly ChatAttachment[] } | null {
+  const message = state.messages.findLast((item) => item.author.kind === 'user');
+  return message ? { text: message.text, files: message.files } : null;
+}
+
+/** What the live region watches: turns still running, and the permission requests waiting. */
+export type LiveSignals = {
+  /** Every turn row in the thread. */
+  known: ReadonlySet<string>;
+  live: ReadonlySet<string>;
+  newest: string | null;
+  finished: ReadonlyMap<string, string | null>;
+  requests: ReadonlyMap<string, string>;
+};
+
+export function liveSignals(items: readonly ThreadItem[]): LiveSignals {
+  const known = new Set<string>();
+  const live = new Set<string>();
+  const finished = new Map<string, string | null>();
+  const requests = new Map<string, string>();
+  let newest: string | null = null;
+  for (const item of items) {
+    if (item.kind !== 'turn') continue;
+    const { turn } = item;
+    known.add(turn.id);
+    newest = turn.id;
+    if (!turn.ended) live.add(turn.id);
+    else if (turn.status === 'done' && turn.blocks.some((block) => block.kind === 'text'))
+      finished.set(turn.id, roleLabels[turn.identity?.role ?? 'assistant']);
+    if (!turn.ended)
+      for (const block of turn.blocks)
+        if (block.kind === 'permission' && block.choice === null)
+          requests.set(`${turn.id}:${block.requestId}`, block.question);
+  }
+  return { known, live, newest, finished, requests };
+}
+
+/**
+ * The lines the polite live region says when the thread moves from `before` to `after`: a reply
+ * that finished, and a permission request that is new. The first view of a thread is the baseline
+ * and says nothing. A reply counts when this view watched it run, or when it is the newest turn and
+ * appeared already done. Older turns that Load earlier brings in say nothing.
+ */
+export function announcements(before: LiveSignals | null, after: LiveSignals): string[] {
+  if (!before) return [];
+  const lines: string[] = [];
+  for (const [id, role] of after.finished) {
+    const watched = before.live.has(id) || (!before.known.has(id) && id === after.newest);
+    if (watched && !before.finished.has(id))
+      lines.push(`${role ? `${role} reply` : 'Reply'} finished.`);
+  }
+  for (const [key, question] of after.requests)
+    if (!before.requests.has(key))
+      lines.push(`Permission requested: ${Array.from(question).slice(0, 120).join('')}`);
+  return lines;
 }

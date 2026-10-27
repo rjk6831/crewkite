@@ -60,7 +60,9 @@ type Project = { id: string; name: string };
 
 // The first message creates the thread. The task needs an outcome and one criterion, so the message
 // is the outcome and the criterion says what is being asked.
-function taskPayload(projectId: string, text: string) {
+// A message of files alone has no text, so the thread is named for its files.
+function taskPayload(projectId: string, message: string, names: readonly string[]) {
+  const text = message.trim() !== '' ? message : `Files: ${names.join(', ')}`;
   const firstLine = text.split('\n').find((line) => line.trim() !== '') ?? text;
   return {
     projectId,
@@ -122,7 +124,11 @@ export function NewThread({
       const result = await createTask({
         command: 'CreateTask',
         expectedRevision: 0,
-        payload: taskPayload(project.id, text),
+        payload: taskPayload(
+          project.id,
+          text,
+          files.map((item) => item.name),
+        ),
       } as DesktopCommand);
       const saved = TaskSchema.safeParse(result.entity);
       if ((result.outcome !== 'applied' && result.outcome !== 'already-applied') || !saved.success)
