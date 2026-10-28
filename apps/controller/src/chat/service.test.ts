@@ -587,6 +587,71 @@ test('a message sent during a turn waits and starts when the turn ends', {
       row.name,
     );
   }
+
+  // One running turn per family: a second thread's message on the same family waits in its own
+  // queue and starts when the first thread's turn ends. Another family starts at once.
+  const shared = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [[{ kind: 'wait' }], [{ kind: 'text', itemId: 'reply', chunks: ['Second.'] }]],
+  });
+  const other = createScriptedChatAdapter({
+    family: 'google',
+    turns: [[{ kind: 'text', itemId: 'reply', chunks: ['Free.'] }]],
+  });
+  const one = standalone(t, {
+    adapters: new Map<ChatFamily, ChatAdapter>([
+      ['openai', shared],
+      ['google', other],
+    ]),
+  });
+  const [second, third] = ['1', '2'].map((digit) => ({
+    ...(one.store.get<Task>('task', one.taskId) as Task),
+    id: `tsk_${digit.repeat(26)}`,
+  }));
+  one.store.transaction(() => {
+    for (const task of [second, third]) one.store.put('task', task.id, 0, task);
+  });
+  const sendTo = (taskId: string, text: string, choice: ChatModelSelection) =>
+    act(one.store, (effects) =>
+      one.service.sendMessage(
+        { taskId, text, selection: choice, role: 'assistant', attachments: [], files: [] },
+        effects,
+      ),
+    );
+  const busy = turnReaches(one, 'running');
+  const launched = next(
+    one,
+    (event) => event.type === 'agent.event' && event.payload.type === 'turn.started',
+  );
+  one.send('First thread.');
+  const held = await busy;
+  await launched;
+  const queued = sendTo(second.id, 'Second thread.', selection);
+  assert.deepEqual(
+    [queued.outcome, queued.next],
+    ['applied', 'OpenAI is answering in another thread. This message starts when that reply ends.'],
+  );
+  assert.equal(shared.requests.length, 1);
+  const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
+  const elsewhere = turnReaches(one, 'done');
+  assert.equal(sendTo(third.id, 'On Google.', google).next, undefined);
+  await elsewhere;
+  assert.equal(other.requests.length, 1);
+  const freed = next(
+    one,
+    (event) =>
+      event.type === 'chat.turn' &&
+      event.taskId === second.id &&
+      (event.payload as ChatTurn).state === 'done',
+  );
+  act(one.store, (effects) =>
+    one.service.stopTurn({ taskId: one.taskId, turnId: held.id }, effects),
+  );
+  await freed;
+  assert.deepEqual(
+    shared.requests.map((request) => request.prompt),
+    ['First thread.', 'Second thread.'],
+  );
 });
 
 test('a thread read returns messages in cursor order and the live events of the open turn', {
