@@ -7,6 +7,8 @@ import type { TestContext } from 'node:test';
 import {
   AnthropicNativeProfileSchema,
   type Approval,
+  CommandSchema,
+  GOOGLE_TERMS_VERSION,
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
   ProjectSchema,
@@ -669,4 +671,18 @@ async function nativeSetup(
   };
 }
 
-export { binding, fixtureClientHash, nativeSetup, nativeWait, setup };
+/** The person has read and acknowledged the current Google terms, so connection steps may run. */
+async function acknowledgeGoogleTerms(context: {
+  controller: Controller;
+  command: (name: string, payload: unknown, revision?: number) => unknown;
+}) {
+  const result = await context.controller.execute(
+    CommandSchema.parse(
+      context.command('AcknowledgeGoogleTerms', { textVersion: GOOGLE_TERMS_VERSION }, 0),
+    ),
+    'local-owner',
+  );
+  assert.equal(result.outcome, 'applied');
+}
+
+export { acknowledgeGoogleTerms, binding, fixtureClientHash, nativeSetup, nativeWait, setup };

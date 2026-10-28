@@ -97,6 +97,7 @@ import {
 import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 import { serve as serveController } from '../server/index.ts';
 import {
+  acknowledgeGoogleTerms,
   binding,
   fixtureClientHash,
   nativeSetup,
@@ -9077,6 +9078,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       },
     };
     const context = await setup(t, options);
+    await acknowledgeGoogleTerms(context);
     let controller = context.controller;
     liveController = controller;
     const { command, source, fixtures, clock, id } = context;
@@ -10333,6 +10335,7 @@ test('official installation can stop and recover without blocking project work',
   let controller: Controller;
   const context = await setup(t, options, () => controller.close());
   controller = context.controller;
+  await acknowledgeGoogleTerms(context);
   const input = context.command(
     'InstallGoogleAcp',
     { profileId: 'google-acp-v1', consent: 'explicit' },

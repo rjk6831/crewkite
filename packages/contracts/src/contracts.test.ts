@@ -2058,6 +2058,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     client: { version: 'fixture', sha256: 'a'.repeat(64), signerTeamId: 'TEAM-FIXTURE' },
     auth: { method: 'oauth-personal', status: 'authenticated' },
     reason: 'qualification-pending',
+    googleTerms: null,
   };
   assert.deepEqual(GoogleAcpSetupSchema.parse(setup), setup);
   assert(ReadDataSchema.safeParse({ kind: 'google-acp-setup', setup }).success);
