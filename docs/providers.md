@@ -33,7 +33,7 @@ In the picker, live models come first. Known models sit under "Known models, not
 
 ### Concurrency
 
-One turn runs on a family at a time across threads. A message or an Ask for a family that is answering in another thread waits in its own thread's queue, which holds up to 8, and starts when that turn ends. Requests for different families in different threads do not wait on each other. Within one thread a new message always waits for the running turn. Plan slices and the review chain's turns start when their step comes and do not wait on other threads.
+One turn runs on a family at a time across threads. A message or an Ask for a family that is answering in another thread waits in its own thread's queue, which holds up to 8, and starts when that turn ends. Requests for different families in different threads do not wait on each other. Within one thread a new message always waits for the running turn. Plan slices and the review chain's turns start when their step comes and do not wait on other threads. A plan already runs its slices one at a time and a chain its steps, and the guard is for competing threads. [ADR 0045](adr/0045-the-orchestrator-proposes-and-the-controller-assigns.md) records this.
 
 ### Attachment delivery
 

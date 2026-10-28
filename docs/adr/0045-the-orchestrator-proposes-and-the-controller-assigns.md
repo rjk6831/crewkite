@@ -56,3 +56,5 @@ A failure stops the chain because later slices may depend on the failed one, and
 ## Amendment, 2026-10-28
 
 A slice marked `readOnly` runs in the ask role, the read-only role the controller already enforces for every adapter. Before this, it ran as a builder turn and only its brief asked it to change nothing. A read-only slice changes nothing, so no review chain follows it, and the challenge after the last slice argues against the last slice that wrote. A plan whose slices all read closes without a challenge. Like an Ask, a read-only slice leaves the thread's pick alone, and a usage limit fails it for the card to run again.
+
+The guard that runs one turn per family at a time across threads skips plan slices and review chain turns. They start when their step comes, even while their family answers in another thread. This narrows the consequence above that one turn per subscription runs at a time. A plan already runs its slices one at a time and a chain its steps one at a time, and the guard exists for competing threads, where a message or an Ask from the person waits in its own thread's queue.
