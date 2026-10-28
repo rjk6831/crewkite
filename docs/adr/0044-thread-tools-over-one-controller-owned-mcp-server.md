@@ -48,3 +48,11 @@ Redaction is a pattern match, and I chose it knowing it misses things. The contr
 - Redaction can miss a secret in a shape the patterns do not match. The tools return only what the thread already shows me.
 - The attach path differs per client and depends on flags each client documents today. A client release that renames them breaks the attach, and the turn runs without the tools. The packet line still names them, so a model may try and fail.
 - The Anthropic, OpenAI and Google attach paths and the Local functions have fixture coverage and no live run on record.
+
+## Amendment, 2026-10-28
+
+The Decision says every other MCP source stays off. For Google it does not. Google's ACP agent loads the servers in its own settings, and CrewKite adds the `crewkite` entry to `mcpServers` on `session/new` and `session/load` without turning the others off. [Provider setup](../providers.md) states this, and I am correcting this record to match it. Anthropic keeps `--strict-mcp-config` and OpenAI turns its listed servers off for the thread, so those two families still run with the one server.
+
+The reason is the transport. The ACP agent owns its settings and reads them itself, and a session offers no way to turn them off from the controller. I accept that a Google turn can reach tools nobody chose for it, and I keep Google turns under the thread's permission policy. A set of servers that CrewKite can enforce for Google needs a new record.
+
+A turn that runs without the thread tools gets a packet that does not name them. The controller decides once per turn. The packet line, the MCP config handed to the client and the notice in the thread all follow that one answer.
