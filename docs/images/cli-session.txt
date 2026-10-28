@@ -19,7 +19,7 @@ $ crewkite
 A fixture-model default  project shop  Ctrl+K keys
 O connect   A ██░░░░░░ 30% left   L set up
 
-[Typed: Clamp the discount at the subtotal, then Enter]
+[Typed: Clamp the discount at the subtotal, then Enter. When the edit asked, pressed Tab]
 
 › Clamp the discount at the subtotal
 
@@ -36,11 +36,11 @@ A fixture-model ◆   Waiting for you
   │ js                                                                                         │
   │ return subtotal - Math.min(discount, subtotal);                                            │
   ╰────────────────────────────────────────────────────────────────────────────────────────────╯
-  ╭────────────────────────────────────────────────────────────────────────────────────────────╮
-  │ Edit net.mjs?                                                                              │
-  │ [1] Allow once   [2] Deny                                                                  │
-  │ Thread policy: Ask each time. Press 1 or 2 to answer.                                      │
-  ╰────────────────────────────────────────────────────────────────────────────────────────────╯
+  ╔════════════════════════════════════════════════════════════════════════════════════════════╗
+  ║ Edit net.mjs?                                                                              ║
+  ║ [1] Allow once   [2] Deny                                                                  ║
+  ║ Thread policy: Ask each time. Press 1 or 2 to answer, Tab to go back.                      ║
+  ╚════════════════════════════════════════════════════════════════════════════════════════════╝
 ╭──────────────────────────────────────────────────────────────────────────────────────────────╮
 │  Message, /command or @file                                                                  │
 ╰──────────────────────────────────────────────────────────────────────────────────────────────╯
@@ -70,7 +70,7 @@ O connect   A ██░░░░░░ 30% left   L set up
 
 Changes (0 files)
 The scratch copy matches the base.
-Accepted on crewkite/clamp-the-discount-at-the-subtotal at e4e3232
+Accepted on crewkite/clamp-the-discount-at-the-subtotal at 02542fe
 Up and Down pick a file. A Accept to branch  D Discard file  P Push  O Open pull request  Esc
 back
 Accepted on crewkite/clamp-the-discount-at-the-subtotal.

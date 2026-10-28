@@ -10,7 +10,7 @@ pnpm crewkite -p "Why can the total go negative?"   # one reply to stdout
 pnpm crewkite thread list --json                # scripting
 ```
 
-The CLI adds no authority. Every action it offers is a command the controller checks the same way it checks the desktop's: a permission answer must name an open request and an option it offered, Accept builds one new local branch, and Push needs your confirmation. No flag or setting grants a permission, raises a limit or accepts a result.
+The CLI adds no authority. Every action it offers is a command the controller checks the same way it checks the desktop's: a permission answer must name an open request and an option it offered, Accept builds one new local branch, and Push needs your confirmation. No setting grants a permission, raises a limit or accepts a result: a thread's permission policy changes only when you name it for that thread, with a flag for one run or by answering the question in the interactive mode.
 
 A recorded session is in [docs/images/cli-session.txt](../../docs/images/cli-session.txt).
 
@@ -18,9 +18,11 @@ A recorded session is in [docs/images/cli-session.txt](../../docs/images/cli-ses
 
 The screen opens with the kite wordmark, in block letters at 72 columns and wider and in two rows below that. Under it sit the thread, the message box, the model the next message goes to and one gauge per provider.
 
+A new thread goes to the registered project of the checkout you started in. The CLI takes that directory from `INIT_CWD` when pnpm set it, else the current directory, and a project matches when its folder name, HEAD commit and branch are the checkout's. When none or several match, the first send opens the thread list and asks which project to use.
+
 A reply streams into the thread as it arrives. Markdown renders as terminal text: headings, lists, quotes, tables and fenced code. Thinking shows as a card with its latest line; Alt+T shows all of it. Tool calls show as cards, and a run of finished reads and searches folds into one line such as "Read 14 files", the way the desktop folds them. While a reply runs, the kite spinner turns beside the model name.
 
-A permission request appears inline with the options the provider offered, numbered: allow once, allow for this thread and deny. Press the number while the message box is empty. The prompt names the thread's permission policy, which you change on the crew screen. A message you send while a reply runs waits in the queue; Alt+S sends the first one now and Alt+X takes it back.
+A permission request appears inline with the options the provider offered, numbered: allow once, allow for this thread and deny. Press Tab to give the request focus, then the number. While the message box has focus, a digit is text. Tab or Escape gives the focus back. The prompt names the thread's permission policy, which you change on the crew screen. A message you send while a reply runs waits in the queue; Alt+S sends the first one now and Alt+X takes it back.
 
 A failed turn shows its cause, the provider's own message and the next step, with Alt+R to retry and Alt+1 to Alt+4 to try it with another connected family, in the order the desktop's Try with uses. Alt+G regenerates the last reply.
 
@@ -53,13 +55,15 @@ Ctrl+G opens Changes: the changed files with their line counts and the diff of t
 
 ### Settings and appearance
 
-Ctrl+O opens Settings: theme, animation, the model new threads start on, and the permission policy and handoff mode new threads get, followed by one card per provider with its connection, its gauge and its models. C checks the Anthropic sign-in or reads the Google or OpenAI quota for the family of the default model.
+Ctrl+O opens Settings: theme, animation, the model new threads start on, the handoff mode new threads get and the permission policy to offer them, followed by one card per provider with its connection, its gauge and its models. C checks the Anthropic sign-in or reads the Google or OpenAI quota for the provider of the default model you picked, and does nothing until you pick one.
 
 Gauges use the desktop's colour rule: green with plenty left, yellow at 40 percent and red when empty. A reading older than 60 minutes draws dotted. Provider marks are O, A, G and L in the kite panel colours. `NO_COLOR` turns every colour off and keeps the shapes. `--no-animation`, or `"animation": "reduced"` or `"off"` in the settings file, keeps the spinner still; the desktop follows the system's reduced motion setting, which a terminal does not expose, so the CLI takes it from the settings file.
 
 ### Settings file
 
-The CLI keeps its own settings in `cli.json` in the CrewKite home. Settings writes it for you; a file you edit by hand is checked with `CliSettingsSchema`, which reuses the schemas the desktop saves its thread defaults with. A value the schema refuses leaves the defaults in force, and the CLI says which field.
+The CLI keeps its own settings in `cli.json` in the CrewKite home. Settings writes it for you; a file you edit by hand is checked with `CliSettingsSchema`, which reuses the schemas the desktop saves its thread defaults with. A value the schema refuses leaves the defaults in force, and the CLI says which field. While it does, Settings saves nothing, so the file stays as you wrote it until you fix it.
+
+A setting never grants a permission. Every new thread starts on ask each time. When `permissionPolicy` names another policy, the interactive mode asks after the first message whether to switch that thread to it; print mode and `thread new` ignore it and take `--permission-policy` for the one run.
 
 ```json
 {
@@ -83,7 +87,7 @@ The packaged CLI runs the thread commands, print mode and the task commands. The
 ## Thread commands and print mode
 
 ```sh
-pnpm crewkite thread new <project-id> "Clamp the discount" --watch
+pnpm crewkite thread new <project-id> "Clamp the discount" [--permission-policy policy] --watch
 pnpm crewkite thread send <task-id> "Add a test" --model openai --watch --json
 pnpm crewkite thread watch <task-id> [--follow]
 pnpm crewkite thread permit <task-id> <request-id> [--thread]
@@ -94,16 +98,29 @@ pnpm crewkite thread push <task-id> [--remote origin] --confirm
 pnpm crewkite thread pr <task-id> [--title text] [--body text]
 pnpm crewkite thread list
 pnpm crewkite thread show <task-id>
-pnpm crewkite -p "message" [--thread task-id | --project project-id] [--model family[/model[:effort]]] [--file path ...]
+pnpm crewkite -p "message" [--thread task-id | --project project-id | --register] [--model family[/model[:effort]]] [--permission-policy policy] [--file path ...]
 ```
 
 `--model` takes a family, which runs its default model, a family and model, or a family, model and effort. Without it the CLI uses the `selection` from `cli.json`, then the connected family with the most allowance left. `--file` attaches a file from disk.
 
 `permit` answers with allow once, or with allow for this thread when you add `--thread`. `push` without `--confirm` prints what it would push and sends nothing.
 
-Print mode sends one message and streams the reply to stdout; tool lines, permission requests and failures go to stderr. Without `--thread` it starts a new thread in the project of the current Git checkout, registering the checkout first when the controller does not know it yet. A permission request waits for an answer from `thread permit` or `thread deny` in another terminal, the interactive mode or the desktop. Print mode and `thread watch` exit 0 when the turn is done, 1 when it failed, 3 when it was stopped and 2 for a usage error.
+Print mode sends one message and streams the reply to stdout; tool lines, permission requests and failures go to stderr. Without `--thread` it starts a new thread in the registered project of the Git checkout you ran it in, found the way the interactive mode finds it, with every `GIT_` variable left out. It registers nothing on its own: a checkout the controller does not hold needs `--project`, or `--register` to register it, and the refusal names both. `-p` counts only before the first positional argument.
 
-With `--json` every line is one object that `CliJsonLineSchema` in `packages/contracts/src/cli.ts` accepts. `kind` says which: `event` for a thread event (agent events, turn and thread records, stored messages), `result` for the controller's answer to a command with its reason and next step, `turn-end` with the status of the followed turn, `thread` for a thread read, `threads` for the list and `error`.
+`--permission-policy ask`, `allow-edits` or `allow-all` sets the new thread's policy for this run, and print mode prints the policy in use to stderr. A permission request waits for an answer from `thread permit` or `thread deny` in another terminal, the interactive mode or the desktop. If the connection to the controller ends and does not come back, print mode and `thread watch` say so and exit 1; the turn may still run in the controller. After a gap in the stream they read the thread again. `thread watch --follow` prints each later turn as its record arrives.
+
+### Exit status
+
+Every command, the task commands included, uses one table.
+
+| Status | Meaning |
+|--------|---------|
+| 0 | The request applied, or the followed turn finished |
+| 1 | It failed while running: an error, a failed read, a lost connection, an incomplete list or a followed turn that failed |
+| 2 | Nothing was done: arguments that do not parse or that the command rejects, or a request the controller refused, with its reason printed |
+| 3 | The followed turn was stopped |
+
+With `--json` every line is one object that `CliJsonLineSchema` in `packages/contracts/src/cli.ts` accepts. `kind` says which: `event` for a thread event (agent events, turn and thread records, stored messages), `result` for the controller's answer to a command with its reason and next step, `turn-end` with the status of the followed turn, `thread` for a thread read, `threads` for the list and `error`. Every line carries `v: 1`. That number names one fixed shape, the embedded thread, turn, message and event shapes included: the CLI's schema test pins a hash of the whole shape, so a change to any of them moves `v`.
 
 ## Task commands
 
