@@ -51,7 +51,7 @@ test('print mode streams the reply to stdout and exits with the status of its tu
   for (const row of cases) {
     const run = capture();
     const code = await runPrint(
-      ['-p', `Check the ${row.name} total`, '--home', home],
+      ['-p', `Check the ${row.name} total`, '--model', 'anthropic/fixture-model', '--home', home],
       run.output,
       connectChat,
       repository,
@@ -71,7 +71,7 @@ test('print mode streams the reply to stdout and exits with the status of its tu
     }
   });
   const printing = runPrint(
-    ['-p', 'Wait for me', '--json', '--home', home],
+    ['-p', 'Wait for me', '--model', 'anthropic/fixture-model', '--json', '--home', home],
     run.output,
     connectChat,
     repository,
@@ -121,7 +121,18 @@ test('thread commands with --json write only lines the published schema accepts'
     }
   };
   const watching = runCli(
-    ['thread', 'new', projectId, 'Clamp the discount', '--watch', '--json', '--home', home],
+    [
+      'thread',
+      'new',
+      projectId,
+      'Clamp the discount',
+      '--model',
+      'anthropic/fixture-model',
+      '--watch',
+      '--json',
+      '--home',
+      home,
+    ],
     capture(parse).output,
   );
   const { taskId, requestId } = await asked.promise;

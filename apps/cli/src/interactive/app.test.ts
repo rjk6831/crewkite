@@ -63,7 +63,10 @@ test('the interactive app sends a typed message, answers a permission by digit a
   const app = render(
     h(App, {
       client,
-      settings: defaultSettings(),
+      settings: {
+        ...defaultSettings(),
+        selection: { family: 'anthropic', model: 'fixture-model', effort: 'default' },
+      },
       settingsProblem: null,
       saveSettings: (next) => {
         saved++;

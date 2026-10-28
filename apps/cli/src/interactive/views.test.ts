@@ -98,11 +98,7 @@ test('each interactive view draws a scripted thread in colour and without it und
   await client.sendMessage({
     taskId: task.id,
     text: 'Clamp it',
-    selection: {
-      family: 'anthropic',
-      model: catalog.families[1].defaultModel ?? '',
-      effort: 'default',
-    },
+    selection: { family: 'anthropic', model: 'fixture-model', effort: 'default' },
   });
   await asked.promise;
   const waiting = threadItems(state);

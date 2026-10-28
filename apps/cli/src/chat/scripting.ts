@@ -120,16 +120,28 @@ export function chooseSelection(
     const model =
       entry.models.find((value) => value.model === (parsed.model ?? entry.defaultModel)) ??
       (parsed.model ? null : entry.models[0]);
-    if (!model) throw new UsageError(`${parsed.family} does not list ${parsed.model}.`);
+    if (model)
+      return {
+        family: parsed.family,
+        model: model.model,
+        effort: (parsed.effort as ChatModelSelection['effort'] | null) ?? model.defaultEffort,
+      };
+    if (!parsed.model || !typedModel(parsed.family, parsed.model))
+      throw new UsageError(`${parsed.family} does not list ${parsed.model ?? 'a model'}.`);
     return {
       family: parsed.family,
-      model: model.model,
-      effort: (parsed.effort as ChatModelSelection['effort'] | null) ?? model.defaultEffort,
+      model: parsed.model,
+      effort: (parsed.effort as ChatModelSelection['effort'] | null) ?? 'default',
     };
   }
   if (saved) {
     const entry = catalog.families.find((value) => value.family === saved.family);
-    if (entry?.connected && entry.models.some((value) => value.model === saved.model)) return saved;
+    if (
+      entry?.connected &&
+      (entry.models.some((value) => value.model === saved.model) ||
+        typedModel(saved.family, saved.model))
+    )
+      return saved;
   }
   const [best] = rankFamilies(catalog.families, [], undefined, 'most-left', now);
   const model = best?.models.find((value) => value.model === best.defaultModel) ?? best?.models[0];
@@ -139,6 +151,14 @@ export function chooseSelection(
 }
 
 export class UsageError extends Error {}
+
+/**
+ * A cloud family takes a model ID its list does not hold, as the desktop's typed model does, and
+ * the client rejects it on the first turn if it is wrong. A Local model has to be on this computer.
+ * The pattern is the renderer's MODEL_ID.
+ */
+const typedModel = (family: ChatModelSelection['family'], model: string) =>
+  family !== 'local' && /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,199}$/.test(model);
 
 type Follow = {
   /** The text of the message whose turn ends the watch. Null follows the running turn. */
