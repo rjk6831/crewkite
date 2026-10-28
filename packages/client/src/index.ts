@@ -172,3 +172,6 @@ export class FrameDecoder {
       throw new ProtocolError('invalid-frame');
   }
 }
+
+export * from './mentions.ts';
+export * from './slash-commands.ts';
