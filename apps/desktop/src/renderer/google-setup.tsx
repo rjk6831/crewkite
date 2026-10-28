@@ -1,6 +1,7 @@
 import {
   GOOGLE_TERMS_CHECKBOX,
   GOOGLE_TERMS_SUMMARY,
+  GOOGLE_TERMS_VERSION,
   googleTermsCurrent,
   type Snapshot,
 } from '@crewkite/contracts';
@@ -251,6 +252,24 @@ export function GoogleSetup({
           />{' '}
           {GOOGLE_TERMS_CHECKBOX}
         </label>
+      )}
+      {!termsAcknowledged && (ready || needsRepair) && (
+        <button
+          className="button secondary"
+          type="button"
+          disabled={!connected || !termsChecked}
+          onClick={() =>
+            void workspace
+              .metadataCommand({
+                command: 'AcknowledgeGoogleTerms',
+                expectedRevision: 0,
+                payload: { textVersion: GOOGLE_TERMS_VERSION },
+              })
+              .catch(() => setMessage('The acknowledgement could not be confirmed.'))
+          }
+        >
+          Acknowledge
+        </button>
       )}
       <p className="muted small">
         Connect Google downloads and verifies the official client when needed, initializes it, then

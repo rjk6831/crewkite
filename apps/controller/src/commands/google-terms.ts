@@ -18,10 +18,21 @@ const GATED = new Set([
   'DiscoverGoogleAcp',
 ]);
 
+export const googleTermsAcknowledged = (store: Store) =>
+  googleTermsCurrent(store.googleAcpSetup().googleTerms);
+
 /** Refuses a Google connection step until the current text is acknowledged. */
-export function googleTermsGate(store: Store, command: Command): CommandResult | undefined {
-  if (!GATED.has(command.command) || googleTermsCurrent(store.googleAcpSetup().googleTerms))
-    return undefined;
+export function googleTermsGate(
+  store: Store,
+  command: Command,
+  preparedGoogle: (runId: string) => boolean,
+): CommandResult | undefined {
+  // A prepared Google run launches the client, so it needs the acknowledgement as well. A ready setup from before the gate is not an exception.
+  const google =
+    GATED.has(command.command) ||
+    (command.command === 'PrepareNativeRun' && command.payload.profileId.startsWith('google-')) ||
+    (command.command === 'StartRun' && preparedGoogle(command.payload.runId));
+  if (!google || googleTermsAcknowledged(store)) return undefined;
   return {
     outcome: 'blocked',
     reason: 'google-terms-not-acknowledged',

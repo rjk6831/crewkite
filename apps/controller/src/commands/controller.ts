@@ -941,7 +941,7 @@ export class Controller {
       return this.store.transaction(() =>
         acknowledgeGoogleTerms(this.store, command.payload.textVersion, this.now()),
       );
-    const termsRefusal = googleTermsGate(this.store, command);
+    const termsRefusal = googleTermsGate(this.store, command, (runId) => this.isPreparedAcp(runId));
     if (termsRefusal) return termsRefusal;
     if (
       [

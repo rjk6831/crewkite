@@ -76,9 +76,6 @@ export async function runGoogleSetupFlow({
   for (;;) {
     const state = await read();
     if (!active()) return { kind: 'stopped' };
-    const stage = nextGoogleStage(state);
-    if (stage === 'ready') return { kind: 'ready' };
-    if (!stage || attempted.has(stage)) return { kind: 'blocked' };
     // The person ticked the box in this click. The controller stores it and refuses every
     // connection step until it holds the current text version.
     if (!acknowledged && !googleTermsCurrent(state.googleAcpSetup?.googleTerms)) {
@@ -92,6 +89,9 @@ export async function runGoogleSetupFlow({
       if (!applied(result)) return { kind: 'blocked', result };
       continue;
     }
+    const stage = nextGoogleStage(state);
+    if (stage === 'ready') return { kind: 'ready' };
+    if (!stage || attempted.has(stage)) return { kind: 'blocked' };
     attempted.add(stage);
     onStage(stage);
     const setup = state.googleAcpSetup;

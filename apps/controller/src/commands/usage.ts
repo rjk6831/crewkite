@@ -34,6 +34,7 @@ import { startNativeSession } from '../providers/openai/native-discovery.ts';
 import { unavailableNativeProfile } from '../providers/openai/profile.ts';
 import { deriveWindow } from '../usage/index.ts';
 import type { Controller } from './controller.ts';
+import { googleTermsAcknowledged } from './google-terms.ts';
 import {
   OpenAiUsageReadSchema,
   ProviderUsageBatchSchema,
@@ -394,6 +395,7 @@ export class UsageCommands {
   ): Promise<CommandResult> | undefined {
     try {
       if (this.closed || this.acpStart) return;
+      if (!googleTermsAcknowledged(this.store)) return;
       if (this.usageRead) return this.usageRead.promise;
       const reader = this.store.googleUsageReader();
       const nowMs = Date.parse(this.now());
@@ -452,6 +454,12 @@ export class UsageCommands {
     command: Extract<Command, { command: 'ObserveUsage' }>,
     principal: string,
   ): Promise<CommandResult> {
+    if (command.payload.family === 'google' && !googleTermsAcknowledged(this.store))
+      return Promise.resolve({
+        outcome: 'blocked',
+        reason: 'google-terms-not-acknowledged',
+        next: 'Acknowledge the Google terms in Settings > Google before reading Google usage.',
+      });
     const pendingReason =
       command.payload.family === 'openai' ? 'openai-usage-read-pending' : 'usage-read-pending';
     const prior = this.usageRead;
