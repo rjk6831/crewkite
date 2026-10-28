@@ -9,9 +9,10 @@ An extension is code. When you turn one on, the controller loads its entry modul
 What the seam controls is what CrewKite hands the extension:
 
 - Every extension is off by default. A new folder, or a changed manifest or module, stays off until you turn it on in Settings > Extensions.
-- Turning one on names the hash of the manifest and the entry file you were shown. A later change to either turns it off again with the line "Changed since it was turned on. Off."
+- Turning one on names the hash of the folder you were shown: the manifest and every regular file in the folder, by sorted relative path, size and bytes. A later change to any file, a new file or a removed one turns it off again with the line "Changed since it was turned on. Off."
+- After loading the module the controller hashes the folder again from disk. A file that changed during the load keeps the extension off until a restart.
 - An extension command runs only through `RunExtensionCommand`. That command passes the same checks as every built-in command: the authenticated local owner, the shared command schema, the idempotency receipt and the task check.
-- The command receives a frozen context. It holds the thread it was run on and only the authority its manifest lists. The thread reader takes no argument and always reads that one thread.
+- The command receives a frozen context. It holds the thread it was run on and only the authority its manifest lists. The thread reader takes no argument and always reads that one thread. The reader and the emitter stop working when the command returns, so a context the module keeps reads and emits nothing.
 - No authority reaches another thread, the scratch copy, your repository, settings, budgets, queues or limits. There is no API for them, and a result that carries extra fields is refused.
 - What an extension returns is shown as plain text and label rows. Clients never render it as markup.
 
@@ -29,7 +30,7 @@ Each extension is a folder under the controller home:
     index.mjs
 ```
 
-The folder name must equal the manifest `id`. The controller lists at most 32 folders, reads a manifest of at most 64 KiB and accepts only regular files, never links. There is no network install. You copy a folder in, then turn it on in Settings > Extensions, which shows the manifest and the authority it asks for.
+The folder name must equal the manifest `id`. The controller lists at most 32 folders and reads a manifest of at most 64 KiB. A folder may hold subfolders and at most 256 regular files with at most 16 MiB in all. A folder with a link, a special file or more than those bounds is refused with `folder-unsupported`. There is no network install. You copy a folder in, then turn it on in Settings > Extensions, which shows the manifest and the authority it asks for.
 
 ## The manifest
 
@@ -86,11 +87,11 @@ export const commands = {
 
 The output is `{ text, rows? }`: up to 4,000 characters of text and up to 32 rows of a label and a value. `ExtensionContext` and `ExtensionCommandOutputSchema` in the contracts package type both. A command runs inside the controller's command transaction, so contract 1 refuses a command that returns a promise. A command that throws or returns another shape changes nothing and returns `extension-failed` or `extension-output-invalid`.
 
-The controller loads a module once per run. A changed manifest or module turns the extension off until you turn it on again. When this run already loaded the old module, restart CrewKite first, since Node keeps the first copy of a module it loaded.
+The controller loads a module once per run. A changed file in the folder turns the extension off until you turn it on again. When this run already tried to load the extension, whether the load worked or failed, restart CrewKite first, since Node keeps the first copy of a module it loaded.
 
 ## Slots
 
-The renderer and the CLI read the slots with `ReadExtensions`. A slot is data: the extension, its own ID, a title and the command it runs. Clients run no extension code.
+The desktop reads the slots with `ReadExtensions`. The CLI reads the same slots once its interactive client lands. A slot is data: the extension, its own ID, a title and the command it runs. Clients run no extension code.
 
 | Slot | Where it shows | What it runs |
 |------|----------------|--------------|
@@ -98,7 +99,7 @@ The renderer and the CLI read the slots with `ReadExtensions`. A slot is data: t
 | `thread-action` | A button in the thread's top bar | Its command on that thread |
 | `inspector-tab` | A tab in the thread inspector | Its command on that thread when the tab opens and on Refresh |
 
-Slots appear only for extensions that are on. `ExtensionSlotSchema` types them for both clients. Crew roles an extension declares are listed in the same read. The crew chain of [ADR 0038](adr/0038-crew-and-flight-modes.md) does not schedule them in contract 1; a role runs through the extension's own commands.
+Slots appear only for extensions that are on. `ExtensionSlotSchema` types them for every client. Crew roles an extension declares are listed in the same read. The crew chain of [ADR 0038](adr/0038-crew-and-flight-modes.md) does not schedule them in contract 1; a role runs through the extension's own commands.
 
 ## Commands
 

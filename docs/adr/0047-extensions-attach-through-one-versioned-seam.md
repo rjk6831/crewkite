@@ -17,10 +17,10 @@ Extensions attach through one seam, typed in `packages/contracts/src/extensions.
 
 - An extension is a folder under `<home>/extensions` with a `manifest.json` and an entry module. The manifest names the extension, its version, the contract version it targets, the authority it asks for and what it adds: commands, event kinds, settings cards, thread actions, inspector tabs and crew roles.
 - The controller validates each manifest. A version that is not three numbers, an authority outside the closed list, a contract major other than this build's, a newer contract minor, an unknown field or a folder that names another extension is refused with one plain line.
-- Every extension is off by default. Turning one on in Settings > Extensions names the hash of the manifest and entry bytes the person was shown, and loads the module once to check it. A later change to either turns it off.
+- Every extension is off by default. Turning one on in Settings > Extensions names the hash the person was shown, and loads the module once to check it. The hash covers the manifest and every regular file in the folder, by sorted relative path, size and bytes. A folder with a link, a special file, more than 256 files or more than 16 MiB is refused. A later change to any file turns the extension off. After the load the controller hashes the folder again from disk and keeps the extension off when it differs.
 - The authority list is closed and small: `thread.read` reads a bounded copy of the thread the command runs on, and `thread.event` adds the extension's own declared event kinds to that thread. Nothing else exists. There is no authority for another thread, the scratch copy, the repository, settings, budgets, queues or limits.
-- An extension command runs only through `RunExtensionCommand`. It passes the same path as every built-in command: the authenticated local owner, the shared schema, the idempotency receipt and the task check. The controller then builds a frozen context with the declared authority, calls the command synchronously inside the command's transaction, validates the output as text and label rows, and emits declared events only after the output passes.
-- Slots for the renderer and the CLI are data: an extension, an ID, a title and the command it runs. Clients show the title and the returned text and run no extension code.
+- An extension command runs only through `RunExtensionCommand`. It passes the same path as every built-in command: the authenticated local owner, the shared schema, the idempotency receipt and the task check. The controller then builds a frozen context with the declared authority, calls the command synchronously inside the command's transaction, validates the output as text and label rows, and emits declared events only after the output passes. The reader and the emitter stop working when the command returns.
+- Slots for the desktop, and for the CLI once its interactive client lands, are data: an extension, an ID, a title and the command it runs. Clients show the title and the returned text and run no extension code.
 - The contract has a version, `EXTENSION_CONTRACT_VERSION`, now 1.0.0. A major bump turns every extension built for an older major off, with the line "Built for extension contract N.x. This CrewKite offers M.x, so it stays off until the extension is updated."
 - Extensions install by copying a folder. There is no network install in this version.
 - Crew roles an extension declares are listed with it. The ADR 0038 chain does not schedule them in contract 1.
@@ -28,7 +28,7 @@ Extensions attach through one seam, typed in `packages/contracts/src/extensions.
 
 ## Why
 
-The person decides what runs on their machine. Enabling an extension is that decision, so it stays off until they make it, and the decision binds the exact bytes they saw. A changed module asks again, the way a changed manifest would.
+The person decides what runs on their machine. Enabling an extension is that decision, so it stays off until they make it, and the decision binds the exact bytes they saw. An entry module can import its siblings, and a `package.json` changes how Node reads a module, so the hash covers the whole folder. Any changed file asks again.
 
 I state plainly that enabling runs code with the person's permissions. I considered running extensions in a worker thread or a separate process with a message channel. Either would narrow what a careless extension can reach by accident, and neither stops a module that imports `node:fs`, so neither would let me claim containment. Contract 1 runs the module in the controller process and limits what CrewKite hands it. A separate process stays open as a later major version if a real extension needs one.
 
@@ -43,9 +43,9 @@ A closed authority list grows by minor versions as real extensions need more. A 
 ## Consequences
 
 - An enabled extension can do anything a program running as the person can do. The docs and the Settings card say so. The seam limits what CrewKite hands it; it does not contain the code.
-- A changed module needs a controller restart before it runs, because Node keeps the first copy of a module it loaded.
+- A changed folder needs a controller restart before it runs again once this run tried to load it, because Node keeps the first copy of a module it loaded. A failed load counts as a try.
 - Extension commands cannot wait on I/O in contract 1. A command that returns a promise is refused.
-- The on and off choices live in `<home>/extensions/enabled.json`, written inside the command's transaction. A crash between that write and the commit keeps the file's choice. A migration-owned table can replace the file.
+- The on and off choices live in `<home>/extensions/enabled.json`, written after the command commits. A crash between the commit and that write loses the choice while the receipt says applied. A migration-owned table can replace the file.
 - Crew roles are listed and not scheduled. Wiring them into the chain is a separate decision.
 - The CLI renders slots from the same read once its interactive client lands.
 - The seam has fixture coverage with the reference extension and test probes, and no premium extension exists yet.
