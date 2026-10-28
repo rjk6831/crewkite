@@ -57,4 +57,30 @@ A failure stops the chain because later slices may depend on the failed one, and
 
 A slice marked `readOnly` runs in the ask role, the read-only role the controller already enforces for every adapter. Before this, it ran as a builder turn and only its brief asked it to change nothing. A read-only slice changes nothing, so no review chain follows it, and the challenge after the last slice argues against the last slice that wrote. A plan whose slices all read closes without a challenge. Like an Ask, a read-only slice leaves the thread's pick alone, and a usage limit fails it for the card to run again.
 
-The guard that runs one turn per family at a time across threads skips plan slices and review chain turns. They start when their step comes, even while their family answers in another thread. This narrows the consequence above that one turn per subscription runs at a time. A plan already runs its slices one at a time and a chain its steps one at a time, and the guard exists for competing threads, where a message or an Ask from the person waits in its own thread's queue.
+The guard that runs one turn per family at a time across threads skips review chain turns. They start when their step comes, even while their family answers in another thread. A chain runs its steps one at a time, and the guard exists for competing threads, where a message or an Ask from the person waits in its own thread's queue. This paragraph first said the guard skipped plan slices too. Since the parallel amendment below, slices of one plan compete with each other, so every turn a slice opens waits for its family like a message does.
+
+## Amendment, 2026-10-28: parallel slices and the replay merge
+
+The Consequences above say parallel slices on isolated copies are out of scope. This amendment brings them in, and the controller still decides everything that runs.
+
+- Slices whose dependencies are all done start together. At most one turn runs per family across every thread, so two ready slices on one family run one after the other, in plan order. A slice whose family answers elsewhere waits on the card as queued. While a slice is blocked, no new slice starts.
+- Each slice runs in its own scratch copy. The controller makes it from the thread's base with the same copy function the thread uses, then writes over it every file the thread's copy changed since the base, so a slice that depends on another starts from that slice's merged work. It records which paths differed when the copy started.
+- A slice's builder turn, its reviews and its fixes all work in that copy. The copy is the turn's working folder, the thread tools read their diff from it, and the controller answers an edit request on its own only when the edit lands inside it. A slice turn starts a new native session with the slice brief, and the thread never resumes that session.
+- Each slice runs the ADR 0038 review chain in its own lane, with the same caps: a review, at most two fixes and at most three reviews. A review without a `Findings` line fails the slice. The project checks do not run inside a lane.
+- A slice that finishes its chain replays onto the thread's copy in plan order, so a slice that finishes early waits for the slices before it. Files compare by blob ID and mode, the way Changes compares a copy with its base. A path the slice changed is written when the thread's copy still holds what the slice started from, skipped when the thread's copy already matches the slice, and is a conflict otherwise. Links are not replayed, since Accept takes them from the base.
+- A conflict marks the slice blocked and the card lists up to 16 conflicting paths. The slice's other paths are merged. The orchestrator's model then gets one turn, as a fixer in the thread's copy, with the slice's version of each conflicting file quoted in its message. When that turn ends done, the slice counts as merged. When it fails or stops, the plan stops and the slice stays blocked, and the card can run it again from a fresh copy.
+- After the last slice the project checks run on the thread's copy through the combined check, with the same question as any check run: Allow once, Allow for this thread or Deny. A failure goes to the fixer under the chain's cap of two fixes. Then the challenger runs, and the closing line counts slices, reviews and fixes.
+- The thread writes one line when a slice starts and one when it finishes or blocks. Stop stops every running slice and keeps the slices already merged. A slice whose chain finished but still waited for its turn to merge merges before the plan stops, and a conflict there leaves it blocked for the card to run again. A restart during a plan stops it with the line "Plan stopped: restarted."
+- A usage limit on a slice fails it for the card to run again. Moving one lane to another family would move the thread's pick, which the other lanes share.
+
+The orchestrator still proposes only. It never picks which slice starts, never resolves a conflict on its own initiative and never answers a permission. A plan grants no permission and raises no limit: each slice turn carries the thread's own policy and grants, and the resolve turn runs under the same rules as any fixer.
+
+I chose a file-level replay because the slice briefs name files, and two slices that touch one file are the case the orchestrator should look at. A line-level merge would merge more on its own and hide the cases where two slices disagree. The controller cannot judge a merge, so the challenger and the checks read the merged copy before anything else runs.
+
+Consequences of this amendment:
+
+- A plan with independent slices on two families takes about as long as its longest slice, and it spends the same allowance as before.
+- Each running slice holds a full copy of the base on disk until the thread is deleted. Copy on write keeps that small on a volume that clones.
+- A shell command that the thread's policy allows can still name a path outside the slice's copy. The working folder, the thread tools and the automatic answers are bound to the copy, and the other copies are not named to the model.
+- The orchestrator's resolve turn counts as a fix in the closing line.
+- The lanes, the replay and the restart line have fixture coverage and no live run on record.

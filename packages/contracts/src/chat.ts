@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ChatChecksEditSchema, ChatChecksStateSchema } from './checks.ts';
+import { ChatPlanConflictsSchema, chatPlanLaneSchema } from './plan-lanes.ts';
 
 // Shared shape of a chat thread, its turns and the live agent stream.
 // Every provider adapter translates its native protocol into these events.
@@ -220,7 +221,14 @@ export const ChatPlanSchema = z
   });
 export type ChatPlan = z.infer<typeof ChatPlanSchema>;
 
-export const ChatPlanSliceStatusSchema = z.enum(['queued', 'running', 'done', 'failed', 'not-run']);
+export const ChatPlanSliceStatusSchema = z.enum([
+  'queued',
+  'running',
+  'done',
+  'failed',
+  'not-run',
+  'blocked',
+]);
 export type ChatPlanSliceStatus = z.infer<typeof ChatPlanSliceStatusSchema>;
 /** Where the controller sent a slice and why, in the words of the system line. */
 export const ChatPlanAssignmentSchema = z.strictObject({
@@ -253,6 +261,10 @@ export const ChatPlanStateSchema = z
           candidates: z.array(ChatPlanAssignmentSchema).max(4),
           /** The builder turn that ran the slice. Null until it starts. */
           turnId: ChatTurnIdSchema.nullable(),
+          /** The running slice's lane. While it runs, `turnId` is the lane's newest turn. */
+          lane: chatPlanLaneSchema(ChatTurnIdSchema).optional(),
+          /** A blocked slice's paths that the thread copy changed too. */
+          conflicts: ChatPlanConflictsSchema.optional(),
         }),
       )
       .min(1)
@@ -460,6 +472,8 @@ export const ChatTurnSchema = z.strictObject({
   stats: ChatTurnStatsSchema.optional(),
   /** Set when the reply stopped at the output limit, so a reopened view can offer Continue. */
   outputLimit: ChatOutputLimitSchema.optional(),
+  /** The plan slice whose lane opened the turn. It runs in that slice's own scratch copy. */
+  slice: ChatPlanSliceIdSchema.optional(),
 });
 export type ChatTurn = z.infer<typeof ChatTurnSchema>;
 

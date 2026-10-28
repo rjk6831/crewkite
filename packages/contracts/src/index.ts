@@ -3855,6 +3855,7 @@ export * from './cli.ts';
 export * from './composer.ts';
 export * from './extensions.ts';
 export * from './mcp.ts';
+export * from './plan-lanes.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

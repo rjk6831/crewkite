@@ -13,6 +13,7 @@ export const sliceStatusLabel: Record<ChatPlanSliceStatus, string> = {
   done: 'Done',
   failed: 'Failed',
   'not-run': 'Not run',
+  blocked: 'Blocked',
 };
 
 export type PlanSliceView = {
@@ -20,8 +21,10 @@ export type PlanSliceView = {
   statusLabel: string;
   /** Per-slice Run is on. */
   canRun: boolean;
-  /** Why Run is off, when it is off for a reason the person can fix. */
+  /** The slices this one waits on, so each row shows its part of the dependency graph. */
   waitsOn: string | null;
+  /** The paths a blocked slice conflicts on in the thread copy. */
+  conflicts: string | null;
   /** Balanced lets the person pick among these before the plan runs. */
   picker: readonly ChatPlanAssignment[] | null;
 };
@@ -35,7 +38,8 @@ export type PlanCardView = {
 };
 
 const waiting = (slice: Slice) => slice.status === 'queued' || slice.status === 'not-run';
-const runnable = (slice: Slice) => waiting(slice) || slice.status === 'failed';
+const runnable = (slice: Slice) =>
+  waiting(slice) || slice.status === 'failed' || slice.status === 'blocked';
 
 /**
  * What the plan card shows and offers, from the controller's plan state and the thread's flight
@@ -49,7 +53,7 @@ const runnable = (slice: Slice) => waiting(slice) || slice.status === 'failed';
 export function planCard(plan: ChatPlanState, flight: ChatFlightMode): PlanCardView {
   const done = plan.slices.filter((slice) => slice.status === 'done').length;
   const total = plan.slices.length;
-  const running = plan.slices.some((slice) => slice.status === 'running');
+  const running = plan.phase === 'running';
   const open = plan.phase === 'proposed';
   const settled = plan.phase === 'stopped' || plan.phase === 'finished';
   const status = new Map(plan.slices.map((slice) => [slice.id, slice.status]));
@@ -61,9 +65,12 @@ export function planCard(plan: ChatPlanState, flight: ChatFlightMode): PlanCardV
       slice,
       statusLabel: sliceStatusLabel[slice.status],
       canRun,
-      waitsOn:
-        offered && runnable(slice) && unmet.length > 0
-          ? `Runs after slice ${unmet.join(', ')}`
+      waitsOn: slice.depends.length
+        ? `Runs after slice ${slice.depends.join(', ')}${unmet.length ? '' : ', done'}`
+        : null,
+      conflicts:
+        slice.status === 'blocked' && slice.conflicts?.length
+          ? `Conflicts in the thread copy: ${slice.conflicts.join(', ')}`
           : null,
       picker:
         flight === 'balanced' && open && waiting(slice) && slice.candidates.length > 1
