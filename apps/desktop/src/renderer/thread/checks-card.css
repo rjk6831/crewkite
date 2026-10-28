@@ -1,0 +1,98 @@
+/* The Checks card in the thread and the checks list in the Crew tab. */
+.th-checks {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  font-size: 13px;
+}
+.th-checks-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+.th-checks-head h3 {
+  font-size: 13px;
+  font-weight: 600;
+}
+.th-checks-runs {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-checks-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+}
+.th-checks-label {
+  font-weight: 600;
+}
+.th-checks-status.is-passed {
+  color: var(--green);
+}
+.th-checks-status.is-failed {
+  color: var(--red);
+}
+.th-checks-command {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+}
+.th-checks-reason {
+  overflow-wrap: anywhere;
+}
+.th-checks-tail {
+  max-height: 160px;
+  margin: 4px 0;
+  padding: 8px;
+  overflow: auto;
+  border-radius: 8px;
+  background: var(--surface-raised);
+  font-family: ui-monospace, monospace;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.th-checks-settings {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.th-checks-settings legend {
+  padding: 0;
+  font-weight: 600;
+}
+.th-checks-settings ul {
+  display: grid;
+  gap: 6px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-checks-settings li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 10px;
+}
+.th-checks-add {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: 8px;
+}
+.th-checks-add label {
+  display: grid;
+  flex: 1 1 200px;
+  gap: 4px;
+}

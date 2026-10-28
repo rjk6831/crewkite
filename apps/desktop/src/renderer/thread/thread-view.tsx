@@ -3,6 +3,7 @@ import { GitBranch, PanelRight } from 'lucide-react';
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
+import { ChecksCard } from './checks-card.tsx';
 import {
   cancelPlan,
   configureThread,
@@ -259,6 +260,15 @@ export function ThreadView({
       }}
     />
   );
+  const checked = thread?.checks && thread.checks.runs.length > 0 && (
+    <ChecksCard
+      checks={thread.checks}
+      onStop={async () => {
+        const last = newestTurnId(state);
+        if (last) await stopTurn(source, { taskId: task.id, turnId: last });
+      }}
+    />
+  );
   const replyId = useMemo(
     () => (activeTurn ? null : lastReply(state, items)),
     [activeTurn, state, items],
@@ -385,9 +395,10 @@ export function ThreadView({
           items={items}
           empty={empty}
           footer={
-            (planned || offer) && (
+            (planned || checked || offer) && (
               <>
                 {planned}
+                {checked}
                 {offer && (
                   <LimitOfferCard
                     key={offer.turnId}

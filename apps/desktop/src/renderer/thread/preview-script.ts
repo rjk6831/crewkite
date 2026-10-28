@@ -397,10 +397,13 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         const {
           taskId: _task,
           dequeue,
+          // The preview has no project files to read, so a checks edit changes nothing.
+          checks: _checks,
           ...patch
         } = payload as Partial<ChatThread> & {
           taskId: string;
           dequeue?: string;
+          checks?: unknown;
         };
         const queued = thread.queued.filter((message) => message.id !== dequeue);
         // Like the controller: no crew means manual, and entering glide turns automatic handoff on.
