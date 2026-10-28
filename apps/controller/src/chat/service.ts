@@ -101,6 +101,7 @@ import {
 import { scratchPath } from './local-tools.ts';
 import {
   adviceContext,
+  askContext,
   challengeContext,
   type DeltaTurn,
   deltaPacket,
@@ -936,6 +937,39 @@ export class ChatService {
   }
 
   /**
+   * A read-only question to one family. It goes the way a message does, so it waits behind a
+   * running turn and behind a turn on that family in another thread. The reply posts as a turn
+   * with the ask role, and the thread keeps its own pick.
+   */
+  ask(payload: Payload<'AskChatFamily'>, effects: Effects): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const entry = this.deps
+      .catalog(task.id)
+      .families.find((value) => value.family === payload.family);
+    const model = payload.model ?? entry?.defaultModel ?? entry?.models[0]?.model;
+    if (!model) return blocked('selection-unavailable', 'Pick a model for this provider first.');
+    const effort = entry?.models.find((value) => value.model === model)?.defaultEffort ?? 'default';
+    const selection = this.deps.resolveSelection(task.id, {
+      family: payload.family,
+      model,
+      effort,
+    });
+    if (!selection) return blocked('selection-unavailable', 'Pick a model the provider lists.');
+    return this.sendMessage(
+      {
+        taskId: task.id,
+        text: payload.question,
+        selection,
+        role: 'ask',
+        attachments: [],
+        files: [],
+      },
+      effects,
+    );
+  }
+
+  /**
    * Plan commands. The controller validates, assigns and runs a plan once plan runs exist; until
    * then a plan command changes nothing and says so.
    */
@@ -1307,10 +1341,12 @@ export class ChatService {
     // Anthropic and Google read no history in a new session, so a rerun on the family that
     // answered carries the conversation before the message in a packet, as a handoff does.
     const rerun = fresh && !turn.handoffFrom;
-    let carries = !!turn.handoffFrom || rerun;
+    // An ask starts cold on any family, so the thread reaches it in the packet.
+    const asked = turn.role === 'ask';
+    let carries = !!turn.handoffFrom || rerun || asked;
     const family = turn.selection.family;
     const pending = turn.handoffFrom ? this.pendingHandoff(task.id) : null;
-    let reason: HandoffReason = pending?.reason ?? (rerun ? 'rerun' : 'manual');
+    let reason: HandoffReason = pending?.reason ?? (asked ? 'ask' : rerun ? 'rerun' : 'manual');
     // A native session holds one model, so another model of the family starts a new session.
     const kept = writer && !fresh ? thread.sessions.find((value) => value.family === family) : null;
     let session =
@@ -1381,7 +1417,7 @@ export class ChatService {
       selection: turn.selection,
       prompt: carries
         ? this.packet(turn, {
-            from: turn.handoffFrom ?? family,
+            from: turn.handoffFrom ?? (asked ? (this.answeredOn(task.id) ?? family) : family),
             reason,
             root,
             base: thread.base,
@@ -1736,8 +1772,12 @@ export class ChatService {
       // family moves the thread like the builder would.
       const own = writesScratch(turn.role) && thread.selection?.family === turn.selection.family;
       const step = crewRole(thread) === turn.role && !own;
-      // A person who already moved the thread has made the choice.
-      if (!thread.autoHandoff || (!step && thread.selection?.family !== turn.selection.family))
+      // A person who already moved the thread has made the choice. A side question moves nothing.
+      if (
+        turn.role === 'ask' ||
+        !thread.autoHandoff ||
+        (!step && thread.selection?.family !== turn.selection.family)
+      )
         return;
       // One automatic move per message. The catalog can be stale, and a family it still shows
       // with allowance may stop on its limit too. A second move would bounce between them.
@@ -2249,6 +2289,7 @@ export class ChatService {
         ? this.lastWrite(turn.taskId)
         : history.findLast((entry) => entry.role === 'assistant')?.text) ?? null;
     if (role === 'advisor') return adviceContext(name, directory, answer);
+    if (role === 'ask') return askContext(name, directory);
     if (role === 'challenger') return challengeContext(name, directory, answer);
     if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';

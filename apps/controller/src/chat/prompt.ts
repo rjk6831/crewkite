@@ -23,13 +23,15 @@ export const familyName: Record<ChatFamily, string> = {
 // rerun: Retry or Regenerate on the family that already answered the message, in a new session.
 // model: the person picked another model of the same family, which starts a new native session.
 // session: the turns since the family last ran do not fit its session, so a new one starts.
-export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model' | 'session';
+// ask: a read-only side question to one family, which reads the thread from the packet.
+export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model' | 'session' | 'ask';
 
 export function handoffReason(reason: HandoffReason): string {
   if (reason === 'rerun') return 'the person asked for the reply again';
   if (reason === 'steer') return 'the person sent a new message during the reply';
   if (reason === 'model') return 'model changed in the composer';
   if (reason === 'session') return 'the thread moved past what the old session could carry';
+  if (reason === 'ask') return 'the person asked a side question';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
@@ -215,6 +217,15 @@ export function adviceContext(
   return [...lines, `The last answer:\n\n${text}`].join('\n');
 }
 
+/** Brief for an ask turn: a read-only answer to one side question about the thread. */
+export function askContext(projectName: string, directory: string): string {
+  return [
+    `You are answering a side question in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    'Do not edit, create or delete files, and do not run commands. You may read and search files to answer.',
+    'Answer the question directly. The thread goes on without you, so do not offer to make changes.',
+  ].join('\n');
+}
+
 /** Brief for a challenger turn: the assumptions the last answer rests on, and which may not hold. */
 export function challengeContext(
   projectName: string,
@@ -330,13 +341,15 @@ export function handoffPacket(input: {
   // holds the reply it replaces. A model change or a session that fell too far behind starts a new
   // session on the same family, and nothing was stopped.
   const opening =
-    input.reason === 'rerun'
-      ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-      : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
-        ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-        : input.from === input.to
-          ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-          : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+    input.reason === 'ask'
+      ? `This is a side question to ${familyName[input.to]} about the thread below. Answer it from the thread and the scratch copy, and change nothing.`
+      : input.reason === 'rerun'
+        ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+        : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
+          ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+          : input.from === input.to
+            ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+            : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
