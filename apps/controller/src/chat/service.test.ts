@@ -590,7 +590,8 @@ test('a message sent during a turn waits and starts when the turn ends', {
   }
 
   // One running turn per family: a second thread's message on the same family waits in its own
-  // queue and starts when the first thread's turn ends. Another family starts at once.
+  // queue and starts when the first thread's turn ends. Another family starts at once, and here
+  // it stops on its limit.
   const shared = createScriptedChatAdapter({
     family: 'openai',
     turns: [
@@ -601,7 +602,19 @@ test('a message sent during a turn waits and starts when the turn ends', {
   });
   const other = createScriptedChatAdapter({
     family: 'google',
-    turns: [[{ kind: 'text', itemId: 'reply', chunks: ['Free.'] }]],
+    turns: [
+      [
+        {
+          kind: 'fail',
+          stopReason: 'limit',
+          failure: chatFailure({
+            stage: 'stream',
+            kind: 'usage-limit',
+            message: 'The weekly limit is reached.',
+          }),
+        },
+      ],
+    ],
   });
   const one = standalone(t, {
     adapters: new Map<ChatFamily, ChatAdapter>([
@@ -638,11 +651,13 @@ test('a message sent during a turn waits and starts when the turn ends', {
   );
   assert.equal(shared.requests.length, 1);
   const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
-  const elsewhere = turnReaches(one, 'done');
+  const elsewhere = turnReaches(one, 'failed');
   assert.equal(sendTo(third.id, 'On Google.', google).next, undefined);
   await elsewhere;
   assert.equal(other.requests.length, 1);
-  // An ask on a busy family waits like a message, behind the thread that waited first.
+  // An ask on a busy family waits like a message, behind the thread that waited first. It was
+  // sent after the limit stopped this thread, so that stop does not hold it.
+  one.clock.advance(1000);
   const asked = act(one.store, (effects) =>
     one.service.ask(
       { taskId: third.id, family: 'openai', model: 'fixture-model', question: 'Why?' },

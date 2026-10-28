@@ -2174,8 +2174,9 @@ export class ChatService {
    * on a usage limit the next message would stop on the same limit, and after a sign-out or a
    * launch failure eight queued messages would be eight failures. Continuing from the card reruns
    * the stopped message and the queue moves once that turn settles, and a new send starts the
-   * oldest queued message right away. A leftover process holds the queue until a later check
-   * finds it gone.
+   * oldest queued message right away. A send that waited on a family busy in another thread
+   * came after the failure too, so the queue moves when that family frees. A leftover process
+   * holds the queue until a later check finds it gone.
    */
   private continueQueue(taskId: string) {
     const effects: Effects = [];
@@ -2186,7 +2187,8 @@ export class ChatService {
         if (!task || !thread.queued.length || thread.activeTurnId || thread.ownershipUnknown)
           return;
         const newest = this.newestTurn(taskId);
-        if (newest && (newest.state === 'failed' || endedOnLimit(newest))) return;
+        const sentAfter = newest?.endedAt && (thread.queued.at(-1)?.at ?? '') > newest.endedAt;
+        if (newest && (newest.state === 'failed' || endedOnLimit(newest)) && !sentAfter) return;
         if (this.waitsOnFamily(task, thread, this.plans.route(thread, thread.queued[0]))) return;
         const started = this.startQueued(task, effects);
         if (started.outcome !== 'applied')
