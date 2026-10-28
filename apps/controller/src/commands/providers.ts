@@ -689,13 +689,13 @@ export class ProviderCommands {
     );
   }
 
-  saveLocal(this: Controller, control: LocalControl) {
+  saveLocal(this: Controller, control: LocalControl, bump = true) {
     // An unknown probe answer is a missing key; the stored JSON has no undefined.
     const { connectedWithoutToken, ...rest } = control;
     const next = LocalControlSchema.parse({
       ...rest,
       ...(connectedWithoutToken === undefined ? {} : { connectedWithoutToken }),
-      revision: control.revision + 1,
+      revision: bump ? control.revision + 1 : control.revision,
     });
     this.store.putLocalControl(next);
     return next;
@@ -886,7 +886,9 @@ export class ProviderCommands {
         secret: Buffer.from(command.payload.token),
         supplied: true,
       };
-      this.saveLocal({ ...control, connectedWithoutToken: false, connectionFailed: false });
+      // The desktop built the connect that follows on the revision it read before this hand
+      // over, so the hand over keeps that revision. That connect clears the same two marks.
+      this.saveLocal({ ...control, connectedWithoutToken: false, connectionFailed: false }, false);
       return { outcome: 'applied' };
     });
   }

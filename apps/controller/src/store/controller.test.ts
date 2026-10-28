@@ -4189,6 +4189,8 @@ test('Local reads keep the selection while its model key is loaded and clear it 
     (
       reopened as unknown as { options: { localProbe: () => Promise<boolean> } }
     ).options.localProbe = async () => false;
+    // The desktop reads the revision for its connect before it hands the token over.
+    const built = reopened.snapshot().localSetup?.revision ?? 0;
     assert.equal((await supply('cli', 'SupplyLocalToken', { token: canary })).outcome, 'denied');
     assert.equal(
       (await supply('desktop', 'SupplyLocalToken', { token: canary })).outcome,
@@ -4196,7 +4198,11 @@ test('Local reads keep the selection while its model key is loaded and clear it 
     );
     const read = await supply('desktop', 'ReadLocalToken', {});
     assert.deepEqual(read.data, { kind: 'local-token', token: canary });
-    await local('BeginLocalConnectionInput', { consent: 'explicit' });
+    const begun = await reopened.execute(
+      context.command('BeginLocalConnectionInput', { consent: 'explicit' }, built),
+      'local-owner',
+    );
+    assert.equal(begun.outcome, 'applied');
     await done();
     const connected = reopened.snapshot().localSetup;
     assert.equal(connected?.connected, true);
