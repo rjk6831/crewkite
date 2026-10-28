@@ -169,7 +169,7 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
     ['usage', 'refresh', '--family', 'openai', '--usage-scope', 'a'.repeat(64)],
     ['usage', 'stop', 'cmd_01ARZ3NDEKTSV4RRFFQ69G5FAV', '--family', 'google'],
   ]) {
-    assert.equal((await execute(args)).code, 2);
+    assert.equal((await execute(args)).code, 1);
     assert.deepEqual(commands, []);
   }
   for (const json of [false, true]) {
@@ -199,7 +199,7 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
     assert.match(partial.err, /incomplete after 1 rows.*workspace-page-stale/);
     fail = false;
   }
-  assert.equal((await execute(['task', 'show', task.id, '--pages', '--json'])).code, 2);
+  assert.equal((await execute(['task', 'show', task.id, '--pages', '--json'])).code, 1);
   assert.deepEqual(commands, []);
 });
 

@@ -82,9 +82,10 @@ export const CLI_JSON_LINE_SHAPE =
 
 /**
  * Exit codes of every CLI command. 0: the request applied, or the followed turn finished. 1: it
- * failed while running: an error, a failed read, a lost connection, or a followed turn that failed.
- * 2: nothing was done: arguments that do not parse or that the command rejects, or a request the
- * controller refused, with its reason printed. 3: the followed turn was stopped.
+ * failed: an error, a failed read, a lost connection, a followed turn that failed, or a value a
+ * task command rejects after reading its arguments. 2: nothing was done: arguments that do not
+ * parse, arguments a thread command or print mode rejects, or a request the controller refused.
+ * 3: the followed turn was stopped.
  */
 export const CLI_EXIT = { done: 0, failed: 1, notDone: 2, stopped: 3 } as const;
 

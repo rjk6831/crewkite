@@ -138,8 +138,6 @@ export async function runCli(
   if (args[0] === 'thread') return runThreadCommand(args.slice(1), output, connect);
   if (printRequested(args)) return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
-  // Errors before the connection are about the arguments: nothing was done.
-  let argumentsChecked = false;
   const streamWrite = async (text: string) => {
     if (output === terminalOutput) {
       if (!process.stdout.write(text)) await once(process.stdout, 'drain');
@@ -626,7 +624,6 @@ export async function runCli(
           ? 'Repository paths must contain 1 to 4096 characters.'
           : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
       );
-    argumentsChecked = true;
     const connected = await connectController({ ...readControllerEndpoint(home), actor });
     client = connected;
     let sent: Command | undefined;
@@ -1981,7 +1978,8 @@ export async function runCli(
     return succeeded(result) ? 0 : 2;
   } catch (error) {
     output.err(`${terminalText(error instanceof Error ? error.message : 'CLI command failed.')}\n`);
-    return argumentsChecked && !notDone(error) ? CLI_EXIT.failed : CLI_EXIT.notDone;
+    // Arguments that do not parse did nothing. Other errors keep the task commands' status 1.
+    return notDone(error) ? CLI_EXIT.notDone : CLI_EXIT.failed;
   } finally {
     client?.close();
   }

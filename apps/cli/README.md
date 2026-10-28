@@ -82,7 +82,7 @@ Key bindings exist for send, newline, stop, threads, changes, settings and help.
 
 ### Packaged builds
 
-The packaged CLI runs the thread commands, print mode and the task commands. The interactive mode needs a source checkout with its dependencies installed for now, and the packaged CLI says so when it is asked to open it.
+The package carries the interactive mode. [scripts/cli-runtime.ts](../../scripts/cli-runtime.ts) copies Ink, React and their pinned closure into a private store under `apps/cli`, laid out so that the two ansi-styles versions in that closure each reach only the packages that asked for them, and copies the renderer modules the views import. The package build itself runs on macOS arm64.
 
 ## Thread commands and print mode
 
@@ -116,8 +116,8 @@ Every command, the task commands included, uses one table.
 | Status | Meaning |
 |--------|---------|
 | 0 | The request applied, or the followed turn finished |
-| 1 | It failed while running: an error, a failed read, a lost connection, an incomplete list or a followed turn that failed |
-| 2 | Nothing was done: arguments that do not parse or that the command rejects, or a request the controller refused, with its reason printed |
+| 1 | It failed: an error, a failed read, a lost connection, an incomplete list, a followed turn that failed, or a value a task command rejects after reading its arguments |
+| 2 | Nothing was done: arguments that do not parse, arguments a thread command or print mode rejects, or a request the controller refused, with its reason printed |
 | 3 | The followed turn was stopped |
 
 With `--json` every line is one object that `CliJsonLineSchema` in `packages/contracts/src/cli.ts` accepts. `kind` says which: `event` for a thread event (agent events, turn and thread records, stored messages), `result` for the controller's answer to a command with its reason and next step, `turn-end` with the status of the followed turn, `thread` for a thread read, `threads` for the list and `error`. Every line carries `v: 1`. That number names one fixed shape, the embedded thread, turn, message and event shapes included: the CLI's schema test pins a hash of the whole shape, so a change to any of them moves `v`.
