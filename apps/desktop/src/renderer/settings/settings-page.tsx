@@ -7,6 +7,7 @@ import { ExtensionsCard } from './extensions-card.tsx';
 import { GeneralCard } from './general-card.tsx';
 import { GoogleCard } from './google-card.tsx';
 import { LocalCard } from './local-card.tsx';
+import { McpCard } from './mcp-card.tsx';
 import { OpenAiCard } from './openai-card.tsx';
 import { PromptsCard } from './prompts-card.tsx';
 import { useProviderActions } from './provider-actions.ts';
@@ -64,6 +65,7 @@ export function SettingsPage({
         <AnthropicCard {...card} entry={entry('anthropic')} />
         <GoogleCard {...card} entry={entry('google')} />
         <LocalCard {...card} entry={entry('local')} />
+        <McpCard />
         <ExtensionsCard source={workspace.source} />
         {workspace.source && <PromptsCard source={workspace.source} />}
       </div>

@@ -45,6 +45,7 @@ import {
   MAX_CHAT_TURN_EVENTS_BYTES,
   type Project,
   rankFamilies,
+  scrubSecrets,
   type Task,
   TaskSchema,
   writesScratch,
@@ -110,6 +111,7 @@ import {
   readChatBranchStatus,
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
+import type { McpRegistry } from './mcp-servers.ts';
 import { createMentionIndex, readInstructions as readInstructionFiles } from './mentions.ts';
 import type { PlanInputs } from './plan.ts';
 import { PlanRunner, sentMessage } from './plan-runner.ts';
@@ -179,6 +181,8 @@ export type ChatServiceDeps = {
    * not open yet. A cloud turn then runs without the tools, and its packet does not name them.
    */
   threadToolsDown?: () => boolean;
+  /** The person's own MCP servers, supplied by the desktop. Absent means none. */
+  mcp?: McpRegistry;
   /** Process table access and timers. Tests replace them; the defaults are the real ones. */
   groupAbsent?: (group: number) => boolean;
   signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -246,6 +250,12 @@ type LiveTurn = {
   calls: Map<string, { title: string; input: unknown }>;
   /** The policy the adapter launched with. It answers what that policy covers on its own. */
   policy: ChatPermissionPolicy;
+  /** This turn started the person's MCP servers. A policy change mid-turn never answers their calls. */
+  mcp: boolean;
+  /** The secret values of the person's servers this turn started, scrubbed from its result. */
+  secrets: readonly string[];
+  /** A Google turn that carries the person's servers: no policy change answers any of its asks. */
+  google: boolean;
   /** Send now stopped this turn. Its queued message starts next with the stopped turn's packet. */
   steered: boolean;
   noticed: boolean;
@@ -1431,6 +1441,9 @@ export class ChatService {
       kinds: new Map(),
       calls: new Map(),
       policy: 'ask',
+      mcp: false,
+      secrets: [],
+      google: false,
       steered: false,
       noticed: false,
       started: false,
@@ -1508,6 +1521,9 @@ export class ChatService {
     if (this.closed || live.stopRequested) return stoppedResult;
     const request = this.request(turn);
     live.policy = request.permissionPolicy;
+    live.mcp = (request.mcp?.servers.length ?? 0) > 0;
+    live.secrets = request.mcp?.secrets ?? [];
+    live.google = live.mcp && turn.selection.family === 'google';
     // The first turn copies the project, which takes time. Stop may have arrived meanwhile.
     if (this.closed || live.stopRequested) return stoppedResult;
     this.record(turn, live, {
@@ -1519,7 +1535,19 @@ export class ChatService {
       role: turn.role,
     });
     if (request.threadTools === false) this.toolsDown(turn, live);
-    live.handle = adapter.startTurn(request, (event) => this.record(turn, live, event));
+    for (const message of request.mcp?.notes ?? [])
+      this.record(turn, live, {
+        type: 'provider.notice',
+        turnId: turn.id,
+        level: 'info',
+        message,
+        trace: true,
+      });
+    // A secret of a server this turn started never reaches the thread, the trace or a prompt card.
+    const secrets = request.mcp?.secrets ?? [];
+    live.handle = adapter.startTurn(request, (event) =>
+      this.record(turn, live, scrubSecrets(event, secrets)),
+    );
     try {
       this.deps.store.transaction(() => this.saveGroups(turn.id, live));
     } catch {
@@ -1660,6 +1688,8 @@ export class ChatService {
     // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
     // the thread allows.
     const balanced = writer && thread.flightMode === 'balanced';
+    const permissionPolicy = writer && !balanced ? thread.permissionPolicy : 'ask';
+    const permissionGrants = writer && !balanced ? (thread.permissionGrants ?? []) : [];
     return {
       turnId: turn.id,
       taskId: task.id,
@@ -1686,10 +1716,19 @@ export class ChatService {
       session,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
-      permissionPolicy: writer && !balanced ? thread.permissionPolicy : 'ask',
+      permissionPolicy,
       // A reviewer or advisor reads only, so what the thread allowed does not reach it.
-      permissionGrants: writer && !balanced ? (thread.permissionGrants ?? []) : [],
+      permissionGrants,
       readOnly: !writer,
+      // Decided with the thread tools above: the person's servers a turn starts follow this turn's
+      // family and this policy, and never exceed it.
+      mcp: this.deps.mcp?.compose({
+        family,
+        taskId: task.id,
+        permissionPolicy,
+        permissionGrants,
+        readOnly: !writer,
+      }),
       deadlineMs: TURN_DEADLINE_MS,
       environment: this.deps.resolveEnvironment(turn.selection.family),
       now: () => Date.parse(this.deps.now()),
@@ -1848,6 +1887,9 @@ export class ChatService {
     if (!balanced && policy === live.policy) return null;
     const call = live.calls.get(open.callId ?? '');
     const kind = live.kinds.get(open.callId ?? '');
+    // A call the kinds do not name may be a server's. Its policy was cut at launch and a looser
+    // thread policy set since does not raise it.
+    if (live.google || (live.mcp && (kind === undefined || kind === 'other'))) return null;
     const words = `${open.question}\n${call?.title ?? ''}`;
     if (/\bnetwork\b/i.test(words)) return null;
     const scratch = this.scratchDirectory(live.taskId);
@@ -1862,7 +1904,9 @@ export class ChatService {
     return policy === 'allow-all' ? allow.id : null;
   }
 
-  private finish(turnId: string, live: LiveTurn, result: ChatTurnResult, left: number[]) {
+  private finish(turnId: string, live: LiveTurn, raw: ChatTurnResult, left: number[]) {
+    // The failure text can echo a server's argument or variable.
+    const result = scrubSecrets(raw, live.secrets);
     const turn = this.turn(turnId);
     if (turn)
       this.record(

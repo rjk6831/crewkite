@@ -40,6 +40,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
+import { McpRegistry } from '../chat/mcp-servers.ts';
 import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
@@ -370,6 +371,8 @@ export class Controller {
     return this.taskOperationRuntime;
   }
 
+  /** The person's MCP servers as the desktop last supplied them. Memory only. */
+  private readonly mcpServers = new McpRegistry();
   private extensionRuntime?: ExtensionHost;
   private extensions(): ExtensionHost {
     this.extensionRuntime ??= new ExtensionHost({
@@ -427,6 +430,7 @@ export class Controller {
       onTurnEnded: (turnId) => this.threadToolsRuntime?.broker.end(turnId),
       threadToolsDown: () =>
         this.threadToolsRuntime !== undefined && (!this.threadToolsRuntime.ready || this.closed),
+      mcp: this.mcpServers,
     });
     return this.chatRuntime;
   }
@@ -911,6 +915,13 @@ export class Controller {
       ].includes(command.command)
     )
       return this.taskOperations().execute(command as TaskOperationCommand);
+    // Before any receipt path: a server's secrets must not reach a journal row either.
+    if (command.command === 'SupplyMcpServers') {
+      if (command.actor.kind !== 'desktop')
+        return { outcome: 'denied', reason: 'desktop-actor-only' };
+      this.mcpServers.set(command.payload);
+      return { outcome: 'applied' };
+    }
     // Before any receipt path: the token must not reach a journal row.
     if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
       return this.localTokenCommand(command);

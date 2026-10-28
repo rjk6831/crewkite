@@ -17,6 +17,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { googleMcpEntries } from '../../chat/mcp-servers.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
@@ -1148,9 +1149,12 @@ export function googleChatAdapter(deps: {
           // ACP takes the session's servers on session/new and session/load. The thread tools are
           // the only one, and the agent starts it in the session's own process.
           const tools = minted.server;
-          const mcpServers = tools
-            ? [{ name: tools.name, command: tools.command, args: [...tools.args], env: [] }]
-            : [];
+          const mcpServers = [
+            ...(tools
+              ? [{ name: tools.name, command: tools.command, args: [...tools.args], env: [] }]
+              : []),
+            ...googleMcpEntries(request.mcp),
+          ];
           let resumed = false;
           if (prior && handshake.agentCapabilities?.loadSession && !cancelled) {
             phase = 'replay';

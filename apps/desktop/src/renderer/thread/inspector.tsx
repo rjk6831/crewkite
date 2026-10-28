@@ -32,6 +32,7 @@ import {
 } from '../extension-slots.tsx';
 import { clientFor } from '../settings/client-status.tsx';
 import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
+import { McpThreadMenu } from '../settings/mcp-card.tsx';
 import {
   crewFromPreset,
   crewPresetNames,
@@ -449,6 +450,7 @@ function ThreadTab({
           ))}
         </select>
       </label>
+      <McpThreadMenu taskId={taskId} permissionPolicy={thread?.permissionPolicy ?? 'ask'} />
       <div className="th-handoff">
         <AutoHandoff thread={thread} onConfigure={onConfigure} />
         {/* The limit offer and the picker rank by the mode too, so it stays open with the box off. */}

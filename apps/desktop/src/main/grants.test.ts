@@ -49,6 +49,11 @@ test('main sends an import by path only for a path it gave the window', () => {
     ['other commands pass', command('RenameChatThread', { taskId, title: 'Plan' }), true],
     ['the window cannot read the Local token', token('ReadLocalToken', {}), false],
     ['the window cannot supply a Local token', token('SupplyLocalToken', { token: 'abc' }), false],
+    [
+      'the window cannot supply MCP servers',
+      token('SupplyMcpServers', { servers: [], threads: {} }),
+      false,
+    ],
   ];
   for (const [claim, value, allowed] of rows)
     assert.equal(grants.refusal(value) === null, allowed, claim);

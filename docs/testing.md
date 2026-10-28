@@ -106,6 +106,16 @@ Two claims from the rc-05 follow-up. Each lives in an existing test.
 | A turn whose thread tools source gives none loses the packet line, runs with an empty config and traces the notice | Anthropic config row |
 | A controller on a home 120 characters deep answers a client and a CLI command, and a socket file left by a crashed run does not block the start | `packages/client/src/output.test.ts`, `packages/client/src/client.test.ts`, `apps/cli/src/main.test.ts` |
 
+## The person's MCP servers
+
+Three claims from the thread MCP servers change. Each lives in a test.
+
+| Claim | Where |
+|-------|-------|
+| A server's policy never exceeds the thread's, a listed read runs unasked only under the reads policy, and a server's annotations or an unlisted name never widen it | `chat/mcp-servers.test.ts`, with a scripted stdio server in `chat/mcp-fixture-server.mjs` |
+| Each family gets the servers the thread turned on only where the controller's gate sees their calls: Anthropic in the one strict config, Google only while every call asks, OpenAI, Local and read only turns never | `chat/mcp-servers.test.ts`, the Anthropic config and permission rows, the queue row in `chat/service.test.ts` |
+| A stored secret is sealed on disk, never returned to the window, kept across an edit, refused without a keychain and removed from a turn's events | `apps/desktop/src/main/mcp-vault.test.ts`, `apps/desktop/src/main/grants.test.ts` |
+
 ## Scratch copy clones
 
 The first turn on a thread fills its scratch directory through `copyScratch` in `apps/controller/src/chat/scratch-copy.ts`. `scratchPlan` in `host/source.ts` lists the base tree with each regular file's size and no bytes, and it applies the same link, submodule and non-UTF-8 path rules as `committedFiles` with `scratch: true`, because both run one classifier. No byte limit applies to the regular files. When the project's checkout sits on the thread's base and git sees no change to a tracked file, each regular file whose parent folders are real folders and whose size matches the committed size is cloned from the checkout with `fs.copyFileSync` and `COPYFILE_FICLONE_FORCE`. The clone is then stream-hashed as a git blob with no filters and compared with the committed oid. A mismatch, such as a same-size edit git was told to ignore with assume-unchanged or skip-worktree, or a checkout that changed during the copy, removes the clone and writes the committed bytes. Every other file is read from git in runs of at most 32 MiB and written. A file larger than a run streams from `git cat-file blob` straight to its target. The first EXDEV, ENOTSUP or similar error ends the clone attempts and the rest is written. `materialize` still checks every path and link before it writes, and `copyScratch` calls it with a write hook, so a clone never skips a check. Progress uses the same `ImportProgress` update as a file import, one per 4 MiB and a final one.

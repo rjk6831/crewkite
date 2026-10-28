@@ -54,6 +54,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -71,6 +72,7 @@ import {
   type ChatToolKind,
 } from '@crewkite/contracts';
 import type { ChatTurnRequest } from '../../chat/adapter.ts';
+import type { ThreadMcp } from '../../chat/mcp-servers.ts';
 import { THREAD_TOOLS_LINE } from '../../chat/prompt.ts';
 import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
@@ -167,6 +169,21 @@ const pdf = file('spec.pdf', 'application/pdf', Buffer.from('%PDF-1.7 spec'));
 const notes = file('notes.md', 'text/markdown; charset=utf-8', Buffer.from('# Notes\nShip it.'));
 const sheet = file('plan.xlsx', 'application/vnd.ms-excel', Buffer.from('PK sheet'));
 
+const notesServer = (policy: 'ask' | 'reads' | 'all'): ThreadMcp => ({
+  servers: [
+    {
+      name: 'notes',
+      command: 'notes-server',
+      args: ['--root', 'docs'],
+      env: { NOTES_KEY: 'value-one' },
+      policy,
+      readTools: ['read_*'],
+    },
+  ],
+  notes: [],
+  secrets: [],
+});
+
 function run(
   script: Step[] | ((scratch: string) => Step[]),
   session: ChatSession | null = null,
@@ -179,6 +196,8 @@ function run(
     readOnly?: boolean;
     /** The controller's answer for this turn. False wins over a thread tools source. */
     turnTools?: boolean;
+    /** The person's servers the controller composed for this turn. */
+    mcp?: ThreadMcp;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
@@ -187,10 +206,22 @@ function run(
   const steps = typeof script === 'function' ? script(join(root, 'scratch')) : script;
   const events: AgentEvent[] = [];
   const waiting = new Map<string, (event: AgentEvent) => void>();
-  const launched = { argv: [] as string[], input: [] as string[] };
+  const launched = {
+    argv: [] as string[],
+    input: [] as string[],
+    config: null as { path: string; mode: number; text: string } | null,
+  };
   const usage: unknown[] = [];
   const spawn: Spawn = (executable, argv, options) => {
     launched.argv = argv;
+    // The config file when the client was given a path: what it held and its mode at launch.
+    const path = argv[argv.indexOf('--mcp-config') + 1] ?? '';
+    if (path.endsWith('mcp.json'))
+      launched.config = {
+        path,
+        mode: statSync(path).mode & 0o777,
+        text: readFileSync(path, 'utf8'),
+      };
     const child = spawnCheckChild(
       process.execPath,
       [executable, JSON.stringify(steps), ...argv],
@@ -222,6 +253,7 @@ function run(
     files,
     readOnly: extra.readOnly,
     threadTools: extra.turnTools,
+    mcp: extra.mcp,
   };
   const handle = anthropicChatAdapter({
     launch: () => ({ executable: fixture, sha256 }),
@@ -377,6 +409,42 @@ test('an edit outside the scratch copy asks under a thread grant or allow-all, a
     { tool: 'Write', file: 'link/notes.md', answered: [] },
     { tool: 'WebFetch', file: null, answered: [] },
     { tool: 'Write', file: '../notes.md', policy: 'allow-all' as const, answered: [] },
+    // A person's server follows the policy the controller cut for it. Allow-all and the grants
+    // say nothing about its tools, and a server the turn did not start always asks.
+    {
+      tool: 'mcp__notes__read_file',
+      file: null,
+      mcp: notesServer('reads'),
+      policy: 'allow-all' as const,
+      answered: ['allow-once'],
+    },
+    {
+      tool: 'mcp__notes__write_file',
+      file: null,
+      mcp: notesServer('reads'),
+      policy: 'allow-all' as const,
+      answered: [],
+    },
+    {
+      tool: 'mcp__notes__read_file',
+      file: null,
+      mcp: notesServer('ask'),
+      policy: 'allow-all' as const,
+      answered: [],
+    },
+    {
+      tool: 'mcp__other__read_file',
+      file: null,
+      mcp: notesServer('all'),
+      policy: 'allow-all' as const,
+      answered: [],
+    },
+    {
+      tool: 'mcp__notes__write_file',
+      file: null,
+      mcp: notesServer('all'),
+      answered: ['allow-once'],
+    },
   ];
   for (const row of rows) {
     const turn = run(
@@ -398,6 +466,10 @@ test('an edit outside the scratch copy asks under a thread grant or allow-all, a
       null,
       ['edit', 'other'],
       row.policy,
+      undefined,
+      undefined,
+      undefined,
+      { mcp: row.mcp },
     );
     t.after(turn.cleanup);
     const asked = await turn.next('permission.requested');
@@ -817,6 +889,31 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
   assert.equal(launches.length, minted);
   assert.ok(declined.launched.argv.includes('--strict-mcp-config'));
   assert.ok(declined.launched.argv.includes('{"mcpServers":{}}'));
+  // The person's servers join the thread tools in the one strict config. Their tools are not on
+  // the allow list, so each call reaches the controller's gate.
+  const joined = run(streamed(), null, [], 'ask', undefined, [], undefined, {
+    threadTools,
+    mcp: notesServer('reads'),
+  });
+  t.after(joined.cleanup);
+  await joined.handle.result;
+  // The person's servers carry secrets, so the config is a file only this user reads, argv holds
+  // its path and no secret value, and the file is gone when the turn settles.
+  const written = joined.launched.config;
+  assert.ok(written);
+  assert.equal(written.mode, 0o600);
+  assert.ok(!joined.launched.argv.some((arg) => arg.includes('value-one')));
+  assert.equal(existsSync(written.path), false);
+  const config = written.text;
+  assert.deepEqual(Object.keys(JSON.parse(config).mcpServers), ['crewkite', 'notes']);
+  assert.deepEqual(JSON.parse(config).mcpServers.notes, {
+    type: 'stdio',
+    command: 'notes-server',
+    args: ['--root', 'docs'],
+    env: { NOTES_KEY: 'value-one' },
+  });
+  assert.ok(joined.launched.argv.includes('--strict-mcp-config'));
+  assert.ok(!joined.launched.argv.some((arg) => arg.includes('mcp__notes')));
   assert.ok(!declined.launched.argv.some((arg) => arg.includes('mcp__crewkite__')));
   // The source gives none although the controller expected tools: the packet loses its line, the
   // config is empty and the trace says so.
@@ -846,7 +943,7 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
   );
   // Each turn launched with its own token.
   const tokens = launches.map((args) => args[args.indexOf('--token') + 1]);
-  assert.equal(tokens.length, 2);
+  assert.equal(tokens.length, 3);
   assert.equal(new Set(tokens).size, tokens.length);
 });
 

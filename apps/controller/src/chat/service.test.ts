@@ -63,6 +63,7 @@ import {
 } from './adapter.ts';
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
+import { McpRegistry } from './mcp-servers.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
 
@@ -518,15 +519,35 @@ test('a message sent during a turn waits and starts when the turn ends', {
         [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
       ],
     });
+    const mcp = new McpRegistry();
     const thread = standalone(t, {
       // The thread tools socket failed to open: every cloud turn says so and runs without them.
       threadToolsDown: () => true,
+      mcp,
       adapters: new Map([['openai', scripted]]),
     });
     const { store, service, taskId } = thread;
+    // The thread turned a server on. OpenAI cannot route its calls through the gate, so the
+    // controller leaves it out of the request and says so in the request's notes.
+    mcp.set({
+      servers: [
+        {
+          name: 'notes',
+          command: 'notes-server',
+          args: [],
+          secretArgs: [],
+          env: {},
+          readTools: [],
+        },
+      ],
+      threads: { [taskId]: { notes: 'all' } },
+    });
     const parked = turnReaches(thread, 'waiting-permission');
     thread.send(first);
     const { id: turnId } = await parked;
+    const sent = (scripted.requests as unknown as ChatTurnRequest[])[0]?.mcp;
+    assert.deepEqual(sent?.servers, []);
+    assert.match(sent?.notes[0] ?? '', /^MCP server notes is off for this turn\./);
     const refused = row.send
       .map((text) => thread.send(text))
       .flatMap((result) => (result.outcome === 'applied' ? [] : [[result.reason, result.next]]));
