@@ -209,6 +209,7 @@ export function settingsPreview(routes: Snapshot['routes'], now: string) {
       client: { version: 'fixture-1', sha256: hash('d'), signerTeamId: 'FIXTURETEAM' },
       auth: { method: 'oauth-personal', status: 'required' },
       reason: 'authentication-required',
+      googleTerms: null,
     },
     localSetup: {
       revision: 5,

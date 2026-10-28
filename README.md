@@ -21,6 +21,10 @@ A crew can work a large request in slices. In the Full crew preset an orchestrat
 
 To try a published build without the source, follow the [preview guide](docs/preview.md). Each provider needs its own client, signed in on your machine. [Provider routes](docs/providers.md) lists the setup for each and which routes have a live run on record.
 
+## Google and your account
+
+Google's third-party access FAQ says that third-party access through its coding client login violates its terms. Its headless FAQ also excludes consumer CLI wrappers. The dated links are in [Google and your account](docs/providers.md#google-and-your-account). Google does not name CrewKite, and CrewKite has no exception from Google. Using the Google route is your own choice and your own risk. Roots No Limits LLC accepts no liability for action Google takes against your account. Settings shows this summary and keeps Connect Google off until you tick a box that says you have read Google's terms and accept the risk. The controller refuses Google use without that acknowledgement, and it asks again when this text changes.
+
 ## Principles
 
 - Qualify official clients on their supported subscription path. Cloud-provider authentication stays with those clients, and CrewKite never reads or stores a provider credential. The one secret it can keep is the token of a model runtime on this device, only when I turn on Remember the Local token, and Forget removes it. CrewKite never falls back to paid API billing on its own.

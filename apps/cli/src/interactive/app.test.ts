@@ -9,6 +9,7 @@ import { connectChat } from '../chat/connect.ts';
 import { startScriptedController } from '../scripted-controller.ts';
 import { defaultSettings } from '../settings.ts';
 import { App } from './app.ts';
+import { beforeGoogleConnection } from './google-gate.ts';
 
 /** A terminal the test types into. Each frame Ink writes replaces the screen. */
 function terminal() {
@@ -118,5 +119,20 @@ test('the interactive app sends a typed message, answers a permission by digit a
   await screen.shows('Stopped');
   screen.type('\u0003');
   await app.waitUntilExit();
+  // The Google terms gate asks only without a current acknowledgement and sends it on a yes only.
+  const sent: unknown[] = [];
+  const gate = (googleTerms: { version: string; at: string } | null, answer: boolean) => ({
+    read: async () => ({ googleAcpSetup: { googleTerms } as never }),
+    send: async (_command: string, payload: unknown) => {
+      sent.push(payload);
+      return { outcome: 'applied' as const };
+    },
+    ask: async () => answer,
+  });
+  const old = { version: '0000-00-00', at: '2026-10-28T00:00:00.000Z' };
+  assert.equal(await beforeGoogleConnection(gate(old, false)), false);
+  assert.deepEqual(sent, []);
+  assert.equal(await beforeGoogleConnection(gate(old, true)), true);
+  assert.equal(sent.length, 1);
   assert.equal(saved, 0);
 });

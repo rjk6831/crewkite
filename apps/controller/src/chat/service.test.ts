@@ -274,11 +274,13 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
     store.put('task', fixtures.task.id, 0, fixtures.task);
   });
   const taskId = fixtures.task.id;
+  const terms = { acknowledged: true };
   const start = () =>
     new ChatService({
       store,
       artifacts: new ArtifactFiles(join(directory, 'artifacts')),
       home: directory,
+      googleTermsAcknowledged: () => terms.acknowledged,
       now: clock.now,
       id: (prefix) => (prefix === 'trn' ? `trn_${ids('msg').slice(4)}` : ids(prefix)),
       emit: (type, taskId, revision, payload) =>
@@ -322,7 +324,7 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
     return result;
   };
   const read = (on = service) => on.readThread({ taskId, limit: 100 });
-  return { clock, store, taskId, service, start, send, read, root: repository.directory };
+  return { clock, store, taskId, service, start, send, read, terms, root: repository.directory };
 }
 
 /** A catalog entry with one model and one weekly window. */
@@ -707,6 +709,10 @@ test('a message sent during a turn waits and starts when the turn ends', {
   assert.equal(shared.requests.length, 1);
   const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
   const elsewhere = turnReaches(one, 'failed');
+  // Google stays off until the current terms are acknowledged, whatever the pick.
+  one.terms.acknowledged = false;
+  assert.equal(sendTo(third.id, 'Too early.', google).reason, 'google-terms-not-acknowledged');
+  one.terms.acknowledged = true;
   assert.equal(sendTo(third.id, 'On Google.', google).next, undefined);
   await elsewhere;
   assert.equal(other.requests.length, 1);

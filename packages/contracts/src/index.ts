@@ -59,6 +59,7 @@ import {
   ReadExtensionsPayloadSchema,
   RunExtensionCommandPayloadSchema,
 } from './extensions.ts';
+import { AcknowledgeGoogleTermsPayloadSchema, GoogleTermsSchema } from './google-terms.ts';
 import { McpSupplySchema } from './mcp.ts';
 
 export const PROTOCOL_VERSION = 1;
@@ -723,6 +724,7 @@ export const GoogleAcpSetupSchema = z
       status: z.enum(['unknown', 'required', 'authenticated']),
     }),
     reason: GoogleAcpReasonSchema.nullable(),
+    googleTerms: GoogleTermsSchema.nullable().default(null),
   })
   .refine(
     (setup) =>
@@ -2526,6 +2528,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadExtensions', ReadExtensionsPayloadSchema),
   mutate('ConfigureExtension', ConfigureExtensionPayloadSchema),
   mutate('RunExtensionCommand', RunExtensionCommandPayloadSchema),
+  mutate('AcknowledgeGoogleTerms', AcknowledgeGoogleTermsPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -3854,6 +3857,7 @@ export * from './checks.ts';
 export * from './cli.ts';
 export * from './composer.ts';
 export * from './extensions.ts';
+export * from './google-terms.ts';
 export * from './mcp.ts';
 export * from './plan-lanes.ts';
 

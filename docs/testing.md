@@ -207,3 +207,10 @@ Three test functions cover the parallel rules of the ADR 0045 amendment. Each ru
 
 The renderer's plan card table adds a blocked row that can run again and a row that lists what it waits on and its conflicts. None of this covers a live provider, a real merge of two models' edits, or the time a real copy takes on a large repository.
 
+## Google terms gate
+
+One claim covers the Google gate in `apps/controller/src/commands/google-terms.test.ts`.
+
+- The controller refuses a Google connection step until the person acknowledged the current terms text. A first connection with no acknowledgement is refused, an acknowledgement of an old text version is refused and stores nothing, an acknowledgement of the current version is stored with the controller time and the version, the same step then reaches setup, and a stored acknowledgement of an older version is refused again. The renderer flow test keeps the setup sequence with a current acknowledgement in place. A chat turn, ask, plan slice, handoff or crew turn that lands on Google is refused with a pointer to Settings > Google until the current text is acknowledged; the chat service test covers that row. The interactive CLI asks the same question and sends the acknowledgement only on an explicit yes, and its app test covers both answers.
+
+This runs against a real controller and real SQLite with no network.
