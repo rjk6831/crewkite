@@ -89,8 +89,9 @@ export function SlotOutput({ outcome }: { outcome: SlotOutcome | null }) {
       <p>{outcome.output.text}</p>
       {outcome.output.rows && (
         <dl className="th-facts">
-          {outcome.output.rows.map((row) => (
-            <div key={row.label}>
+          {outcome.output.rows.map((row, index) => (
+            // biome-ignore lint/suspicious/noArrayIndexKey: one output's rows never reorder, and labels can repeat.
+            <div key={`${index}:${row.label}`}>
               <dt>{row.label}</dt>
               <dd>{row.value}</dd>
             </div>

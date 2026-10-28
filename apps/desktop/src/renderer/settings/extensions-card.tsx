@@ -146,8 +146,10 @@ export function ExtensionsCard({ source }: { source: ExtensionSource | undefined
                   {listing.manifest && ` ${listing.manifest.version}`}
                 </span>
                 <small className="st-hint">
-                  {stateText[listing.state]}
-                  {listing.line && `. ${listing.line}`}
+                  {/* A changed listing's line already says it is off. */}
+                  {listing.state === 'changed' && listing.line
+                    ? listing.line
+                    : `${stateText[listing.state]}${listing.line ? `. ${listing.line}` : ''}`}
                 </small>
                 {listing.manifest?.description && (
                   <small className="st-hint">{listing.manifest.description}</small>

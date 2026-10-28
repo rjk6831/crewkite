@@ -723,7 +723,16 @@ export function Inspector({
 }) {
   const panel = useRef<HTMLElement>(null);
   const size = useInspectorWidth(panel);
-  const extensionTabs = slotsOf(useExtensions(source).read, 'inspector-tab');
+  const extensionRead = useExtensions(source).read;
+  const extensionTabs = slotsOf(extensionRead, 'inspector-tab');
+  // An extension tab whose extension turned off falls back to Changes once the read is in.
+  const missingTab =
+    tab.startsWith('ext:') &&
+    extensionRead !== null &&
+    !extensionTabs.some((slot) => extensionTabId(slot) === tab);
+  useEffect(() => {
+    if (missingTab) onTab('changes');
+  }, [missingTab, onTab]);
   // Escape closes the panel unless a picker or field inside it already took the key, or a dialog
   // such as search is open and owns it.
   useEffect(() => {
