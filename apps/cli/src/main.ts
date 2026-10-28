@@ -50,11 +50,15 @@ import {
   TaskSchema,
   type WorkspaceContinuation,
 } from '@crewkite/contracts';
+import { connectChat } from './chat/connect.ts';
+import { type Connect, runPrint, runThreadCommand } from './chat/scripting.ts';
 
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
 
-const help = `Usage: crewkite project add <path> [--json] [--home path]
+const help = `Usage: crewkite -p <message> [--thread task-id | --project project-id] [--model family[/model]] [--json]
+       crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show> ... (crewkite thread --help)
+       crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite artifact <read|verify|save> <artifact-id> [--output new-file] [--json] [--home path]
@@ -124,7 +128,14 @@ const terminalOutput: Output = {
     process.stderr.write(text);
   },
 };
-export async function runCli(args: string[], output: Output = terminalOutput): Promise<number> {
+export async function runCli(
+  args: string[],
+  output: Output = terminalOutput,
+  connect: Connect = connectChat,
+): Promise<number> {
+  if (args[0] === 'thread') return runThreadCommand(args.slice(1), output, connect);
+  if (args.some((arg) => arg === '-p' || arg === '--print' || /^(-p.|--print=)/.test(arg)))
+    return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
   const streamWrite = async (text: string) => {
     if (output === terminalOutput) {
