@@ -279,7 +279,7 @@ export function withAttachments(
   const kept = attachments.map(inProject).filter(inside);
   const dropped = attachments.filter((path) => !inside(inProject(path)));
   return [
-    text,
+    ...(text ? [text] : []),
     ...(kept.length ? [`Attached paths:\n${kept.join('\n')}`] : []),
     ...(dropped.length
       ? [
@@ -370,9 +370,20 @@ export function earlierReach(family: ChatFamily, path: string): string {
   return family === 'local' ? 'not sent to Local' : `Path: ${path}`;
 }
 
-/** The message text under its heading. The request carries it once. */
+/**
+ * The message text under its heading. The request carries it once. A message of files alone has
+ * no text, and the file section the adapter adds below is its body.
+ */
 export function newMessageBlock(text: string): string {
-  return `New message from the person:\n${text}`;
+  return text
+    ? `New message from the person:\n${text}`
+    : 'New message from the person: the files attached to this message, with no text.';
+}
+
+/** What a transcript shows for a person's message. A message of files alone names them. */
+export function spokenText(text: string, files: readonly Pick<ChatAttachment, 'name'>[]): string {
+  if (text || !files.length) return text;
+  return `(Files only: ${files.map((file) => file.name).join(', ')})`;
 }
 
 /** One line for a file: name, type, size, then the tail. */
@@ -389,7 +400,8 @@ export function attachedSection(lines: readonly string[]): string {
 }
 
 export function earlierFileLine(file: EarlierFile): string {
-  return attachedLine(file.attachment, `came with "${file.came}", ${file.reach}`);
+  const came = file.came ? `came with "${file.came}"` : 'came with a message with no text';
+  return attachedLine(file.attachment, `${came}, ${file.reach}`);
 }
 
 /** Files from before the new message, listed once, or nothing. The packet and the delta packet both use it. */

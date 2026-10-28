@@ -112,6 +112,7 @@ import {
   handoffReason,
   presentInstructions,
   reviewContext,
+  spokenText,
   systemContext,
   withAttachments,
 } from './prompt.ts';
@@ -350,10 +351,7 @@ export class ChatService {
     if (!task) return blocked('task-not-found');
     // A queued message is checked now too, so the person hears about a missing file at send. Each
     // file comes from what its import stored, so the type the controller detected decides how a
-    // provider reads the bytes.
-    // shortcut: the payload, the queued message and the user entry need at least one character of
-    // text, so a message with files and no text cannot be sent yet. Upgrade: allow empty text
-    // when files are present in those three schemas.
+    // provider reads the bytes. A message may be files alone; the file section is then its body.
     const files = payload.files.flatMap((file) => {
       const stored = this.storedAttachment(task.id, file);
       return stored ? [stored.attachment] : [];
@@ -2460,7 +2458,9 @@ export class ChatService {
         family: value.selection.family,
         model: value.selection.model,
         role: value.role,
-        message: asked?.text ?? null,
+        message: asked
+          ? spokenText(asked.text, asked.kind === 'user-message' ? (asked.files ?? []) : [])
+          : null,
         reply: value.assistantMessageId
           ? (this.findEntry(taskId, value.assistantMessageId)?.text ?? null)
           : null,
@@ -2860,7 +2860,9 @@ export class ChatService {
       .reverse()
       .map((row) => {
         const entry = ConversationEntrySchema.parse(JSON.parse(row.body as string));
-        return { role: entry.kind === 'user-message' ? 'user' : 'assistant', text: entry.text };
+        return entry.kind === 'user-message'
+          ? { role: 'user', text: spokenText(entry.text, entry.files ?? []) }
+          : { role: 'assistant', text: entry.text };
       });
   }
 
