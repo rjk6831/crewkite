@@ -25,6 +25,7 @@ import {
   copyInstalledDependencies,
   inspectInstalledDependencies,
 } from '../apps/controller/src/host/toolchain.ts';
+import { stageCliRuntime } from './cli-runtime.ts';
 import { copyRuntimePackages } from './runtime-packages.ts';
 
 const helperSourcePath = 'apps/controller/src/providers/local/secure-input.m';
@@ -483,11 +484,7 @@ export async function packageDesktop() {
         !(name.startsWith('@crewkite/') && version === 'workspace:*') &&
         name !== 'zod' &&
         !(path === 'apps/controller' && name === '@lmstudio/sdk' && version === '2.1.0') &&
-        // shortcut: the package leaves out the CLI's terminal interface. Its closure holds two
-        // ansi-styles versions, which one flat runtime realm cannot hold, and the interactive
-        // view imports renderer modules this runtime does not copy. The packaged CLI keeps its
-        // commands and print mode and says interactive mode needs a source checkout. Upgrade
-        // path: a nested realm for apps/cli with Ink's pinned closure and its notices.
+        // The CLI's terminal interface ships in its own store, staged by stageCliRuntime below.
         !(
           path === 'apps/cli' &&
           ((name === 'ink' && version === '8.0.0') || (name === 'react' && version === '19.3.1'))
@@ -560,6 +557,8 @@ export async function packageDesktop() {
     ],
     budget: copyBudget,
   });
+  // Ink, React and the renderer modules the interactive CLI imports, in a store under apps/cli.
+  const cliRuntime = await stageCliRuntime({ source: checkout, runtime, budget: copyBudget });
   for (const entry of verificationFiles) {
     const from = join(checkout, entry.path);
     const to = join(runtime, entry.path);
@@ -593,7 +592,7 @@ export async function packageDesktop() {
     copy(from, join(stage, destination));
     notices.push({ name, version, license: destination, sha256: hash(from) });
   }
-  for (const item of runtimePackages)
+  for (const item of [...runtimePackages, ...cliRuntime.packages])
     notice(
       item.name,
       item.version,
