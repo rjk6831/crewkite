@@ -893,6 +893,18 @@ export class ChatService {
   }
 
   /**
+   * Plan commands. The controller validates, assigns and runs a plan once plan runs exist; until
+   * then a plan command changes nothing and says so.
+   */
+  planCommand(payload: Payload<'RunChatPlan'> | Payload<'CancelChatPlan'>): CommandResult {
+    if (!this.task(payload.taskId)) return blocked('task-not-found');
+    return blocked(
+      'plan-unavailable',
+      'Plans cannot run in this version. Send the work as a message.',
+    );
+  }
+
+  /**
    * Remove event output artifacts that no activity row names, and each file once no artifact names
    * its hash. The file goes before the record, so a crash between the two leaves a record that
    * startup finds and removes.

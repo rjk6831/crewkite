@@ -1173,6 +1173,9 @@ export class Controller {
         'DiscardChatChange',
         'RenameChatThread',
         'DeleteChatThread',
+        'AskChatFamily',
+        'RunChatPlan',
+        'CancelChatPlan',
       ].includes(command.command)
     ) {
       // A thread streams events many times a second. Its commands serialize on the active turn,
@@ -1335,6 +1338,9 @@ export class Controller {
         return this.chat().renameThread(command.payload);
       case 'DeleteChatThread':
         return this.chat().deleteThread(command.payload, effects);
+      case 'RunChatPlan':
+      case 'CancelChatPlan':
+        return this.chat().planCommand(command.payload);
       case 'ReadChatTurnEvents':
         return this.chat().readTurnEvents(command.payload);
       case 'AcceptChatChanges':
