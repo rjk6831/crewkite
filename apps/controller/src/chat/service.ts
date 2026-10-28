@@ -60,7 +60,10 @@ import {
   type FileContent,
   git,
   type KeptEntry,
+  type PlannedFile,
   readCandidateFiles,
+  readPlannedBlobs,
+  scratchPlan,
 } from '../host/source.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../host/worker.ts';
 import { localSliceFits } from '../providers/local/budget.ts';
@@ -1547,8 +1550,9 @@ export class ChatService {
     const directory = this.scratchDirectory(task.id);
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
-    const source = committedFiles(root, thread.base, { scratch: true });
+    const source = scratchPlan(root, thread.base);
     copyScratch(directory, source.files, source.links, {
+      read: (files) => readPlannedBlobs(root, files as PlannedFile[]),
       checkout: { root, base: thread.base },
       name: basename(root),
       onProgress: (progress) => {

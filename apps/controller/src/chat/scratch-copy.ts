@@ -1,6 +1,12 @@
 import { constants, copyFileSync, lstatSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { type FileContent, git, type LinkEntry, materialize } from '../host/source.ts';
+import {
+  type FileContent,
+  type FileEntry,
+  git,
+  type LinkEntry,
+  materialize,
+} from '../host/source.ts';
 import type { ImportProgress } from './files.ts';
 
 /** Put one checkout file at a new path as a copy-on-write clone. It throws when it cannot. */
@@ -22,7 +28,13 @@ export type ScratchCopyOptions = {
   onProgress?: (progress: ImportProgress) => void;
   /** Names the copy in progress updates. */
   name?: string;
+  /** Reads the bytes of files that came without any, such as a few planned blobs. */
+  read?: (files: readonly FileEntry[]) => Buffer[];
+  /** The most bytes one `read` call asks for, apart from a single larger file. */
+  chunkBytes?: number;
 };
+
+const CHUNK_BYTES = 32 * 1024 * 1024;
 
 /**
  * Fill a new empty scratch directory with the base's files and links. The rules for paths, links
@@ -33,7 +45,7 @@ export type ScratchCopyOptions = {
  */
 export function copyScratch(
   directory: string,
-  files: readonly FileContent[],
+  files: readonly (FileEntry | FileContent)[],
   links: readonly LinkEntry[],
   options: ScratchCopyOptions = {},
 ): { cloned: number; written: number } {
@@ -45,11 +57,33 @@ export function copyScratch(
   let written = 0;
   let bytes = 0;
   let reported = 0;
+  // Files without bytes are read in runs, so memory holds one run and never the whole base.
+  let run = new Map<string, Buffer>();
+  const bytesOf = (file: FileEntry | FileContent): Buffer => {
+    if ('content' in file) return file.content;
+    if (!run.has(file.path)) {
+      if (!options.read) throw new Error('A scratch file needs its bytes.');
+      const from = files.indexOf(file);
+      const chunk: FileEntry[] = [];
+      for (let at = from, size = 0; at < files.length; at++) {
+        const next = files[at];
+        if ('content' in next || (chunk.length && size + next.bytes > chunkBytes)) break;
+        chunk.push(next);
+        size += next.bytes;
+      }
+      const blobs = options.read(chunk);
+      run = new Map(chunk.map((entry, index) => [entry.path, blobs[index]]));
+    }
+    const bytes = run.get(file.path) as Buffer;
+    run.delete(file.path);
+    return bytes;
+  };
+  const chunkBytes = options.chunkBytes ?? CHUNK_BYTES;
   materialize(directory, files, links, (file, target) => {
     if (cloning && options.checkout && cloneOne(options.checkout.root, file, target)) cloned++;
     else {
       rmSync(target, { force: true });
-      writeFileSync(target, file.content, { flag: 'wx', mode: 0o600 });
+      writeFileSync(target, bytesOf(file), { flag: 'wx', mode: 0o600 });
       written++;
     }
     bytes += file.bytes;
@@ -61,7 +95,7 @@ export function copyScratch(
   options.onProgress?.({ name, bytes: total, total });
   return { cloned, written };
 
-  function cloneOne(root: string, file: FileContent, target: string): boolean {
+  function cloneOne(root: string, file: FileEntry, target: string): boolean {
     try {
       const source = join(root, file.path);
       const state = lstatSync(source);

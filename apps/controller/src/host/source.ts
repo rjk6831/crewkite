@@ -384,7 +384,17 @@ export function committedFiles(
   return selected.map(({ mode, name }, index) => content(name, mode, blobs[index]));
 }
 
-function scratchSource(path: string, output: Buffer): CommittedSource {
+type ScratchClasses = {
+  regular: { mode: FileEntry['mode']; oid: string; name: string }[];
+  linked: { oid: string; name: string; raw: Buffer }[];
+  // Blobs under paths the copy cannot name. The accepted tree still needs their bytes.
+  encoded: KeptEntry[];
+  skipped: SkippedEntry[];
+  kept: KeptEntry[];
+};
+
+/** Sort a base tree into what the copy holds, what it holds as a link and what it leaves out. */
+function classifyScratch(output: Buffer): ScratchClasses {
   const records: Buffer[] = [];
   for (let start = 0; start < output.length; ) {
     const end = output.indexOf(0, start);
@@ -398,12 +408,8 @@ function scratchSource(path: string, output: Buffer): CommittedSource {
     );
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
-  const skipped: SkippedEntry[] = [];
-  const kept: KeptEntry[] = [];
-  const regular: { mode: FileEntry['mode']; oid: string; name: string }[] = [];
-  const linked: { oid: string; name: string; raw: Buffer }[] = [];
-  // Blobs under paths the copy cannot name. The accepted tree still needs their bytes.
-  const encoded: KeptEntry[] = [];
+  const classes: ScratchClasses = { regular: [], linked: [], encoded: [], skipped: [], kept: [] };
+  const { regular, linked, encoded, skipped, kept } = classes;
   for (const record of records) {
     const tab = record.indexOf(9);
     const match =
@@ -433,17 +439,15 @@ function scratchSource(path: string, output: Buffer): CommittedSource {
     } else if (mode === '120000') linked.push({ oid, name, raw });
     else regular.push({ mode: mode as FileEntry['mode'], oid, name });
   }
-  const blobs = readBlobs(
-    path,
-    [...regular, ...linked, ...encoded].map((entry) => entry.oid),
-  );
-  const files = regular.map(({ mode, name }, index) => content(name, mode, blobs[index]));
-  encoded.forEach((entry, index) => {
-    entry.content = blobs[regular.length + linked.length + index];
-  });
+  return classes;
+}
+
+/** Settle the links once their targets are read. Returns the links the copy holds. */
+function settleLinks(classes: ScratchClasses, blobs: readonly Buffer[]): LinkEntry[] {
+  const { linked, skipped, kept } = classes;
   const candidates = new Map<string, LinkEntry>();
   linked.forEach(({ oid, name, raw }, index) => {
-    const bytes = blobs[regular.length + index];
+    const bytes = blobs[index];
     kept.push({ path: raw, mode: '120000', oid, content: bytes });
     let target: string;
     try {
@@ -458,10 +462,100 @@ function scratchSource(path: string, output: Buffer): CommittedSource {
   for (const name of candidates.keys())
     if (!inside.has(name)) skipped.push({ path: name, reason: 'link-outside' });
   skipped.sort((left, right) => (left.path < right.path ? -1 : left.path > right.path ? 1 : 0));
-  return { files, links: [...inside.values()], skipped, kept };
+  return [...inside.values()];
 }
 
-function readBlobs(path: string, oids: readonly string[]): Buffer[] {
+function scratchSource(path: string, output: Buffer): CommittedSource {
+  const classes = classifyScratch(output);
+  const { regular, linked, encoded } = classes;
+  const blobs = readBlobs(
+    path,
+    [...regular, ...linked, ...encoded].map((entry) => entry.oid),
+  );
+  const files = regular.map(({ mode, name }, index) => content(name, mode, blobs[index]));
+  encoded.forEach((entry, index) => {
+    entry.content = blobs[regular.length + linked.length + index];
+  });
+  const links = settleLinks(classes, blobs.slice(regular.length, regular.length + linked.length));
+  return { files, links, skipped: classes.skipped, kept: classes.kept };
+}
+
+/** A regular file of the base that the copy holds, with its size and no bytes. */
+export type PlannedFile = FileEntry & { oid: string };
+export type ScratchPlan = {
+  files: PlannedFile[];
+  links: LinkEntry[];
+  skipped: SkippedEntry[];
+  kept: KeptEntry[];
+};
+
+/**
+ * The scratch copy's entries without the regular files' bytes. Links and entries the copy leaves
+ * out follow the rules `committedFiles` applies with `scratch: true`. A regular file carries its
+ * size, and an empty `hash`, because its identity is its `oid`. No byte limit applies to the
+ * regular files; `readPlannedBlobs` reads them a few at a time.
+ */
+export function scratchPlan(path: string, base: string): ScratchPlan {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(base))
+    throw new Error('Invalid committed source identity.');
+  const classes = classifyScratch(git(path, ['ls-tree', '-rz', '--full-tree', base]));
+  const { regular, linked, encoded } = classes;
+  const blobs = readBlobs(
+    path,
+    [...linked, ...encoded].map((entry) => entry.oid),
+  );
+  encoded.forEach((entry, index) => {
+    entry.content = blobs[linked.length + index];
+  });
+  const links = settleLinks(classes, blobs.slice(0, linked.length));
+  const sizes = blobSizes(
+    path,
+    regular.map((entry) => entry.oid),
+  );
+  const files = regular.map(({ mode, oid, name }, index) => ({
+    path: name,
+    mode,
+    hash: '',
+    bytes: sizes[index],
+    oid,
+  }));
+  return { files, links, skipped: classes.skipped, kept: classes.kept };
+}
+
+function blobSizes(path: string, oids: readonly string[]): number[] {
+  if (!oids.length) return [];
+  let out: string;
+  try {
+    out = runGit(
+      path,
+      ['cat-file', '--batch-check'],
+      `${oids.join('\n')}\n`,
+      undefined,
+      oids.length * 160 + 1024,
+    ).toString('utf8');
+  } catch {
+    throw new Error(
+      'A committed blob is unavailable locally. Fetch it outside this workspace and prepare again.',
+    );
+  }
+  const lines = out.split('\n');
+  return oids.map((oid, index) => {
+    const match = /^([a-f0-9]{40}|[a-f0-9]{64}) blob (0|[1-9][0-9]*)$/.exec(lines[index] ?? '');
+    if (!match || match[1] !== oid) throw Error('A committed blob is unavailable locally.');
+    return Number(match[2]);
+  });
+}
+
+/** The bytes of some planned files. The caller keeps the total of one call bounded. */
+export function readPlannedBlobs(path: string, files: readonly PlannedFile[]): Buffer[] {
+  return readBlobs(
+    path,
+    files.map((file) => file.oid),
+    files.reduce((sum, file) => sum + file.bytes, 0),
+  );
+}
+
+function readBlobs(path: string, oids: readonly string[], limit = MAX_SOURCE_BYTES): Buffer[] {
   if (!oids.length) return [];
   let batch: Buffer;
   try {
@@ -470,7 +564,7 @@ function readBlobs(path: string, oids: readonly string[]): Buffer[] {
       ['cat-file', '--batch'],
       `${oids.join('\n')}\n`,
       undefined,
-      MAX_SOURCE_BYTES + oids.length * 96,
+      limit + oids.length * 96,
     );
   } catch {
     throw new Error(
@@ -489,8 +583,7 @@ function readBlobs(path: string, oids: readonly string[]): Buffer[] {
       throw Error('A committed blob is unavailable locally or changed identity.');
     const size = Number(header[2]);
     total += size;
-    if (!Number.isSafeInteger(size) || total > MAX_SOURCE_BYTES)
-      throw Error('Source exceeds the byte limit.');
+    if (!Number.isSafeInteger(size) || total > limit) throw Error('Source exceeds the byte limit.');
     offset = end + 1;
     if (offset + size >= batch.length || batch[offset + size] !== 10)
       throw Error('Incomplete committed blob response.');
@@ -810,10 +903,10 @@ export function applyReplacement(
 
 export function materialize(
   root: string,
-  files: readonly FileContent[],
+  files: readonly (FileEntry | FileContent)[],
   links: readonly LinkEntry[] = [],
   /** Puts one file's bytes at its path. The default writes them. A caller may clone them instead. */
-  write: (file: FileContent, target: string) => void = writeScratchFile,
+  write: (file: FileEntry | FileContent, target: string) => void = writeScratchFile,
 ) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   if (
@@ -831,7 +924,7 @@ export function materialize(
     throw new Error('A scratch link leads outside the copy.');
   for (const file of files) {
     safePath(file.path, seen, prefixes);
-    if (createHash('sha256').update(file.content).digest('hex') !== file.hash)
+    if ('content' in file && createHash('sha256').update(file.content).digest('hex') !== file.hash)
       throw new Error('Source content identity changed.');
     mkdirSync(dirname(join(root, file.path)), { recursive: true, mode: 0o700 });
     write(file, join(root, file.path));
@@ -843,7 +936,8 @@ export function materialize(
   }
 }
 
-function writeScratchFile(file: FileContent, target: string) {
+function writeScratchFile(file: FileEntry | FileContent, target: string) {
+  if (!('content' in file)) throw new Error('A scratch file needs its bytes.');
   writeFileSync(target, file.content, { flag: 'wx', mode: file.mode === '100755' ? 0o755 : 0o644 });
 }
 

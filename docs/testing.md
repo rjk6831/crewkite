@@ -97,9 +97,9 @@ Fake providers prove controller decisions: admission, routing, recovery and evid
 
 ## Scratch copy clones
 
-The first turn on a thread fills its scratch directory through `copyScratch` in `apps/controller/src/chat/scratch-copy.ts`. When the project's checkout sits on the thread's base and git sees no change to a tracked file, each regular file whose size matches the committed size is cloned from the checkout with `fs.copyFileSync` and `COPYFILE_FICLONE_FORCE`. Every other file is written from the committed bytes. The first EXDEV, ENOTSUP or similar error ends the clone attempts and the rest is written. The path, link, submodule and non-UTF-8 rules stay in `materialize`, which `copyScratch` calls with a write hook, so a clone never skips a check. Progress uses the same `ImportProgress` update as a file import, one per 4 MiB and a final one.
+The first turn on a thread fills its scratch directory through `copyScratch` in `apps/controller/src/chat/scratch-copy.ts`. `scratchPlan` in `host/source.ts` lists the base tree with each regular file's size and no bytes, and it applies the same link, submodule and non-UTF-8 path rules as `committedFiles` with `scratch: true`, because both run one classifier. No byte limit applies to the regular files. When the project's checkout sits on the thread's base and git sees no change to a tracked file, each regular file whose size matches the committed size is cloned from the checkout with `fs.copyFileSync` and `COPYFILE_FICLONE_FORCE`. Every other file is read from git in runs of at most 32 MiB (a larger single file is read alone) and written. The first EXDEV, ENOTSUP or similar error ends the clone attempts and the rest is written. `materialize` still checks every path and link before it writes, and `copyScratch` calls it with a write hook, so a clone never skips a check. Progress uses the same `ImportProgress` update as a file import, one per 4 MiB and a final one.
 
-Two tests protect these claims in `scratch-copy.test.ts`. A clean checkout on the base is cloned, reports progress and produces the same tree hash as a plain copy. A volume that cannot clone, and an edited checkout, both fall back to writing and produce that same tree hash. Both inject the clone primitive, so they run on Linux with no reflink support, no network and no waits. Deleting a thread removes its `chat/<task>` folder, which holds the scratch copy, so a clone adds nothing to delete; the existing delete test in `service.test.ts` covers it.
+Two tests protect these claims in `scratch-copy.test.ts`. A clean checkout on the base is cloned, reports progress, leaves out the same link as the whole-read path and produces the same tree hash as that path. A volume that cannot clone, and an edited checkout, both fall back to writing and produce that same tree hash. The fallback test lowers the run limit to 1 MiB over a fixture that holds a 5 MiB file, and asserts the blobs arrive as one 5 MiB read and one 16 byte read, so a base larger than a run still copies. Both inject the clone primitive, so they run on Linux with no reflink support, no network and no waits. Deleting a thread removes its `chat/<task>` folder, which holds the scratch copy, so a clone adds nothing to delete; the existing delete test in `service.test.ts` covers it.
 
 Measurement on a 1 GiB repository, 256 files of 4 MiB random bytes in 16 folders, generated outside the repository by this script and never committed:
 
@@ -112,15 +112,13 @@ done
 git add -A && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
 ```
 
-A script then read the files into memory and timed `copyScratch` into an empty directory, once without a checkout and once with one.
+A throwaway test built the controller fixture, committed the 1 GiB tree on top of its repository, sent one message to a scripted adapter and timed the send until the turn finished. That span covers `ensureScratch` and a one-word turn.
 
-| Where | Path taken | Time | Bytes |
-|-------|------------|------|-------|
-| Linux 6.18 container, ext4 on a virtual disk, warm cache | write only | 2.90 s | 1,073,741,824 written |
-| Same | clone attempted, first call fails, 256 files written | 3.32 s | 1,073,741,824 written |
-| Same, cold cache | write only | 8.33 s | 1,073,741,824 written |
+| Where | Path taken | Send to done | Bytes |
+|-------|------------|--------------|-------|
+| Linux 6.18 container, ext4 on a virtual disk | clone attempted, first call fails, 256 files read from git and written | 14.4 s and 14.3 s in two runs | 1,073,741,824 written |
 | APFS on the Mac | clone | still to be measured on the Mac | still to be measured on the Mac |
 
-ext4 has no reflink, so this container could not exercise a successful clone, and I have no figure for it. The second row shows what the fallback costs on a volume that cannot clone: the status check and one failed call add well under half a second. The APFS figure, and the bytes it leaves unshared on disk, come from running the same script on the Mac.
+ext4 has no reflink, so this container could not exercise a successful clone, and I have no figure for it. Before this change the same repository could not start a turn at all, because the whole-read path stopped at 64 MiB. The write path now works at 1 GiB with memory held to one run. The APFS figure, and the bytes it leaves unshared on disk, come from running the same script on the Mac.
 
-Two limits stay. The service still reads every committed blob into memory before it copies, and `committedFiles` caps that at 64 MiB, so a 1 GiB repository does not reach the clone path through the service yet. The Changes and Accept paths read the whole base the same way. Lifting that needs a lazy source that reads only links and skipped entries, which is a separate change.
+Two limits stay. The Changes tab, Discard and Accept still read the whole base through `committedFiles` and refuse a base over 64 MiB, and a scratch directory over 64 MiB fails the scratch read. A turn on a large repository starts, and those three actions need a follow-up change.

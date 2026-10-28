@@ -14,7 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { committedFiles } from '../host/source.ts';
+import { committedFiles, readPlannedBlobs, scratchPlan } from '../host/source.ts';
 import type { ImportProgress } from './files.ts';
 import { type CloneFile, copyScratch } from './scratch-copy.ts';
 
@@ -74,15 +74,30 @@ function copy(clone: CloneFile | undefined, dirty = false) {
   const target = join(out, 'target');
   try {
     if (dirty) writeFileSync(join(root, 'src/deep/a.txt'), 'edited\n');
-    const source = committedFiles(root, base, { scratch: true });
-    copyScratch(plain, source.files, source.links);
+    // The whole-read path is the reference. The plan path never loads the base at once.
+    const whole = committedFiles(root, base, { scratch: true });
+    copyScratch(plain, whole.files, whole.links);
+    const plan = scratchPlan(root, base);
     const progress: ImportProgress[] = [];
-    const result = copyScratch(target, source.files, source.links, {
+    const reads: number[] = [];
+    const result = copyScratch(target, plan.files, plan.links, {
       checkout: { root, base },
       clone,
+      chunkBytes: 1024 * 1024,
+      read: (files) => {
+        reads.push(files.reduce((sum, file) => sum + file.bytes, 0));
+        return readPlannedBlobs(root, files as typeof plan.files);
+      },
       onProgress: (update) => progress.push(update),
     });
-    return { result, progress, same: treeHash(plain) === treeHash(target), files: source.files };
+    return {
+      result,
+      progress,
+      reads,
+      same: treeHash(plain) === treeHash(target),
+      files: plan.files,
+      skipped: plan.skipped.map((entry) => entry.reason),
+    };
   } finally {
     rmSync(root, { recursive: true, force: true });
     rmSync(out, { recursive: true, force: true });
@@ -91,13 +106,15 @@ function copy(clone: CloneFile | undefined, dirty = false) {
 
 test('a clean checkout on the base is cloned and the copy holds the same tree as a plain copy', () => {
   const calls: string[] = [];
-  const { result, progress, same, files } = copy((from, to) => {
+  const { result, progress, same, files, skipped, reads } = copy((from, to) => {
     calls.push(from);
     copyFileSync(from, to);
   });
   assert.equal(same, true);
   assert.deepEqual(result, { cloned: files.length, written: 0 });
   assert.equal(calls.length, files.length);
+  assert.deepEqual(skipped, ['link-outside']);
+  assert.deepEqual(reads, []);
   // The 5 MiB file crosses the 4 MiB step once, then the copy reports its end.
   assert.equal(progress.length, 2);
   assert.equal(progress.at(-1)?.bytes, progress.at(-1)?.total);
@@ -110,6 +127,8 @@ test('a volume that cannot clone and an edited checkout both fall back to writin
     throw Object.assign(new Error('no reflink'), { code: 'ENOTSUP' });
   });
   assert.equal(unsupported.same, true);
+  // The 5 MiB file is over the 1 MiB run limit, so it is read alone and the small ones together.
+  assert.deepEqual(unsupported.reads, [5 * 1024 * 1024, 16]);
   assert.equal(attempts, 1);
   assert.deepEqual(unsupported.result, { cloned: 0, written: unsupported.files.length });
   let calls = 0;
