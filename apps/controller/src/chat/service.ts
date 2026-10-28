@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
@@ -83,7 +84,7 @@ import {
   writeDiscardMark,
   writeThreadBaseRef,
 } from './changes.ts';
-import { commandsAllowed, enabledChecks, ThreadChecks } from './checks.ts';
+import { type ChecksOutcome, commandsAllowed, enabledChecks, ThreadChecks } from './checks.ts';
 import {
   dropStaged,
   FileRefused,
@@ -361,6 +362,11 @@ export class ChatService {
   private readonly plans: PlanRunner;
   /** Project checks the crew chain runs after a fix and after the last slice. */
   private readonly checks: ThreadChecks;
+  /** The question each thread waits on before its checks run, with what to do with the answer. */
+  private readonly checkAsk = new Map<
+    string,
+    { requestId: string; settle: (answer: 'allow' | 'deny' | 'stop', effects: Effects) => void }
+  >();
   private closed = false;
   /** The copy `importing` made, for the import command it commits next. */
   private staged:
@@ -384,6 +390,12 @@ export class ChatService {
         }),
       scratchDirectory: (taskId) => this.scratchDirectory(taskId),
       projectPath: deps.projectPath,
+      groupAbsent: deps.groupAbsent ?? groupAbsent,
+      holdOwnership: (taskId) =>
+        deps.store.transaction(() => {
+          const task = this.task(taskId);
+          if (task) this.putThread(task, { ...this.thread(taskId), ownershipUnknown: true });
+        }),
       deadlineMs: deps.checkDeadlineMs,
     });
   }
@@ -407,7 +419,7 @@ export class ChatService {
       return blocked('file-not-found', 'Attach the file again, then send.');
     const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
-    const free = !thread.activeTurnId && !left.length && !this.checks.running(task.id);
+    const free = !thread.activeTurnId && !left.length && !this.checksBusy(task.id);
     // One running turn per family across threads. The message waits in this thread's queue and
     // starts when the other thread's turn on that family ends.
     const waiting = this.waitsOnFamily(
@@ -437,6 +449,14 @@ export class ChatService {
   }
 
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
+    const asked = this.checkAsk.get(payload.taskId);
+    if (asked?.requestId === payload.requestId) {
+      if (payload.choice !== 'allow' && payload.choice !== 'deny')
+        return blocked('permission-not-pending', 'Choose allow or deny.');
+      this.dropCheckAsk(payload.taskId);
+      asked.settle(payload.choice, effects);
+      return { outcome: 'applied' };
+    }
     const live = this.activeLive(payload.taskId, payload.turnId);
     if (!live) return blocked('no-active-turn');
     const open = live.permissions.get(payload.requestId);
@@ -458,15 +478,24 @@ export class ChatService {
 
   stopTurn(payload: Payload<'StopChatTurn'>, effects: Effects): CommandResult {
     const live = this.activeLive(payload.taskId, payload.turnId);
-    // Between a fix turn and the next step the chain may be running the project checks.
-    if (!live && !this.checks.stop(payload.taskId)) return blocked('no-active-turn');
+    if (!live) {
+      // Between a fix turn and the next step the chain may wait on the person's answer or run
+      // the project checks. Stop ends that and leaves the queue alone; the queue starts once
+      // the chain has stopped.
+      const asked = this.checkAsk.get(payload.taskId);
+      if (asked) {
+        this.dropCheckAsk(payload.taskId);
+        asked.settle('stop', effects);
+      } else if (!this.checks.stop(payload.taskId)) return blocked('no-active-turn');
+      return { outcome: 'applied', data: { kind: 'chat-queue', messages: [] } };
+    }
     // The turn result marks the row stopped once the provider has let go.
-    if (live) live.stopRequested = true;
+    live.stopRequested = true;
     // Stop ends the wait too. The cleared messages go back so the composer can offer the text.
     const task = this.task(payload.taskId);
     const thread = this.thread(payload.taskId);
     if (task && thread.queued.length) this.putThread(task, { ...thread, queued: [] });
-    if (live) effects.push(() => this.call(() => live.handle?.stop()));
+    effects.push(() => this.call(() => live.handle?.stop()));
     return { outcome: 'applied', data: { kind: 'chat-queue', messages: thread.queued } };
   }
 
@@ -1115,6 +1144,8 @@ export class ChatService {
       },
       free: (task) => !this.checkedThread(task).left.length,
       scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      runCombinedChecks: (taskId, directory) => this.runCombinedChecks(taskId, directory),
+      stopCombinedChecks: (taskId) => this.stopCombinedChecks(taskId),
       localContext: () => this.deps.localContext?.() ?? null,
       localSliceFits: this.deps.localSliceFits ?? localSliceFits,
     };
@@ -1264,6 +1295,8 @@ export class ChatService {
       if (present.length !== turn.groups?.length) this.putTurn(task, withGroups(turn, present));
       left.push(...present);
     }
+    // A project check the journal cannot prove gone holds the thread like a provider process.
+    left.push(...this.checks.orphans(task.id));
     const { ownershipUnknown: flagged, ...thread } = this.thread(task.id);
     if (flagged && !left.length) this.putThread(task, thread);
     return left;
@@ -1285,6 +1318,8 @@ export class ChatService {
 
   close(): Promise<void> | undefined {
     this.closed = true;
+    for (const asked of [...this.checkAsk.values()]) asked.settle('stop', []);
+    this.checkAsk.clear();
     this.checks.close();
     const running = [...this.live.values()];
     for (const live of running) {
@@ -2081,10 +2116,51 @@ export class ChatService {
       this.stopCrew(task, this.thread(task.id), chain, `the ${step} could not start`, started.next);
   }
 
+  /** The thread waits on a check question or runs checks, so no turn may start. */
+  private checksBusy(taskId: string): boolean {
+    return this.checkAsk.has(taskId) || this.checks.running(taskId);
+  }
+
+  private dropCheckAsk(taskId: string) {
+    this.checkAsk.delete(taskId);
+    const task = this.task(taskId);
+    const thread = this.thread(taskId);
+    if (task && thread.checks?.ask)
+      this.putThread(task, { ...thread, checks: { ...thread.checks, ask: null } });
+  }
+
   /**
-   * Run the thread's enabled checks before the chain goes on. The chain waits with its step
-   * unchanged and no open turn, so a restart stops it like any other chain left mid-step. True
-   * when the run was queued; false when no check is on or the thread does not allow commands.
+   * Whether the person must answer before these checks run. Balanced always asks, as it does for
+   * a command outside the read-only set. Glide runs them when the thread's policy covers commands.
+   * A check whose command or script changed since it was turned on asks in every mode.
+   */
+  private checksNeedAsk(thread: ChatThread, changed: readonly string[]): boolean {
+    return thread.flightMode !== 'glide' || changed.length > 0 || !commandsAllowed(thread);
+  }
+
+  /** Put the question on the thread. The answer arrives as ResolveChatPermission. */
+  private raiseCheckAsk(
+    task: Task,
+    thread: ChatThread,
+    trigger: 'fix' | 'plan' | 'combined',
+    assessed: ReturnType<ThreadChecks['assess']>,
+    settle: (answer: 'allow' | 'deny' | 'stop', effects: Effects) => void,
+  ) {
+    const requestId = `chkask_${randomBytes(16).toString('hex')}`;
+    this.checkAsk.set(task.id, { requestId, settle });
+    const current = thread.checks;
+    if (!current) return;
+    this.putThread(task, {
+      ...thread,
+      checks: { ...current, ask: { requestId, trigger, ...assessed } },
+    });
+  }
+
+  /**
+   * Run the thread's enabled checks before the chain goes on, after the person has answered when
+   * the thread needs an answer. The chain waits with its step unchanged and no open turn, so a
+   * restart stops it like any other chain left mid-step. True when the checks were queued or the
+   * question was raised; false when no check is on.
    */
   private startChecks(
     task: Task,
@@ -2094,25 +2170,65 @@ export class ChatService {
     effects: Effects,
   ): boolean {
     if (!enabledChecks(thread).length) return false;
-    if (!commandsAllowed(thread)) {
-      this.appendEntry(task, {
-        kind: 'chat-system',
-        author: { kind: 'system', turnId: null },
-        text: 'The project checks did not run. This thread does not allow commands yet. Allow commands for this thread, and the checks run after the next fix.',
-      });
-      return false;
-    }
     const before = thread.crewChain;
+    const assessed = this.checks.assess(task, thread);
     // The run starts right after this transaction commits, in the same tick, so a rollback leaves
     // no reservation behind.
-    effects.push(() => {
-      const entry = this.checks.reserve(task.id);
-      this.checks.run(task.id, trigger, undefined, entry).then(
-        (result) => this.checksDone(task.id, before, next, result),
-        () => this.checksDone(task.id, before, next, null),
-      );
+    const go = (fx: Effects, repin: boolean) =>
+      fx.push(() => {
+        if (repin) this.checks.repin(task);
+        const entry = this.checks.reserve(task.id);
+        this.checks.run(task.id, trigger, undefined, entry).then(
+          (result) => this.checksDone(task.id, before, next, result),
+          () => this.checksDone(task.id, before, next, null),
+        );
+      });
+    if (!this.checksNeedAsk(thread, assessed.changed)) {
+      go(effects, false);
+      return true;
+    }
+    this.raiseCheckAsk(task, thread, trigger, assessed, (answer, fx) => {
+      if (answer === 'allow') go(fx, assessed.changed.length > 0);
+      else
+        fx.push(() =>
+          this.checksDone(task.id, before, next, {
+            outcome: answer === 'stop' ? 'stopped' : 'denied',
+            runs: [],
+            brief: null,
+          }),
+        );
     });
     return true;
+  }
+
+  /**
+   * Run the enabled checks on a merged copy, for the combined review before the challenger. The
+   * same question comes first when the thread needs one. `denied` means the person said no.
+   */
+  async runCombinedChecks(taskId: string, directory: string): Promise<ChecksOutcome> {
+    if (this.closed) throw new Error('The chat service is closed.');
+    const task = this.task(taskId);
+    if (!task) throw new Error('No thread has that task.');
+    const thread = this.thread(taskId);
+    const none = { outcome: 'none', runs: [], brief: null } as const;
+    if (!enabledChecks(thread).length) return none;
+    const assessed = this.checks.assess(task, thread, directory);
+    if (this.checksNeedAsk(thread, assessed.changed)) {
+      if (this.checkAsk.has(taskId)) return { outcome: 'denied', runs: [], brief: null };
+      const answer = await new Promise<'allow' | 'deny' | 'stop'>((resolve) =>
+        this.deps.store.transaction(() =>
+          this.raiseCheckAsk(task, this.thread(taskId), 'combined', assessed, resolve),
+        ),
+      );
+      if (answer !== 'allow')
+        return { outcome: answer === 'stop' ? 'stopped' : 'denied', runs: [], brief: null };
+    }
+    return this.checks.run(taskId, 'combined', directory);
+  }
+
+  /** Stop the runs on a merged copy. Only the plan step that started them calls it. */
+  stopCombinedChecks(taskId: string): boolean {
+    return this.checks.stopCombined(taskId);
   }
 
   /** The checks ended. Feed a failure to the fixer while fixes remain, otherwise go on. */
@@ -2120,7 +2236,7 @@ export class ChatService {
     taskId: string,
     before: ChatCrewChain | null,
     next: ChatCrewChain,
-    result: Awaited<ReturnType<ThreadChecks['run']>> | null,
+    result: ChecksOutcome | null,
   ) {
     const effects: Effects = [];
     try {
@@ -2142,6 +2258,8 @@ export class ChatService {
           return this.stopCrew(task, thread, before, 'you stopped the checks');
         if (sentMessage(thread))
           return this.stopCrew(task, thread, before, 'you sent a new message');
+        if (result.outcome === 'denied')
+          line('The project checks did not run. The commands were not allowed.');
         const labels = (status: 'passed' | 'failed') =>
           result.runs
             .filter((run) => run.status === status)
@@ -2356,7 +2474,7 @@ export class ChatService {
           !thread.queued.length ||
           thread.activeTurnId ||
           thread.ownershipUnknown ||
-          this.checks.running(taskId)
+          this.checksBusy(taskId)
         )
           return;
         const newest = this.newestTurn(taskId);

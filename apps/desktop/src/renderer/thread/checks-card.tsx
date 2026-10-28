@@ -26,14 +26,22 @@ const sizeLabel = (bytes: number) =>
 export function ChecksCard({
   checks,
   onStop,
+  onAnswer,
 }: {
   checks: ChatChecksState;
   onStop: () => Promise<void>;
+  onAnswer: (requestId: string, choice: 'allow' | 'deny') => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  if (checks.runs.length === 0) return null;
-  const open = checks.runs.some((run) => run.status === 'running');
+  const ask = checks.ask;
+  if (checks.runs.length === 0 && !ask) return null;
+  const open = checks.runs.some((run) => run.status === 'running') || !!ask;
+  const act = (work: Promise<void>) => {
+    setBusy(true);
+    setError(null);
+    work.catch((cause: unknown) => setError(failure(cause))).finally(() => setBusy(false));
+  };
   return (
     <section className="th-checks" aria-label="Checks">
       <header className="th-checks-head">
@@ -43,18 +51,49 @@ export function ChecksCard({
             type="button"
             className="th-pill th-outline"
             disabled={busy}
-            onClick={() => {
-              setBusy(true);
-              setError(null);
-              onStop()
-                .catch((cause: unknown) => setError(failure(cause)))
-                .finally(() => setBusy(false));
-            }}
+            onClick={() => act(onStop())}
           >
             Stop
           </button>
         )}
       </header>
+      {ask && (
+        <fieldset className="th-checks-ask">
+          <legend className="th-sr">Allow these commands</legend>
+          <p>
+            {ask.changed.length > 0
+              ? `A command or script changed since you turned it on: ${ask.changed.join(', ')}. `
+              : ''}
+            Run these commands in the scratch copy?
+          </p>
+          <ul>
+            {ask.commands.map((item) => (
+              <li key={item.label}>
+                <span className="th-checks-label">{item.label}</span>
+                <span className="th-muted th-checks-command">{item.resolved}</span>
+              </li>
+            ))}
+          </ul>
+          <div className="th-plan-actions">
+            <button
+              type="button"
+              className="th-button"
+              disabled={busy}
+              onClick={() => act(onAnswer(ask.requestId, 'allow'))}
+            >
+              Allow once
+            </button>
+            <button
+              type="button"
+              className="th-pill th-outline"
+              disabled={busy}
+              onClick={() => act(onAnswer(ask.requestId, 'deny'))}
+            >
+              Skip the checks
+            </button>
+          </div>
+        </fieldset>
+      )}
       <ol className="th-checks-runs">
         {[...checks.runs].reverse().map((run) => (
           <li key={run.id} className={`th-checks-run is-${run.status}`}>
@@ -147,7 +186,7 @@ export function ChecksSettings({
                 />
                 <span>{item.label}</span>
               </label>
-              <span className="th-muted th-checks-command">{item.command}</span>
+              <span className="th-muted th-checks-command">{item.resolved}</span>
               {item.source === 'custom' && (
                 <button
                   type="button"
@@ -191,10 +230,9 @@ export function ChecksSettings({
       </form>
       <p className="th-muted">
         Balanced and Glide run the checks that are on after each fix and after the last slice. A
-        failing check goes to the next fix.{' '}
-        {allowed
-          ? 'This thread allows commands.'
-          : 'Allow commands for this thread, or the checks do not run.'}
+        failing check goes to the next fix. Balanced asks before every run. Glide runs them when
+        this thread allows commands, and asks again when a command or script changed.{' '}
+        {allowed ? 'This thread allows commands.' : 'This thread does not allow commands yet.'}
       </p>
       {error && (
         <p className="th-error" role="alert">

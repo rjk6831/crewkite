@@ -23,7 +23,14 @@ export const ChatCheckSchema = z.strictObject({
   kind: ChatCheckKindSchema,
   source: ChatCheckSourceSchema,
   command: z.string().min(1).max(500),
+  /** What the command runs, such as the script text and any pre and post scripts. */
+  resolved: z.string().min(1).max(500),
   enabled: z.boolean(),
+  /**
+   * A digest of the command and the files behind it, taken when the person turned it on. A run
+   * that finds another digest asks again. Null while the check is off.
+   */
+  pin: hash.nullable(),
 });
 export type ChatCheck = z.infer<typeof ChatCheckSchema>;
 
@@ -57,8 +64,21 @@ export const ChatCheckRunSchema = z.strictObject({
 });
 export type ChatCheckRun = z.infer<typeof ChatCheckRunSchema>;
 
+/** The question the person answers before checks run: the exact commands, and what changed. */
+export const ChatChecksAskSchema = z.strictObject({
+  requestId: z.string().regex(/^chkask_[0-9a-f]{32}$/),
+  trigger: z.enum(['fix', 'plan', 'combined']),
+  commands: z
+    .array(z.strictObject({ label: z.string().max(80), resolved: z.string().max(500) }))
+    .max(16),
+  /** Labels of checks whose command or script changed since the person turned them on. */
+  changed: z.array(z.string().max(80)).max(16),
+});
+export type ChatChecksAsk = z.infer<typeof ChatChecksAskSchema>;
+
 export const ChatChecksStateSchema = z.strictObject({
   items: z.array(ChatCheckSchema).max(16),
+  ask: ChatChecksAskSchema.nullable().default(null),
   /** The newest runs, oldest first. */
   runs: z.array(ChatCheckRunSchema).max(CHECK_RUNS_KEPT),
   detectedAt: timestamp.nullable(),

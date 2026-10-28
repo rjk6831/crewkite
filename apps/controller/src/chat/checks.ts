@@ -1,7 +1,6 @@
-import { randomBytes } from 'node:crypto';
-import { existsSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { basename, join } from 'node:path';
+import { createHash, randomBytes } from 'node:crypto';
+import { existsSync, lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { basename, join, resolve, sep } from 'node:path';
 import { stripVTControlCharacters } from 'node:util';
 import {
   type Artifact,
@@ -13,9 +12,14 @@ import {
   type ChatChecksEdit,
   type ChatChecksState,
   type ChatThread,
+  canonicalJson,
+  ProjectCommandPreviewSchema,
   type Task,
 } from '@crewkite/contracts';
+import { hashCanonical } from '@crewkite/contracts/hash';
 import type { ArtifactFiles } from '../artifacts/index.ts';
+import { liveOperations } from '../commands/live-operations.ts';
+import { OperationStore } from '../commands/operation-store.ts';
 import { createOwnedProjectCommandRunner } from '../commands/owned-runner.ts';
 import {
   type ProjectCommandDefinition,
@@ -23,16 +27,23 @@ import {
   startProjectCommand,
 } from '../commands/project-command.ts';
 import { executablePin } from '../commands/task-operations.ts';
+import { inspectSource } from '../host/source.ts';
 import { createIds } from '../store/ids.ts';
 import type { Store } from '../store/index.ts';
 import { redact } from './thread-reader.ts';
 
 // Project checks in the loop (ADR 0038 chain, ADR 0002 authority). The controller detects the
-// checks, the person switches them, and the chain runs the enabled ones in the thread's scratch
-// copy through the shared process owner. A check is never a shell line: the controller resolves
-// the program and pins its bytes before every run. Output lands in the artifact store.
+// checks and the person switches them on. A run needs the person's answer to a permission
+// question unless Glide's policy already covers commands and nothing changed since the switch.
+// A check runs without a shell: the controller finds the program on PATH and pins its bytes
+// before every run, and records the process in the operation journal like any project command.
+// A command the person adds cannot start a shell or a wrapper, run inline code or name a file
+// outside the scratch copy. Output lands in the artifact store.
 
-export type DetectedCheck = Pick<ChatCheck, 'id' | 'label' | 'kind' | 'source' | 'command'>;
+export type DetectedCheck = Pick<
+  ChatCheck,
+  'id' | 'label' | 'kind' | 'source' | 'command' | 'resolved'
+>;
 
 const MAX_ITEMS = 16;
 const FILE_BYTES = 1024 * 1024;
@@ -42,6 +53,39 @@ const KEPT_BYTES = 12 * 1024;
 const BRIEF_CHARACTERS = 12_000;
 const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
 const SHELLS = new Set(['bash', 'cmd', 'dash', 'fish', 'ksh', 'powershell', 'pwsh', 'sh', 'zsh']);
+// Programs that start another program, fetch code or hand the line to a shell.
+const WRAPPERS = new Set([
+  'env',
+  'nice',
+  'nohup',
+  'time',
+  'timeout',
+  'xargs',
+  'sudo',
+  'doas',
+  'command',
+  'exec',
+  'setsid',
+  'stdbuf',
+  'busybox',
+  'npx',
+  'pnpx',
+  'bunx',
+]);
+const INTERPRETERS = new Set([
+  'node',
+  'nodejs',
+  'python',
+  'python3',
+  'ruby',
+  'perl',
+  'php',
+  'bun',
+  'deno',
+]);
+const INLINE_FLAG = /^(--eval|--print)(=.*)?$|^-[a-zA-Z]*[ecpE][a-zA-Z]*$/;
+export const ADDED_RULE =
+  'Name a program on PATH and files inside the scratch copy. Shells, wrappers such as env, inline code such as node -e and paths outside the copy are refused.';
 
 const KINDS = [
   ['test', 'Tests'],
@@ -67,9 +111,27 @@ function packageManager(directory: string): string {
   return 'npm';
 }
 
+function packageScripts(directory: string): Record<string, unknown> | null {
+  const manifest = read(directory, 'package.json');
+  if (!manifest) return null;
+  try {
+    const scripts = (JSON.parse(manifest) as { scripts?: unknown }).scripts;
+    return scripts && typeof scripts === 'object' && !Array.isArray(scripts)
+      ? (scripts as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+const clipText = (text: string, characters: number) =>
+  text.length > characters ? `${text.slice(0, characters - 1).toWellFormed()}…` : text;
+
 /**
  * The checks a project declares: package.json scripts, pyproject.toml tool tables, Makefile
- * targets and a Cargo.toml. Reads files only; nothing is run and nothing is installed.
+ * targets and a Cargo.toml. Reads files only; nothing is run and nothing is installed. The
+ * resolved text names what the command runs, including the pre and post scripts npm and yarn
+ * run around a script.
  */
 export function detectChecks(directory: string): DetectedCheck[] {
   const found: DetectedCheck[] = [];
@@ -77,24 +139,34 @@ export function detectChecks(directory: string): DetectedCheck[] {
     source: DetectedCheck['source'],
     kind: 'test' | 'lint' | 'typecheck',
     command: string,
+    resolved = command,
   ) => {
     const label = KINDS.find(([value]) => value === kind)?.[1] ?? kind;
-    found.push({ id: `${source}:${kind}`, label: `${label} (${source})`, kind, source, command });
+    found.push({
+      id: `${source}:${kind}`,
+      label: `${label} (${source})`,
+      kind,
+      source,
+      command,
+      resolved: clipText(resolved, 500),
+    });
   };
 
-  const manifest = read(directory, 'package.json');
-  if (manifest) {
-    let scripts: unknown;
-    try {
-      scripts = (JSON.parse(manifest) as { scripts?: unknown }).scripts;
-    } catch {
-      scripts = undefined;
-    }
-    if (scripts && typeof scripts === 'object' && !Array.isArray(scripts)) {
-      const manager = packageManager(directory);
-      for (const [kind] of KINDS)
-        if (typeof (scripts as Record<string, unknown>)[kind] === 'string')
-          add('package.json', kind, `${manager} run ${kind}`);
+  const scripts = packageScripts(directory);
+  if (scripts) {
+    const manager = packageManager(directory);
+    for (const [kind] of KINDS) {
+      if (typeof scripts[kind] !== 'string') continue;
+      const names = manager === 'pnpm' ? [kind] : [`pre${kind}`, kind, `post${kind}`];
+      const parts = names.flatMap((name) =>
+        typeof scripts[name] === 'string' ? [`${name}: ${scripts[name]}`] : [],
+      );
+      add(
+        'package.json',
+        kind,
+        `${manager} run ${kind}`,
+        `${manager} run ${kind} runs ${parts.join('; ')}`,
+      );
     }
   }
 
@@ -107,8 +179,16 @@ export function detectChecks(directory: string): DetectedCheck[] {
 
   const make = read(directory, 'Makefile');
   if (make !== null)
-    for (const [kind] of KINDS)
-      if (new RegExp(`^${kind}\\s*:`, 'm').test(make)) add('Makefile', kind, `make ${kind}`);
+    for (const [kind] of KINDS) {
+      const target = new RegExp(`^${kind}\\s*:[^\\n]*\\n((?:\\t[^\\n]*\\n?)*)`, 'm').exec(make);
+      if (!target) continue;
+      const recipe = target[1]
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .join('; ');
+      add('Makefile', kind, `make ${kind}`, `make ${kind} runs ${recipe || 'no recipe'}`);
+    }
 
   if (read(directory, 'Cargo.toml') !== null) {
     add('Cargo.toml', 'test', 'cargo test');
@@ -131,6 +211,65 @@ export function commandWords(command: string): string[] | null {
   return words;
 }
 
+/**
+ * Why a command a person added is refused, or null. Wrappers and interpreters with inline code
+ * would run what the words do not show, and a path outside the scratch copy names a file the
+ * fixer cannot be held to.
+ */
+export function addedProblem(words: readonly string[], scratch: string): string | null {
+  const program = basename(words[0]).toLowerCase();
+  if (WRAPPERS.has(program)) return ADDED_RULE;
+  if (INTERPRETERS.has(program)) {
+    for (const word of words.slice(1)) {
+      if (word === '-m' || !word.startsWith('-')) break;
+      if (INLINE_FLAG.test(word)) return ADDED_RULE;
+    }
+    if (program === 'deno' && words[1] === 'eval') return ADDED_RULE;
+  }
+  const root = resolve(scratch);
+  for (const word of words) {
+    const value = word.includes('=') ? word.slice(word.indexOf('=') + 1) : word;
+    if (value.split('/').includes('..')) return ADDED_RULE;
+    if (value.startsWith('/') && !(resolve(value) + sep).startsWith(root + sep)) return ADDED_RULE;
+  }
+  return null;
+}
+
+/** A digest of the command and of the files that decide what it runs. */
+function sourceDigest(
+  item: Pick<ChatCheck, 'kind' | 'source' | 'command'>,
+  directory: string,
+): string {
+  const hash = createHash('sha256');
+  hash.update(`${item.command}\0`);
+  if (item.source === 'package.json') {
+    const scripts = packageScripts(directory);
+    for (const name of [`pre${item.kind}`, item.kind, `post${item.kind}`])
+      hash.update(`${name}=${typeof scripts?.[name] === 'string' ? scripts[name] : ''}\0`);
+  } else if (item.source === 'custom') {
+    // A word that names a file of the copy pins the file, so editing a script asks again.
+    for (const word of item.command.split(/\s+/).slice(1)) {
+      const content = word.startsWith('-') ? null : read(directory, word);
+      if (content !== null) hash.update(`${word}\0${content}\0`);
+    }
+  } else {
+    hash.update(read(directory, item.source) ?? 'missing');
+  }
+  return hash.digest('hex');
+}
+
+/** What an item runs now, and the digest to compare with its pin. */
+function describe(item: ChatCheck, directory: string): { resolved: string; digest: string } {
+  const found =
+    item.source === 'custom' ? null : detectChecks(directory).find((value) => value.id === item.id);
+  return {
+    resolved:
+      found?.resolved ??
+      (item.source === 'custom' ? item.command : `${item.command} (no longer declared)`),
+    digest: sourceDigest(item, directory),
+  };
+}
+
 const RECIPE: Record<ChatCheck['kind'], ProjectCommandRecipeName> = {
   test: 'test',
   lint: 'lint',
@@ -138,7 +277,7 @@ const RECIPE: Record<ChatCheck['kind'], ProjectCommandRecipeName> = {
   custom: 'test',
 };
 
-/** The thread allows commands outside the read-only set: Allow all, or a command grant. */
+/** The thread's own policy covers commands outside the read-only set: Allow all or a grant. */
 export function commandsAllowed(thread: ChatThread): boolean {
   return thread.permissionPolicy === 'allow-all' || !!thread.permissionGrants?.includes('command');
 }
@@ -147,7 +286,7 @@ export const enabledChecks = (thread: ChatThread): ChatCheck[] =>
   (thread.checks?.items ?? []).filter((item) => item.enabled);
 
 export type ChecksOutcome = Readonly<{
-  /** none: nothing is switched on. denied: the thread does not allow commands. */
+  /** none: nothing is switched on. denied: the person did not allow the commands. */
   outcome: 'none' | 'denied' | 'passed' | 'failed' | 'stopped';
   runs: readonly ChatCheckRun[];
   /** The message for a fix turn, or null when nothing failed. */
@@ -165,6 +304,9 @@ export type ChecksHost = {
   update: (taskId: string, change: (thread: ChatThread) => ChatThread) => void;
   scratchDirectory: (taskId: string) => string;
   projectPath: (projectId: string) => string | undefined;
+  /** Block the thread's turns until the recorded process groups are found gone. */
+  holdOwnership: (taskId: string) => void;
+  groupAbsent: (group: number) => boolean;
   deadlineMs?: number;
 };
 
@@ -187,14 +329,13 @@ const PENDING_CHUNKS = 64;
 /**
  * Start reading a process stream at once and hand its chunks on as the consumer asks. A process
  * that exits before anyone reads has its unread output dropped by Node, and the artifact store
- * opens its file first, so a quick check would lose its output. At most 64 chunks wait.
+ * opens its file first, so a quick check would lose its output. At most 64 chunks wait, and
+ * `abandon` ends the read when the consumer is gone.
  */
-function eager(
-  source: AsyncIterable<Uint8Array>,
-  keep: (chunk: Uint8Array) => void,
-): AsyncIterable<Uint8Array> {
+function eager(source: AsyncIterable<Uint8Array>, keep: (chunk: Uint8Array) => void) {
   const waiting: Uint8Array[] = [];
   let ended = false;
+  let abandoned = false;
   let failure: unknown;
   let wake: (() => void) | undefined;
   let drained: (() => void) | undefined;
@@ -202,14 +343,23 @@ function eager(
     wake?.();
     wake = undefined;
   };
+  const abandon = () => {
+    abandoned = true;
+    waiting.length = 0;
+    drained?.();
+    drained = undefined;
+    notify();
+  };
   void (async () => {
     try {
       for await (const chunk of source) {
+        if (abandoned) break;
         keep(chunk);
         waiting.push(chunk);
         notify();
-        if (waiting.length >= PENDING_CHUNKS)
+        if (waiting.length >= PENDING_CHUNKS && !abandoned)
           await new Promise<void>((resolve) => (drained = resolve));
+        if (abandoned) break;
       }
     } catch (error) {
       failure = error;
@@ -218,20 +368,25 @@ function eager(
       notify();
     }
   })();
-  return {
+  const stream: AsyncIterable<Uint8Array> = {
     async *[Symbol.asyncIterator]() {
-      for (;;) {
-        const chunk = waiting.shift();
-        if (chunk) {
-          drained?.();
-          drained = undefined;
-          yield chunk;
-        } else if (failure) throw failure;
-        else if (ended) return;
-        else await new Promise<void>((resolve) => (wake = resolve));
+      try {
+        for (;;) {
+          const chunk = waiting.shift();
+          if (chunk) {
+            drained?.();
+            drained = undefined;
+            yield chunk;
+          } else if (failure) throw failure;
+          else if (ended || abandoned) return;
+          else await new Promise<void>((resolve) => (wake = resolve));
+        }
+      } finally {
+        abandon();
       }
     },
   };
+  return { stream, abandon };
 }
 
 export function checkFixBrief(runs: readonly Finished[]): string {
@@ -249,18 +404,17 @@ export function checkFixBrief(runs: readonly Finished[]): string {
   ].join('\n\n');
 }
 
-// The service that started last. Code outside the service reaches its checks through it.
-let bound: ThreadChecks | undefined;
-
 export class ThreadChecks {
   private readonly host: ChecksHost;
   private readonly entries = new Set<Entry>();
+  private readonly ops = new Set<string>();
   private readonly ids: ReturnType<typeof createIds>;
+  private readonly journal: OperationStore;
 
   constructor(host: ChecksHost) {
     this.host = host;
     this.ids = createIds(host.now);
-    bound = this;
+    this.journal = new OperationStore(host.store, host.now);
   }
 
   /** A run of this thread's own scratch copy is open. The thread takes no new turn meanwhile. */
@@ -275,11 +429,22 @@ export class ThreadChecks {
     return entry;
   }
 
-  /** Stop the thread's open runs. True when there was one. */
+  /**
+   * Stop the thread's open runs of the scratch copy. Runs on a merged copy belong to the plan
+   * step that started them and end only through `stopCombined`.
+   */
   stop(taskId: string): boolean {
+    return this.stopWhere(taskId, false);
+  }
+
+  stopCombined(taskId: string): boolean {
+    return this.stopWhere(taskId, true);
+  }
+
+  private stopWhere(taskId: string, combined: boolean): boolean {
     let any = false;
     for (const entry of this.entries)
-      if (entry.taskId === taskId) {
+      if (entry.taskId === taskId && entry.combined === combined) {
         any = true;
         entry.stopped = true;
         entry.stop();
@@ -294,11 +459,16 @@ export class ThreadChecks {
     }
   }
 
-  /** Runs left open by a controller that is gone have no process this one owns. */
+  /**
+   * After a restart nobody owns an open run. It reads as failed, the question it waited on is
+   * gone, and a process the journal cannot prove gone keeps the thread from taking a turn.
+   */
   recover() {
+    this.journal.recover(this.host.groupAbsent, this.ops);
     const rows = this.host.store.db
       .prepare(
-        "SELECT DISTINCT task_id FROM chat_threads, json_each(body,'$.checks.runs') WHERE json_extract(value,'$.status')='running'",
+        `SELECT task_id FROM chat_threads WHERE json_extract(body,'$.checks.ask') IS NOT NULL
+        OR EXISTS (SELECT 1 FROM json_each(body,'$.checks.runs') WHERE json_extract(value,'$.status')='running')`,
       )
       .all() as { task_id: string }[];
     for (const { task_id } of rows)
@@ -314,8 +484,33 @@ export class ThreadChecks {
               }
             : run,
         );
-        return { ...thread, checks: { ...thread.checks, runs } };
+        return { ...thread, checks: { ...thread.checks, runs, ask: null } };
       });
+    const unknown = this.host.store.db
+      .prepare(
+        "SELECT DISTINCT task_id FROM task_operations WHERE kind='project-command' AND state='unknown'",
+      )
+      .all() as { task_id: string }[];
+    for (const { task_id } of unknown) this.host.holdOwnership(task_id);
+  }
+
+  /** Process groups of this task's unresolved commands that are still present. Reads only. */
+  orphans(taskId: string): number[] {
+    return this.journal
+      .list(taskId, undefined, 21)
+      .filter(
+        (record) =>
+          record.kind === 'project-command' &&
+          ['running', 'stopping', 'unknown'].includes(record.state) &&
+          !this.ops.has(record.id),
+      )
+      .flatMap((record) =>
+        record.phases.flatMap((phase) =>
+          phase.state === 'owned' && phase.group !== null && !this.host.groupAbsent(phase.group)
+            ? [phase.group]
+            : [],
+        ),
+      );
   }
 
   private directory(task: Task): string {
@@ -326,13 +521,14 @@ export class ThreadChecks {
   /** The checks the copy declares, with the switches and added commands the thread already has. */
   refresh(task: Task, thread: ChatThread): ChatChecksState {
     const before = thread.checks;
-    const detected = detectChecks(this.directory(task)).map((item) => ({
-      ...item,
-      enabled: before?.items.find((old) => old.id === item.id)?.enabled ?? false,
-    }));
+    const detected = detectChecks(this.directory(task)).map((item) => {
+      const old = before?.items.find((value) => value.id === item.id);
+      return { ...item, enabled: old?.enabled ?? false, pin: old?.pin ?? null };
+    });
     const custom = (before?.items ?? []).filter((item) => item.source === 'custom');
     return {
       items: [...detected, ...custom].slice(0, MAX_ITEMS),
+      ask: before?.ask ?? null,
       runs: before?.runs ?? [],
       detectedAt: this.host.now(),
     };
@@ -344,15 +540,24 @@ export class ThreadChecks {
     thread: ChatThread,
     edit: ChatChecksEdit,
   ): { state: ChatChecksState } | { error: string } {
+    const directory = this.directory(task);
     let state = edit.refresh || !thread.checks ? this.refresh(task, thread) : thread.checks;
     if (edit.switch) {
       const wanted = edit.switch;
       if (!state.items.some((item) => item.id === wanted.id))
         return { error: 'That check is not in this thread. Refresh the list.' };
+      // Turning a check on pins what it runs now. A later change to the script asks again.
       state = {
         ...state,
         items: state.items.map((item) =>
-          item.id === wanted.id ? { ...item, enabled: wanted.enabled } : item,
+          item.id === wanted.id
+            ? {
+                ...item,
+                enabled: wanted.enabled,
+                resolved: wanted.enabled ? describe(item, directory).resolved : item.resolved,
+                pin: wanted.enabled ? sourceDigest(item, directory) : null,
+              }
+            : item,
         ),
       };
     }
@@ -364,11 +569,8 @@ export class ThreadChecks {
     }
     if (edit.add) {
       const words = commandWords(edit.add);
-      if (!words)
-        return {
-          error:
-            'Write a program and its arguments as plain words. Quotes, pipes, variables and shells are not accepted.',
-        };
+      const problem = words ? addedProblem(words, this.host.scratchDirectory(task.id)) : ADDED_RULE;
+      if (!words || problem) return { error: problem ?? ADDED_RULE };
       const command = words.join(' ');
       if (state.items.length >= MAX_ITEMS)
         return { error: `A thread keeps at most ${MAX_ITEMS} checks.` };
@@ -376,28 +578,69 @@ export class ThreadChecks {
         return { error: 'That command is already in the list.' };
       let number = 1;
       while (state.items.some((item) => item.id === `custom:${number}`)) number += 1;
+      const added = {
+        id: `custom:${number}`,
+        label: command.slice(0, 80),
+        kind: 'custom' as const,
+        source: 'custom' as const,
+        command,
+        resolved: command,
+        enabled: true,
+        pin: null,
+      };
       state = {
         ...state,
-        items: [
-          ...state.items,
-          {
-            id: `custom:${number}`,
-            label: command.slice(0, 80),
-            kind: 'custom',
-            source: 'custom',
-            command,
-            enabled: true,
-          },
-        ],
+        items: [...state.items, { ...added, pin: sourceDigest(added, directory) }],
       };
     }
     return { state };
   }
 
+  /** What a run would execute, and which checks changed since the person turned them on. */
+  assess(
+    task: Task,
+    thread: ChatThread,
+    directory?: string,
+  ): { commands: { label: string; resolved: string }[]; changed: string[] } {
+    const where = directory ?? this.directory(task);
+    const commands: { label: string; resolved: string }[] = [];
+    const changed: string[] = [];
+    for (const item of enabledChecks(thread)) {
+      const now = describe(item, where);
+      commands.push({ label: item.label.slice(0, 80), resolved: now.resolved });
+      if (item.pin !== now.digest) changed.push(item.label.slice(0, 80));
+    }
+    return { commands, changed };
+  }
+
+  /** The person allowed the changed commands: pin what they run now. */
+  repin(task: Task) {
+    const directory = this.directory(task);
+    this.host.update(task.id, (thread) =>
+      thread.checks
+        ? {
+            ...thread,
+            checks: {
+              ...thread.checks,
+              items: thread.checks.items.map((item) =>
+                item.enabled
+                  ? {
+                      ...item,
+                      resolved: describe(item, directory).resolved,
+                      pin: sourceDigest(item, directory),
+                    }
+                  : item,
+              ),
+            },
+          }
+        : thread,
+    );
+  }
+
   private save(taskId: string, run: ChatCheckRun) {
     try {
       this.host.update(taskId, (thread) => {
-        const current = thread.checks ?? { items: [], runs: [], detectedAt: null };
+        const current = thread.checks ?? { items: [], ask: null, runs: [], detectedAt: null };
         const runs = current.runs.some((value) => value.id === run.id)
           ? current.runs.map((value) => (value.id === run.id ? run : value))
           : [...current.runs, run];
@@ -410,8 +653,8 @@ export class ThreadChecks {
 
   /**
    * Run the thread's enabled checks one after another in `directory` (the scratch copy unless a
-   * merged copy is named). A failure does not end the list: the fix message carries every
-   * failure. Stop ends the open check and skips the rest.
+   * merged copy is named). The caller has the person's answer already. A failure does not end
+   * the list: the fix message carries every failure. Stop ends the open check and skips the rest.
    */
   async run(
     taskId: string,
@@ -425,7 +668,6 @@ export class ThreadChecks {
       const thread = this.host.thread(taskId);
       const items = enabledChecks(thread);
       if (!task || !items.length) return { outcome: 'none', runs: [], brief: null };
-      if (!commandsAllowed(thread)) return { outcome: 'denied', runs: [], brief: null };
       const finished: Finished[] = [];
       for (const item of items) {
         if (entry.stopped) break;
@@ -486,37 +728,90 @@ export class ThreadChecks {
       return { run: done, output };
     };
     const words = commandWords(item.command);
-    if (!words)
+    const scratch = this.host.scratchDirectory(task.id);
+    if (!words || (item.source === 'custom' && addedProblem(words, scratch)))
+      return end({ status: 'failed', reason: 'The command is not one a check may run.' });
+    const root = this.host.projectPath(task.projectId);
+    if (!root || !thread.base)
+      return end({ status: 'failed', reason: 'The project or its base commit is missing.' });
+    let pin: { path: string; sha256: string };
+    try {
+      pin = executablePin(words[0]);
+    } catch {
+      return end({ status: 'failed', reason: `Could not find ${words[0]} on this computer.` });
+    }
+
+    const operationId = this.ids('cmd');
+    let where: string;
+    let definition: Artifact;
+    let preview: ReturnType<typeof ProjectCommandPreviewSchema.parse>;
+    try {
+      where = realpathSync(directory ?? scratch);
+      const home = join(this.host.home, 'operations', operationId);
+      mkdirSync(join(home, 'environment'), { recursive: true, mode: 0o700 });
+      mkdirSync(join(home, 'temporary'), { recursive: true, mode: 0o700 });
+      const repositoryRoot = realpathSync(root);
+      preview = ProjectCommandPreviewSchema.parse({
+        version: 1,
+        id: operationId,
+        taskId: task.id,
+        taskRevision: task.revision,
+        source: inspectSource(task.projectId, repositoryRoot),
+        sourceMode: 'committed-head',
+        repositoryRoot,
+        scratchRoot: where,
+        cwd: where,
+        recipe: RECIPE[item.kind],
+        executable: pin.path,
+        executableSha256: pin.sha256,
+        executableIdentity: 'verified-prelaunch-sha256',
+        argv: words.slice(1),
+        // The program gets its own home and temporary folders. PATH stays the controller's.
+        environment: {
+          CI: '1',
+          LANG: 'C',
+          NO_COLOR: '1',
+          HOME: join(home, 'environment'),
+          TMPDIR: join(home, 'temporary'),
+          ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
+        },
+        deadlineMs: this.host.deadlineMs ?? DEADLINE_MS,
+        nativeTrust: 'required',
+      });
+      const published = this.host.artifacts.publish(Buffer.from(canonicalJson(preview)));
+      definition = ArtifactSchema.parse({
+        id: this.ids('art'),
+        ...published,
+        mediaType: 'application/json',
+      });
+      this.journal.createAndBegin(
+        { id: operationId, taskId: task.id, kind: 'project-command', definition },
+        this.ids('cmd'),
+        hashCanonical(preview),
+        () => {},
+        () => this.host.store.put('artifact', definition.id, 0, definition),
+      );
+    } catch (error) {
       return end({
         status: 'failed',
-        reason: 'The command needs a shell, which checks never use.',
+        reason: error instanceof Error ? error.message.slice(0, 300) : 'The check could not start.',
       });
+    }
+
+    this.ops.add(operationId);
+    liveOperations.add(operationId);
+    const named = (hash: string | undefined) =>
+      artifacts.find((value) => value.hash === hash) ?? null;
+    const brief = (artifact: Artifact | null) =>
+      artifact ? { id: artifact.id, hash: artifact.hash, bytes: artifact.bytes } : null;
     try {
-      const root = this.host.projectPath(task.projectId);
-      if (!root || !thread.base)
-        return end({ status: 'failed', reason: 'The project or its base commit is missing.' });
-      let pin: { path: string; sha256: string };
-      try {
-        pin = executablePin(words[0]);
-      } catch {
-        return end({ status: 'failed', reason: `Could not find ${words[0]} on this computer.` });
-      }
-      const where = realpathSync(directory ?? this.host.scratchDirectory(task.id));
-      const environment: Record<string, string> = {
-        CI: '1',
-        LANG: 'C',
-        NO_COLOR: '1',
-        TMPDIR: tmpdir(),
-        ...(process.env.HOME ? { HOME: process.env.HOME } : {}),
-        ...(process.env.PATH ? { PATH: process.env.PATH } : {}),
-      };
-      const definition: ProjectCommandDefinition = {
+      const request: ProjectCommandDefinition = {
         version: 1,
-        operationId: this.ids('cmd'),
-        recipe: RECIPE[item.kind],
+        operationId,
+        recipe: preview.recipe,
         source: {
           projectId: task.projectId,
-          repositoryRoot: realpathSync(root),
+          repositoryRoot: preview.repositoryRoot,
           baseRevision: thread.base,
         },
         scratchRoot: where,
@@ -524,40 +819,98 @@ export class ThreadChecks {
         executable: pin.path,
         executableIdentity: 'verified-prelaunch-sha256',
         executableSha256: pin.sha256,
-        argv: words.slice(1),
-        environment,
+        argv: preview.argv,
+        environment: Object.fromEntries(
+          Object.entries(preview.environment).filter(
+            (value): value is [string, string] => typeof value[1] === 'string',
+          ),
+        ),
         output: { stdout: 'artifact', stderr: 'artifact', chunkBytes: 65536 },
       };
-      const execution = startProjectCommand(definition, {
-        runner: createOwnedProjectCommandRunner({
-          deadlineMs: this.host.deadlineMs ?? DEADLINE_MS,
-        }),
-        // Ownership stays with the shared owner. A restart reads the run as failed.
-        lifecycle: { intent: () => {}, owned: () => {}, quiescent: () => {} },
+      const execution = startProjectCommand(request, {
+        runner: createOwnedProjectCommandRunner({ deadlineMs: preview.deadlineMs }),
+        lifecycle: {
+          intent: () => {
+            this.journal.phase(operationId, 'command', 'intent', null);
+          },
+          owned: (group) => {
+            this.journal.phase(operationId, 'command', 'owned', group);
+          },
+          quiescent: (group) => {
+            this.journal.phase(operationId, 'command', 'closed', group);
+          },
+        },
         publishStream: async (source, options) => {
-          const bytes = await this.host.artifacts.publishStream(eager(source, keep), {
-            signal: options?.signal,
-          });
-          const artifact = ArtifactSchema.parse({
-            id: this.ids('art'),
-            ...bytes,
-            mediaType: 'text/plain; charset=utf-8',
-          });
-          this.host.store.transaction(() =>
-            this.host.store.put('artifact', artifact.id, 0, artifact),
-          );
-          artifacts.push(artifact);
-          return bytes;
+          const feed = eager(source, keep);
+          try {
+            const bytes = await this.host.artifacts.publishStream(feed.stream, {
+              signal: options?.signal,
+            });
+            const artifact = ArtifactSchema.parse({
+              id: this.ids('art'),
+              ...bytes,
+              mediaType: 'text/plain; charset=utf-8',
+            });
+            this.host.store.transaction(() =>
+              this.host.store.put('artifact', artifact.id, 0, artifact),
+            );
+            artifacts.push(artifact);
+            return bytes;
+          } catch (error) {
+            // The store failed: stop reading so the process is not held by a full queue.
+            feed.abandon();
+            throw error;
+          }
         },
       });
       entry.stop = execution.stop;
       if (entry.stopped) execution.stop();
       const result = await execution.result;
-      const named = (hash: string | undefined) => {
-        const artifact = artifacts.find((value) => value.hash === hash);
-        return artifact ? { id: artifact.id, hash: artifact.hash, bytes: artifact.bytes } : null;
+      const stdout = named(result.stdout?.hash);
+      const stderr = named(result.stderr?.hash);
+      const saved = { stdout: brief(stdout), stderr: brief(stderr) };
+      const reasons: Record<string, string> = {
+        'nonzero-exit': `Exit code ${result.code}.`,
+        signal: `Ended by signal ${result.signal}.`,
+        deadline: `Timed out after ${Math.round(preview.deadlineMs / 60_000)} minutes.`,
+        launch: 'The command could not start.',
+        output: 'The output could not be saved.',
+        ownership: 'CrewKite could not confirm the process exited.',
       };
-      const saved = { stdout: named(result.stdout?.hash), stderr: named(result.stderr?.hash) };
+      if (result.status === 'unknown') {
+        this.journal.finish(
+          operationId,
+          {
+            state: 'unknown',
+            reason: 'operation-ownership-unknown',
+            next: 'Quit the process, then send again.',
+            stdout,
+            stderr,
+          },
+          { outcome: 'blocked', reason: 'operation-ownership-unknown' },
+        );
+        // No turn may edit the scratch copy while a process of unknown ownership may run.
+        this.host.holdOwnership(task.id);
+        return end({
+          status: 'failed',
+          reason: 'CrewKite could not confirm the process exited. Quit it before the next turn.',
+          exitCode: result.code,
+          ...saved,
+        });
+      }
+      this.journal.finish(
+        operationId,
+        {
+          state: result.status,
+          reason: result.status === 'succeeded' ? 'exit-zero' : result.reason,
+          next: null,
+          stdout,
+          stderr,
+        },
+        result.status === 'succeeded'
+          ? { outcome: 'applied' }
+          : { outcome: 'blocked', reason: result.reason },
+      );
       if (result.status === 'succeeded') return end({ status: 'passed', exitCode: 0, ...saved });
       if (result.status === 'cancelled')
         return end({
@@ -566,14 +919,6 @@ export class ThreadChecks {
           exitCode: result.code,
           ...saved,
         });
-      const reasons: Record<string, string> = {
-        'nonzero-exit': `Exit code ${result.code}.`,
-        signal: `Ended by signal ${result.signal}.`,
-        deadline: `Timed out after ${Math.round((this.host.deadlineMs ?? DEADLINE_MS) / 60_000)} minutes.`,
-        launch: 'The command could not start.',
-        output: 'The output could not be saved.',
-        ownership: 'CrewKite could not confirm the process exited.',
-      };
       return end({
         status: 'failed',
         reason: reasons[result.reason] ?? 'The command failed.',
@@ -581,21 +926,30 @@ export class ThreadChecks {
         ...saved,
       });
     } catch (error) {
+      // The process may still own a group the journal has not seen closed.
+      const record = this.journal.get(operationId);
+      const open = record?.phases.some((phase) => phase.state !== 'closed') ?? false;
+      try {
+        this.journal.finish(
+          operationId,
+          open
+            ? { state: 'unknown', reason: 'operation-ownership-unknown', next: null }
+            : { state: 'failed', reason: 'operation-failed', next: null },
+          open
+            ? { outcome: 'blocked', reason: 'operation-ownership-unknown' }
+            : { outcome: 'blocked', reason: 'operation-failed' },
+        );
+      } catch {
+        // Recovery reads the rows that are left.
+      }
+      if (open) this.host.holdOwnership(task.id);
       return end({
         status: 'failed',
         reason: error instanceof Error ? error.message.slice(0, 300) : 'The check could not run.',
       });
+    } finally {
+      this.ops.delete(operationId);
+      liveOperations.delete(operationId);
     }
   }
-}
-
-/**
- * Run the enabled checks of a thread in a merged copy, for the combined review before the
- * challenger. The copy is any directory the caller owns. The runs show on the thread's Checks
- * card like the others. `denied` means the thread does not allow commands, and `none` that no
- * check is switched on.
- */
-export function runCombinedChecks(taskId: string, directory: string): Promise<ChecksOutcome> {
-  if (!bound) return Promise.reject(new Error('The chat service has not started.'));
-  return bound.run(taskId, 'combined', directory);
 }

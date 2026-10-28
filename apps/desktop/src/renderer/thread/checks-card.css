@@ -96,3 +96,20 @@
   flex: 1 1 200px;
   gap: 4px;
 }
+
+.th-checks-ask {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+.th-checks-ask ul {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}

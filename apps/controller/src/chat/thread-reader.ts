@@ -78,10 +78,14 @@ export function redact(text: string): string {
 }
 
 /** The newest run of each check as lines: a summary, then the last lines of its output. */
-function runLines(runs: readonly ChatCheckRun[]): string[] {
+function runLines(runs: readonly ChatCheckRun[]): { at: string; lines: string[] }[] {
+  // Delete before set, so a check that ran again moves to the end with its newest run.
   const latest = new Map<string, ChatCheckRun>();
-  for (const run of runs) latest.set(run.checkId, run);
-  return [...latest.values()].flatMap((run) => {
+  for (const run of runs) {
+    latest.delete(run.checkId);
+    latest.set(run.checkId, run);
+  }
+  return [...latest.values()].map((run) => {
     const seconds = run.durationMs === null ? '' : ` in ${(run.durationMs / 1000).toFixed(1)} s`;
     const head = `${run.label} (${run.command}): ${run.status}${seconds}${run.reason ? `. ${run.reason}` : ''}`;
     const output = redact(run.tail)
@@ -89,7 +93,10 @@ function runLines(runs: readonly ChatCheckRun[]): string[] {
       .filter((line) => line.trim())
       .slice(-RUN_OUTPUT_LINES)
       .map((line) => `  ${line}`);
-    return [head, ...output].map((line) => clipped(line, TRACE_CHARACTERS));
+    return {
+      at: run.startedAt,
+      lines: [head, ...output].map((line) => clipped(line, TRACE_CHARACTERS)),
+    };
   });
 }
 
@@ -286,20 +293,32 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
       const state = ChatChecksStateSchema.safeParse(
         row ? (JSON.parse(row.body as string) as { checks?: unknown }).checks : undefined,
       );
-      const runs = state.success ? runLines(state.data.runs).slice(-CHECK_LINES) : [];
-      const lines = store.db
+      // Run lines take at most three quarters of the answer, newest runs first to stay, so the
+      // system lines about checks keep room. Both kinds are ordered by when they happened.
+      const runs = state.success ? runLines(state.data.runs) : [];
+      const kept: typeof runs = [];
+      let used = 0;
+      for (const group of runs.toReversed()) {
+        if (used + group.lines.length > (CHECK_LINES * 3) / 4) break;
+        kept.unshift(group);
+        used += group.lines.length;
+      }
+      const entries = store.db
         .prepare(
           "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='chat-system' AND json_extract(body,'$.text') LIKE '%check%' ORDER BY sequence DESC LIMIT ?",
         )
-        .all(taskId, Math.max(0, CHECK_LINES - runs.length))
-        .reverse()
-        .map((row) =>
-          clipped(
-            redact(ConversationEntrySchema.parse(JSON.parse(row.body as string)).text),
-            TRACE_CHARACTERS,
-          ),
-        );
-      return ThreadChecksResultSchema.parse({ lines: [...lines, ...runs] });
+        .all(taskId, CHECK_LINES - used)
+        .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)));
+      const merged = [
+        ...kept,
+        ...entries.map((entry) => ({
+          at: entry.at,
+          lines: [clipped(redact(entry.text), TRACE_CHARACTERS)],
+        })),
+      ].sort((a, b) => a.at.localeCompare(b.at));
+      return ThreadChecksResultSchema.parse({
+        lines: merged.flatMap((group) => group.lines).slice(-CHECK_LINES),
+      });
     },
 
     live() {

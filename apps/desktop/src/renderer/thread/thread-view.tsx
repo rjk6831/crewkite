@@ -260,12 +260,17 @@ export function ThreadView({
       }}
     />
   );
-  const checked = thread?.checks && thread.checks.runs.length > 0 && (
+  const checked = thread?.checks && (thread.checks.runs.length > 0 || thread.checks.ask) && (
     <ChecksCard
       checks={thread.checks}
       onStop={async () => {
         const last = newestTurnId(state);
         if (last) await stopTurn(source, { taskId: task.id, turnId: last });
+      }}
+      onAnswer={async (requestId, choice) => {
+        const last = newestTurnId(state);
+        if (last)
+          await resolvePermission(source, { taskId: task.id, turnId: last, requestId, choice });
       }}
     />
   );
