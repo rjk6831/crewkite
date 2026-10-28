@@ -1,5 +1,5 @@
-import { lstatSync } from 'node:fs';
-import { join } from 'node:path';
+import { lstatSync, realpathSync } from 'node:fs';
+import { join, relative, sep } from 'node:path';
 import { foldersOf, rankMentions } from '@crewkite/client';
 import {
   type ChatInstructionsRead,
@@ -15,6 +15,38 @@ import { fitBytes, listFiles, readScratchFile } from './local-tools.ts';
 // A folder is a candidate only when it holds a listed file, so an ignored folder never shows.
 
 const LISTING_MS = 3000;
+
+/**
+ * Keep the paths whose every parent folder resolves inside the copy. The listing checks only the
+ * last segment of a path, so a folder replaced by a link to somewhere else would still list its
+ * files. A path with a missing or outside parent is dropped.
+ */
+function insideCopy(scratch: string, paths: readonly string[]): string[] {
+  let root: string;
+  try {
+    root = realpathSync.native(scratch);
+  } catch {
+    return [];
+  }
+  const verdict = new Map<string, boolean>();
+  const inside = (folder: string): boolean => {
+    let known = verdict.get(folder);
+    if (known === undefined) {
+      try {
+        const within = relative(root, realpathSync.native(join(root, folder)));
+        known = within !== '..' && !within.startsWith(`..${sep}`) && !within.startsWith('/');
+      } catch {
+        known = false;
+      }
+      verdict.set(folder, known);
+    }
+    return known;
+  };
+  return paths.filter((path) => {
+    const cut = path.lastIndexOf('/');
+    return cut < 0 || inside(path.slice(0, cut));
+  });
+}
 
 export type MentionIndex = {
   complete(
@@ -37,9 +69,12 @@ export function createMentionIndex(now: () => number): MentionIndex {
       const current = now();
       let listing = kept.get(scratch);
       if (!listing || current - listing.at > LISTING_MS || current < listing.at) {
-        const paths = listFiles(scratch, environment)
-          .map(({ path }) => path)
-          .filter((path) => !path.split('/').includes('.git'));
+        const paths = insideCopy(
+          scratch,
+          listFiles(scratch, environment)
+            .map(({ path }) => path)
+            .filter((path) => !path.split('/').includes('.git')),
+        );
         const entries: ChatMention[] = [];
         for (const path of paths) entries.push({ path, kind: 'file' });
         for (const path of foldersOf(paths)) entries.push({ path, kind: 'folder' });

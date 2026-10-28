@@ -150,7 +150,10 @@ export function Composer({
   const field = useRef<HTMLTextAreaElement>(null);
   const bar = useRef<HTMLDivElement>(null);
   const [caret, setCaret] = useState(0);
-  const [mentions, setMentions] = useState<ChatMention[]>([]);
+  const [found, setFound] = useState<{ query: string; items: ChatMention[] }>({
+    query: '',
+    items: [],
+  });
   const [active, setActive] = useState(0);
   const [dismissed, setDismissed] = useState<string | null>(null);
   useImperativeHandle(ref, () => {
@@ -203,22 +206,24 @@ export function Composer({
   const triggerQuery = trigger?.query;
   useEffect(() => {
     if (!taskId || triggerQuery === undefined) {
-      setMentions([]);
+      setFound({ query: '', items: [] });
       return;
     }
     let live = true;
     completeMention(source, taskId, triggerQuery).then(
       (read) => {
         if (!live) return;
-        setMentions(read.mentions);
+        setFound({ query: triggerQuery, items: read.mentions });
         setActive(0);
       },
-      () => live && setMentions([]),
+      () => live && setFound({ query: triggerQuery, items: [] }),
     );
     return () => {
       live = false;
     };
   }, [source, taskId, triggerQuery]);
+  // Results for an earlier query stay out of the list, so Enter never inserts a stale match.
+  const mentions = trigger && found.query === trigger.query ? found.items : [];
   const slashMatches: SlashCommand[] = trigger ? [] : completeSlash(text);
   const menuItems: MenuItem[] =
     dismissed === text
@@ -311,10 +316,12 @@ export function Composer({
   }
   function clearBox() {
     setText('');
+    setCaret(0);
     drafts.delete(draftKey);
   }
   function fillBox(value: string) {
     setText(value);
+    setCaret(value.length);
     drafts.set(draftKey, value);
     requestAnimationFrame(() => {
       field.current?.focus();
@@ -362,6 +369,8 @@ export function Composer({
       else if (roles.role !== 'ask') roles.toggle('ask');
       return;
     }
+    // A command the view cannot run, and /help, leave the box as it is.
+    if (action === 'none') return;
     clearBox();
     if (action === 'new-thread') onNewThread?.();
     else if (action === 'open-settings') onOpenSettings?.();

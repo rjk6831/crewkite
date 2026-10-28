@@ -1,4 +1,4 @@
-import { promptPlaceholders, promptsToJson } from '@crewkite/client';
+import { type DesktopSource, promptPlaceholders } from '@crewkite/client';
 import type { SavedPrompt } from '@crewkite/contracts';
 import { useEffect, useState } from 'react';
 import { deletePrompt, readPrompts, savePrompt, type ThreadSource } from '../thread/commands.ts';
@@ -9,7 +9,11 @@ const NAME = /^[a-z0-9][a-z0-9-]{0,39}$/;
  * Named prompts with {{placeholders}}. In a thread, /prompt name puts one in the box. The
  * controller keeps the list in its home, so the desktop and the command line share it.
  */
-export function PromptsCard({ source }: { source: ThreadSource }) {
+export function PromptsCard({
+  source,
+}: {
+  source: ThreadSource & Pick<DesktopSource, 'savePrompts'>;
+}) {
   const [prompts, setPrompts] = useState<SavedPrompt[]>([]);
   const [name, setName] = useState('');
   const [body, setBody] = useState('');
@@ -36,15 +40,17 @@ export function PromptsCard({ source }: { source: ThreadSource }) {
       return false;
     }
   }
-  function exportFile() {
-    const url = URL.createObjectURL(
-      new Blob([promptsToJson(prompts)], { type: 'application/json' }),
-    );
-    const link = document.createElement('a');
-    link.href = url;
-    link.download = 'crewkite-prompts.json';
-    link.click();
-    URL.revokeObjectURL(url);
+  // Main reads the prompts from the controller and saves them through its dialog.
+  async function exportFile() {
+    if (!source.savePrompts) {
+      setNote('Export needs the desktop app.');
+      return;
+    }
+    try {
+      setNote((await source.savePrompts()) === 'saved' ? 'Saved.' : null);
+    } catch (failure) {
+      setNote(failure instanceof Error ? failure.message : 'The file was not saved.');
+    }
   }
   const valid = NAME.test(name) && body.trim() !== '';
   return (
@@ -127,7 +133,7 @@ export function PromptsCard({ source }: { source: ThreadSource }) {
             <button type="submit" disabled={!valid}>
               Save prompt
             </button>
-            <button type="button" disabled={prompts.length === 0} onClick={exportFile}>
+            <button type="button" disabled={prompts.length === 0} onClick={() => void exportFile()}>
               Export JSON
             </button>
           </div>

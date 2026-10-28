@@ -39,9 +39,14 @@ test('saved prompts persist in the controller home, export as JSON and insert wi
   // /prompt name key=value fills what it is given and names what is still open.
   assert.deepEqual(
     completeSlash('/pr').map(({ name }) => name),
-    ['provider', 'pr', 'prompt'],
+    ['pr', 'provider', 'prompt'],
   );
   assert.equal(parseSlash('/usr/bin/env is missing'), null);
+  // A message that starts with a command word is a message, and an exact name selects itself.
+  assert.equal(parseSlash('/new endpoint returns 500'), null);
+  assert.equal(parseSlash('/help me fix the build'), null);
+  assert.equal(parseSlash('/new')?.name, 'new');
+  assert.equal(completeSlash('/pr')[0].name, 'pr');
   const slash = parseSlash('/prompt review-notes area="the login form" risk=leaks');
   assert.equal(slash?.name, 'prompt');
   const { name, values } = parsePromptArgument(slash?.argument ?? '');

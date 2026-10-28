@@ -7,7 +7,7 @@ const taskId = z.string().regex(/^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
 
 /** The most candidates one completion returns. */
 export const MENTION_LIMIT_MAX = 50;
-/** Instruction files at the copy root that the chip can show. */
+/** The most bytes of an instruction file the chip shows. */
 export const INSTRUCTION_VIEW_BYTES = 64 * 1024;
 
 const mentionPath = z
@@ -18,6 +18,7 @@ const mentionPath = z
     (value) =>
       !value.startsWith('/') &&
       !value.includes('\0') &&
+      !value.includes('`') &&
       !value.includes('\\') &&
       !value.split('/').includes('..'),
     'A mention path is relative and stays inside the copy.',

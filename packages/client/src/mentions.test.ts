@@ -24,6 +24,8 @@ test('mention completion ranks by name match, stays bounded, ignores input order
   // A subsequence still finds the file, and a query with no match finds nothing.
   assert.equal(rank('smn', 5)[0], 'src/main.ts');
   assert.deepEqual(rank('zzz'), []);
+  // A path with a backtick cannot be one token, so it is never offered.
+  assert.deepEqual(rank('odd', 3, [{ path: 'odd`name.ts', kind: 'file' }]), []);
   // An empty query lists the shallowest entries, and the limit bounds every answer.
   assert.deepEqual(rank('', 2), ['a', 'src']);
   assert.equal(rank('', 500, candidates).length <= 50, true);

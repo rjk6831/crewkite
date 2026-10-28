@@ -38,18 +38,31 @@ export const slashCommands: readonly SlashCommand[] = [
 
 export type ParsedSlash = Readonly<{ name: SlashName; argument: string }>;
 
-/** A line that starts with a known command name. Any other text, such as a path, is a message. */
+/**
+ * A line that is a known command. A command that takes no argument matches only on its own, so
+ * "/new endpoint returns 500" stays a message. Any other text, such as a path, is a message too.
+ */
 export function parseSlash(text: string): ParsedSlash | null {
   const match = /^\/([a-z]+)(?:\s+([\s\S]*))?$/.exec(text.trim());
   if (!match) return null;
   const command = slashCommands.find(({ name }) => name === match[1]);
-  return command ? { name: command.name, argument: (match[2] ?? '').trim() } : null;
+  const argument = (match[2] ?? '').trim();
+  if (!command || (argument !== '' && !command.argument)) return null;
+  return { name: command.name, argument };
 }
 
-/** Commands whose name starts with what is typed after the slash, while the name is unfinished. */
+/**
+ * Commands whose name starts with what is typed after the slash, while the name is unfinished.
+ * An exact name comes first, so "/pr" selects /pr and not /provider.
+ */
 export function completeSlash(text: string): SlashCommand[] {
   const match = /^\/([a-z]*)$/.exec(text);
-  return match ? slashCommands.filter(({ name }) => name.startsWith(match[1])) : [];
+  if (!match) return [];
+  const found = slashCommands.filter(({ name }) => name.startsWith(match[1]));
+  return [
+    ...found.filter(({ name }) => name === match[1]),
+    ...found.filter(({ name }) => name !== match[1]),
+  ];
 }
 
 /** The text `/help` shows. */

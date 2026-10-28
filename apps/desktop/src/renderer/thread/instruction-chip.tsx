@@ -26,7 +26,14 @@ export function InstructionChip({
     if (!taskId) return;
     let live = true;
     readInstructions(source, taskId).then(
-      (read) => live && setFiles(read.files),
+      (read) => {
+        if (!live) return;
+        setFiles(read.files);
+        // The text shown belongs to the read before this one.
+        setOpen(null);
+        setShown(false);
+        setProblem(null);
+      },
       () => live && setFiles([]),
     );
     return () => {

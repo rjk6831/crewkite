@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, extname, relative, sep } from 'node:path';
+import { promptsToJson } from '@crewkite/client';
 import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
 import {
   ArtifactSchema,
@@ -547,6 +548,46 @@ export async function installBridge(
       if (failed) throw new Error('The system could not open this file.');
     }
     return 'done';
+  });
+  // The saved prompts are the controller's. Main reads them, so the page never supplies the bytes,
+  // and the person picks where the file goes.
+  ipcMain.handle('crewkite:save-prompts', async (event) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const read = await send(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'ReadChatPrompts',
+        payload: {},
+      }),
+    );
+    if (!applied(read) || read.data?.kind !== 'chat-prompts')
+      throw new Error('The saved prompts could not be read.');
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Save prompts',
+      defaultPath: 'crewkite-prompts.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      const file = openSync(
+        choice.filePath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(file, promptsToJson(read.data.prompts));
+        fsyncSync(file);
+      } finally {
+        closeSync(file);
+      }
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return 'saved';
   });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);

@@ -29,8 +29,11 @@ export function findMentionTrigger(text: string, caret: number): MentionTrigger 
  */
 export function mentionText(mention: MentionCandidate): string {
   const path = mention.kind === 'folder' ? `${mention.path.replace(/\/+$/, '')}/` : mention.path;
-  return /[\s`]/.test(path) ? `\`${path.replaceAll('`', '')}\`` : path;
+  return /\s/.test(path) ? `\`${path}\`` : path;
 }
+
+/** A path with a backtick cannot be written as one token, so it is never offered. */
+export const isMentionable = (path: string): boolean => !path.includes('`');
 
 /** Replace the unfinished mention with the chosen path and a space, and say where the caret goes. */
 export function insertMention(
@@ -89,6 +92,7 @@ export function rankMentions<T extends MentionCandidate>(
   const needle = query.trim().toLowerCase().replace(/^\.\//, '');
   const scored: { item: T; score: number }[] = [];
   for (const item of candidates) {
+    if (!isMentionable(item.path)) continue;
     const value = needle === '' ? 1 : score(item.path, needle);
     if (value > 0) scored.push({ item, score: value });
   }

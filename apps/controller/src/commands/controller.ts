@@ -944,10 +944,6 @@ export class Controller {
         return this.chat().openPullRequest(command.payload);
       return this.chat().branchStatus(command.payload);
     }
-    // Saved prompts are text in the controller home. They change no task, so they skip the task
-    // journal, and saving the same prompt twice leaves the same file.
-    if (command.command === 'SaveChatPrompt' || command.command === 'DeleteChatPrompt')
-      return this.savedPrompts(command);
     // The file copies before the command's transaction opens. A replay answers from its receipt.
     if (command.command === 'ImportChatAttachment' && !this.store.receipt(command.key))
       return this.chat().importing(command.payload, () => this.commitCommand(command, principal));
@@ -1307,6 +1303,9 @@ export class Controller {
         };
       return;
     }
+    // Saved prompts have no task. Their receipts come from the normal journal, so a replayed key
+    // answers from its receipt and an old save cannot overwrite a newer body.
+    if (command.command === 'SaveChatPrompt' || command.command === 'DeleteChatPrompt') return;
     if (
       [
         'SendChatMessage',
@@ -1524,6 +1523,8 @@ export class Controller {
               : { kind: 'chat-instructions', ...this.chat().readInstructions(command.payload) },
         };
       case 'ReadChatPrompts':
+      case 'SaveChatPrompt':
+      case 'DeleteChatPrompt':
         return this.savedPrompts(command);
       case 'ReadChatCatalog':
         this.refreshStaleChatModels();
