@@ -15,6 +15,7 @@ import {
   type Task,
   writesScratch,
 } from '@crewkite/contracts';
+import type { ChecksOutcome } from './checks.ts';
 import { detectType } from './files.ts';
 import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
 import { familyName, PLAN_RETRY, planRetryText, sliceBrief } from './prompt.ts';
@@ -54,6 +55,10 @@ export type PlanHost = {
   /** Whether no process of an earlier turn may still write to the scratch copy. */
   free: (task: Task) => boolean;
   scratchDirectory: (taskId: string) => string;
+  /** The project checks on a merged copy, before the challenger. They ask like any run. */
+  runCombinedChecks: (taskId: string, directory: string) => Promise<ChecksOutcome>;
+  /** End the runs on merged copies. Only the plan's own Stop calls it. */
+  stopCombinedChecks: (taskId: string) => boolean;
   /** The loaded Local model's context length, or null. */
   localContext: () => number | null;
   localSliceFits: PlanInputs['localSliceFits'];

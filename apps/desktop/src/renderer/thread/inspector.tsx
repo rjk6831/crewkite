@@ -46,7 +46,8 @@ import { useCatalog } from '../settings/use-catalog.ts';
 import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
-import type { ThreadSource } from './commands.ts';
+import { ChecksSettings } from './checks-card.tsx';
+import { configureThread, type ThreadSource } from './commands.ts';
 import { FamilyMark } from './family-mark.tsx';
 import { modelLine } from './message-list.tsx';
 import type { ThreadSettings } from './thread-state.ts';
@@ -679,6 +680,14 @@ function CrewTab({
         {crew ? mode.title : 'Start from a preset to run the crew in Balanced or Glide.'}
       </p>
       <AutoHandoff thread={thread} onConfigure={onConfigure} />
+      <ChecksSettings
+        thread={thread}
+        onEdit={(checks) =>
+          thread
+            ? configureThread(source, { taskId: thread.taskId, checks }).then(() => {})
+            : Promise.resolve()
+        }
+      />
       {note && (
         <p className="th-note" role="status">
           {note}

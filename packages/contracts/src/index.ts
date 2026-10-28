@@ -3829,6 +3829,7 @@ export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export { canonicalJson } from './canonical.ts';
 export * from './chat.ts';
+export * from './checks.ts';
 export * from './extensions.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
