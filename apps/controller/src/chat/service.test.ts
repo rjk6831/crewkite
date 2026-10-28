@@ -1878,6 +1878,31 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       card: ['finished', 'done', 'done'],
     },
     {
+      name: 'a read-only slice runs as an ask with no review, and the challenge follows the last write',
+      plan: [
+        planReply({
+          ...twoSlices,
+          slices: [twoSlices.slices[0], { ...twoSlices.slices[1], readOnly: true }],
+        }),
+      ],
+      builds: [reply('Built part 1.'), reply('Part 2 reads fine.')],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['ask', 'openai'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 2 slices, 1 review, 0 fixes.',
+      chain: { step: 'finished', reviewRounds: 0, fixes: 0, reason: null },
+      builderAt: 1,
+      card: ['finished', 'done', 'done'],
+      // The adapter request that carried the read-only slice.
+      readOnlyAt: 2,
+    },
+    {
       name: 'balanced waits for Run plan, and an override moves a slice to a ranked family',
       plan: [planReply({ ...twoSlices, slices: [twoSlices.slices[0]] })],
       // OpenAI would build the slice without the override.
@@ -2091,6 +2116,12 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       const of = `Slice 1 of ${row.card.length - 1} in plan p1: Part 1`;
       assert.match(brief ?? '', new RegExp(`^${of}$`, 'm'), row.name);
       assert.match(brief ?? '', /^Do part 1\.$/m, row.name);
+      if ('readOnlyAt' in row) {
+        const readOnly = asked[row.readOnlyAt] as unknown as ChatTurnRequest | undefined;
+        assert.match(readOnly?.prompt ?? '', /^Slice 2 of 2 in plan p1: Part 2$/m, row.name);
+        assert.equal(readOnly?.role, 'ask', row.name);
+        assert.equal(readOnly?.readOnly, true, row.name);
+      }
       continue;
     }
     // The person's pick stays on the builder whatever the crew borrowed.

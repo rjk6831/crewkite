@@ -13,6 +13,7 @@ import {
   type CommandResult,
   planOrder,
   type Task,
+  writesScratch,
 } from '@crewkite/contracts';
 import { detectType } from './files.ts';
 import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
@@ -332,7 +333,11 @@ export class PlanRunner {
       );
       return;
     }
-    const last = plan.slices.findLast((slice) => slice.turnId)?.turnId;
+    // The challenge argues against the last change. A plan whose slices only read changed nothing.
+    const last = plan.slices.findLast((slice) => {
+      const turn = slice.turnId ? this.host.turn(slice.turnId) : undefined;
+      return turn && writesScratch(turn.role);
+    })?.turnId;
     // Manual runs nothing after a builder turn, so the plan closes without a challenge.
     if (thread.flightMode === 'manual' || !last) return this.finish(task, thread, plan);
     this.host.crewStep(
@@ -364,10 +369,13 @@ export class PlanRunner {
     }
     const selection = this.selection(task.id, thread, slice.assignment);
     const text = sliceBrief(source, brief, slice.assignment.reason);
+    // A read-only slice runs as an ask, the read-only role every adapter enforces, so its turn
+    // cannot edit the scratch copy. It changes nothing, so no review chain follows it.
+    const role = slice.readOnly ? 'ask' : 'assistant';
     const started = this.host.begin(
       task,
       thread,
-      { text, role: 'assistant', selection, attachments: [], files: [] },
+      { text, role, selection, attachments: [], files: [] },
       effects,
     );
     const after = this.host.thread(task.id);
@@ -382,8 +390,9 @@ export class PlanRunner {
         true,
       );
     }
-    // The slice's family becomes the thread's pick, as a builder turn's does, so a usage limit
-    // moves the slice through the thread's own handoff.
+    // A writing slice's family becomes the thread's pick, as a builder turn's does, so a usage
+    // limit moves the slice through the thread's own handoff. A read-only slice leaves the pick
+    // alone, as an ask does, and a limit fails it for the card to run again.
     this.put(task, after, plan, {
       [slice.id]: { status: 'running', turnId: after.activeTurnId },
     });
