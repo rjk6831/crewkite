@@ -11,7 +11,9 @@ import {
   earlierReach,
   handoffPacket,
   instructionFiles,
+  spokenText,
   systemContext,
+  withAttachments,
 } from './prompt.ts';
 
 const [shared, anthropic, google] = instructionFiles;
@@ -146,5 +148,27 @@ test('a request holds the new message once and lists each file once, in the sect
   assert.match(
     request('local', earlier('local'), [], true),
     /came with "the first screenshot", not sent to Local/,
+  );
+
+  // Files alone: on a resume the file section is the whole body, and a packet says the message
+  // has no text and puts the section right after it.
+  const alone = [withAttachments('', [], '/scratch', '/project'), attachedSection(own)]
+    .filter(Boolean)
+    .join('\n\n');
+  assert.equal(alone, `Files attached to this message:\n${own[0]}`);
+  const packet = handoffPacket({
+    from: 'openai',
+    to: 'google',
+    reason: 'manual',
+    history: [{ role: 'user', text: spokenText('', [fresh]) }],
+    files: [],
+    prompt: '',
+    earlier: [{ attachment: old, came: '', reach: earlierReach('google', '/x') }],
+  });
+  assert.match(packet, /^Person:\n\(Files only: fresh\.pdf\)$/m);
+  assert.match(packet, /old\.png, .*came with a message with no text, sent as a file link below$/m);
+  assert.match(
+    packet,
+    /New message from the person: the files attached to this message, with no text\.$/,
   );
 });

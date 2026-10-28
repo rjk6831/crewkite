@@ -2267,6 +2267,37 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
       packetText.indexOf('New message from the person:'),
   );
   assert.doesNotMatch(packetText, /^n33\.txt/m);
+  // Files alone: the request text is empty, the file goes in the request's files, and a later
+  // packet names the files where the message would be.
+  const silent = async (files: ChatAttachment[], choice: ChatModelSelection, text = '') => {
+    const done = turnReaches({ store: carry.store }, 'done');
+    act(carry.store, (effects) =>
+      carry.service.sendMessage(
+        {
+          taskId: carry.taskId,
+          text,
+          selection: choice,
+          role: 'assistant',
+          attachments: [],
+          files,
+        },
+        effects,
+      ),
+    );
+    await done;
+  };
+  await silent([notes[0]], selection);
+  const filesOnly = families.get('openai')?.requests.at(-1) as unknown as ChatTurnRequest;
+  assert.equal(filesOnly.prompt, '');
+  assert.deepEqual(
+    filesOnly.files?.map((entry) => entry.attachment.name),
+    ['n0.txt'],
+  );
+  await silent([], google, 'And now?');
+  assert.match(
+    families.get('google')?.requests.at(-1)?.prompt ?? '',
+    /^Person:\n\(Files only: n0\.txt\)$/m,
+  );
   // A Local reply that stops at its output limit writes the counts, and Continue asks the same
   // model for the rest in a new message. The partial reply stays in the thread.
   const local = { family: 'local', model: 'local-model', effort: 'default' } as const;

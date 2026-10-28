@@ -444,7 +444,7 @@ function promptBlocks(
       );
   }
   const section = attachedSection(lines);
-  if (section) blocks[0] = { type: 'text', text: `${text}\n\n${section}` };
+  if (section) blocks[0] = { type: 'text', text: [text, section].filter(Boolean).join('\n\n') };
   return { blocks, linked, attached: files.some((file) => !file.earlier) };
 }
 
