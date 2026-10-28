@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
@@ -56,12 +56,16 @@ import {
   refValue,
 } from '../host/publication.ts';
 import {
-  committedFiles,
-  type FileContent,
+  blobToFile,
+  type CandidateHash,
   git,
-  type KeptEntry,
-  materialize,
-  readCandidateFiles,
+  hashCandidateFiles,
+  type PlannedFile,
+  readPlannedBlobs,
+  type ScratchPlan,
+  ScratchTooLarge,
+  scratchPlan,
+  treeFromScratch,
 } from '../host/source.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../host/worker.ts';
 import { localSliceFits } from '../providers/local/budget.ts';
@@ -75,9 +79,11 @@ import {
   chatFailure,
 } from './adapter.ts';
 import {
+  changeCounts,
   type DiscardOutcome,
   deleteThreadBaseRef,
   discardScratchPath,
+  LISTED_FILES,
   readDiscardMark,
   scratchChanges,
   writeDiscardMark,
@@ -122,6 +128,7 @@ import {
   systemContext,
   withAttachments,
 } from './prompt.ts';
+import { copyScratch } from './scratch-copy.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
 import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
 
@@ -579,22 +586,31 @@ export class ChatService {
       return blocked('git-identity-missing', 'Configure a Git name and email before acceptance.');
     const scratch = this.scratchDirectory(task.id);
     let fileCount: number;
-    let files: FileContent[];
-    let kept: KeptEntry[];
+    let plan: ScratchPlan;
+    let candidates: CandidateHash[];
     try {
-      const source = committedFiles(root, base, { scratch: true });
-      kept = source.kept;
+      plan = scratchPlan(root, base);
+      candidates = hashCandidateFiles(scratch, root, plan);
       // The Changes tab count, so the system line matches what the person reviewed. A base link
       // the copy changed is listed there and comes from the base, so it is not counted.
-      const links = new Set(source.links.map((link) => link.path));
-      fileCount = scratchChanges(root, scratch, base, false).filter(
-        (file) => !links.has(file.path),
-      ).length;
-      files = readCandidateFiles(scratch, root, base, source);
-    } catch {
+      const counts = changeCounts(plan, candidates, scratch);
+      fileCount = counts.files;
+      // Changes lists a bounded number of entries. A file the person could not see is not published.
+      if (counts.listed > LISTED_FILES)
+        return blocked(
+          'too-many-changes',
+          `${fileCount.toLocaleString('en-US')} files changed, and Changes lists the first ${LISTED_FILES.toLocaleString('en-US')} entries. Accept only publishes files you can review, so discard changes until the list is complete, then accept again.`,
+        );
+    } catch (error) {
+      if (error instanceof ScratchTooLarge) return blocked('scratch-unreadable', error.message);
+      if (/unsupported (symlink|special file|file mode)/.test((error as Error).message))
+        return blocked(
+          'scratch-unreadable',
+          'Remove new links and special files from the scratch copy.',
+        );
       return blocked(
         'scratch-unreadable',
-        'Remove new links and special files from the scratch copy.',
+        `The scratch copy could not be compared. ${plain(error)}`,
       );
     }
     if (!fileCount) return blocked('no-changes', 'Ask for a change in this thread first.');
@@ -602,29 +618,49 @@ export class ChatService {
     const work = mkdtempSync(join(this.deps.home, 'chat', task.id, 'accept-'));
     let commit: string;
     try {
-      const prepared = preparePublication({
-        source: root,
-        repository: work,
-        base,
-        files,
-        kept,
-        identity,
-        at,
-        message: payload.message?.trim()
-          ? `${payload.message.trimEnd()}\n`
-          : `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
-      });
-      applyPublication({
-        source: root,
-        pack: prepared.pack,
-        destinationRef: ref,
-        treeOid: prepared.treeOid,
-        commitOid: prepared.commitOid,
-        base,
-      });
+      let prepared: { treeOid: string; commitOid: string; pack: { file: string } };
+      try {
+        prepared = preparePublication({
+          source: root,
+          repository: work,
+          base,
+          tree: treeFromScratch({
+            repository: work,
+            source: root,
+            scratch,
+            plan,
+            candidates,
+          }),
+          identity,
+          at,
+          message: payload.message?.trim()
+            ? `${payload.message.trimEnd()}\n`
+            : `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
+        });
+      } catch (error) {
+        return blocked(
+          'branch-not-created',
+          `The branch could not be built from the scratch copy. ${plain(error)}`,
+        );
+      }
+      try {
+        applyPublication({
+          source: root,
+          pack: prepared.pack,
+          destinationRef: ref,
+          treeOid: prepared.treeOid,
+          commitOid: prepared.commitOid,
+          base,
+        });
+      } catch (error) {
+        return blocked(
+          'branch-not-created',
+          /already exists/.test((error as Error).message)
+            ? 'Choose another branch name and accept again.'
+            : `The branch could not be added to the repository. ${plain(error)}`,
+        );
+      }
       commit = prepared.commitOid;
-    } catch {
-      return blocked('branch-not-created', 'Choose another branch name and accept again.');
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -1120,11 +1156,29 @@ export class ChatService {
     const root = task && this.deps.projectPath(task.projectId);
     if (!thread.scratchReady || !thread.base || !root)
       return { taskId: payload.taskId, base: thread.base, files: [] };
-    return {
-      taskId: payload.taskId,
-      base: thread.base,
-      files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
-    };
+    try {
+      return {
+        taskId: payload.taskId,
+        base: thread.base,
+        files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
+      };
+    } catch (error) {
+      if (!(error instanceof ScratchTooLarge)) throw error;
+      // The read has no field for a cause, so one entry says why the list is empty.
+      return {
+        taskId: payload.taskId,
+        base: thread.base,
+        files: [
+          {
+            // A backslash cannot sit in a scratch path, so Discard can never match this note.
+            path: '\\Changes could not be listed',
+            additions: 0,
+            deletions: 0,
+            patch: `${error.message}\n`,
+          },
+        ],
+      };
+    }
   }
 
   readCatalog(payload: Payload<'ReadChatCatalog'>): ChatCatalogRead {
@@ -1555,8 +1609,20 @@ export class ChatService {
     const directory = this.scratchDirectory(task.id);
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
-    const source = committedFiles(root, thread.base, { scratch: true });
-    materialize(directory, source.files, source.links);
+    const source = scratchPlan(root, thread.base);
+    copyScratch(directory, source.files, source.links, {
+      read: (files) => readPlannedBlobs(root, files as PlannedFile[]),
+      stream: (file, target) => blobToFile(root, (file as PlannedFile).oid, target),
+      checkout: { root, base: thread.base },
+      name: basename(root),
+      onProgress: (progress) => {
+        try {
+          this.deps.onImportProgress?.(task.id, progress);
+        } catch {
+          // A progress update that fails to send changes nothing about the copy.
+        }
+      },
+    });
     this.pinBase(task, root, thread.base);
     // The thread record travels in every chat.thread event, so it keeps the first 64 entries and
     // the total. The first turn says once what the copy left out.
@@ -2415,13 +2481,9 @@ export class ChatService {
     if (role === 'orchestrator') return orchestratorContext(name, directory);
     if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';
-    let files: ChatChangesRead['files'] | null = null;
-    try {
-      files = scratchChanges(root, directory, base);
-    } catch {
-      // The brief says the changes could not be read, and the model works from the files.
-    }
-    return reviewContext(name, directory, base, files, crew);
+    // The brief says why the changes could not be read, and the model works from the files.
+    const files = this.scratchDiff(turn.taskId, root, base);
+    return reviewContext(name, directory, base, files, crew, this.unreadable.get(turn.taskId));
   }
 
   /** The newest reply from a turn that wrote to the scratch copy. */
@@ -2436,11 +2498,18 @@ export class ChatService {
 
   private scratchDiff(taskId: string, root: string, base: string): FileDiff[] | null {
     try {
-      return scratchChanges(root, this.scratchDirectory(taskId), base);
-    } catch {
+      const files = scratchChanges(root, this.scratchDirectory(taskId), base);
+      this.unreadable.delete(taskId);
+      return files;
+    } catch (error) {
+      if (error instanceof ScratchTooLarge) this.unreadable.set(taskId, error.message);
+      else this.unreadable.delete(taskId);
       return null;
     }
   }
+
+  // Why the last Changes read of a thread failed when the cause was size, for the prompts.
+  private unreadable = new Map<string, string>();
 
   /**
    * The next provider starts cold, so the packet states what the scratch copy holds and where
@@ -2471,7 +2540,12 @@ export class ChatService {
         to: turn.selection.family,
         reason: input.reason,
         history,
-        files: [...changeList(changes), ...stopped, ...patches, ...checks],
+        files: [
+          ...changeList(changes, this.unreadable.get(turn.taskId)),
+          ...stopped,
+          ...patches,
+          ...checks,
+        ],
         prompt: input.prompt,
         threadTools: input.threadTools,
         instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
@@ -2767,7 +2841,11 @@ export class ChatService {
     base: string,
   ): { lines: string[]; changed: FileDiff[] } {
     const now = this.scratchDiff(taskId, root, base);
-    if (now === null) return { lines: ['The scratch changes could not be read.'], changed: [] };
+    if (now === null)
+      return {
+        lines: [this.unreadable.get(taskId) ?? 'The scratch changes could not be read.'],
+        changed: [],
+      };
     const record = this.readSeen(taskId, family);
     if (record?.sequence !== seen)
       return {
@@ -3332,8 +3410,8 @@ const clip = (text: string, characters: number) =>
 /** Two records of a changed file match when their counts and patch match. */
 const fileDigest = (file: FileDiff) => hashCanonical([file.additions, file.deletions, file.patch]);
 
-function changeList(files: readonly FileDiff[] | null): string[] {
-  if (files === null) return ['The scratch changes could not be read.'];
+function changeList(files: readonly FileDiff[] | null, why?: string): string[] {
+  if (files === null) return [why ?? 'The scratch changes could not be read.'];
   if (files.length === 0) return ['No files changed yet.'];
   return [
     ...files
@@ -3565,4 +3643,11 @@ function newest<T>(items: readonly T[], budget: number): T[] {
 
 function size(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value));
+}
+
+/** What a failed git call or check says, without the command line. */
+function plain(error: unknown): string {
+  const stderr = (error as { stderr?: Buffer | string })?.stderr?.toString().trim();
+  const text = stderr || (error instanceof Error ? error.message : String(error));
+  return `${text.split('\n')[0].slice(0, 300)}`;
 }
