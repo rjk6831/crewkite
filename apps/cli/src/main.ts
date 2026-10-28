@@ -56,7 +56,8 @@ import { type Connect, runPrint, runThreadCommand } from './chat/scripting.ts';
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
 
-const help = `Usage: crewkite -p <message> [--thread task-id | --project project-id] [--model family[/model]] [--json]
+const help = `Usage: crewkite                     interactive mode in a terminal [--no-animation]
+       crewkite -p <message> [--thread task-id | --project project-id] [--model family[/model]] [--json]
        crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show> ... (crewkite thread --help)
        crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
@@ -2085,5 +2086,33 @@ function succeeded(result: CommandResult) {
   return result.outcome === 'applied' || result.outcome === 'already-applied';
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
-  process.exitCode = await runCli(process.argv.slice(2));
+/** No subcommand on a terminal opens the interactive mode. It takes --home and --no-animation. */
+export function interactiveArgs(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--no-animation' || arg.startsWith('--home=')) continue;
+    if (arg === '--home' && index + 1 < args.length) {
+      index++;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const args = process.argv.slice(2);
+  if (process.stdout.isTTY && process.stdin.isTTY && interactiveArgs(args)) {
+    // Ink and the renderer modules load only here, so the commands and print mode run without them.
+    const { startInteractive } = await import('./interactive/start.ts').catch((error) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ERR_MODULE_NOT_FOUND') throw error;
+      return { startInteractive: null };
+    });
+    if (!startInteractive) {
+      process.stderr.write(
+        'Interactive mode needs a source checkout with its dependencies installed. The thread commands and crewkite -p work here.\n',
+      );
+      process.exitCode = 2;
+    } else process.exitCode = await startInteractive(args);
+  } else process.exitCode = await runCli(args);
+}

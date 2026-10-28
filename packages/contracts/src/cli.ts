@@ -91,7 +91,7 @@ export type CliKeyAction = z.infer<typeof CliKeyActionSchema>;
 export const CliKeySchema = z
   .string()
   .regex(
-    /^(?:(?:ctrl|alt|shift)\+){0,3}(?:enter|escape|tab|up|down|left|right|pageup|pagedown|f[1-9]|f1[0-2]|[a-z0-9])$/,
+    /^(?:(?:ctrl|alt|shift)\+){0,3}(?:enter|escape|tab|up|down|left|right|pageup|pagedown|home|end|[a-z0-9])$/,
   );
 
 /**
