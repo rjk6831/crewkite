@@ -520,10 +520,11 @@ function chatArguments(
     request.permissionPolicy === 'ask' ? 'default' : 'acceptEdits',
     // Review and advice turns read only. The thread tools only read, on every turn.
     ...(allowed.length ? ['--allowedTools', allowed.join(',')] : []),
-    // The config option takes several values, so the flag after it closes the list.
-    ...(server
-      ? ['--mcp-config', JSON.stringify({ mcpServers: server }), '--strict-mcp-config']
-      : []),
+    // The config option takes several values, so the flag after it closes the list. Strict mode
+    // goes on every turn: with no thread tools the config is empty and no other server loads.
+    '--mcp-config',
+    JSON.stringify({ mcpServers: server ?? {} }),
+    '--strict-mcp-config',
     '--model',
     model,
     // The client documents low, medium, high, xhigh and max. It has no minimal level.

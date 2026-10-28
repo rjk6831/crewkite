@@ -5,8 +5,9 @@
 //   --include-partial-messages --permission-prompt-tool stdio --setting-sources ''
 //   --settings {"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}
 //   --permission-mode default|acceptEdits
-//   [--allowedTools Read,Grep,Glob,mcp__crewkite__*] [--mcp-config {"mcpServers":{"crewkite":
-//   {"type":"stdio","command":NODE,"args":[...]}}} --strict-mcp-config] --model M
+//   [--allowedTools Read,Grep,Glob,mcp__crewkite__*] --mcp-config {"mcpServers":{}} or
+//   {"mcpServers":{"crewkite":{"type":"stdio","command":NODE,"args":[...]}}} --strict-mcp-config
+//   --model M
 //   [--effort E] [--resume S] [--add-dir F]. With no setting sources neither the scratch copy's own .claude
 //   settings nor the user file load, so no allow rule answers an ask before CrewKite sees it.
 //
@@ -619,6 +620,10 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
     '--permission-mode',
     'default',
+    // A turn with no thread tools still runs strict, so none of the person's servers load.
+    '--mcp-config',
+    '{"mcpServers":{}}',
+    '--strict-mcp-config',
     '--model',
     model,
   ];
@@ -644,15 +649,14 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
   const withTools = (argv: string[], allowed: string[]) => (_work: string) => {
     const args = launches.at(-1) ?? [];
     const config = { mcpServers: { crewkite: { type: 'stdio', command: process.execPath, args } } };
-    const at = argv.indexOf('--model');
+    const at = argv.indexOf('--mcp-config');
     return [
       ...argv.slice(0, at),
       '--allowedTools',
       allowed.join(','),
       '--mcp-config',
       JSON.stringify(config),
-      '--strict-mcp-config',
-      ...argv.slice(at),
+      ...argv.slice(at + 2),
     ];
   };
   const large = file('large.pdf', 'application/pdf', Buffer.alloc(25 * 1024 * 1024, 0x20));
@@ -777,10 +781,12 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     const result = await turn.handle.result;
     const resolved = (value: unknown) => (typeof value === 'function' ? value(turn.work) : value);
     assert.deepEqual(turn.launched.argv, resolved(row.argv));
-    // Exactly one server per launch, and nothing else names MCP.
+    // Exactly one config per launch. It holds the thread tools or nothing, and strict mode keeps
+    // every other server out.
     const configs = turn.launched.argv.filter((arg) => arg.startsWith('{"mcpServers"'));
-    assert.equal(configs.length, row.tools ? 1 : 0);
-    if (row.tools) assert.deepEqual(Object.keys(JSON.parse(configs[0]).mcpServers), ['crewkite']);
+    assert.equal(configs.length, 1);
+    assert.deepEqual(Object.keys(JSON.parse(configs[0]).mcpServers), row.tools ? ['crewkite'] : []);
+    assert.ok(turn.launched.argv.includes('--strict-mcp-config'));
     const started = turn.events.find((event) => event.type === 'turn.started');
     assert.equal(started?.effort, row.badge ?? 'default', JSON.stringify(row));
     assert.deepEqual(JSON.parse(turn.launched.input[0] ?? ''), {
