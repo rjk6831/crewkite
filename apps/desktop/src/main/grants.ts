@@ -6,6 +6,7 @@ import type { AttachmentTarget } from '../shared/open-file.ts';
  * The file paths main handed one window: picker choices, saved clipboard images and files the
  * preload read from a drop. The renderer is not trusted, so the bridge passes an import by path to
  * the controller only when main gave that path to the window first. Pasted bytes need no grant.
+ * The same check refuses the two Local token commands, which only main sends.
  */
 export class PathGrants {
   private readonly paths = new Set<string>();
@@ -20,6 +21,9 @@ export class PathGrants {
 
   /** Why the bridge refuses this command, or null when it may go to the controller. */
   refusal(command: Command): string | null {
+    // The window never holds the Local token. Main moves it on its own port, past this check.
+    if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
+      return 'The window cannot read or supply the Local token.';
     if (command.command !== 'ImportChatAttachment' || !('path' in command.payload.source))
       return null;
     return this.paths.has(command.payload.source.path)
