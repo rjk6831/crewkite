@@ -49,6 +49,7 @@ import {
   ReadExtensionsPayloadSchema,
   RunExtensionCommandPayloadSchema,
 } from './extensions.ts';
+import { AcknowledgeGoogleTermsPayloadSchema, GoogleTermsSchema } from './google-terms.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -712,6 +713,7 @@ export const GoogleAcpSetupSchema = z
       status: z.enum(['unknown', 'required', 'authenticated']),
     }),
     reason: GoogleAcpReasonSchema.nullable(),
+    googleTerms: GoogleTermsSchema.nullable().default(null),
   })
   .refine(
     (setup) =>
@@ -2510,6 +2512,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadExtensions', ReadExtensionsPayloadSchema),
   mutate('ConfigureExtension', ConfigureExtensionPayloadSchema),
   mutate('RunExtensionCommand', RunExtensionCommandPayloadSchema),
+  mutate('AcknowledgeGoogleTerms', AcknowledgeGoogleTermsPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -3830,6 +3833,7 @@ export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export { canonicalJson } from './canonical.ts';
 export * from './chat.ts';
 export * from './extensions.ts';
+export * from './google-terms.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

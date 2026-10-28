@@ -424,6 +424,7 @@ export function useWorkspace() {
             | 'RefreshAnthropicUsage'
             | 'StopAnthropicUsage'
             | 'CheckNativeConnection'
+            | 'AcknowledgeGoogleTerms'
             | 'InstallGoogleAcp'
             | 'StopGoogleAcpInstall'
             | 'InitializeGoogleAcp'
@@ -453,6 +454,7 @@ export function useWorkspace() {
         input.command === 'RefreshAnthropicUsage' ||
         input.command === 'StopAnthropicUsage' ||
         input.command === 'CheckNativeConnection' ||
+        input.command === 'AcknowledgeGoogleTerms' ||
         input.command === 'InstallGoogleAcp' ||
         input.command === 'StopGoogleAcpInstall' ||
         input.command === 'InitializeGoogleAcp' ||

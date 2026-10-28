@@ -77,6 +77,10 @@ Live qualification pending.
 
 ### Google
 
+#### Google and your account
+
+Google's [third-party access FAQ](https://antigravity.google/docs/faq/) says that third-party access through an Antigravity login violates its terms. Its [headless FAQ](https://antigravity.google/docs/faq/#can-i-use-antigravity-cli-headless-mode-in-third-party-coding-agents-or-automate-account-switching) also excludes consumer CLI wrappers. I checked both on 21 October 2026. Google does not name CrewKite, and CrewKite has no exception from Google. Using the Google route is your own choice and your own risk. Roots No Limits LLC accepts no liability for action Google takes against your account. Settings shows this summary and keeps Connect Google off until you tick a box that says you have read Google's terms and accept the risk. The controller refuses a Google connection without that acknowledgement, and it asks again when this text changes.
+
 The transport is Google's published ACP agent, with CrewKite as the protocol client over the agent's stdio. Each turn starts the pinned agent and sends `initialize` with filesystem and terminal services off, so the agent works with its own tools in the scratch copy. It then sends `session/load` with the saved session ID when the agent supports loading, and `session/new` otherwise, both rooted at the scratch copy. It sets the model and thought level with `session/set_config_option` and sends `session/prompt`.
 
 `agent_message_chunk` and `agent_thought_chunk` updates stream as text and thinking. `tool_call` and `tool_call_update` become tool cards. A card names the file, pattern or command the frame gives, such as `Read src/app.ts lines 3-9`, and keeps the agent's own title when the frame names none. `session/request_permission` becomes a permission request. Stop sends `session/cancel` and answers open requests as cancelled. Quota, rate-limit and resource-exhausted errors end the turn with a limit.

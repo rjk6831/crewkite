@@ -1,11 +1,17 @@
 import type { DesktopCommand } from '@crewkite/client';
-import type { CommandResult, WorkspaceState } from '@crewkite/contracts';
+import {
+  type CommandResult,
+  GOOGLE_TERMS_VERSION,
+  googleTermsCurrent,
+  type WorkspaceState,
+} from '@crewkite/contracts';
 
 type GoogleState = Pick<WorkspaceState, 'googleAcpInstall' | 'googleAcpSetup'>;
 type GoogleCommand = Extract<
   DesktopCommand,
   {
     command:
+      | 'AcknowledgeGoogleTerms'
       | 'InstallGoogleAcp'
       | 'InitializeGoogleAcp'
       | 'AuthenticateGoogleAcp'
@@ -66,12 +72,26 @@ export async function runGoogleSetupFlow({
   onStage: (stage: GoogleSetupStage) => void;
 }): Promise<GoogleSetupFlowResult> {
   const attempted = new Set<GoogleSetupStage>();
+  let acknowledged = false;
   for (;;) {
     const state = await read();
     if (!active()) return { kind: 'stopped' };
     const stage = nextGoogleStage(state);
     if (stage === 'ready') return { kind: 'ready' };
     if (!stage || attempted.has(stage)) return { kind: 'blocked' };
+    // The person ticked the box in this click. The controller stores it and refuses every
+    // connection step until it holds the current text version.
+    if (!acknowledged && !googleTermsCurrent(state.googleAcpSetup?.googleTerms)) {
+      acknowledged = true;
+      const result = await command({
+        command: 'AcknowledgeGoogleTerms',
+        expectedRevision: 0,
+        payload: { textVersion: GOOGLE_TERMS_VERSION },
+      });
+      if (!active()) return { kind: 'stopped' };
+      if (!applied(result)) return { kind: 'blocked', result };
+      continue;
+    }
     attempted.add(stage);
     onStage(stage);
     const setup = state.googleAcpSetup;

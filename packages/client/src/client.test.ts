@@ -633,6 +633,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     client: { version: '1.4.0', sha256: 'a'.repeat(64), signerTeamId: 'TESTTEAM' },
     auth: { method: 'oauth-personal', status: 'authenticated' },
     reason: 'qualification-pending',
+    googleTerms: null,
   };
   const acpCases = [
     'show',

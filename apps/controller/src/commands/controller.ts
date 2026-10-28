@@ -97,6 +97,7 @@ import { CombinedCommands } from './combined.ts';
 import { CombinedAssemblyCommands } from './combined-assembly.ts';
 import { CombinedEvaluationCommands } from './combined-evaluation.ts';
 import { EvaluationCommands } from './evaluation.ts';
+import { acknowledgeGoogleTerms, googleTermsGate } from './google-terms.ts';
 import { NativeEvidenceCommands } from './native-evidence.ts';
 import { NativeLaunchCommands } from './native-launch.ts';
 import { NativePlanCommands } from './native-plans.ts';
@@ -901,6 +902,12 @@ export class Controller {
         this.outputReads.delete(reading);
       }
     }
+    if (command.command === 'AcknowledgeGoogleTerms')
+      return this.store.transaction(() =>
+        acknowledgeGoogleTerms(this.store, command.payload.textVersion, this.now()),
+      );
+    const termsRefusal = googleTermsGate(this.store, command);
+    if (termsRefusal) return termsRefusal;
     if (
       [
         'InitializeGoogleAcp',

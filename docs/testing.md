@@ -151,3 +151,11 @@ Three claims cover the extension seam in [ADR 0047](adr/0047-extensions-attach-t
 - The reference extension from the testkit is listed off with its manifest. Its thread action and command appear only while it is on, and turning it off removes both. A new sibling module or `package.json` in its folder turns it off until the file goes, a link or a folder over 256 files is refused, and a contract major bump in its manifest turns it off with the plain line. A folder that changes while its module loads stays off, and a module fixed after a failed load needs a restart.
 
 These run against a real controller and real SQLite with synthetic extension modules. They make no claim about the behavior of a separately licensed extension.
+
+## Google terms gate
+
+One claim covers the Google gate in `apps/controller/src/commands/google-terms.test.ts`.
+
+- The controller refuses a Google connection step until the person acknowledged the current terms text. A first connection with no acknowledgement is refused, an acknowledgement of an old text version is refused and stores nothing, an acknowledgement of the current version is stored with the controller time and the version, the same step then reaches setup, and a stored acknowledgement of an older version is refused again. The renderer flow test keeps the setup sequence with a current acknowledgement in place.
+
+This runs against a real controller and real SQLite with no network.

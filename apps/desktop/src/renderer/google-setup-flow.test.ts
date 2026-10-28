@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { WorkspaceState } from '@crewkite/contracts';
+import { GOOGLE_TERMS_VERSION, type WorkspaceState } from '@crewkite/contracts';
 import { pollGoogleSetupStatus, runGoogleSetupFlow } from './google-setup-flow.ts';
 
 type GoogleState = Pick<WorkspaceState, 'googleAcpInstall' | 'googleAcpSetup'>;
@@ -18,6 +18,7 @@ const setup = (
   client: null,
   auth: { method: null, status: 'unknown' },
   reason: null,
+  googleTerms: { version: GOOGLE_TERMS_VERSION, at: '2026-10-28T00:00:00.000Z' },
   ...change,
 });
 
