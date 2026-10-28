@@ -11,7 +11,7 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 ![The thread view: a streamed reply, a thinking card, tool cards with a diff and an inline permission prompt.](docs/images/thread.png)
 
-A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan, assigns each slice by allowance and difficulty, and runs it. Builders on any family run the slices, and any model can read what another did through read-only thread tools. Local takes the slices that fit its context. <!-- L9: confirm the crew paragraph once the orchestrator and thread tools are integrated -->
+A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan, assigns each slice by allowance and difficulty, and runs it. Builders on any family run the slices, and any model can read what another did through read-only thread tools. Local takes the easy slices that fit its context.
 
 ## Install
 
