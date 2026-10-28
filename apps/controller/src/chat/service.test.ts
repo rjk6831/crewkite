@@ -507,6 +507,8 @@ test('a message sent during a turn waits and starts when the turn ends', {
   const users = (read: ChatThreadRead) => read.messages.filter((m) => m.author.kind === 'user');
   for (const row of cases) {
     const thread = standalone(t, {
+      // The thread tools socket failed to open: every cloud turn says so and runs without them.
+      threadToolsDown: () => true,
       adapters: new Map([
         [
           'openai',
@@ -585,6 +587,23 @@ test('a message sent during a turn waits and starts when the turn ends', {
     assert.deepEqual(
       after.turns.slice(1).map((turn) => turn.userMessageId),
       started,
+      row.name,
+    );
+    const ran = after.turns.map((turn) => turn.id);
+    assert.deepEqual(
+      after.messages
+        .filter((message) => message.text.startsWith('Thread tools are unavailable'))
+        .map((message) => message.author.kind === 'system' && message.author.turnId),
+      ran,
+      row.name,
+    );
+    assert.deepEqual(
+      agentEvents(thread).flatMap((event) =>
+        event.type === 'provider.notice' && event.trace && /thread_live/.test(event.message)
+          ? [event.turnId]
+          : [],
+      ),
+      ran,
       row.name,
     );
   }

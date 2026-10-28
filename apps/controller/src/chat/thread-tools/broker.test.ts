@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { existsSync, lstatSync, mkdirSync, mkdtempSync, rmSync } from 'node:fs';
 import { connect } from 'node:net';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { THREAD_TOOLS, type ThreadToolName, ThreadToolsBroker } from './broker.ts';
 import { fixtureReader, fixtureSecrets, fixtureThread, fixtureTurn } from './fixture.ts';
@@ -36,17 +37,34 @@ function exchange(path: string, hello: object, calls: object[] = []): Promise<Ex
 }
 
 test('a turn token opens one connection to one thread, and every read comes back bounded and redacted', async (t) => {
-  const home = mkdtempSync(join(tmpdir(), 'crewkite-thread-tools-'));
+  // A controller home 120 characters deep, where a socket inside the home passes the 104 and
+  // 108 byte Unix socket path limits, still gets thread tools.
+  const root = mkdtempSync(join(tmpdir(), 'crewkite-thread-tools-'));
+  const home = join(root, 'h'.repeat(119 - root.length));
+  mkdirSync(home);
+  assert.equal(home.length, 120);
   let counter = 0;
   const broker = new ThreadToolsBroker({
     home,
     random: (size) => Buffer.alloc(size, ++counter),
   });
+  // A controller that crashed left its socket file behind. The next start removes it and binds.
+  mkdirSync(dirname(broker.socketPath), { recursive: true, mode: 0o700 });
+  const crashed = spawnSync(process.execPath, [
+    '-e',
+    "require('node:net').createServer().listen(process.argv[1], () => process.kill(process.pid, 'SIGKILL'))",
+    broker.socketPath,
+  ]);
+  assert.equal(crashed.signal, 'SIGKILL');
+  assert(lstatSync(broker.socketPath).isSocket());
   await broker.start();
+  assert.equal(lstatSync(broker.socketPath).mode & 0o777, 0o600);
+  assert.equal(lstatSync(dirname(broker.socketPath)).mode & 0o777, 0o700);
   t.after(async () => {
     await broker.close();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true });
   });
+  assert(Buffer.byteLength(broker.socketPath) <= 100, broker.socketPath);
   const token = (server: { args: readonly string[] }) =>
     server.args[server.args.indexOf('--token') + 1];
   const reader = fixtureReader();
@@ -151,4 +169,8 @@ test('a turn token opens one connection to one thread, and every read comes back
   broker.end('trn_01M51M322B2AEBXD9MA74CBCFN');
   const ended = await exchange(broker.socketPath, { thread: fixtureThread, token: token(other) });
   assert.deepEqual(ended.hello, { ok: false });
+
+  // The controller exits: its socket file goes with it.
+  await broker.close();
+  assert(!existsSync(broker.socketPath));
 });

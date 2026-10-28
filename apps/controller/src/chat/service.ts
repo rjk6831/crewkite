@@ -161,6 +161,8 @@ export type ChatServiceDeps = {
    * when settling fails, so what the turn was lent (its thread tools token) ends with it.
    */
   onTurnEnded?: (turnId: string) => void;
+  /** True when the thread tools socket failed to open, so cloud turns run without the tools. */
+  threadToolsDown?: () => boolean;
   /** Process table access and timers. Tests replace them; the defaults are the real ones. */
   groupAbsent?: (group: number) => boolean;
   signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -1360,6 +1362,8 @@ export class ChatService {
       effort: turn.selection.effort,
       role: turn.role,
     });
+    if (turn.selection.family !== 'local' && this.deps.threadToolsDown?.())
+      this.toolsDown(turn, live);
     live.handle = adapter.startTurn(request, (event) => this.record(turn, live, event));
     try {
       this.deps.store.transaction(() => this.saveGroups(turn.id, live));
@@ -1368,6 +1372,32 @@ export class ChatService {
     }
     if (this.closed || live.stopRequested) live.handle.stop();
     return live.handle.result;
+  }
+
+  /**
+   * The thread tools socket did not open, so this cloud turn runs without the tools. The thread
+   * says so on every such turn, and the turn trace names the tools it lacks.
+   */
+  private toolsDown(turn: ChatTurn, live: LiveTurn) {
+    try {
+      this.deps.store.transaction(() =>
+        this.appendEntry(this.task(turn.taskId) as Task, {
+          kind: 'chat-system',
+          author: { kind: 'system', turnId: turn.id },
+          text: 'Thread tools are unavailable: the controller could not open its socket. This turn runs without them.',
+        }),
+      );
+    } catch {
+      // The trace below still records it.
+    }
+    this.record(turn, live, {
+      type: 'provider.notice',
+      turnId: turn.id,
+      level: 'info',
+      message:
+        'Thread tools absent for this turn: thread_turns, thread_turn, thread_diff, thread_checks and thread_live.',
+      trace: true,
+    });
   }
 
   /**
