@@ -46,6 +46,7 @@ import { TaskConversation } from '../conversation/conversation.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
 import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
 import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
+import { ExtensionHost } from '../extensions/host.ts';
 import type { GitIdentity } from '../host/publication.ts';
 import { inspectSourceDetails, projectRoot } from '../host/source.ts';
 import { groupAbsent, type OwnedCommand, type OwnedWorker, type Schedule } from '../host/worker.ts';
@@ -366,6 +367,17 @@ export class Controller {
         ),
     });
     return this.taskOperationRuntime;
+  }
+
+  private extensionRuntime?: ExtensionHost;
+  private extensions(): ExtensionHost {
+    this.extensionRuntime ??= new ExtensionHost({
+      home: this.home,
+      task: (taskId) => this.store.get<Task>('task', taskId),
+      readThread: (taskId) => this.chat().readThread({ taskId, limit: 50 }),
+      emit: (task, payload) => this.event('extension.event', task.id, task.revision, payload),
+    });
+    return this.extensionRuntime;
   }
 
   private chatRuntime?: ChatService;
@@ -1251,6 +1263,8 @@ export class Controller {
 
   checkRevision(command: Command): CommandResult | undefined {
     if (!('expectedRevision' in command)) return;
+    if (command.command === 'ConfigureExtension' || command.command === 'RunExtensionCommand')
+      return this.extensions().checkRevision(command);
     if (
       command.command === 'ConfigureLocal' ||
       command.command === 'BeginLocalConnectionInput' ||
@@ -1468,6 +1482,12 @@ export class Controller {
         return this.chat().cancelPlan(command.payload, effects);
       case 'ReadChatTurnEvents':
         return this.chat().readTurnEvents(command.payload);
+      case 'ReadExtensions':
+        return { outcome: 'applied', data: { kind: 'extensions', ...this.extensions().read() } };
+      case 'ConfigureExtension':
+        return this.extensions().configure(command.payload);
+      case 'RunExtensionCommand':
+        return this.extensions().run(command.payload);
       case 'AcceptChatChanges':
         return this.chat().accept(
           command.payload,
