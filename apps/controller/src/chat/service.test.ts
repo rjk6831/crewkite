@@ -14,6 +14,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -27,6 +28,7 @@ import type {
   AgentEvent,
   ChatAttachment,
   ChatCatalogRead,
+  ChatCheckRun,
   ChatCrew,
   ChatFamily,
   ChatHandoffMode,
@@ -61,6 +63,7 @@ import {
 } from './adapter.ts';
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
+import { McpRegistry } from './mcp-servers.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
 
@@ -516,15 +519,35 @@ test('a message sent during a turn waits and starts when the turn ends', {
         [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
       ],
     });
+    const mcp = new McpRegistry();
     const thread = standalone(t, {
       // The thread tools socket failed to open: every cloud turn says so and runs without them.
       threadToolsDown: () => true,
+      mcp,
       adapters: new Map([['openai', scripted]]),
     });
     const { store, service, taskId } = thread;
+    // The thread turned a server on. OpenAI cannot route its calls through the gate, so the
+    // controller leaves it out of the request and says so in the request's notes.
+    mcp.set({
+      servers: [
+        {
+          name: 'notes',
+          command: 'notes-server',
+          args: [],
+          secretArgs: [],
+          env: {},
+          readTools: [],
+        },
+      ],
+      threads: { [taskId]: { notes: 'all' } },
+    });
     const parked = turnReaches(thread, 'waiting-permission');
     thread.send(first);
     const { id: turnId } = await parked;
+    const sent = (scripted.requests as unknown as ChatTurnRequest[])[0]?.mcp;
+    assert.deepEqual(sent?.servers, []);
+    assert.match(sent?.notes[0] ?? '', /^MCP server notes is off for this turn\./);
     const refused = row.send
       .map((text) => thread.send(text))
       .flatMap((result) => (result.outcome === 'applied' ? [] : [[result.reason, result.next]]));
@@ -1843,6 +1866,39 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       chain: { step: 'finished', reviewRounds: 2, fixes: 1, reason: null },
     },
     {
+      name: 'a failing check goes to the fixer as its message, then the chain goes on',
+      reviews: [reply(twoFindings), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      gate: true,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['fixer', 'openai'],
+        ['fixer', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 2 review rounds, 2 fixes.',
+      chain: { step: 'finished', reviewRounds: 2, fixes: 2, reason: null },
+    },
+    {
+      name: 'a fixer that edits the check script makes the chain ask before the check runs',
+      reviews: [reply(twoFindings), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      gate: true,
+      edit: true,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['fixer', 'openai'],
+        ['fixer', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 2 review rounds, 2 fixes.',
+      chain: { step: 'finished', reviewRounds: 2, fixes: 2, reason: null },
+    },
+    {
       name: 'findings 0 at once',
       reviews: [reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
@@ -1917,8 +1973,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         ['ask', 'google'],
       ],
       line: 'Crew finished: 2 slices, 2 reviews, 0 fixes.',
-      // The challenge follows the last slice's own review chain.
-      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      // Each slice reviews in its own lane. The thread's chain holds the challenge alone.
+      chain: { step: 'finished', reviewRounds: 0, fixes: 0, reason: null },
       builderAt: 3,
       card: ['finished', 'done', 'done'],
     },
@@ -1964,7 +2020,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         ['challenger', 'google'],
       ],
       line: 'Crew finished: 1 slice, 1 review, 0 fixes.',
-      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      chain: { step: 'finished', reviewRounds: 0, fixes: 0, reason: null },
       builderAt: 1,
       card: ['finished', 'done'],
     },
@@ -2008,16 +2064,28 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
   for (const row of cases) {
     const now = createTestClock().now();
     const planned = 'plan' in row;
+    // The gate script lives in the scratch copy, as a project's own script would. It fails the
+    // first time it runs and passes after, so the first fix does not satisfy it. The row turns
+    // the check on when the builder starts, once the copy exists.
+    let begun: ((scratch: string) => void) | undefined;
+    let fixers = 0;
+    const openai = createScriptedChatAdapter({
+      family: 'openai',
+      turns: planned
+        ? [...row.plan, ...row.builds]
+        : [reply('Built it.'), reply('Fixed both.'), reply('Fixed the gate.')],
+    });
+    const gateAdapter = {
+      ...openai,
+      startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+        if (openai.requests.length === 0) begun?.(request.scratch.directory);
+        if ('edit' in row && request.role === 'fixer' && fixers++ === 0)
+          appendFileSync(join(request.scratch.directory, 'gate.mjs'), '\n// edited by the fixer\n');
+        return openai.startTurn(request, emit);
+      },
+    };
     const adapters = new Map([
-      [
-        'openai',
-        createScriptedChatAdapter({
-          family: 'openai',
-          turns: planned
-            ? [...row.plan, ...row.builds]
-            : [reply('Built it.'), reply('Fixed both.')],
-        }),
-      ],
+      ['openai', 'gate' in row ? gateAdapter : openai],
       ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: row.reviews })],
       [
         'google',
@@ -2056,6 +2124,32 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     assert.equal(thread.read().thread.autoHandoff, !balanced, row.name);
     if (row.autoHandoff === false)
       store.transaction(() => service.configure({ taskId, autoHandoff: false }));
+    const asks: ChatThread[] = [];
+    store.subscribe((event) => {
+      if (event.type === 'chat.thread' && (event.payload as ChatThread).checks?.ask)
+        asks.push(event.payload as ChatThread);
+    });
+    if ('gate' in row)
+      begun = (scratch) => {
+        writeFileSync(
+          join(scratch, 'gate.mjs'),
+          [
+            "import { existsSync, writeFileSync } from 'node:fs';",
+            "const marker = new URL('ran', import.meta.url);",
+            'if (existsSync(marker)) process.exit(0);',
+            "writeFileSync(marker, 'x');",
+            "console.log('gate: expected 3 got 2');",
+            'process.exitCode = 1;',
+          ].join('\n'),
+        );
+        store.transaction(() =>
+          service.configure({
+            taskId,
+            permissionPolicy: 'allow-all',
+            checks: { add: 'node gate.mjs' },
+          }),
+        );
+      };
     const ended = next(
       thread,
       (event) =>
@@ -2096,6 +2190,34 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         row.name,
       );
     } else thread.send('Fix the rounding.', pick('openai'));
+    if ('edit' in row) {
+      // The fixer changed the script the person turned on, so Glide asks even with Allow all.
+      const raised = (
+        await next(
+          thread,
+          (event) => event.type === 'chat.thread' && !!(event.payload as ChatThread).checks?.ask,
+        )
+      ).payload as ChatThread;
+      assert.equal(raised.checks?.runs.length, 0, row.name);
+      assert.deepEqual(raised.checks?.ask?.changed, ['node gate.mjs'], row.name);
+      assert.deepEqual(
+        raised.checks?.ask?.commands,
+        [{ label: 'node gate.mjs', resolved: 'node gate.mjs' }],
+        row.name,
+      );
+      const answer = act(store, (effects) =>
+        service.resolvePermission(
+          {
+            taskId,
+            turnId: thread.read().turns.at(-1)?.id as string,
+            requestId: raised.checks?.ask?.requestId as string,
+            choice: 'allow',
+          },
+          effects,
+        ),
+      );
+      assert.equal(answer.outcome, 'applied', row.name);
+    }
     const answered =
       'ask' in row &&
       next(
@@ -2171,6 +2293,36 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     }
     // The person's pick stays on the builder whatever the crew borrowed.
     assert.equal(read.thread.selection?.family, 'openai', row.name);
+    if ('gate' in row) {
+      const requests = adapters.get('openai')?.requests ?? [];
+      assert.equal(requests[2]?.role, 'fixer');
+      assert.match(requests[2]?.prompt ?? '', /^The project checks failed in the scratch copy\./);
+      assert.match(requests[2]?.prompt ?? '', /gate: expected 3 got 2/);
+      // The second fix is the last one the chain allows, and the second run passes.
+      const runs = read.thread.checks?.runs ?? [];
+      assert.deepEqual(
+        runs.map((run) => [run.status, run.exitCode, run.reason, run.trigger]),
+        [
+          ['failed', 1, 'Exit code 1.', 'fix'],
+          ['passed', 0, null, 'fix'],
+        ],
+      );
+      assert.equal(runs[0].tail, 'gate: expected 3 got 2');
+      const files = new ArtifactFiles(join(dirname(thread.root), 'artifacts'));
+      assert.equal(
+        files.read(runs[0].stdout?.hash ?? '').toString('utf8'),
+        'gate: expected 3 got 2\n',
+      );
+      // Only the edited script asked, and the second fix ran on the pin the answer renewed.
+      assert.equal(asks.length, 'edit' in row ? 1 : 0, row.name);
+      const lines = read.messages.map((message) => message.text);
+      assert.ok(lines.some((line) => line.startsWith('Checks failed: node ')));
+      assert.ok(lines.some((line) => line.startsWith('Checks passed: node ')));
+      // A provider reads the newest run of each check through thread_checks.
+      const seen = service.threadReads(taskId).checks().lines;
+      assert.match(seen.join('\n'), /\): passed in \d+\.\d s/);
+      continue;
+    }
     const reviewed = adapters.get('anthropic')?.requests[0];
     assert.match(reviewed?.systemContext ?? '', /reads exactly `Findings: N`/, row.name);
     assert.equal(reviewed?.prompt, 'Review the current changes.', row.name);
@@ -2197,6 +2349,351 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     assert.match(delta, /^Anthropic, reviewer \(anthropic-model\):\nClean\.\nFindings: 0$/m);
     assert.match(delta, /^Google, challenger \(google-model\):\nIt holds\.$/m);
   }
+});
+
+// A plan's slices run side by side, each in its own scratch copy, and merge in plan order.
+// OpenAI takes the medium slices and Local the easy ones, so two families answer at once.
+test('plan slices run side by side in their own copies, merge in plan order and stop together', {
+  timeout: 60000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep => ({ kind: 'text', itemId: 'r', chunks: [text] });
+  const write = (path: string, content: string): ChatScriptStep => ({
+    kind: 'tool',
+    callId: `w-${path}`,
+    toolKind: 'edit',
+    title: `Write ${path}`,
+    write: { path, content },
+  });
+  const park: ChatScriptStep = { kind: 'permission', requestId: 'park', question: 'Go on?' };
+  const failed: ChatScriptStep = {
+    kind: 'fail',
+    stopReason: 'error',
+    failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
+  };
+  const slice = (id: number, difficulty: 'easy' | 'medium', depends: number[] = []) => ({
+    id,
+    title: `Part ${id}`,
+    brief: `Do part ${id}.`,
+    files: [],
+    depends,
+    difficulty,
+    readOnly: false,
+  });
+  const planned = (slices: object[]): ChatScriptStep[] => [
+    reply(
+      `\`\`\`json plan\n${JSON.stringify({ planId: 'p1', goal: 'Split it.', slices })}\n\`\`\``,
+    ),
+  ];
+  const rows = [
+    {
+      name: 'two families at once, a shared family waits, a dependency starts from merged work',
+      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'medium'), slice(4, 'easy', [1])],
+      openai: [[park, write('a.txt', 'one\n'), reply('Built 1.')], [write('c.txt', 'three\n')]],
+      local: [[write('b.txt', 'two\n')], [write('d.txt', 'four\n')]],
+      line: 'Crew finished: 4 slices, 0 reviews, 0 fixes.',
+      card: ['finished', 'done', 'done', 'done', 'done'],
+      files: { 'a.txt': 'one\n', 'b.txt': 'two\n', 'c.txt': 'three\n', 'd.txt': 'four\n' },
+    },
+    {
+      name: 'a conflict blocks the slice and the orchestrator merges it in one turn',
+      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      openai: [[write('net.mjs', 'one\n')], [write('net.mjs', 'one\ntwo\n'), reply('Merged.')]],
+      local: [[write('net.mjs', 'two\n')]],
+      line: 'Crew finished: 2 slices, 0 reviews, 1 fix.',
+      card: ['finished', 'done', 'done'],
+      files: { 'net.mjs': 'one\ntwo\n' },
+      conflict: true,
+    },
+    {
+      name: 'a conflict the orchestrator cannot resolve stops the plan with the slice blocked',
+      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      openai: [[write('net.mjs', 'one\n')], [failed]],
+      local: [[write('net.mjs', 'two\n')]],
+      line: 'Plan stopped: the orchestrator could not resolve slice 2.',
+      card: ['stopped', 'done', 'blocked'],
+      files: { 'net.mjs': 'one\n' },
+      conflict: true,
+    },
+    {
+      // Slice 2 finished while slice 1 runs, so it merges before the stop and is not lost.
+      name: 'stop ends every running slice and keeps the finished one',
+      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'easy', [2])],
+      openai: [[{ kind: 'wait' } as const]],
+      local: [[write('b.txt', 'two\n')]],
+      line: 'Plan stopped: you cancelled it.',
+      card: ['stopped', 'not-run', 'done', 'not-run'],
+      files: { 'b.txt': 'two\n' },
+      stop: true,
+    },
+    {
+      // Slice 2 cannot start, and the slice 1 turn opened in the same step never runs.
+      name: 'a slice that cannot start stops the plan before a sibling opened beside it runs',
+      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      openai: [[write('a.txt', 'one\n')]],
+      local: [],
+      line: 'Plan stopped: slice 2 could not start. Connect this provider in Settings or pick another.',
+      card: ['stopped', 'not-run', 'failed'],
+      files: {},
+      unplugged: true,
+    },
+  ];
+  for (const row of rows) {
+    const now = createTestClock().now();
+    const scripted = (family: ChatFamily, turns: ChatScriptStep[][]) =>
+      createScriptedChatAdapter({ family, turns });
+    const openai = scripted('openai', [planned(row.slices), ...row.openai]);
+    const local = scripted('local', row.local);
+    // What each slice's copy held when its turn started.
+    const held: Record<string, boolean> = {};
+    const watch = (adapter: typeof openai) => ({
+      ...adapter,
+      startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+        held[request.turnId] = existsSync(join(request.scratch.directory, 'a.txt'));
+        return adapter.startTurn(request, emit);
+      },
+    });
+    const families = [familyEntry('openai', 10, null, now), familyEntry('local', 90, null, now)];
+    const thread = standalone(t, {
+      adapters: new Map([
+        ['openai', watch(openai)],
+        ...('unplugged' in row ? [] : [['local', watch(local)] as const]),
+      ]),
+      catalog: () => ({ families }),
+      localContext: () => 32_768,
+      localSliceFits: () => true,
+    });
+    const { store, service, taskId } = thread;
+    const crew: ChatCrew = {
+      name: 'Plan crew',
+      members: [
+        { role: 'builder', selection: pick('openai') },
+        { role: 'orchestrator', selection: pick('openai') },
+      ],
+    };
+    store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+    const cards: ChatThread[] = [];
+    store.subscribe((event) => {
+      if (event.type === 'chat.thread' && (event.payload as ChatThread).plan)
+        cards.push(event.payload as ChatThread);
+    });
+    const ended = next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        /^(Crew finished|Plan stopped)/.test((event.payload as { text: string }).text),
+    );
+    const parked = next(
+      thread,
+      (event) => event.type === 'agent.event' && event.payload.type === 'permission.requested',
+    );
+    const merging = next(
+      thread,
+      (event) =>
+        event.type === 'chat.thread' &&
+        (event.payload as ChatThread).plan?.slices[1]?.lane?.step === 'merge',
+    );
+    thread.send('Split the work.', pick('openai'));
+    if (row.name.startsWith('two families')) {
+      await parked;
+      // Slice 2 ran and finished while slice 1 still waits on its question. It merges after slice
+      // 1, in plan order. Slice 3 waits for OpenAI, and slice 4 for slice 1.
+      const shown = ((await merging).payload as ChatThread).plan;
+      assert.deepEqual(
+        shown?.slices.map((value) => [value.status, value.lane?.step ?? null]),
+        [
+          ['running', 'build'],
+          ['running', 'merge'],
+          ['queued', null],
+          ['queued', null],
+        ],
+        row.name,
+      );
+      const open = thread.read().turns.find((turn) => turn.slice === 1);
+      assert.equal(
+        act(store, (effects) =>
+          service.resolvePermission(
+            { taskId, turnId: open?.id as string, requestId: 'park', choice: 'allow-once' },
+            effects,
+          ),
+        ).outcome,
+        'applied',
+        row.name,
+      );
+    }
+    if ('stop' in row) {
+      await merging;
+      assert.equal(
+        act(store, (effects) => service.cancelPlan({ taskId, planId: 'p1' }, effects)).outcome,
+        'applied',
+        row.name,
+      );
+    }
+    await ended;
+    if ('stop' in row || 'unplugged' in row) await settles(thread);
+    const read = thread.read();
+    const lines = read.messages.map((message) => message.text);
+    assert.equal(lines.at(-1), row.line, row.name);
+    const card = read.thread.plan;
+    assert.deepEqual(
+      card ? [card.phase, ...card.slices.map((value) => value.status)] : null,
+      row.card,
+      row.name,
+    );
+    const scratch = join(dirname(thread.root), 'chat', taskId, 'scratch');
+    for (const [path, content] of Object.entries(row.files))
+      assert.equal(readFileSync(join(scratch, path), 'utf8'), content, `${row.name}: ${path}`);
+    // Every slice turn worked in its own copy, never in the thread's or another slice's.
+    const requests = [...openai.requests, ...local.requests];
+    const copies = requests.flatMap((request) => {
+      const turn = read.turns.find((value) => value.id === request.turnId);
+      return turn?.slice !== undefined && turn.role === 'assistant'
+        ? [[turn.slice, request.scratch.directory] as const]
+        : [];
+    });
+    assert.equal(new Set(copies.map(([, directory]) => directory)).size, copies.length, row.name);
+    for (const [id, directory] of copies) {
+      assert.notEqual(directory, scratch, row.name);
+      assert.ok(directory.endsWith(join('slices', String(id), 'copy')), row.name);
+    }
+    if (row.name.startsWith('two families')) {
+      // Slices start in one turn per family. Slice 4 started from slice 1's merged work.
+      assert.deepEqual(
+        read.turns.map((turn) => [turn.selection.family, turn.slice ?? null]),
+        [
+          ['openai', null],
+          ['openai', 1],
+          ['local', 2],
+          ['openai', 3],
+          ['local', 4],
+        ],
+        row.name,
+      );
+      const fourth = read.turns.find((turn) => turn.slice === 4);
+      assert.equal(held[fourth?.id ?? ''], true, row.name);
+      const finished = lines.filter((line) => /^Slice \d finished/.test(line));
+      assert.deepEqual(
+        finished,
+        [1, 2, 3, 4].map((id) => `Slice ${id} finished: 1 file merged.`),
+        row.name,
+      );
+      assert.ok(lines.includes('Slice 2 started on Local (local-model).'), row.name);
+    }
+    if ('conflict' in row) {
+      const blocked = cards.find((value) => value.plan?.slices[1]?.status === 'blocked')?.plan;
+      assert.deepEqual(blocked?.slices[1]?.conflicts, ['net.mjs'], row.name);
+      assert.ok(
+        lines.includes(
+          'Slice 2 blocked: 1 file conflicts with the thread copy: net.mjs. The orchestrator gets one turn to resolve it.',
+        ),
+        row.name,
+      );
+      // The orchestrator's model resolves in the thread copy, with the slice's version quoted.
+      const resolve = openai.requests.at(-1);
+      assert.equal(resolve?.role, 'fixer', row.name);
+      assert.equal(resolve?.scratch.directory, scratch, row.name);
+      assert.match(resolve?.prompt ?? '', /^net\.mjs, as the slice left it:\n\n```\ntwo\n```$/m);
+    }
+    if ('stop' in row) {
+      const stopped = read.turns.find((turn) => turn.slice === 1);
+      assert.equal(stopped?.state, 'stopped', row.name);
+      assert.ok(lines.includes('Slice 2 finished: 1 file merged.'), row.name);
+    }
+    if ('unplugged' in row) {
+      assert.equal(read.turns.find((turn) => turn.slice === 1)?.state, 'stopped', row.name);
+      assert.equal(openai.requests.length, 1, row.name);
+      assert.ok(!existsSync(join(scratch, 'a.txt')), row.name);
+    }
+  }
+});
+
+// Startup recovery stops a plan whose slice was mid-review with one plain line.
+test('a restart during a plan shows the plan stopped with a line', {
+  timeout: 30000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const plan = {
+    planId: 'p1',
+    goal: 'One part.',
+    slices: [
+      {
+        id: 1,
+        title: 'Part 1',
+        brief: 'Do it.',
+        files: [],
+        depends: [],
+        difficulty: 'medium',
+        readOnly: false,
+      },
+    ],
+  };
+  const now = createTestClock().now();
+  const families = [familyEntry('openai', 10, null, now), familyEntry('anthropic', 50, null, now)];
+  const { store, service, taskId, start, send, read } = standalone(t, {
+    adapters: new Map([
+      [
+        'openai',
+        createScriptedChatAdapter({
+          family: 'openai',
+          turns: [
+            [
+              {
+                kind: 'text',
+                itemId: 'r',
+                chunks: [`\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``],
+              },
+            ],
+            [{ kind: 'text', itemId: 'r', chunks: ['Built.'] }],
+          ],
+        }),
+      ],
+      [
+        'anthropic',
+        createScriptedChatAdapter({ family: 'anthropic', turns: [[{ kind: 'wait' }]] }),
+      ],
+    ]),
+    catalog: () => ({ families }),
+  });
+  const crew: ChatCrew = {
+    name: 'Plan crew',
+    members: [
+      { role: 'builder', selection: pick('openai') },
+      { role: 'reviewer', selection: pick('anthropic') },
+      { role: 'orchestrator', selection: pick('openai') },
+    ],
+  };
+  store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+  const reviewing = next(
+    { store },
+    (event) =>
+      event.type === 'chat.turn' &&
+      (event.payload as ChatTurn).role === 'reviewer' &&
+      (event.payload as ChatTurn).state === 'running',
+  );
+  send('Do the part.', pick('openai'));
+  await reviewing;
+  t.after(() => service.close());
+
+  const restarted = start();
+  restarted.recover();
+  const after = read(restarted);
+  assert.equal(after.messages.at(-1)?.text, 'Plan stopped: restarted.');
+  assert.deepEqual(
+    after.thread.plan && [
+      after.thread.plan.phase,
+      ...after.thread.plan.slices.map((s) => s.status),
+    ],
+    ['stopped', 'not-run'],
+  );
+  assert.equal(after.turns.at(-1)?.state, 'failed');
 });
 
 // Each row parks a turn on one ask. Balanced answers safe asks at ask time. A policy changed
@@ -3016,4 +3513,254 @@ test('the thread reader returns bounded, redacted reads of its own thread only',
     thread.service.stopTurn({ taskId: thread.taskId, turnId: running }, effects),
   );
   await turnReaches(thread, 'stopped');
+});
+
+const textReply = (text: string): ChatScriptStep[] => [
+  { kind: 'text', itemId: 'r', chunks: [text] },
+];
+
+// Claim: Stop ends an open project check and the chain, a message sent meanwhile waits and then
+// runs, and a check process the journal cannot prove gone keeps the thread from taking a turn
+// until it is gone. A restart reads the open check as failed with the reason.
+test('stop during a check keeps the queue, and an orphan check holds the thread', {
+  timeout: 60000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const findings = textReply('Rounding drops a cent.\nFindings: 1');
+  const openai = createScriptedChatAdapter({
+    family: 'openai',
+    turns: ['Built it.', 'Fixed it.', 'Built again.', 'Fixed again.', 'Went on.', 'Then this.'].map(
+      textReply,
+    ),
+  });
+  let begun: ((scratch: string) => void) | undefined;
+  const adapters = new Map([
+    [
+      'openai',
+      {
+        ...openai,
+        startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+          if (openai.requests.length === 0) begun?.(request.scratch.directory);
+          return openai.startTurn(request, emit);
+        },
+      },
+    ],
+    ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: [findings, findings] })],
+  ] as const);
+  const families = [familyEntry('openai', 10, null, now), familyEntry('anthropic', 50, null, now)];
+  // The process table the services read. Nothing is present until the restart below.
+  let present = false;
+  const thread = standalone(t, {
+    adapters,
+    catalog: () => ({ families }),
+    groupAbsent: () => !present,
+  });
+  const { store, service, taskId } = thread;
+  const running = (state: ChatCheckRun['status']) => (event: Event) =>
+    event.type === 'chat.thread' &&
+    (event.payload as ChatThread).checks?.runs.at(-1)?.status === state;
+  // The check runs until the controller stops it.
+  begun = (scratch) => {
+    writeFileSync(join(scratch, 'block.mjs'), 'setInterval(() => {}, 60_000);\n');
+    store.transaction(() =>
+      service.configure({
+        taskId,
+        crew: {
+          name: 'Pair',
+          members: [
+            { role: 'builder', selection: pick('openai') },
+            { role: 'reviewer', selection: pick('anthropic') },
+          ],
+        },
+        flightMode: 'glide',
+        permissionPolicy: 'allow-all',
+        checks: { add: 'node block.mjs' },
+      }),
+    );
+  };
+  const open = next(thread, running('running'));
+  thread.send('Fix the rounding.', pick('openai'));
+  await open;
+  // The thread takes no turn while the check runs.
+  assert.equal(thread.send('One more thing.', pick('openai')).outcome, 'applied');
+  assert.equal(thread.read().thread.queued.length, 1);
+  assert.equal(thread.read().turns.length, 3);
+
+  const stoppedLine = next(
+    thread,
+    (event) =>
+      event.type === 'conversation.entry' &&
+      /^Crew stopped/.test((event.payload as { text: string }).text),
+  );
+  const second = next(thread, (event) => {
+    const checks = event.type === 'chat.thread' ? (event.payload as ChatThread).checks : undefined;
+    return checks?.runs.length === 2 && checks.runs[1].status === 'running';
+  });
+  const stopped = act(store, (effects) =>
+    service.stopTurn({ taskId, turnId: thread.read().turns.at(-1)?.id as string }, effects),
+  );
+  assert.equal(stopped.outcome, 'applied');
+  // Stop keeps what the person queued. It is not handed back to the composer.
+  assert.equal(stopped.data?.kind === 'chat-queue' && stopped.data.messages.length, 0);
+  assert.equal(thread.read().thread.queued.length, 1);
+  await stoppedLine;
+  const after = thread.read();
+  assert.equal(
+    after.messages.find((m) => m.text.startsWith('Crew stopped'))?.text,
+    'Crew stopped: you stopped the checks.',
+  );
+  const [first] = after.thread.checks?.runs ?? [];
+  assert.deepEqual([first.status, first.reason], ['stopped', 'You stopped it.']);
+  // The queued message runs after the chain stopped, and its own chain reaches the check again.
+  await second;
+  const again = thread.read();
+  assert.deepEqual(
+    again.turns.map((turn) => turn.role),
+    ['assistant', 'reviewer', 'fixer', 'assistant', 'reviewer', 'fixer'],
+  );
+  assert.equal(again.thread.queued.length, 0);
+
+  // The controller stops with that check open. Its process is alive, so the journal cannot prove
+  // it gone: the thread takes no turn, and the open run reads as failed with the reason.
+  present = true;
+  const restarted = thread.start();
+  restarted.recover();
+  const held = thread.read(restarted);
+  assert.equal(held.thread.ownershipUnknown, true);
+  const [, orphan] = held.thread.checks?.runs ?? [];
+  assert.equal(orphan.status, 'failed');
+  assert.match(orphan.reason ?? '', /^CrewKite restarted while this check ran\./);
+  // A message waits in the queue while the hold stands.
+  assert.equal(thread.send('Go on.', pick('openai'), restarted).outcome, 'applied');
+  assert.equal(thread.read(restarted).thread.queued.length, 1);
+  assert.equal(thread.read(restarted).turns.length, 6);
+  // Once the process table shows the group gone, the next command lifts the hold and the queue
+  // runs.
+  present = false;
+  store.transaction(() => restarted.configure({ taskId, flightMode: 'manual' }));
+  const done = settles(thread);
+  assert.equal(thread.send('Then this.', pick('openai'), restarted).outcome, 'applied');
+  await done;
+  const last = thread.read(restarted);
+  assert.equal(last.thread.ownershipUnknown, undefined);
+  assert.deepEqual(
+    last.turns.slice(6).map((turn) => turn.state),
+    ['done', 'done'],
+  );
+  // The check of the first service is still running; closing it ends the process.
+  service.close();
+});
+
+// Claim: a check is plain words the controller resolves itself. Balanced asks before every run,
+// naming the exact commands, and a no skips the checks. Glide runs them when its policy covers
+// commands and asks again when the script changed. The same checks run on a merged copy.
+test('checks refuse shell lines, ask before running and run on a merged copy', {
+  timeout: 30000,
+}, async (t) => {
+  const thread = standalone(t, {
+    adapters: new Map([
+      ['openai', createScriptedChatAdapter({ family: 'openai', turns: [textReply('Built.')] })],
+    ]),
+  });
+  const { store, service, taskId } = thread;
+  const dir = mkdtempSync(join(tmpdir(), 'crewkite-merged-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const gate =
+    "import { existsSync } from 'node:fs';\nif (existsSync('ok')) process.exit(0);\nconsole.log('broken total');\nprocess.exitCode = 1;\n";
+  const merged = (name: string, ok: boolean, script = gate) => {
+    mkdirSync(join(dir, name));
+    if (ok) writeFileSync(join(dir, name, 'ok'), '');
+    writeFileSync(join(dir, name, 'gate.mjs'), script);
+    return realpathSync(join(dir, name));
+  };
+  const done = turnReaches(thread, 'done');
+  thread.send('Build it.');
+  const built = await done;
+  const configure = (patch: object) =>
+    store.transaction(() => service.configure({ taskId, ...patch }));
+  // The same script as the merged copies hold, in the scratch copy the person turns it on from.
+  writeFileSync(join(dirname(thread.root), 'chat', taskId, 'scratch', 'gate.mjs'), gate);
+  for (const add of [
+    'sh -c x',
+    'npm test | cat',
+    'node "a b"',
+    'env FOO=1 node gate.mjs',
+    'node -e 1',
+    'python3 -c x',
+    'node /etc/passwd',
+    'node ../gate.mjs',
+  ]) {
+    const refused = configure({ checks: { add } });
+    assert.deepEqual([refused.outcome, refused.reason], ['blocked', 'checks-invalid'], add);
+  }
+  assert.equal(configure({ checks: { add: 'node gate.mjs' } }).outcome, 'applied');
+  assert.equal(configure({ checks: { add: 'node gate.mjs' } }).reason, 'checks-invalid');
+  assert.equal(
+    configure({ checks: { switch: { id: 'nothing:test', enabled: true } } }).reason,
+    'checks-invalid',
+  );
+
+  const answer = (choice: 'allow' | 'allow-thread' | 'deny') => {
+    const ask = thread.read().thread.checks?.ask;
+    assert.ok(ask, 'a question is waiting');
+    const result = act(store, (effects) =>
+      service.resolvePermission(
+        { taskId, turnId: built.id, requestId: ask.requestId, choice },
+        effects,
+      ),
+    );
+    assert.equal(result.outcome, 'applied');
+    return ask;
+  };
+  // Manual and Balanced ask, whatever the policy. The question names the exact command.
+  configure({ permissionPolicy: 'allow-all' });
+  const first = merged('first', false);
+  const refused = service.runCombinedChecks(taskId, first);
+  const ask = answer('deny');
+  assert.deepEqual(ask.commands, [{ label: 'node gate.mjs', resolved: 'node gate.mjs' }]);
+  assert.deepEqual(ask.changed, []);
+  assert.equal((await refused).outcome, 'denied');
+  assert.equal(thread.read().thread.checks?.runs.length, 0);
+  assert.equal(thread.read().thread.checks?.ask, null);
+
+  // Glide with Allow all runs without a question.
+  configure({
+    crew: { name: 'Solo', members: [{ role: 'builder', selection }] },
+    flightMode: 'glide',
+  });
+  const quiet = service.runCombinedChecks(taskId, merged('second', true));
+  assert.equal(thread.read().thread.checks?.ask, null);
+  assert.equal((await quiet).outcome, 'passed');
+
+  // Balanced asks again. Allow for this thread covers the same command set afterwards.
+  configure({ flightMode: 'balanced' });
+  const pending = service.runCombinedChecks(taskId, first);
+  answer('allow-thread');
+  const failed = await pending;
+  assert.equal(failed.outcome, 'failed');
+  assert.match(failed.brief ?? '', /broken total/);
+  assert.deepEqual(
+    failed.runs.map((run) => [run.status, run.trigger]),
+    [['failed', 'combined']],
+  );
+  const covered = service.runCombinedChecks(taskId, merged('fourth', true));
+  assert.equal(thread.read().thread.checks?.ask, null);
+  assert.equal((await covered).outcome, 'passed');
+
+  // A changed script asks in every mode, even for an allowed command set.
+  const edited = service.runCombinedChecks(taskId, merged('third', true, `${gate}// edited\n`));
+  assert.deepEqual(answer('deny').changed, ['node gate.mjs']);
+  assert.equal((await edited).outcome, 'denied');
+  // A service that has closed refuses, and so does a task it does not know.
+  await assert.rejects(service.runCombinedChecks(`tsk_${'9'.repeat(26)}`, first), /No thread/);
+  configure({ checks: { switch: { id: 'custom:1', enabled: false } } });
+  assert.equal((await service.runCombinedChecks(taskId, first)).outcome, 'none');
+  assert.equal(configure({ checks: { remove: 'custom:1' } }).outcome, 'applied');
+  service.close();
+  await assert.rejects(service.runCombinedChecks(taskId, first), /closed/);
 });

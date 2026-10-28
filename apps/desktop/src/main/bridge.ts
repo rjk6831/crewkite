@@ -10,6 +10,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, extname, relative, sep } from 'node:path';
+import { promptsToJson } from '@crewkite/client';
 import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
 import {
   ArtifactSchema,
@@ -24,6 +25,8 @@ import {
   type Event,
   EventSchema,
   MAX_FRAME_BYTES,
+  type McpServerInput,
+  type McpState,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
@@ -38,6 +41,7 @@ import {
   RememberedLocalToken,
   type SecretStorage,
 } from './local-token.ts';
+import { McpVault, supplyMcp } from './mcp-vault.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { assertSender, openExternalLink } from './security.ts';
@@ -275,6 +279,11 @@ export async function installBridge(
         'ReadChatChanges',
         'ReadChatCatalog',
         'ReadExtensions',
+        'CompleteChatMention',
+        'ReadChatInstructions',
+        'ReadChatPrompts',
+        'SaveChatPrompt',
+        'DeleteChatPrompt',
         'RefreshChatModels',
         'ReadChatBranchStatus',
         'PushChatBranch',
@@ -481,6 +490,38 @@ export async function installBridge(
       );
     },
   );
+  // The person's MCP servers. Main keeps the secrets and the renderer gets the view only. Every
+  // change goes to the controller in memory, so a thread's next turn sees it.
+  const mcp = new McpVault(controller.paths.profile, storage);
+  const handOver = async () => {
+    if (client)
+      await supplyMcp(
+        mcp,
+        (value) => client?.command(value) ?? Promise.resolve(null),
+        desktopActor,
+      );
+  };
+  const mcpCall = (name: string, run: (input: Record<string, unknown>) => McpState) => {
+    ipcMain.handle(`crewkite:mcp-${name}`, async (event, input: unknown) => {
+      assertSender(event, window);
+      const state = run((input ?? {}) as Record<string, unknown>);
+      await handOver().catch(() => {});
+      return state;
+    });
+  };
+  ipcMain.handle('crewkite:mcp-state', (event) => {
+    assertSender(event, window);
+    return mcp.state();
+  });
+  mcpCall('save', (input) => mcp.save(input as McpServerInput));
+  mcpCall('remove', (input) => mcp.remove(String(input.name)));
+  mcpCall('thread', (input) =>
+    mcp.setThread(
+      String(input.taskId),
+      String(input.name),
+      (input.policy as string | null) ?? null,
+    ),
+  );
   ipcMain.handle('crewkite:local-token-status', async (event) => {
     assertSender(event, window);
     return tokens.status();
@@ -544,6 +585,46 @@ export async function installBridge(
     }
     return 'done';
   });
+  // The saved prompts are the controller's. Main reads them, so the page never supplies the bytes,
+  // and the person picks where the file goes.
+  ipcMain.handle('crewkite:save-prompts', async (event) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const read = await send(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'ReadChatPrompts',
+        payload: {},
+      }),
+    );
+    if (!applied(read) || read.data?.kind !== 'chat-prompts')
+      throw new Error('The saved prompts could not be read.');
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Save prompts',
+      defaultPath: 'crewkite-prompts.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      const file = openSync(
+        choice.filePath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(file, promptsToJson(read.data.prompts));
+        fsyncSync(file);
+      } finally {
+        closeSync(file);
+      }
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return 'saved';
+  });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);
     listening = true;
@@ -570,6 +651,7 @@ export async function installBridge(
     try {
       receipts.load();
       client = await controller.connect();
+      await handOver().catch(() => {});
       client.onConnection((state) => {
         connection = { kind: 'connection', state, reconnectAvailable: state === 'offline' };
         notice(connection);

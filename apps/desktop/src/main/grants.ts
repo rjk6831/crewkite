@@ -24,6 +24,8 @@ export class PathGrants {
     // The window never holds the Local token. Main moves it on its own port, past this check.
     if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
       return 'The window cannot read or supply the Local token.';
+    if (command.command === 'SupplyMcpServers')
+      return 'The window cannot supply MCP servers. Main holds their secrets.';
     if (command.command !== 'ImportChatAttachment' || !('path' in command.payload.source))
       return null;
     return this.paths.has(command.payload.source.path)

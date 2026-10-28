@@ -106,6 +106,16 @@ Two claims from the rc-05 follow-up. Each lives in an existing test.
 | A turn whose thread tools source gives none loses the packet line, runs with an empty config and traces the notice | Anthropic config row |
 | A controller on a home 120 characters deep answers a client and a CLI command, and a socket file left by a crashed run does not block the start | `packages/client/src/output.test.ts`, `packages/client/src/client.test.ts`, `apps/cli/src/main.test.ts` |
 
+## The person's MCP servers
+
+Three claims from the thread MCP servers change. Each lives in a test.
+
+| Claim | Where |
+|-------|-------|
+| A server's policy never exceeds the thread's, a listed read runs unasked only under the reads policy, and a server's annotations or an unlisted name never widen it | `chat/mcp-servers.test.ts`, with a scripted stdio server in `chat/mcp-fixture-server.mjs` |
+| Each family gets the servers the thread turned on only where the controller's gate sees their calls: Anthropic in the one strict config, Google only while every call asks, OpenAI, Local and read only turns never | `chat/mcp-servers.test.ts`, the Anthropic config and permission rows, the queue row in `chat/service.test.ts` |
+| A stored secret is sealed on disk, never returned to the window, kept across an edit, refused without a keychain and removed from a turn's events | `apps/desktop/src/main/mcp-vault.test.ts`, `apps/desktop/src/main/grants.test.ts` |
+
 ## Scratch copy clones
 
 The first turn on a thread fills its scratch directory through `copyScratch` in `apps/controller/src/chat/scratch-copy.ts`. `scratchPlan` in `host/source.ts` lists the base tree with each regular file's size and no bytes, and it applies the same link, submodule and non-UTF-8 path rules as `committedFiles` with `scratch: true`, because both run one classifier. No byte limit applies to the regular files. When the project's checkout sits on the thread's base and git sees no change to a tracked file, each regular file whose parent folders are real folders and whose size matches the committed size is cloned from the checkout with `fs.copyFileSync` and `COPYFILE_FICLONE_FORCE`. The clone is then stream-hashed as a git blob with no filters and compared with the committed oid. A mismatch, such as a same-size edit git was told to ignore with assume-unchanged or skip-worktree, or a checkout that changed during the copy, removes the clone and writes the committed bytes. Every other file is read from git in runs of at most 32 MiB and written. A file larger than a run streams from `git cat-file blob` straight to its target. The first EXDEV, ENOTSUP or similar error ends the clone attempts and the rest is written. `materialize` still checks every path and link before it writes, and `copyScratch` calls it with a write hook, so a clone never skips a check. Progress uses the same `ImportProgress` update as a file import, one per 4 MiB and a final one.
@@ -151,6 +161,51 @@ Three claims cover the extension seam in [ADR 0047](adr/0047-extensions-attach-t
 - The reference extension from the testkit is listed off with its manifest. Its thread action and command appear only while it is on, and turning it off removes both. A new sibling module or `package.json` in its folder turns it off until the file goes, a link or a folder over 256 files is refused, and a contract major bump in its manifest turns it off with the plain line. A folder that changes while its module loads stays off, and a module fixed after a failed load needs a restart.
 
 These run against a real controller and real SQLite with synthetic extension modules. They make no claim about the behavior of a separately licensed extension.
+
+## Project checks in the loop
+
+The detection table builds small project directories and checks which checks the controller reads from them: package.json scripts with the package manager chosen by the lock file, pyproject.toml tool tables, Makefile targets, a Cargo.toml, a broken manifest and an empty project. It also checks the resolved text, which names the pre and post scripts npm runs, and the rule for commands a person adds: shells, wrappers such as env, inline code flags and paths outside the scratch copy are refused. A detected check starts switched off.
+
+The crew chain rows run a real Node script as a check after a fix turn. The script lives in the scratch copy and the row turns the check on from there. The first run fails, and its output reaches the next fixer turn as the whole message. The second run passes, and the chain finishes with two fixes. The rows read the run records, the output artifact bytes and the lines `thread_checks` returns. A second row has the fixer edit the script. The chain then raises the permission question even though the thread allows commands, nothing runs before the answer, and the answer renews the pin so the next run needs no question.
+
+The stop row opens a check that runs until stopped. A message sent meanwhile waits, Stop ends the process and the chain, and the queue is kept: the message runs afterwards and its own chain reaches a check again. A second service on the same store then reads that open check as failed with the restart reason. Its process is still present, so the operation journal cannot prove it gone and the thread takes no turn. Once the process table shows the group gone, the next command lifts the hold and the queue runs. The permission row shows that Glide with Allow all runs without a question, that Balanced asks with the exact commands, that a denial runs nothing, that Allow for this thread covers the same command set afterwards, that a changed script asks again, and that the same checks run on merged copies. A closed service refuses and an unknown thread throws. These are real local processes with no network, installed dependencies or provider.
+
+Output is read from each process as it starts, so a check that exits before the artifact store has opened its file keeps its output. The tail on the card is redacted and holds the last 1000 characters. The full output is in the artifact store. A pin covers the command, the script text behind it and files of the copy named in a custom command. It does not cover files a script goes on to read. No claim covers the checks of a real project, a package manager or a toolchain.
+
+## Composer parity
+
+Three claims cover the composer additions, and each runs at the lowest layer that can see it.
+
+The mention ranking table runs in the client package on a synthetic file list. It checks that exact and prefix name matches outrank looser ones, that case is ignored, that a subsequence still finds a file, that an empty query lists the shallowest entries, that every answer stays within the limit and that the order does not depend on the input order. The same table checks that an at sign inside an email address starts no mention and that insertion writes the path the provider's tools open: relative to the copy root, a trailing slash on a folder and backticks around a path with white space.
+
+The controller table builds a scratch copy with ignored folders, a link to a file outside and instruction files, then asks for completions. Nothing under `node_modules` or `.git`, no link and no path outside the copy comes back, and the limit bounds the answer. The same table checks the instruction chip source: plain instruction files at the copy root are listed, a link to an outside file is not, a folder swapped for a link to somewhere else offers none of its old files, only a listed name can be read, and a copy with none lists none.
+
+The saved prompt table covers the controller home. Prompts persist, a repeated name replaces its body, the export is the versioned JSON file in name order, and a damaged file is refused and left as it is. The same table parses `/prompt name key=value` and checks that insertion fills the values given and names the placeholders still open. A message that starts with a command word, such as `/new endpoint returns 500`, or a path such as `/usr/bin` stays a message, and an exact command name such as `/pr` is chosen before longer names that start with it.
+
+These tables use synthetic files and no network. They do not exercise the composer's keyboard handling or the Settings card, which a manual desktop check covers.
+
+## CLI
+
+Six claims cover the interactive CLI and its scripting path. Each runs a real controller on a private socket with the scripted chat adapter, or a pure module, and no provider client.
+
+- Print mode streams the reply to stdout and exits with the status of its turn: 0 when done, 1 when it failed on a usage limit or the controller went away, and 3 when another command stopped it. It finds the registered project from `INIT_CWD` with a misleading `GIT_DIR` set, refuses an unregistered checkout with status 2 and registers nothing until `--register`. A permission policy in `cli.json` leaves a new thread on ask; `--permission-policy` sets it for the run. Arguments that do not parse exit 2 in every command.
+- The thread commands with `--json` write only lines `CliJsonLineSchema` accepts, whose full shape matches the pinned hash for `v: 2`, through a new thread, a watched permission answered by `thread permit`, Accept, `list` and `show`. Push without `--confirm` sends nothing and says what it would push.
+- Each interactive view draws a scripted thread: the wordmark at both sizes, the folded reads, Markdown, the open permission with its options and the thread policy, the answered thread, Changes with the diff and the accepted branch, the crew, the plan card in Balanced and after a stop, Settings with provider cards and a dotted stale gauge, the thread list and help. Under `NO_COLOR` every view keeps its text and draws no colour. The kite panels and gauges take the desktop's colours, yellow at 40 percent and red at empty, and the spinner moves only with full animation.
+- Slash commands parse only from the shared list, and the message box keeps multi-line editing, history on Up and Down, slash and mention completion, and absolute paths after `@` as attachments.
+- `cli.json` is checked with the schemas the desktop saves its defaults with, falls back to defaults with a named field, is written private to its owner, and backs the renderer's preference functions. Key bindings match their modifiers exactly.
+- The interactive app preselects the project from `INIT_CWD`, offers the saved policy and keeps ask when the person declines, keeps a digit as text until Tab gives the request focus, answers it with a digit, asks before Ctrl+C leaves a running reply, stops it with Escape and leaves on the next Ctrl+C.
+
+These tests establish the CLI's own wiring. The controller's permission, acceptance and push rules keep their existing claims, and the CLI test adds none of its own.
+
+## Parallel plan slices
+
+Three test functions cover the parallel rules of the ADR 0045 amendment. Each runs at the lowest layer that can see it, with scripted adapters, a synthetic repository and real SQLite.
+
+- The ready table in the plan tests is pure. It checks that independent slices on two families start together, that two ready slices on one family start one at a time in plan order, that a family busy in another thread holds its slice back, that a slice waits until every dependency is done, that a slice with no family never starts and that nothing starts while a slice is blocked.
+- The lane rows in the service tests run a real plan in Glide on two scripted families. In the first row, slice 1 parks on a question while slice 2 runs and finishes on the other family, which proves two slice turns were open at once. Slice 2 then waits to merge until slice 1 has, slice 3 waits for its family, and slice 4 starts from a copy that already holds slice 1's merged file. Every slice turn worked in its own copy, never the thread's, and the thread copy ends with all four files. The conflict rows have two slices change one file. The second one is blocked with the path on the card and a line, and the orchestrator's model gets one turn in the thread copy with the slice's version quoted. When that turn writes the merge, the plan finishes. When it fails, the plan stops with the slice blocked. The stop row cancels the plan while slice 1 runs and slice 2 has finished but waits to merge: slice 1's turn ends stopped, slice 2 merges before the stop and keeps its file, and the rest show not run. A row whose second slice cannot start shows that the first slice's turn, opened in the same step, starts as stopped and never reaches its provider.
+- The restart test stops the controller while a slice's review runs. A second service on the same store fails the open turn and writes "Plan stopped: restarted." with the slice not run.
+
+The renderer's plan card table adds a blocked row that can run again and a row that lists what it waits on and its conflicts. None of this covers a live provider, a real merge of two models' edits, or the time a real copy takes on a large repository.
 
 ## Google terms gate
 

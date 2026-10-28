@@ -32,6 +32,7 @@ import {
 } from '../extension-slots.tsx';
 import { clientFor } from '../settings/client-status.tsx';
 import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
+import { McpThreadMenu } from '../settings/mcp-card.tsx';
 import {
   crewFromPreset,
   crewPresetNames,
@@ -46,7 +47,8 @@ import { useCatalog } from '../settings/use-catalog.ts';
 import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
-import type { ThreadSource } from './commands.ts';
+import { ChecksSettings } from './checks-card.tsx';
+import { configureThread, type ThreadSource } from './commands.ts';
 import { FamilyMark } from './family-mark.tsx';
 import { modelLine } from './message-list.tsx';
 import type { ThreadSettings } from './thread-state.ts';
@@ -448,6 +450,7 @@ function ThreadTab({
           ))}
         </select>
       </label>
+      <McpThreadMenu taskId={taskId} permissionPolicy={thread?.permissionPolicy ?? 'ask'} />
       <div className="th-handoff">
         <AutoHandoff thread={thread} onConfigure={onConfigure} />
         {/* The limit offer and the picker rank by the mode too, so it stays open with the box off. */}
@@ -679,6 +682,14 @@ function CrewTab({
         {crew ? mode.title : 'Start from a preset to run the crew in Balanced or Glide.'}
       </p>
       <AutoHandoff thread={thread} onConfigure={onConfigure} />
+      <ChecksSettings
+        thread={thread}
+        onEdit={(checks) =>
+          thread
+            ? configureThread(source, { taskId: thread.taskId, checks }).then(() => {})
+            : Promise.resolve()
+        }
+      />
       {note && (
         <p className="th-note" role="status">
           {note}

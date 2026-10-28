@@ -1,3 +1,4 @@
+import { foldersOf, rankMentions } from '@crewkite/client';
 import {
   type CommandResult,
   canonicalJson,
@@ -54,6 +55,54 @@ export function createPreviewSource(): DesktopSource {
     'ReadChatBranchStatus',
     'SteerChatMessage',
   ]);
+  // The composer commands answer from a small scripted project and an in-memory prompt list.
+  const sampleFiles = ['net.mjs', 'test/net.test.mjs', 'docs/usage.md', 'AGENTS.md'];
+  const sampleEntries = [
+    ...sampleFiles.map((path) => ({ path, kind: 'file' as const })),
+    ...foldersOf(sampleFiles).map((path) => ({ path, kind: 'folder' as const })),
+  ];
+  const prompts = new Map<string, string>();
+  const promptList = () => ({
+    kind: 'chat-prompts',
+    prompts: [...prompts]
+      .map(([name, body]) => ({ name, body }))
+      .sort((a, b) => (a.name < b.name ? -1 : 1)),
+  });
+  function composerCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
+    const applied = (data: unknown) => ({ outcome: 'applied', data }) as CommandResult;
+    const taskId = typeof payload.taskId === 'string' ? payload.taskId : fixtures.task.id;
+    if (name === 'CompleteChatMention')
+      return applied({
+        kind: 'chat-mentions',
+        taskId,
+        mentions: rankMentions(
+          sampleEntries,
+          String(payload.query ?? ''),
+          Number(payload.limit ?? 8),
+        ),
+      });
+    if (name === 'ReadChatInstructions') {
+      const wanted = payload.name === 'AGENTS.md';
+      return applied({
+        kind: 'chat-instructions',
+        taskId,
+        files: ['AGENTS.md'],
+        name: wanted ? 'AGENTS.md' : null,
+        text: wanted ? 'Keep changes small and run the tests.\n' : null,
+        truncated: false,
+      });
+    }
+    if (name === 'ReadChatPrompts') return applied(promptList());
+    if (name === 'SaveChatPrompt') {
+      prompts.set(String(payload.name), String(payload.body));
+      return applied(promptList());
+    }
+    if (name === 'DeleteChatPrompt') {
+      prompts.delete(String(payload.name));
+      return applied(promptList());
+    }
+    return null;
+  }
   const scripts = new Map<string, ReturnType<typeof createThreadScript>>();
   function chatCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
     if (!chatCommands.has(name)) return null;
@@ -82,6 +131,11 @@ export function createPreviewSource(): DesktopSource {
     return script.command(name, payload);
   }
   async function command(input: DesktopCommand): Promise<CommandResult> {
+    const composer = composerCommand(
+      (input as { command: string }).command,
+      input.payload as Record<string, unknown>,
+    );
+    if (composer) return composer;
     const chat = chatCommand(
       (input as { command: string }).command,
       input.payload as Record<string, unknown>,

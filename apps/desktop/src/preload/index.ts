@@ -5,6 +5,7 @@ import {
   CommandResultSchema,
   DesktopNoticeSchema,
   EventSchema,
+  McpStateSchema,
   ProjectPageSchema,
   SnapshotSchema,
   TaskPageSchema,
@@ -150,6 +151,14 @@ const bridge: DesktopSource = {
       throw plain(failure);
     }
   },
+  savePrompts: async () => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-prompts');
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
     await ipcRenderer.invoke('crewkite:reconnect');
@@ -163,6 +172,17 @@ const bridge: DesktopSource = {
   localTokenStatus: () => tokenStatus('crewkite:local-token-status'),
   rememberLocalToken: () => tokenStatus('crewkite:local-token-remember'),
   forgetLocalToken: () => tokenStatus('crewkite:local-token-forget'),
+  mcp: {
+    state: async () => McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-state')),
+    save: async (server) =>
+      McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-save', server)),
+    remove: async (name) =>
+      McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-remove', { name })),
+    setThread: async (taskId, name, policy) =>
+      McpStateSchema.parse(
+        await ipcRenderer.invoke('crewkite:mcp-thread', { taskId, name, policy }),
+      ),
+  },
   onOpenThread(listener) {
     openThread.add(listener);
     return () => {

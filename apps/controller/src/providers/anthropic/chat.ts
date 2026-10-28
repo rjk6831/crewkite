@@ -10,6 +10,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  writeSync,
 } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -31,6 +32,7 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
+import { anthropicMcpEntries, mcpToolAnswer } from '../../chat/mcp-servers.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
@@ -487,6 +489,8 @@ function chatArguments(
   resume: string | null,
   folders: string[],
   tools: ThreadToolsServer | null,
+  /** The config as inline JSON, or the path of the file that holds it when it carries secrets. */
+  config: (server: Record<string, unknown>) => string,
 ) {
   const { effort, model } = request.selection;
   // The thread tools are the one MCP server a turn gets. Strict mode keeps the person's own
@@ -524,7 +528,7 @@ function chatArguments(
     // The config option takes several values, so the flag after it closes the list. Strict mode
     // goes on every turn: with no thread tools the config is empty and no other server loads.
     '--mcp-config',
-    JSON.stringify({ mcpServers: server ?? {} }),
+    config({ ...(server ?? {}), ...anthropicMcpEntries(request.mcp) }),
     '--strict-mcp-config',
     '--model',
     model,
@@ -571,10 +575,14 @@ function startTurn(
   };
   // Copies of the files that go as path lines. The folder lives as long as the turn.
   const staging = join(request.work.directory, 'files');
+  // The person's servers can carry secret arguments and variables, so their config goes in a file
+  // only this user can read, and the client's argv names the file. It goes with the turn.
+  const mcpFile = join(request.work.directory, 'tmp', 'mcp.json');
   const unstage = () => {
     if (!isAbsolute(staging)) return;
     try {
       rmSync(staging, { recursive: true, force: true });
+      rmSync(mcpFile, { force: true });
     } catch {}
   };
   const refuse = (failure: ChatFailure): ChatTurnHandle => ({
@@ -677,6 +685,21 @@ function startTurn(
       prior,
       message.folders,
       request.threadTools === false ? null : (deps.threadTools?.(request) ?? null),
+      (servers) => {
+        const text = JSON.stringify({ mcpServers: servers });
+        if (!request.mcp?.servers.length) return text;
+        const handle = openSync(
+          mcpFile,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
+          0o600,
+        );
+        try {
+          writeSync(handle, text);
+        } finally {
+          closeSync(handle);
+        }
+        return mcpFile;
+      },
     );
     child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,
@@ -1083,15 +1106,25 @@ function startTurn(
       (kind !== 'edit' || inside) &&
       (allowed.has(toolName) ||
         (kind !== 'other' && request.permissionGrants?.includes(kind) === true));
+    // A tool of the person's own MCP server follows the policy the controller cut to the thread's
+    // ceiling. Allow-all and the kind grants say nothing about it, and a tool of any server this
+    // turn did not attach asks.
+    const mcp = mcpToolAnswer(request.mcp, toolName);
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
     // Edits land only in the scratch copy, so allow-all sends an edit outside it to the person.
     const automatic = request.readOnly
       ? 'deny'
-      : request.permissionPolicy === 'allow-all' && (kind !== 'edit' || inside)
-        ? 'allow-once'
-        : granted
-          ? 'allow-thread'
-          : null;
+      : mcp !== null
+        ? mcp === 'allow'
+          ? 'allow-once'
+          : allowed.has(toolName)
+            ? 'allow-thread'
+            : null
+        : request.permissionPolicy === 'allow-all' && (kind !== 'edit' || inside)
+          ? 'allow-once'
+          : granted
+            ? 'allow-thread'
+            : null;
     // The ask is open before the event goes out, so an answer given from inside the
     // controller's event handler still finds it.
     if (!automatic) asks.set(requestId, entry);

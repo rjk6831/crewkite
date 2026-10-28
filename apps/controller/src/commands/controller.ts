@@ -40,6 +40,8 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
+import { McpRegistry } from '../chat/mcp-servers.ts';
+import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
@@ -370,6 +372,8 @@ export class Controller {
     return this.taskOperationRuntime;
   }
 
+  /** The person's MCP servers as the desktop last supplied them. Memory only. */
+  private readonly mcpServers = new McpRegistry();
   private extensionRuntime?: ExtensionHost;
   private extensions(): ExtensionHost {
     this.extensionRuntime ??= new ExtensionHost({
@@ -379,6 +383,27 @@ export class Controller {
       emit: (task, payload) => this.event('extension.event', task.id, task.revision, payload),
     });
     return this.extensionRuntime;
+  }
+
+  private savedPrompts(
+    command: Extract<
+      Command,
+      { command: 'ReadChatPrompts' | 'SaveChatPrompt' | 'DeleteChatPrompt' }
+    >,
+  ): CommandResult {
+    try {
+      const prompts =
+        command.command === 'SaveChatPrompt'
+          ? savePrompt(this.home, command.payload)
+          : command.command === 'DeleteChatPrompt'
+            ? deletePrompt(this.home, command.payload.name)
+            : readPrompts(this.home);
+      return { outcome: 'applied', data: { kind: 'chat-prompts', ...prompts } };
+    } catch (failure) {
+      if (failure instanceof PromptsRefused)
+        return { outcome: 'blocked', reason: failure.reason, next: failure.next };
+      throw failure;
+    }
   }
 
   private chatRuntime?: ChatService;
@@ -406,6 +431,7 @@ export class Controller {
       onTurnEnded: (turnId) => this.threadToolsRuntime?.broker.end(turnId),
       threadToolsDown: () =>
         this.threadToolsRuntime !== undefined && (!this.threadToolsRuntime.ready || this.closed),
+      mcp: this.mcpServers,
     });
     return this.chatRuntime;
   }
@@ -441,7 +467,7 @@ export class Controller {
     return runtime.broker.mint({
       taskId: request.taskId,
       turnId: request.turnId,
-      reader: this.chat().threadReads(request.taskId),
+      reader: this.chat().threadReads(request.taskId, request.scratch.directory),
     });
   }
 
@@ -853,7 +879,7 @@ export class Controller {
         return { ...connection, connectedWithoutToken: secret === null };
       },
       // Local runs the same five reads as functions in this process. No socket or token.
-      threadReader: (request) => this.chat().threadReads(request.taskId),
+      threadReader: (request) => this.chat().threadReads(request.taskId, request.scratch.directory),
     });
     return new Map<ChatFamily, ChatAdapter>([
       ['openai', openai],
@@ -890,6 +916,13 @@ export class Controller {
       ].includes(command.command)
     )
       return this.taskOperations().execute(command as TaskOperationCommand);
+    // Before any receipt path: a server's secrets must not reach a journal row either.
+    if (command.command === 'SupplyMcpServers') {
+      if (command.actor.kind !== 'desktop')
+        return { outcome: 'denied', reason: 'desktop-actor-only' };
+      this.mcpServers.set(command.payload);
+      return { outcome: 'applied' };
+    }
     // Before any receipt path: the token must not reach a journal row.
     if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
       return this.localTokenCommand(command);
@@ -1302,6 +1335,9 @@ export class Controller {
         };
       return;
     }
+    // Saved prompts have no task. Their receipts come from the normal journal, so a replayed key
+    // answers from its receipt and an old save cannot overwrite a newer body.
+    if (command.command === 'SaveChatPrompt' || command.command === 'DeleteChatPrompt') return;
     if (
       [
         'SendChatMessage',
@@ -1513,6 +1549,21 @@ export class Controller {
               ? { kind: 'chat-thread', ...this.chat().readThread(command.payload) }
               : { kind: 'chat-changes', ...this.chat().readChanges(command.payload) },
         };
+      case 'CompleteChatMention':
+      case 'ReadChatInstructions':
+        if (!this.store.get<Task>('task', command.payload.taskId))
+          return { outcome: 'blocked', reason: 'task-not-found' };
+        return {
+          outcome: 'applied',
+          data:
+            command.command === 'CompleteChatMention'
+              ? { kind: 'chat-mentions', ...this.chat().completeMention(command.payload) }
+              : { kind: 'chat-instructions', ...this.chat().readInstructions(command.payload) },
+        };
+      case 'ReadChatPrompts':
+      case 'SaveChatPrompt':
+      case 'DeleteChatPrompt':
+        return this.savedPrompts(command);
       case 'ReadChatCatalog':
         this.refreshStaleChatModels();
         return {

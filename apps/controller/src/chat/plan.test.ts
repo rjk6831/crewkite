@@ -8,6 +8,7 @@ import type {
   ChatPlanSlice,
 } from '@crewkite/contracts';
 import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
+import { readySlices } from './plan-lanes.ts';
 
 const NOW = Date.parse('2026-10-28T00:00:00.000Z');
 const hours = (value: number) => new Date(NOW + value * 3_600_000).toISOString();
@@ -230,4 +231,92 @@ test('assignment is a pure function of connected families, allowances, difficult
     (parsePlan(block(JSON.stringify(outside))) as { error: string }).error,
     /slices\.0\.files\.0: A plan names files by their path inside the scratch copy\./,
   );
+});
+
+test('ready slices start together with every dependency done, one per family, none while one is blocked', () => {
+  type Row = { id: number; family: ChatFamily | null; depends: number[]; status: string };
+  const card = (rows: Row[]) => ({
+    slices: rows.map((row) => ({
+      id: row.id,
+      title: `Slice ${row.id}`,
+      difficulty: 'medium' as const,
+      depends: row.depends,
+      readOnly: false,
+      status: row.status as 'queued',
+      assignment: row.family
+        ? { family: row.family, model: `${row.family}-model`, reason: 'Ranked.' }
+        : null,
+      candidates: [],
+      turnId: null,
+    })),
+  });
+  const rows: {
+    name: string;
+    slices: Row[];
+    busy: ChatFamily[];
+    ready: number[];
+  }[] = [
+    {
+      name: 'independent slices on two families start together',
+      slices: [
+        { id: 1, family: 'openai', depends: [], status: 'queued' },
+        { id: 2, family: 'local', depends: [], status: 'queued' },
+      ],
+      busy: [],
+      ready: [1, 2],
+    },
+    {
+      name: 'two ready slices on one family run one after the other, in plan order',
+      slices: [
+        { id: 1, family: 'openai', depends: [], status: 'queued' },
+        { id: 2, family: 'openai', depends: [], status: 'queued' },
+      ],
+      busy: [],
+      ready: [1],
+    },
+    {
+      name: 'a family answering elsewhere holds its slice back',
+      slices: [
+        { id: 1, family: 'openai', depends: [], status: 'queued' },
+        { id: 2, family: 'local', depends: [], status: 'queued' },
+      ],
+      busy: ['openai'],
+      ready: [2],
+    },
+    {
+      name: 'a slice waits until every slice it depends on is done',
+      slices: [
+        { id: 1, family: 'openai', depends: [], status: 'done' },
+        { id: 2, family: 'local', depends: [], status: 'running' },
+        { id: 3, family: 'google', depends: [1, 2], status: 'queued' },
+        { id: 4, family: 'anthropic', depends: [1], status: 'queued' },
+      ],
+      busy: ['local'],
+      ready: [4],
+    },
+    {
+      name: 'a slice with no family to run on never starts',
+      slices: [
+        { id: 1, family: null, depends: [], status: 'queued' },
+        { id: 2, family: 'local', depends: [], status: 'queued' },
+      ],
+      busy: [],
+      ready: [2],
+    },
+    {
+      name: 'nothing starts while a slice is blocked',
+      slices: [
+        { id: 1, family: 'openai', depends: [], status: 'blocked' },
+        { id: 2, family: 'local', depends: [], status: 'queued' },
+      ],
+      busy: [],
+      ready: [],
+    },
+  ];
+  for (const row of rows)
+    assert.deepEqual(
+      readySlices(card(row.slices), new Set(row.busy)).map((slice) => slice.id),
+      row.ready,
+      row.name,
+    );
 });

@@ -16,9 +16,11 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative } from 'node:path';
 import { test } from 'node:test';
+import { cliRendererModules } from './cli-runtime.ts';
 import { copyPackagePayload } from './package.mjs';
+import { copyRuntimeStore } from './runtime-packages.ts';
 
-test('runtime package aliases stay contained after copying and relocation', (t) => {
+test('runtime package aliases stay contained after copying and relocation', async (t) => {
   const directory = realpathSync(mkdtempSync(join(tmpdir(), 'package-links-')));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   for (const kind of [
@@ -82,4 +84,94 @@ test('runtime package aliases stay contained after copying and relocation', (t) 
     );
     assert.equal(existsSync(donor), false);
   }
+
+  // A store holds two versions of one package, each reached only by the package that asked for
+  // it, drops the installer's command shims, takes an upstream notice for a package without a
+  // license file, and still resolves after the stage moves.
+  const store = join(directory, 'store');
+  const installed = join(store, 'source/node_modules/.pnpm');
+  const put = (name, version, dependencies, license = true) => {
+    const folder = join(installed, `${name}@${version}/node_modules/${name}`);
+    mkdirSync(join(folder, 'node_modules/.bin'), { recursive: true });
+    writeFileSync(
+      join(folder, 'package.json'),
+      JSON.stringify({ name, version, main: 'index.cjs', dependencies }),
+    );
+    const requires = Object.keys(dependencies)
+      .map((dependency) => `require('${dependency}')`)
+      .join(', ');
+    writeFileSync(
+      join(folder, 'index.cjs'),
+      `module.exports = ['${name}@${version}', ${requires}].flat();\n`,
+    );
+    if (license) writeFileSync(join(folder, 'LICENSE'), `${name} license\n`);
+    for (const [dependency, wanted] of Object.entries(dependencies))
+      symlinkSync(
+        join(installed, `${dependency}@${wanted}/node_modules/${dependency}`),
+        join(dirname(folder), dependency),
+      );
+  };
+  put('shade', '2.0.0', {});
+  put('shade', '1.0.0', {});
+  put('wrap', '1.0.0', { shade: '1.0.0' }, false);
+  put('top', '1.0.0', { shade: '2.0.0', wrap: '1.0.0' });
+  mkdirSync(join(store, 'source/apps/cli/node_modules'), { recursive: true });
+  mkdirSync(join(store, 'source/notices'));
+  writeFileSync(join(store, 'source/notices/wrap-LICENSE'), 'wrap upstream license\n');
+  writeFileSync(join(store, 'source/apps/cli/package.json'), '{"dependencies":{"top":"1.0.0"}}');
+  symlinkSync(
+    join(installed, 'top@1.0.0/node_modules/top'),
+    join(store, 'source/apps/cli/node_modules/top'),
+  );
+  mkdirSync(join(store, 'stage/apps/cli'), { recursive: true });
+  const budget = {
+    deadline: Date.now() + 60_000,
+    now: Date.now,
+    maximumEntries: 10_000,
+    maximumBytes: 1 << 24,
+  };
+  const copied = await copyRuntimeStore({
+    source: join(store, 'source'),
+    from: 'apps/cli/package.json',
+    destination: join(store, 'stage/apps/cli'),
+    realm: '.cli-store',
+    roots: ['top'],
+    packages: [
+      { name: 'top', version: '1.0.0', edges: ['shade', 'wrap'], license: 'LICENSE' },
+      {
+        name: 'wrap',
+        version: '1.0.0',
+        edges: ['shade'],
+        license: 'LICENSE',
+        notice: 'notices/wrap-LICENSE',
+      },
+      { name: 'shade', version: '1.0.0', edges: [], license: 'LICENSE' },
+      { name: 'shade', version: '2.0.0', edges: [], license: 'LICENSE' },
+    ],
+    budget,
+  });
+  assert.deepEqual(copied.map((item) => `${item.name}@${item.version}`).sort(), [
+    'shade@1.0.0',
+    'shade@2.0.0',
+    'top@1.0.0',
+    'wrap@1.0.0',
+  ]);
+  assert.equal(
+    readFileSync(copied.find((item) => item.name === 'wrap').license, 'utf8'),
+    'wrap upstream license\n',
+  );
+  renameSync(join(store, 'stage'), join(store, 'moved'));
+  rmSync(join(store, 'source'), { recursive: true });
+  const fromCli = createRequire(join(store, 'moved/apps/cli/package.json'));
+  assert.deepEqual(fromCli('top'), ['top@1.0.0', 'shade@2.0.0', 'wrap@1.0.0', 'shade@1.0.0']);
+  assert.equal(
+    existsSync(
+      join(store, 'moved/apps/cli/node_modules/.cli-store/top@1.0.0/node_modules/top/node_modules'),
+    ),
+    false,
+  );
+  // The interactive CLI's renderer imports are found from its entry, value imports only.
+  const modules = cliRendererModules(join(import.meta.dirname, '..'));
+  assert(modules.includes('apps/desktop/src/renderer/thread/thread-state.ts'));
+  assert(!modules.some((path) => path.endsWith('.tsx') || path.endsWith('/source.ts')));
 });

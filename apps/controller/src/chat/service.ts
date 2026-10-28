@@ -1,3 +1,4 @@
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
@@ -14,6 +15,8 @@ import {
   ChatFailureSchema,
   type ChatFamily,
   ChatFamilySchema,
+  type ChatInstructionsRead,
+  type ChatMentionsRead,
   type ChatMessage,
   type ChatModelSelection,
   type ChatOutputLimit,
@@ -42,6 +45,7 @@ import {
   MAX_CHAT_TURN_EVENTS_BYTES,
   type Project,
   rankFamilies,
+  scrubSecrets,
   type Task,
   TaskSchema,
   writesScratch,
@@ -89,6 +93,7 @@ import {
   writeDiscardMark,
   writeThreadBaseRef,
 } from './changes.ts';
+import { type ChecksOutcome, commandsAllowed, enabledChecks, ThreadChecks } from './checks.ts';
 import {
   dropStaged,
   FileRefused,
@@ -106,6 +111,8 @@ import {
   readChatBranchStatus,
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
+import type { McpRegistry } from './mcp-servers.ts';
+import { createMentionIndex, readInstructions as readInstructionFiles } from './mentions.ts';
 import type { PlanInputs } from './plan.ts';
 import { PlanRunner, sentMessage } from './plan-runner.ts';
 import {
@@ -174,6 +181,8 @@ export type ChatServiceDeps = {
    * not open yet. A cloud turn then runs without the tools, and its packet does not name them.
    */
   threadToolsDown?: () => boolean;
+  /** The person's own MCP servers, supplied by the desktop. Absent means none. */
+  mcp?: McpRegistry;
   /** Process table access and timers. Tests replace them; the defaults are the real ones. */
   groupAbsent?: (group: number) => boolean;
   signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -189,10 +198,13 @@ export type ChatServiceDeps = {
   localContext?: () => number | null;
   /** Whether a slice's files fit a Local prompt. The default is the Local budget rule. */
   localSliceFits?: PlanInputs['localSliceFits'];
+  /** The most one project check may run. The default is ten minutes. */
+  checkDeadlineMs?: number;
 };
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
 type Effects = (() => void)[];
+type CheckAnswer = 'allow' | 'allow-thread' | 'deny' | 'stop';
 type EntryDraft = ConversationEntry extends infer Entry
   ? Entry extends ConversationEntry
     ? Omit<Entry, 'id' | 'taskId' | 'revision' | 'cursor' | 'at'>
@@ -238,6 +250,14 @@ type LiveTurn = {
   calls: Map<string, { title: string; input: unknown }>;
   /** The policy the adapter launched with. It answers what that policy covers on its own. */
   policy: ChatPermissionPolicy;
+  /** The scratch copy the turn works in: the thread's, or its plan slice's own. */
+  scratch: string;
+  /** This turn started the person's MCP servers. A policy change mid-turn never answers their calls. */
+  mcp: boolean;
+  /** The secret values of the person's servers this turn started, scrubbed from its result. */
+  secrets: readonly string[];
+  /** A Google turn that carries the person's servers: no policy change answers any of its asks. */
+  google: boolean;
   /** Send now stopped this turn. Its queued message starts next with the stopped turn's packet. */
   steered: boolean;
   noticed: boolean;
@@ -365,8 +385,17 @@ const stoppedResult: ChatTurnResult = {
 export class ChatService {
   private readonly deps: ChatServiceDeps;
   private readonly live = new Map<string, LiveTurn>();
+  /** Plan slice turns stopped before their launch ran. Each starts as stopped. */
+  private readonly stoppedEarly = new Set<string>();
   /** Orchestrator plans: proposal, assignment and the slice chain (ADR 0045). */
   private readonly plans: PlanRunner;
+  /** Project checks the crew chain runs after a fix and after the last slice. */
+  private readonly checks: ThreadChecks;
+  /** The question each thread waits on before its checks run, with what to do with the answer. */
+  private readonly checkAsk = new Map<
+    string,
+    { requestId: string; settle: (answer: CheckAnswer, effects: Effects) => void }
+  >();
   private closed = false;
   /** The copy `importing` made, for the import command it commits next. */
   private staged:
@@ -376,6 +405,28 @@ export class ChatService {
   constructor(deps: ChatServiceDeps) {
     this.deps = deps;
     this.plans = new PlanRunner(this.planHost());
+    this.checks = new ThreadChecks({
+      store: deps.store,
+      artifacts: deps.artifacts,
+      home: deps.home,
+      now: deps.now,
+      task: (taskId) => this.task(taskId),
+      thread: (taskId) => this.thread(taskId),
+      update: (taskId, change) =>
+        deps.store.transaction(() => {
+          const task = this.task(taskId);
+          if (task) this.putThread(task, change(this.thread(taskId)));
+        }),
+      scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      projectPath: deps.projectPath,
+      groupAbsent: deps.groupAbsent ?? groupAbsent,
+      holdOwnership: (taskId) =>
+        deps.store.transaction(() => {
+          const task = this.task(taskId);
+          if (task) this.putThread(task, { ...this.thread(taskId), ownershipUnknown: true });
+        }),
+      deadlineMs: deps.checkDeadlineMs,
+    });
   }
 
   /**
@@ -397,7 +448,11 @@ export class ChatService {
       return blocked('file-not-found', 'Attach the file again, then send.');
     const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
-    const free = !thread.activeTurnId && !left.length;
+    const free =
+      !thread.activeTurnId &&
+      !left.length &&
+      !this.checksBusy(task.id) &&
+      !this.plans.holds(thread);
     // One running turn per family across threads. The message waits in this thread's queue and
     // starts when the other thread's turn on that family ends.
     const waiting = this.waitsOnFamily(
@@ -427,6 +482,17 @@ export class ChatService {
   }
 
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
+    const asked = this.checkAsk.get(payload.taskId);
+    if (asked?.requestId === payload.requestId) {
+      if (!['allow', 'allow-thread', 'deny'].includes(payload.choice))
+        return blocked(
+          'permission-not-pending',
+          'Choose allow once, allow for this thread or deny.',
+        );
+      this.dropCheckAsk(payload.taskId);
+      asked.settle(payload.choice as CheckAnswer, effects);
+      return { outcome: 'applied' };
+    }
     const live = this.activeLive(payload.taskId, payload.turnId);
     if (!live) return blocked('no-active-turn');
     const open = live.permissions.get(payload.requestId);
@@ -448,7 +514,17 @@ export class ChatService {
 
   stopTurn(payload: Payload<'StopChatTurn'>, effects: Effects): CommandResult {
     const live = this.activeLive(payload.taskId, payload.turnId);
-    if (!live) return blocked('no-active-turn');
+    if (!live) {
+      // Between a fix turn and the next step the chain may wait on the person's answer or run
+      // the project checks. Stop ends that and leaves the queue alone; the queue starts once
+      // the chain has stopped.
+      const asked = this.checkAsk.get(payload.taskId);
+      if (asked) {
+        this.dropCheckAsk(payload.taskId);
+        asked.settle('stop', effects);
+      } else if (!this.checks.stop(payload.taskId)) return blocked('no-active-turn');
+      return { outcome: 'applied', data: { kind: 'chat-queue', messages: [] } };
+    }
     // The turn result marks the row stopped once the provider has let go.
     live.stopRequested = true;
     // Stop ends the wait too. The cleared messages go back so the composer can offer the text.
@@ -476,6 +552,12 @@ export class ChatService {
       return blocked('selection-unavailable', 'Pick a model the provider lists.');
     if (payload.dequeue && !thread.queued.some((message) => message.id === payload.dequeue))
       return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
+    let checks = thread.checks;
+    if (payload.checks) {
+      const edited = this.checks.edit(task, thread, payload.checks);
+      if ('error' in edited) return blocked('checks-invalid', edited.error);
+      checks = edited.state;
+    }
     // A thread with no crew is manual.
     const crew = payload.crew === undefined ? thread.crew : payload.crew;
     if (!crew && payload.flightMode && payload.flightMode !== 'manual')
@@ -495,6 +577,7 @@ export class ChatService {
       handoffMode: payload.handoffMode ?? thread.handoffMode,
       crew,
       flightMode,
+      ...(checks ? { checks } : {}),
     });
     if (payload.permissionPolicy && thread.activeTurnId) {
       const answer = () => this.answerCovered(task.id);
@@ -504,16 +587,19 @@ export class ChatService {
     return { outcome: 'applied' };
   }
 
-  /** Answer every open ask of the running turn that the thread now covers. */
+  /** Answer every open ask of the running turns that the thread now covers. */
   private answerCovered(taskId: string) {
     const thread = this.thread(taskId);
-    const live = thread.activeTurnId ? this.activeLive(taskId, thread.activeTurnId) : undefined;
-    if (!live) return;
-    for (const requestId of [...live.permissions.keys()]) {
-      const choice = this.covered(thread, live, requestId);
-      if (!choice) continue;
-      live.permissions.delete(requestId);
-      this.call(() => live.handle?.respondPermission(requestId, choice));
+    // Plan slices run side by side, so every open turn of the thread hears the new policy.
+    for (const [turnId, open] of this.live) {
+      const live = open.taskId === taskId ? this.activeLive(taskId, turnId) : undefined;
+      if (!live) continue;
+      for (const requestId of [...live.permissions.keys()]) {
+        const choice = this.covered(thread, live, requestId);
+        if (!choice) continue;
+        live.permissions.delete(requestId);
+        this.call(() => live.handle?.respondPermission(requestId, choice));
+      }
     }
   }
 
@@ -987,11 +1073,12 @@ export class ChatService {
   }
 
   /** The read-only thread tools for one thread, as the MCP server and the Local functions call them. */
-  threadReads(taskId: string): ThreadReads {
+  threadReads(taskId: string, scratch?: string): ThreadReads {
     return createThreadReader(
       {
         store: this.deps.store,
         home: this.deps.home,
+        ...(scratch ? { scratch } : {}),
         projectPath: this.deps.projectPath,
         now: () => Date.parse(this.deps.now()),
       },
@@ -1116,7 +1203,38 @@ export class ChatService {
       reply: (turn) => text(turn.taskId, turn.assistantMessageId),
       message: (turn) => text(turn.taskId, turn.userMessageId),
       begin: (task, thread, input, effects) => this.begin(task, thread, input, effects),
-      crewStep: (task, thread, chain, effects) => this.crewStep(task, thread, chain, effects),
+      beginLane: (task, thread, input, effects) => {
+        const started = this.begin(task, thread, input, effects, undefined, input.slice);
+        return started.outcome === 'applied' ? (this.newestTurn(task.id)?.id ?? started) : started;
+      },
+      crewStep: (task, thread, chain, effects, brief) =>
+        this.crewStep(task, thread, chain, effects, undefined, brief),
+      findings: (review) => statedFindings(review),
+      reviewBrief: CREW_REVIEW,
+      familyBusy: (family) =>
+        !!this.deps.store.db
+          .prepare(
+            "SELECT 1 FROM chat_turns WHERE json_extract(body,'$.selection.family')=? AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') LIMIT 1",
+          )
+          .get(family),
+      stopTurn: (taskId, turnId) => {
+        const live = this.activeLive(taskId, turnId);
+        // A turn opened in the same transaction has no live turn yet. Its launch reads this.
+        if (!live && !this.live.has(turnId)) this.stoppedEarly.add(turnId);
+        if (!live) return;
+        live.stopRequested = true;
+        queueMicrotask(() => this.call(() => live.handle?.stop()));
+      },
+      planThreads: () =>
+        (
+          this.deps.store.db
+            .prepare(
+              "SELECT task_id FROM chat_threads WHERE json_extract(body,'$.plan.phase')='running'",
+            )
+            .all() as { task_id: string }[]
+        ).map((row) => row.task_id),
+      wakeQueues: () => this.wakeQueues(),
+      projectPath: (task) => this.deps.projectPath(task.projectId),
       stopActive: (taskId, effects) => {
         const id = this.thread(taskId).activeTurnId;
         const live = id ? this.activeLive(taskId, id) : undefined;
@@ -1126,6 +1244,16 @@ export class ChatService {
       },
       free: (task) => !this.checkedThread(task).left.length,
       scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      runCombinedChecks: (taskId, directory) => this.runCombinedChecks(taskId, directory),
+      stopCombinedChecks: (taskId) => {
+        // A plan stopped while its checks wait on the person's answer ends that wait too.
+        const asked = this.checkAsk.get(taskId);
+        if (asked) {
+          this.dropCheckAsk(taskId);
+          asked.settle('stop', []);
+        }
+        return this.stopCombinedChecks(taskId) || !!asked;
+      },
       localContext: () => this.deps.localContext?.() ?? null,
       localSliceFits: this.deps.localSliceFits ?? localSliceFits,
     };
@@ -1181,6 +1309,30 @@ export class ChatService {
     }
   }
 
+  private readonly mentionIndex = createMentionIndex(() => Date.now());
+
+  /** Ranked files and folders of the scratch copy for the text typed after an at sign. */
+  completeMention(payload: Payload<'CompleteChatMention'>): ChatMentionsRead {
+    const thread = this.thread(payload.taskId);
+    const mentions = thread.scratchReady
+      ? this.mentionIndex.complete(
+          this.scratchDirectory(payload.taskId),
+          this.deps.resolveEnvironment('local'),
+          payload.query,
+          payload.limit,
+        )
+      : [];
+    return { taskId: payload.taskId, mentions };
+  }
+
+  /** The instruction files at the copy root, and the text of one the person opens. */
+  readInstructions(payload: Payload<'ReadChatInstructions'>): ChatInstructionsRead {
+    const thread = this.thread(payload.taskId);
+    return thread.scratchReady
+      ? readInstructionFiles(payload.taskId, this.scratchDirectory(payload.taskId), payload.name)
+      : { taskId: payload.taskId, files: [], name: null, text: null, truncated: false };
+  }
+
   readCatalog(payload: Payload<'ReadChatCatalog'>): ChatCatalogRead {
     return ChatCatalogReadSchema.parse(this.deps.catalog(payload.taskId));
   }
@@ -1203,6 +1355,8 @@ export class ChatService {
    */
   recover() {
     this.sweepDeleted();
+    // A check still marked running belonged to the process that is gone.
+    this.checks.recover();
     const rows = this.deps.store.db
       .prepare(
         "SELECT id,task_id FROM chat_turns WHERE json_extract(body,'$.state') IN ('queued','running','waiting-permission') OR json_array_length(body,'$.groups')>0 ORDER BY task_id,sequence",
@@ -1248,6 +1402,8 @@ export class ChatService {
         const task = this.task(taskId);
         if (task) this.release(task);
       }
+      // A plan says it stopped before its chain does, so a plan mid-review gets its line too.
+      this.plans.recoverThreads(plans.map((row) => row.task_id));
       // The step turn failed above, so the chain stops where it was. Nothing relaunches on its own.
       for (const row of chains) {
         const task = this.task(row.task_id);
@@ -1256,7 +1412,6 @@ export class ChatService {
         if (task && thread.crewChain && !(open && OPEN_STATES.has(open.state)))
           this.stopCrew(task, thread, thread.crewChain, 'CrewKite restarted');
       }
-      this.plans.recoverThreads(plans.map((row) => row.task_id));
     });
     for (const row of waiting) this.continueQueue(row.task_id);
   }
@@ -1291,6 +1446,8 @@ export class ChatService {
       if (present.length !== turn.groups?.length) this.putTurn(task, withGroups(turn, present));
       left.push(...present);
     }
+    // A project check the journal cannot prove gone holds the thread like a provider process.
+    left.push(...this.checks.orphans(task.id));
     const { ownershipUnknown: flagged, ...thread } = this.thread(task.id);
     if (flagged && !left.length) this.putThread(task, thread);
     return left;
@@ -1312,6 +1469,9 @@ export class ChatService {
 
   close(): Promise<void> | undefined {
     this.closed = true;
+    for (const asked of [...this.checkAsk.values()]) asked.settle('stop', []);
+    this.checkAsk.clear();
+    this.checks.close();
     const running = [...this.live.values()];
     for (const live of running) {
       live.stopRequested = true;
@@ -1333,6 +1493,10 @@ export class ChatService {
       kinds: new Map(),
       calls: new Map(),
       policy: 'ask',
+      scratch: this.scratchDirectory(turn.taskId),
+      mcp: false,
+      secrets: [],
+      google: false,
       steered: false,
       noticed: false,
       started: false,
@@ -1340,6 +1504,7 @@ export class ChatService {
       gone: new Set(),
       done: Promise.resolve(),
     };
+    if (this.stoppedEarly.delete(turn.id)) live.stopRequested = true;
     this.live.set(turn.id, live);
     live.done = this.run(turn, live);
   }
@@ -1410,6 +1575,10 @@ export class ChatService {
     if (this.closed || live.stopRequested) return stoppedResult;
     const request = this.request(turn);
     live.policy = request.permissionPolicy;
+    live.scratch = request.scratch.directory;
+    live.mcp = (request.mcp?.servers.length ?? 0) > 0;
+    live.secrets = request.mcp?.secrets ?? [];
+    live.google = live.mcp && turn.selection.family === 'google';
     // The first turn copies the project, which takes time. Stop may have arrived meanwhile.
     if (this.closed || live.stopRequested) return stoppedResult;
     this.record(turn, live, {
@@ -1421,7 +1590,19 @@ export class ChatService {
       role: turn.role,
     });
     if (request.threadTools === false) this.toolsDown(turn, live);
-    live.handle = adapter.startTurn(request, (event) => this.record(turn, live, event));
+    for (const message of request.mcp?.notes ?? [])
+      this.record(turn, live, {
+        type: 'provider.notice',
+        turnId: turn.id,
+        level: 'info',
+        message,
+        trace: true,
+      });
+    // A secret of a server this turn started never reaches the thread, the trace or a prompt card.
+    const secrets = request.mcp?.secrets ?? [];
+    live.handle = adapter.startTurn(request, (event) =>
+      this.record(turn, live, scrubSecrets(event, secrets)),
+    );
     try {
       this.deps.store.transaction(() => this.saveGroups(turn.id, live));
     } catch {
@@ -1479,7 +1660,9 @@ export class ChatService {
     const message = this.findEntry(task.id, turn.userMessageId);
     if (message?.kind !== 'user-message' || !thread.base)
       throw Error('The message for this turn is missing.');
-    const directory = this.scratchDirectory(task.id);
+    // A plan slice works in its own copy and starts cold: no session, no packet.
+    const lane = turn.slice !== undefined;
+    const directory = this.plans.laneScratch(task, turn) ?? this.scratchDirectory(task.id);
     const prompt = withAttachments(message.text, message.attachments ?? [], directory, root);
     const history = this.history(task.id, message.cursor);
     const writer = writesScratch(turn.role);
@@ -1499,7 +1682,8 @@ export class ChatService {
     const pending = turn.handoffFrom ? this.pendingHandoff(task.id) : null;
     let reason: HandoffReason = pending?.reason ?? (asked ? 'ask' : rerun ? 'rerun' : 'manual');
     // A native session holds one model, so another model of the family starts a new session.
-    const kept = writer && !fresh ? thread.sessions.find((value) => value.family === family) : null;
+    const kept =
+      writer && !fresh && !lane ? thread.sessions.find((value) => value.family === family) : null;
     let session =
       kept && this.sessionModel(task.id, kept, turn.sequence) === turn.selection.model
         ? kept
@@ -1510,6 +1694,7 @@ export class ChatService {
       writer &&
       !fresh &&
       !carries &&
+      !lane &&
       RESUMING.has(family) &&
       !thread.sessions.some((value) => value.family === family) &&
       this.droppedSession(task.id, family)
@@ -1562,6 +1747,8 @@ export class ChatService {
     // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
     // the thread allows.
     const balanced = writer && thread.flightMode === 'balanced';
+    const permissionPolicy = writer && !balanced ? thread.permissionPolicy : 'ask';
+    const permissionGrants = writer && !balanced ? (thread.permissionGrants ?? []) : [];
     return {
       turnId: turn.id,
       taskId: task.id,
@@ -1588,10 +1775,19 @@ export class ChatService {
       session,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
-      permissionPolicy: writer && !balanced ? thread.permissionPolicy : 'ask',
+      permissionPolicy,
       // A reviewer or advisor reads only, so what the thread allowed does not reach it.
-      permissionGrants: writer && !balanced ? (thread.permissionGrants ?? []) : [],
+      permissionGrants,
       readOnly: !writer,
+      // Decided with the thread tools above: the person's servers a turn starts follow this turn's
+      // family and this policy, and never exceed it.
+      mcp: this.deps.mcp?.compose({
+        family,
+        taskId: task.id,
+        permissionPolicy,
+        permissionGrants,
+        readOnly: !writer,
+      }),
       deadlineMs: TURN_DEADLINE_MS,
       environment: this.deps.resolveEnvironment(turn.selection.family),
       now: () => Date.parse(this.deps.now()),
@@ -1750,9 +1946,12 @@ export class ChatService {
     if (!balanced && policy === live.policy) return null;
     const call = live.calls.get(open.callId ?? '');
     const kind = live.kinds.get(open.callId ?? '');
+    // A call the kinds do not name may be a server's. Its policy was cut at launch and a looser
+    // thread policy set since does not raise it.
+    if (live.google || (live.mcp && (kind === undefined || kind === 'other'))) return null;
     const words = `${open.question}\n${call?.title ?? ''}`;
     if (/\bnetwork\b/i.test(words)) return null;
-    const scratch = this.scratchDirectory(live.taskId);
+    const scratch = live.scratch;
     if (balanced) {
       // A delete or move is marked by the adapter from the client's own change type.
       if (kind === 'edit')
@@ -1764,7 +1963,9 @@ export class ChatService {
     return policy === 'allow-all' ? allow.id : null;
   }
 
-  private finish(turnId: string, live: LiveTurn, result: ChatTurnResult, left: number[]) {
+  private finish(turnId: string, live: LiveTurn, raw: ChatTurnResult, left: number[]) {
+    // The failure text can echo a server's argument or variable.
+    const result = scrubSecrets(raw, live.secrets);
     const turn = this.turn(turnId);
     if (turn)
       this.record(
@@ -1786,6 +1987,7 @@ export class ChatService {
         const end = { ...ending(result, live.items, left), effort: live.effort };
         seen =
           !!turn &&
+          turn.slice === undefined &&
           writesScratch(turn.role) &&
           RESUMING.has(turn.selection.family) &&
           end.session?.family === turn.selection.family &&
@@ -1813,6 +2015,8 @@ export class ChatService {
       this.continueOnLimit(turnId);
     if (turn && !this.closed) this.advanceCrew(turnId);
     if (turn && !this.closed) this.plans.settled(turnId);
+    // A family freed here may let a waiting plan slice start in any thread.
+    if (turn && !this.closed) this.plans.wake();
     // A handoff above opens the rerun first. The queue waits for that turn to settle. The family
     // is free now, so a thread that waited on it may start too.
     if (turn && !this.closed) this.wakeQueues();
@@ -1886,13 +2090,22 @@ export class ChatService {
     const thread = this.thread(task.id);
     // The session has now seen the thread up to this turn. Later turns on other families reach it
     // in a delta packet.
+    // A plan slice's session ran in the slice's own copy, so the thread never resumes it.
     const session =
-      writesScratch(turn.role) && end.session?.family === turn.selection.family
+      writesScratch(turn.role) &&
+      turn.slice === undefined &&
+      end.session?.family === turn.selection.family
         ? { ...end.session, seenSequence: turn.sequence }
         : null;
+    // Plan slices run side by side. The thread stays busy while any of its turns is open.
+    const other = this.deps.store.db
+      .prepare(
+        "SELECT id FROM chat_turns WHERE task_id=? AND id<>? AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') ORDER BY sequence LIMIT 1",
+      )
+      .get(task.id, turn.id) as { id: string } | undefined;
     this.putThread(task, {
       ...thread,
-      activeTurnId: thread.activeTurnId === turn.id ? null : thread.activeTurnId,
+      activeTurnId: thread.activeTurnId === turn.id ? (other?.id ?? null) : thread.activeTurnId,
       sessions: session
         ? [...thread.sessions.filter((value) => value.family !== session.family), session]
         : thread.sessions,
@@ -1938,7 +2151,8 @@ export class ChatService {
     try {
       const turn = this.turn(turnId);
       const task = turn && this.task(turn.taskId);
-      if (!turn || !task || turn.state !== 'failed') return;
+      // A plan slice that reaches a limit fails, and the card runs it again.
+      if (!turn || !task || turn.state !== 'failed' || turn.slice !== undefined) return;
       const thread = this.thread(task.id);
       // A crew step reruns on its own and leaves the thread's pick alone. A fixer on the thread's
       // family moves the thread like the builder would.
@@ -2011,7 +2225,8 @@ export class ChatService {
       this.deps.store.transaction(() => {
         const turn = this.turn(turnId);
         const task = turn && this.task(turn.taskId);
-        if (!turn || !task) return;
+        // A plan slice runs its own review chain in its lane.
+        if (!turn || !task || turn.slice !== undefined) return;
         const thread = this.thread(task.id);
         // A builder turn always starts a fresh chain, so a chain left mid-step by a failed write
         // never blocks the next one.
@@ -2048,13 +2263,11 @@ export class ChatService {
           return this.stopCrew(task, thread, chain, `the ${chain.step} failed`);
         if (thread.flightMode === 'manual')
           return this.stopCrew(task, thread, chain, 'the thread is in manual mode');
-        if (chain.step === 'fix')
-          return this.crewStep(
-            task,
-            thread,
-            { ...chain, step: 'review', fixes: chain.fixes + 1 },
-            effects,
-          );
+        if (chain.step === 'fix') {
+          const next = { ...chain, step: 'review', fixes: chain.fixes + 1 } as const;
+          if (this.startChecks(task, thread, next, 'fix', effects)) return;
+          return this.crewStep(task, thread, next, effects);
+        }
         if (chain.step === 'challenge') return this.finishCrew(task, thread, chain);
         const review = turn.assistantMessageId
           ? this.findEntry(task.id, turn.assistantMessageId)?.text
@@ -2087,10 +2300,9 @@ export class ChatService {
     chain: ChatCrewChain,
     effects: Effects,
     review?: string,
+    brief?: string,
   ) {
     const step = chain.step as CrewStep;
-    // A plan with slices left runs the next one, and the challenger waits for the last.
-    if (step === 'challenge' && this.plans.beforeChallenge(task, thread, chain, effects)) return;
     const members = thread.crew?.members ?? [];
     const member = (role: string) => members.find((entry) => entry.role === role)?.selection;
     const selection =
@@ -2100,7 +2312,11 @@ export class ChatService {
       return this.stopCrew(task, thread, chain, `the crew has no ${CREW_ROLES[step]}`);
     const saved = this.putThread(task, { ...thread, crewChain: chain });
     const text =
-      step === 'review' ? CREW_REVIEW : step === 'fix' ? fixerBrief(review ?? '') : CREW_CHALLENGE;
+      step === 'review'
+        ? CREW_REVIEW
+        : step === 'fix'
+          ? (brief ?? fixerBrief(review ?? ''))
+          : CREW_CHALLENGE;
     const started = this.begin(
       task,
       saved,
@@ -2109,6 +2325,197 @@ export class ChatService {
     );
     if (started.outcome !== 'applied')
       this.stopCrew(task, this.thread(task.id), chain, `the ${step} could not start`, started.next);
+  }
+
+  /** The thread waits on a check question or runs checks, so no turn may start. */
+  private checksBusy(taskId: string): boolean {
+    return this.checkAsk.has(taskId) || this.checks.running(taskId);
+  }
+
+  private dropCheckAsk(taskId: string) {
+    this.checkAsk.delete(taskId);
+    const task = this.task(taskId);
+    const thread = this.thread(taskId);
+    if (task && thread.checks?.ask)
+      this.putThread(task, { ...thread, checks: { ...thread.checks, ask: null } });
+  }
+
+  /**
+   * Whether the person must answer before these checks run. A check whose command or script
+   * changed since it was turned on asks in every mode. Otherwise a command set the person
+   * allowed for the thread runs. Failing that, Balanced asks as it does for a command outside the
+   * read-only set, and Glide runs them when the thread's policy covers commands.
+   */
+  private checksNeedAsk(
+    thread: ChatThread,
+    assessed: Pick<ReturnType<ThreadChecks['assess']>, 'changed' | 'set'>,
+  ): boolean {
+    if (assessed.changed.length > 0) return true;
+    if (thread.checks?.approved === assessed.set) return false;
+    return thread.flightMode !== 'glide' || !commandsAllowed(thread);
+  }
+
+  /** Put the question on the thread. The answer arrives as ResolveChatPermission. */
+  private raiseCheckAsk(
+    task: Task,
+    thread: ChatThread,
+    trigger: 'fix' | 'plan' | 'combined',
+    assessed: ReturnType<ThreadChecks['assess']>,
+    settle: (answer: CheckAnswer, effects: Effects) => void,
+  ) {
+    const requestId = `chkask_${randomBytes(16).toString('hex')}`;
+    this.checkAsk.set(task.id, { requestId, settle });
+    const current = thread.checks;
+    if (!current) return;
+    this.putThread(task, {
+      ...thread,
+      checks: {
+        ...current,
+        ask: {
+          requestId,
+          trigger,
+          commands: assessed.commands,
+          changed: assessed.changed,
+        },
+      },
+    });
+  }
+
+  /**
+   * Run the thread's enabled checks before the chain goes on, after the person has answered when
+   * the thread needs an answer. The chain waits with its step unchanged and no open turn, so a
+   * restart stops it like any other chain left mid-step. True when the checks were queued or the
+   * question was raised; false when no check is on.
+   */
+  private startChecks(
+    task: Task,
+    thread: ChatThread,
+    next: ChatCrewChain,
+    trigger: 'fix' | 'plan',
+    effects: Effects,
+  ): boolean {
+    if (!enabledChecks(thread).length) return false;
+    const before = thread.crewChain;
+    const assessed = this.checks.assess(task, thread);
+    // The run starts right after this transaction commits, in the same tick, so a rollback leaves
+    // no reservation behind.
+    const go = (fx: Effects, repin: boolean, approve: boolean) =>
+      fx.push(() => {
+        if (repin) this.checks.repin(task);
+        if (approve) this.checks.approve(task.id, assessed.set);
+        const entry = this.checks.reserve(task.id);
+        this.checks.run(task.id, trigger, undefined, entry).then(
+          (result) => this.checksDone(task.id, before, next, result),
+          () => this.checksDone(task.id, before, next, null),
+        );
+      });
+    if (!this.checksNeedAsk(thread, assessed)) {
+      go(effects, false, false);
+      return true;
+    }
+    this.raiseCheckAsk(task, thread, trigger, assessed, (answer, fx) => {
+      if (answer === 'allow' || answer === 'allow-thread')
+        go(fx, assessed.changed.length > 0, answer === 'allow-thread');
+      else
+        fx.push(() =>
+          this.checksDone(task.id, before, next, {
+            outcome: answer === 'stop' ? 'stopped' : 'denied',
+            runs: [],
+            brief: null,
+          }),
+        );
+    });
+    return true;
+  }
+
+  /**
+   * Run the enabled checks on a merged copy, for the combined review before the challenger. The
+   * same question comes first when the thread needs one. `denied` means the person said no.
+   */
+  async runCombinedChecks(taskId: string, directory: string): Promise<ChecksOutcome> {
+    if (this.closed) throw new Error('The chat service is closed.');
+    const task = this.task(taskId);
+    if (!task) throw new Error('No thread has that task.');
+    const thread = this.thread(taskId);
+    const none = { outcome: 'none', runs: [], brief: null } as const;
+    if (!enabledChecks(thread).length) return none;
+    const assessed = this.checks.assess(task, thread, directory);
+    if (this.checksNeedAsk(thread, assessed)) {
+      if (this.checkAsk.has(taskId)) return { outcome: 'denied', runs: [], brief: null };
+      const answer = await new Promise<CheckAnswer>((resolve) =>
+        this.deps.store.transaction(() =>
+          this.raiseCheckAsk(task, this.thread(taskId), 'combined', assessed, resolve),
+        ),
+      );
+      if (answer === 'allow-thread') this.checks.approve(taskId, assessed.set);
+      if (answer !== 'allow' && answer !== 'allow-thread')
+        return { outcome: answer === 'stop' ? 'stopped' : 'denied', runs: [], brief: null };
+    }
+    return this.checks.run(taskId, 'combined', directory);
+  }
+
+  /** Stop the runs on a merged copy. Only the plan step that started them calls it. */
+  stopCombinedChecks(taskId: string): boolean {
+    return this.checks.stopCombined(taskId);
+  }
+
+  /** The checks ended. Feed a failure to the fixer while fixes remain, otherwise go on. */
+  private checksDone(
+    taskId: string,
+    before: ChatCrewChain | null,
+    next: ChatCrewChain,
+    result: ChecksOutcome | null,
+  ) {
+    const effects: Effects = [];
+    try {
+      this.deps.store.transaction(() => {
+        const task = this.task(taskId);
+        if (!task || !before || this.closed) return;
+        const thread = this.thread(taskId);
+        // A new builder turn or another step took the chain over while the checks ran.
+        if (thread.activeTurnId || canonicalJson(thread.crewChain) !== canonicalJson(before))
+          return;
+        const line = (text: string) =>
+          this.appendEntry(task, {
+            kind: 'chat-system',
+            author: { kind: 'system', turnId: null },
+            text,
+          });
+        if (!result) return this.stopCrew(task, thread, before, 'the checks could not run');
+        if (result.outcome === 'stopped')
+          return this.stopCrew(task, thread, before, 'you stopped the checks');
+        if (sentMessage(thread))
+          return this.stopCrew(task, thread, before, 'you sent a new message');
+        if (result.outcome === 'denied')
+          line('The project checks did not run. The commands were not allowed.');
+        const labels = (status: 'passed' | 'failed') =>
+          result.runs
+            .filter((run) => run.status === status)
+            .map((run) => run.label)
+            .join(', ');
+        if (result.outcome === 'failed') {
+          const room = next.fixes < MAX_FIXES;
+          line(
+            `Checks failed: ${labels('failed')}.${room ? ' The fixer runs on their output.' : ` They still fail after ${next.fixes} ${next.fixes === 1 ? 'fix' : 'fixes'}, so the chain goes on.`}`,
+          );
+          if (room)
+            return this.crewStep(
+              task,
+              thread,
+              { ...next, step: 'fix' },
+              effects,
+              undefined,
+              result.brief ?? undefined,
+            );
+        } else if (result.outcome === 'passed') line(`Checks passed: ${labels('passed')}.`);
+        return this.crewStep(task, thread, next, effects);
+      });
+    } catch {
+      // The chain stays where it was. The person can still run each step from the thread.
+      return;
+    }
+    for (const effect of effects) this.call(effect);
+    if (!this.closed) this.wakeQueues();
   }
 
   private finishCrew(task: Task, thread: ChatThread, chain: ChatCrewChain) {
@@ -2195,6 +2602,7 @@ export class ChatService {
     input: Message,
     effects: Effects,
     id?: string,
+    slice?: number,
   ): CommandResult {
     const selection = this.pick(task, thread, input.selection);
     if ('outcome' in selection) return selection;
@@ -2207,7 +2615,7 @@ export class ChatService {
     this.openTurn(
       task,
       thread,
-      { selection, role: input.role, messageId: message.id, base },
+      { selection, role: input.role, messageId: message.id, base, slice },
       effects,
     );
     return { outcome: 'applied', revision: task.revision };
@@ -2289,7 +2697,14 @@ export class ChatService {
       this.deps.store.transaction(() => {
         const task = this.task(taskId);
         const thread = this.thread(taskId);
-        if (!task || !thread.queued.length || thread.activeTurnId || thread.ownershipUnknown)
+        if (
+          !task ||
+          !thread.queued.length ||
+          thread.activeTurnId ||
+          thread.ownershipUnknown ||
+          this.checksBusy(taskId) ||
+          this.plans.holds(thread)
+        )
           return;
         const newest = this.newestTurn(taskId);
         const sentAfter = newest?.endedAt && (thread.queued.at(-1)?.at ?? '') > newest.endedAt;
@@ -2325,13 +2740,15 @@ export class ChatService {
       role: ChatTurn['role'];
       messageId: string;
       base: string;
+      /** A plan slice's lane: the turn leaves the thread's pick, handoff and sessions alone. */
+      slice?: number;
     },
     effects: Effects,
   ) {
-    const { selection, role, messageId, base } = input;
+    const { selection, role, messageId, base, slice } = input;
     // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
     // still waiting for the next answer.
-    const own = writesScratch(role);
+    const own = writesScratch(role) && slice === undefined;
     const pending = own ? this.pendingHandoff(task.id) : null;
     let handoffFrom: ChatFamily | null = null;
     // Sending on the provider the thread came from cancels the switch. After Send now the same
@@ -2373,14 +2790,16 @@ export class ChatService {
       endedAt: null,
       failure: null,
       handoffFrom,
+      ...(slice === undefined ? {} : { slice }),
     });
     this.putTurn(task, turn);
-    // A fixer runs on the crew's pick, so the thread keeps the person's own.
+    // A fixer runs on the crew's pick, so the thread keeps the person's own. Plan slices run side
+    // by side, and the thread names one of them as its running turn.
     this.putThread(task, {
       ...thread,
       base,
-      selection: role === 'assistant' ? selection : thread.selection,
-      activeTurnId: turn.id,
+      selection: role === 'assistant' && slice === undefined ? selection : thread.selection,
+      activeTurnId: slice !== undefined && thread.activeTurnId ? thread.activeTurnId : turn.id,
     });
     effects.push(() => this.launch(turn));
   }
@@ -2431,6 +2850,8 @@ export class ChatService {
   private activeLive(taskId: string, turnId: string): LiveTurn | undefined {
     const live = this.live.get(turnId);
     if (!live || live.finished || live.taskId !== taskId) return;
+    // A plan slice's open turn answers its own asks and Stop, beside the thread's running turn.
+    if (this.turn(turnId)?.slice !== undefined) return live;
     return this.thread(taskId).activeTurnId === turnId ? live : undefined;
   }
 
@@ -2470,7 +2891,7 @@ export class ChatService {
     history: readonly ChatHistoryEntry[],
   ): string {
     const { role } = turn;
-    const crew = crewRole(thread) === role;
+    const crew = crewRole(thread) === role || turn.slice !== undefined;
     const answer =
       (crew && role === 'challenger'
         ? this.lastWrite(turn.taskId)
@@ -2482,7 +2903,7 @@ export class ChatService {
     if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';
     // The brief says why the changes could not be read, and the model works from the files.
-    const files = this.scratchDiff(turn.taskId, root, base);
+    const files = this.scratchDiff(turn.taskId, root, base, directory);
     return reviewContext(name, directory, base, files, crew, this.unreadable.get(turn.taskId));
   }
 
@@ -2496,9 +2917,14 @@ export class ChatService {
     return row ? ConversationEntrySchema.parse(JSON.parse(row.body as string)).text : undefined;
   }
 
-  private scratchDiff(taskId: string, root: string, base: string): FileDiff[] | null {
+  private scratchDiff(
+    taskId: string,
+    root: string,
+    base: string,
+    directory = this.scratchDirectory(taskId),
+  ): FileDiff[] | null {
     try {
-      const files = scratchChanges(root, this.scratchDirectory(taskId), base);
+      const files = scratchChanges(root, directory, base);
       this.unreadable.delete(taskId);
       return files;
     } catch (error) {

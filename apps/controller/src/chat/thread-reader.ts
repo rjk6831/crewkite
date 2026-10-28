@@ -2,6 +2,8 @@ import { join } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
+  type ChatCheckRun,
+  ChatChecksStateSchema,
   type ChatTurn,
   ChatTurnSchema,
   ConversationEntrySchema,
@@ -45,6 +47,8 @@ export type ThreadReaderSource = Readonly<{
   store: Store;
   /** The controller home. The thread's scratch copy is under it. */
   home: string;
+  /** The copy `thread_diff` reads when it is not the thread's own, as for a plan slice. */
+  scratch?: string;
   projectPath: (projectId: string) => string | undefined;
   /** Milliseconds, for the elapsed time of a running turn. */
   now: () => number;
@@ -58,6 +62,7 @@ const TRACE_ENTRIES = 200;
 const TRACE_CHARACTERS = 500;
 const FILES = 200;
 const CHECK_LINES = 64;
+const RUN_OUTPUT_LINES = 6;
 const TRUNCATED = '\n[truncated]';
 const OPEN = new Set<ChatTurn['state']>(['queued', 'running', 'waiting-permission']);
 
@@ -73,6 +78,29 @@ export function redact(text: string): string {
       /\b([A-Za-z_][A-Za-z0-9_.-]*(?:TOKEN|SECRET|KEY)[A-Za-z0-9_]*)(["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/gi,
       '$1$2[redacted]',
     );
+}
+
+/** The newest run of each check as lines: a summary, then the last lines of its output. */
+function runLines(runs: readonly ChatCheckRun[]): { at: string; lines: string[] }[] {
+  // Delete before set, so a check that ran again moves to the end with its newest run.
+  const latest = new Map<string, ChatCheckRun>();
+  for (const run of runs) {
+    latest.delete(run.checkId);
+    latest.set(run.checkId, run);
+  }
+  return [...latest.values()].map((run) => {
+    const seconds = run.durationMs === null ? '' : ` in ${(run.durationMs / 1000).toFixed(1)} s`;
+    const head = `${run.label} (${run.command}): ${run.status}${seconds}${run.reason ? `. ${run.reason}` : ''}`;
+    const output = redact(run.tail)
+      .split('\n')
+      .filter((line) => line.trim())
+      .slice(-RUN_OUTPUT_LINES)
+      .map((line) => `  ${line}`);
+    return {
+      at: run.startedAt,
+      lines: [head, ...output].map((line) => clipped(line, TRACE_CHARACTERS)),
+    };
+  });
 }
 
 /** The newest text that fits the byte budget, cut at a character. */
@@ -239,7 +267,8 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
             );
       let all: ReturnType<typeof scratchChanges>;
       try {
-        all = scratchChanges(root, join(source.home, 'chat', taskId, 'scratch'), base);
+        const scratch = source.scratch ?? join(source.home, 'chat', taskId, 'scratch');
+        all = scratchChanges(root, scratch, base);
       } catch (error) {
         if (!(error instanceof ScratchTooLarge)) throw error;
         return ThreadDiffResultSchema.parse({ diff: `${error.message}\n`, more: null });
@@ -271,19 +300,36 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
     },
 
     checks() {
-      const lines = store.db
+      const row = store.db.prepare('SELECT body FROM chat_threads WHERE task_id=?').get(taskId);
+      const state = ChatChecksStateSchema.safeParse(
+        row ? (JSON.parse(row.body as string) as { checks?: unknown }).checks : undefined,
+      );
+      // Run lines take at most three quarters of the answer, newest runs first to stay, so the
+      // system lines about checks keep room. Both kinds are ordered by when they happened.
+      const runs = state.success ? runLines(state.data.runs) : [];
+      const kept: typeof runs = [];
+      let used = 0;
+      for (const group of runs.toReversed()) {
+        if (used + group.lines.length > (CHECK_LINES * 3) / 4) break;
+        kept.unshift(group);
+        used += group.lines.length;
+      }
+      const entries = store.db
         .prepare(
           "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='chat-system' AND json_extract(body,'$.text') LIKE '%check%' ORDER BY sequence DESC LIMIT ?",
         )
-        .all(taskId, CHECK_LINES)
-        .reverse()
-        .map((row) =>
-          clipped(
-            redact(ConversationEntrySchema.parse(JSON.parse(row.body as string)).text),
-            TRACE_CHARACTERS,
-          ),
-        );
-      return ThreadChecksResultSchema.parse({ lines });
+        .all(taskId, CHECK_LINES - used)
+        .map((row) => ConversationEntrySchema.parse(JSON.parse(row.body as string)));
+      const merged = [
+        ...kept,
+        ...entries.map((entry) => ({
+          at: entry.at,
+          lines: [clipped(redact(entry.text), TRACE_CHARACTERS)],
+        })),
+      ].sort((a, b) => a.at.localeCompare(b.at));
+      return ThreadChecksResultSchema.parse({
+        lines: merged.flatMap((group) => group.lines).slice(-CHECK_LINES),
+      });
     },
 
     live() {
