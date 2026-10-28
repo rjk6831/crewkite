@@ -173,3 +173,16 @@ The controller table builds a scratch copy with ignored folders, a link to a fil
 The saved prompt table covers the controller home. Prompts persist, a repeated name replaces its body, the export is the versioned JSON file in name order, and a damaged file is refused and left as it is. The same table parses `/prompt name key=value` and checks that insertion fills the values given and names the placeholders still open. A message that starts with a command word, such as `/new endpoint returns 500`, or a path such as `/usr/bin` stays a message, and an exact command name such as `/pr` is chosen before longer names that start with it.
 
 These tables use synthetic files and no network. They do not exercise the composer's keyboard handling or the Settings card, which a manual desktop check covers.
+
+## CLI
+
+Six claims cover the interactive CLI and its scripting path. Each runs a real controller on a private socket with the scripted chat adapter, or a pure module, and no provider client.
+
+- Print mode streams the reply to stdout and exits with the status of its turn: 0 when done, 1 when it failed on a usage limit or the controller went away, and 3 when another command stopped it. It finds the registered project from `INIT_CWD` with a misleading `GIT_DIR` set, refuses an unregistered checkout with status 2 and registers nothing until `--register`. A permission policy in `cli.json` leaves a new thread on ask; `--permission-policy` sets it for the run. Arguments that do not parse exit 2 in every command.
+- The thread commands with `--json` write only lines `CliJsonLineSchema` accepts, whose full shape matches the pinned hash for `v: 1`, through a new thread, a watched permission answered by `thread permit`, Accept, `list` and `show`. Push without `--confirm` sends nothing and says what it would push.
+- Each interactive view draws a scripted thread: the wordmark at both sizes, the folded reads, Markdown, the open permission with its options and the thread policy, the answered thread, Changes with the diff and the accepted branch, the crew, the plan card in Balanced and after a stop, Settings with provider cards and a dotted stale gauge, the thread list and help. Under `NO_COLOR` every view keeps its text and draws no colour. The kite panels and gauges take the desktop's colours, yellow at 40 percent and red at empty, and the spinner moves only with full animation.
+- Slash commands parse only from the shared list, and the message box keeps multi-line editing, history on Up and Down, slash and mention completion, and absolute paths after `@` as attachments.
+- `cli.json` is checked with the schemas the desktop saves its defaults with, falls back to defaults with a named field, is written private to its owner, and backs the renderer's preference functions. Key bindings match their modifiers exactly.
+- The interactive app preselects the project from `INIT_CWD`, offers the saved policy and keeps ask when the person declines, keeps a digit as text until Tab gives the request focus, answers it with a digit, asks before Ctrl+C leaves a running reply, stops it with Escape and leaves on the next Ctrl+C.
+
+These tests establish the CLI's own wiring. The controller's permission, acceptance and push rules keep their existing claims, and the CLI test adds none of its own.

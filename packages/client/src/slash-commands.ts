@@ -17,18 +17,22 @@ export type SlashName =
   | 'help'
   | 'prompt';
 
+/**
+ * `argument` names the text a command takes after its name. The terminal client uses it, such as a
+ * branch for /accept; the desktop opens the same place and leaves the text unused.
+ */
 export type SlashCommand = Readonly<{ name: SlashName; summary: string; argument?: string }>;
 
 export const slashCommands: readonly SlashCommand[] = [
   { name: 'new', summary: 'Start a new thread.' },
-  { name: 'model', summary: 'Pick the model for this thread.' },
-  { name: 'provider', summary: 'Pick the provider for this thread.' },
+  { name: 'model', summary: 'Pick the model for this thread.', argument: 'model' },
+  { name: 'provider', summary: 'Pick the provider for this thread.', argument: 'family' },
   { name: 'crew', summary: 'Show the crew and the flight mode.' },
   { name: 'plan', summary: 'Show the plan the orchestrator proposed.' },
   { name: 'ask', summary: 'Ask another model a read-only question.', argument: 'question' },
-  { name: 'handoff', summary: 'Move the thread to another provider.' },
+  { name: 'handoff', summary: 'Move the thread to another provider.', argument: 'family' },
   { name: 'changes', summary: 'Show the changes in the scratch copy.' },
-  { name: 'accept', summary: 'Go to Changes to accept them on a branch.' },
+  { name: 'accept', summary: 'Go to Changes to accept them on a branch.', argument: 'branch' },
   { name: 'push', summary: 'Go to Changes to push the branch.' },
   { name: 'pr', summary: 'Go to Changes to open a pull request.' },
   { name: 'settings', summary: 'Open settings.' },

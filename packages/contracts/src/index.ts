@@ -3848,6 +3848,7 @@ export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export { canonicalJson } from './canonical.ts';
 export * from './chat.ts';
 export * from './checks.ts';
+export * from './cli.ts';
 export * from './composer.ts';
 export * from './extensions.ts';
 
