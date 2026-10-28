@@ -41,6 +41,7 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
 import { ChatService } from '../chat/service.ts';
+import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
 import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
@@ -388,8 +389,42 @@ export class Controller {
       onTurnSettled: (family) => {
         if (family === 'anthropic') void this.anthropicUsage().refreshWhenDue(this.id('cmd'));
       },
+      // The turn's thread tools token dies with the turn.
+      onTurnEnded: (turnId) => this.threadToolsRuntime?.broker.end(turnId),
     });
     return this.chatRuntime;
+  }
+
+  // One broker for the controller's life. Its socket listens once the default adapters exist, and
+  // a turn that starts before it listens, or after listening failed, runs without the tools.
+  private threadToolsRuntime?: {
+    broker: ThreadToolsBroker;
+    ready: boolean;
+    started: Promise<void>;
+  };
+  private threadToolsBroker() {
+    if (this.threadToolsRuntime) return this.threadToolsRuntime;
+    const broker = new ThreadToolsBroker({ home: this.home });
+    const runtime = { broker, ready: false, started: Promise.resolve() };
+    runtime.started = broker.start().then(
+      () => {
+        runtime.ready = !this.closed;
+      },
+      () => {},
+    );
+    this.threadToolsRuntime = runtime;
+    return runtime;
+  }
+
+  /** The thread tools server for one cloud turn, with a token scoped to its thread and turn. */
+  private threadTools(request: ChatTurnRequest): ThreadToolsServer | null {
+    const runtime = this.threadToolsRuntime;
+    if (!runtime?.ready || this.closed) return null;
+    return runtime.broker.mint({
+      taskId: request.taskId,
+      turnId: request.turnId,
+      reader: this.chat().threadReads(request.taskId),
+    });
   }
 
   /** The context of the Local model a turn would run on, when Local is connected. */
@@ -718,6 +753,8 @@ export class Controller {
 
   /** One adapter per family, each resolving its client from the profiles at launch time. */
   private defaultChatAdapters(): Map<ChatFamily, ChatAdapter> {
+    this.threadToolsBroker();
+    const threadTools = (request: ChatTurnRequest) => this.threadTools(request);
     const client = (ids: string[], family: string) => {
       const profile = this.resolveProfiles().find(
         (value) => ids.includes(value.facts.id) && value.facts.available && value.client,
@@ -733,17 +770,20 @@ export class Controller {
         environment: request.environment,
       }),
       spawn: this.options.nativeSpawn as Parameters<typeof openAiChatAdapter>[0]['spawn'],
+      threadTools,
     });
     const anthropic = anthropicChatAdapter({
       launch: () => client(['anthropic-file-v1', 'anthropic-file-compact-v1'], 'Anthropic'),
       spawn: this.options.nativeSpawn as Parameters<typeof anthropicChatAdapter>[0]['spawn'],
       schedule: this.options.schedule,
       onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),
+      threadTools,
     });
     const google = googleChatAdapter({
       onPromptCapabilities: (capabilities) => {
         this.googlePrompt = capabilities;
       },
+      threadTools,
       launch: (request: ChatTurnRequest) => {
         const setup = this.store.googleAcpSetup();
         const resolution = this.acpResolution();
@@ -794,6 +834,8 @@ export class Controller {
         this.localVision = { modelKey: connection.modelKey, vision: connection.vision };
         return { ...connection, connectedWithoutToken: secret === null };
       },
+      // Local runs the same five reads as functions in this process. No socket or token.
+      threadReader: (request) => this.chat().threadReads(request.taskId),
     });
     return new Map<ChatFamily, ChatAdapter>([
       ['openai', openai],
@@ -1087,6 +1129,15 @@ export class Controller {
     if (operationClosing) native.push(operationClosing);
     const chatClosing = this.chatRuntime?.close();
     if (chatClosing) native.push(chatClosing);
+    // The thread tools socket closes now, so a controller started next on this home binds its
+    // own. Nothing the store holds waits on it.
+    const tools = this.threadToolsRuntime;
+    if (tools) {
+      const closeTools = () => void tools.broker.close().catch(() => {});
+      if (tools.ready) closeTools();
+      else void tools.started.then(closeTools);
+      tools.ready = false;
+    }
     this.outputAbort.abort();
     native.push(...this.outputReads);
     const usageClosing = this.anthropicUsageRuntime?.close();

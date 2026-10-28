@@ -875,10 +875,12 @@ function limitThread(
     familyEntry('local', 60, inHours(1), now),
   ];
   const settled: [string, string][] = [];
+  const ended: string[] = [];
   const thread = standalone(t, {
     adapters,
     catalog: () => ({ families }),
     onTurnSettled: (family, taskId) => settled.push([family, taskId]),
+    onTurnEnded: (turnId) => ended.push(turnId),
   });
   const { store, service, taskId } = thread;
   store.transaction(() =>
@@ -888,7 +890,7 @@ function limitThread(
       ...(options.handoffMode ? { handoffMode: options.handoffMode } : {}),
     }),
   );
-  return { ...thread, adapters, limit, settled };
+  return { ...thread, adapters, limit, settled, ended };
 }
 
 test('a usage limit writes a system line, and auto handoff runs the same message once on the next family', {
@@ -934,6 +936,11 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     ['google', on.taskId],
     ['google', on.taskId],
   ]);
+  // Each turn's thread tools token ends with the turn, the failed one too.
+  assert.deepEqual(
+    on.ended,
+    thread.turns.map((turn) => turn.id),
+  );
   assert.equal(thread.thread.selection?.model, 'google-model');
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${thread.turns[2].id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];

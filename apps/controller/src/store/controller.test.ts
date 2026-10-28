@@ -4204,11 +4204,12 @@ test('Local reads keep the selection while its model key is loaded and clear it 
     assert.equal(connected?.connectedWithoutToken, false);
     assert.equal(connected?.operation, null);
     assert.equal(JSON.stringify(reopened.snapshot()).includes(canary), false);
+    // Files only: the thread tools socket lives in the home too and holds nothing at rest.
     const held = (directory: string): string[] =>
       readdirSync(directory, { withFileTypes: true }).flatMap((entry) =>
         entry.isDirectory()
           ? held(join(directory, entry.name))
-          : readFileSync(join(directory, entry.name)).includes(canary)
+          : entry.isFile() && readFileSync(join(directory, entry.name)).includes(canary)
             ? [entry.name]
             : [],
       );

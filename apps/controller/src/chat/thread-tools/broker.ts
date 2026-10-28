@@ -228,14 +228,11 @@ export class ThreadToolsBroker {
     for (const socket of this.sockets) socket.destroy();
     if (!this.listening) return;
     this.listening = false;
+    // Closing the server removes the socket file at once. A second unlink after the callback
+    // could remove the socket of a broker started since on the same home.
     await new Promise<void>((resolve, reject) =>
       this.server.close((error) => (error ? reject(error) : resolve())),
     );
-    try {
-      unlinkSync(this.socketPath);
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-    }
   }
 
   private accept(socket: Socket) {

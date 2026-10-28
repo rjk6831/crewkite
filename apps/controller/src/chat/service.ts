@@ -155,6 +155,11 @@ export type ChatServiceDeps = {
    * It runs outside the turn's transaction, and a throw never reaches the turn.
    */
   onTurnSettled?: (family: ChatFamily, taskId: string) => void;
+  /**
+   * Runs once for every turn whose adapter result came back, before the row settles and even
+   * when settling fails, so what the turn was lent (its thread tools token) ends with it.
+   */
+  onTurnEnded?: (turnId: string) => void;
   /** Process table access and timers. Tests replace them; the defaults are the real ones. */
   groupAbsent?: (group: number) => boolean;
   signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -1665,6 +1670,11 @@ export class ChatService {
       );
     live.finished = true;
     this.live.delete(turnId);
+    try {
+      this.deps.onTurnEnded?.(turnId);
+    } catch {
+      // A token left open fails its next call once the client is gone. The turn settles anyway.
+    }
     let seen = false;
     try {
       this.deps.store.transaction(() => {
