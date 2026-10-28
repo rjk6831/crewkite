@@ -2,6 +2,8 @@ import { z } from 'zod';
 import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
+  AskChatFamilyPayloadSchema,
+  CancelChatPlanPayloadSchema,
   ChatAttachmentSchema,
   ChatBranchStatusSchema,
   ChatCatalogChangeSchema,
@@ -34,6 +36,7 @@ import {
   RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   RetryChatTurnPayloadSchema,
+  RunChatPlanPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -2493,6 +2496,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('DiscardChatChange', DiscardChatChangePayloadSchema),
   mutate('RenameChatThread', RenameChatThreadPayloadSchema),
   mutate('DeleteChatThread', DeleteChatThreadPayloadSchema),
+  mutate('AskChatFamily', AskChatFamilyPayloadSchema),
+  mutate('RunChatPlan', RunChatPlanPayloadSchema),
+  mutate('CancelChatPlan', CancelChatPlanPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),

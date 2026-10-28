@@ -2275,6 +2275,12 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   const rename = (title: string) =>
     store.transaction(() => service.renameThread({ taskId, title }));
   assert.equal(rename(' \n ').reason, 'title-empty');
+  // A plan command refuses until plan runs exist, and changes nothing.
+  for (const planned of [
+    service.planCommand({ taskId, planId: 'plan-1' }),
+    service.planCommand({ taskId, planId: 'plan-1', sliceId: 1 }),
+  ])
+    assert.equal(planned.reason, 'plan-unavailable');
   const renamed = rename('  Sales\n chart ').entity as Task;
   assert.deepEqual([renamed.title, renamed.revision], ['Sales chart', 1]);
   assert.deepEqual(store.get<Task>('task', taskId), renamed);
