@@ -8,6 +8,8 @@ import {
   writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
+import { createCommandKey } from '@crewkite/client/node';
+import { type Command, CommandResultSchema, CommandSchema } from '@crewkite/contracts';
 
 /** The part of Electron's safeStorage that the vault uses, so a test can supply its own. */
 export type SecretStorage = {
@@ -127,8 +129,8 @@ export class LocalTokenVault {
 
 /**
  * How the controller gives up and takes back the token it holds in memory. The controller owns
- * the token window and its helper, so main needs a controller command for each direction. While
- * none exists, supported is false and the option reports itself unavailable.
+ * the token window and its helper, so main needs a controller command for each direction. A port
+ * without them reports supported false, and the option reports itself unavailable.
  */
 export type LocalTokenPort = {
   supported: boolean;
@@ -143,6 +145,38 @@ export const unsupportedPort: LocalTokenPort = {
   give: async () => false,
 };
 export const PORT_REASON = 'This controller cannot hand the token to the desktop yet.';
+
+/**
+ * The port over the controller client. SupplyLocalToken and ReadLocalToken are reads, so they go
+ * to the client directly: no receipt, grant or retry record of the desktop ever holds the token.
+ */
+export function controllerPort(
+  command: (value: Command) => Promise<unknown>,
+  actor: Command['actor'],
+): LocalTokenPort {
+  const run = async (name: 'SupplyLocalToken' | 'ReadLocalToken', payload: object) =>
+    CommandResultSchema.parse(
+      await command(
+        CommandSchema.parse({
+          protocol: 1,
+          key: createCommandKey(),
+          actor,
+          command: name,
+          payload,
+        }),
+      ),
+    );
+  return {
+    supported: true,
+    take: async () => {
+      const result = await run('ReadLocalToken', {});
+      return result.outcome === 'applied' && result.data?.kind === 'local-token'
+        ? result.data.token
+        : null;
+    },
+    give: async (token) => (await run('SupplyLocalToken', { token })).outcome === 'applied',
+  };
+}
 export type LocalSetupView = {
   endpoint: string | null;
   authMode?: LocalTokenMode;

@@ -3,7 +3,9 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import type { Command } from '@crewkite/contracts';
 import {
+  controllerPort,
   type LocalTokenPort,
   LocalTokenVault,
   PORT_REASON,
@@ -14,6 +16,7 @@ import {
 } from './local-token.ts';
 
 const endpoint = 'ws://127.0.0.1:1234';
+const actor = { id: 'desktop', kind: 'desktop' as const };
 const storage = (
   backend: string | undefined,
   options: { encryption?: boolean; broken?: boolean } = {},
@@ -80,17 +83,19 @@ test('a remembered Local token needs a real backend and goes with a changed endp
     writeFileSync(file, '{"version":2}');
     assert.equal(vault.read(endpoint, 'token'), null);
 
-    // The renderer calls: the controller hands the token over, Forget clears its copy.
+    // The renderer calls over the real port: the controller hands the token over on
+    // ReadLocalToken, takes it back on SupplyLocalToken, and Forget clears its copy.
     let held: string | null = 'live-token';
     const given: string[] = [];
-    const port: LocalTokenPort = {
-      supported: true,
-      take: async () => held,
-      give: async (token) => {
-        given.push(token);
-        return true;
-      },
-    };
+    const sent: Command[] = [];
+    const port = controllerPort(async (command) => {
+      sent.push(command);
+      if (command.command === 'ReadLocalToken')
+        return { outcome: 'applied', data: { kind: 'local-token', token: held } };
+      if (command.command !== 'SupplyLocalToken') throw new Error('Not a token command.');
+      given.push(command.payload.token);
+      return { outcome: 'applied' };
+    }, actor);
     const disconnects: number[] = [];
     const setup = { endpoint, authMode: 'token' as const, secretConfigured: true, revision: 7 };
     const calls = (use: LocalTokenPort) =>
@@ -108,6 +113,14 @@ test('a remembered Local token needs a real backend and goes with a changed endp
     assert.deepEqual(await remembered.remember(), { available: true, remembered: true });
     assert.equal(await remembered.supply(), true);
     assert.deepEqual(given, ['live-token']);
+    // Reads with the desktop actor and no expected revision, so no receipt holds the token.
+    assert.deepEqual(
+      sent.map((command) => [command.command, command.actor, 'expectedRevision' in command]),
+      [
+        ['ReadLocalToken', actor, false],
+        ['SupplyLocalToken', actor, false],
+      ],
+    );
     held = null;
     await remembered.forget();
     assert.deepEqual(disconnects, [7]);

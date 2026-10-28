@@ -33,10 +33,10 @@ import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
 import {
+  controllerPort,
   LocalTokenVault,
   RememberedLocalToken,
   type SecretStorage,
-  unsupportedPort,
 } from './local-token.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
@@ -262,12 +262,6 @@ export async function installBridge(
     });
     const refused = grants.refusal(command);
     if (refused) throw new Error(refused);
-    // A remembered token goes to the controller in memory, so Connect needs no token window.
-    if (command.command === 'BeginLocalConnectionInput' && (await tokens.supply())) {
-      assertSender(event, window);
-      const setup = (await client?.workspaceState())?.localSetup;
-      return { outcome: 'applied', revision: setup?.revision ?? command.expectedRevision };
-    }
     if (
       [
         'GetWorkspaceState',
@@ -372,6 +366,12 @@ export async function installBridge(
         )
           throw new Error('The setup operation changed. Read its current state before stopping.');
       }
+      // A remembered token goes to the controller in memory first, so the connect that follows
+      // uses it with no token window. Without one, or when the hand over fails, the window asks.
+      if (command.command === 'BeginLocalConnectionInput') {
+        await tokens.supply().catch(() => false);
+        assertSender(event, window);
+      }
       const result = await execute(command, () => assertSender(event, window));
       if (command.command === 'ConfigureLocal' && applied(result))
         await tokens.reconcile().catch(() => {});
@@ -459,7 +459,10 @@ export async function installBridge(
   // because no setup deletes the remembered token.
   const tokens = new RememberedLocalToken(
     new LocalTokenVault(controller.paths.profile, storage),
-    unsupportedPort,
+    controllerPort(async (command) => {
+      if (!client) throw new Error('The controller is offline.');
+      return client.command(command);
+    }, desktopActor),
     async () => {
       if (!client) throw new Error('The controller is offline.');
       return (await client.workspaceState()).localSetup ?? null;
