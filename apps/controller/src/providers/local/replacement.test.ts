@@ -554,6 +554,26 @@ test('Local generation binds its loopback authentication mode and loaded instanc
       );
     else assert.equal(choice.state, 'installed-unloaded', label);
   }
+  {
+    // A loaded instance that is generating shows as busy and still qualifies: the turn waits.
+    const f = fixture();
+    f.model.getInstanceProcessingState = async () => ({ status: 'generating', queued: 1 });
+    const discovery = await discoverLocalModels(discoveryClient(f), { now: () => 0 });
+    assert(discovery.kind === 'observed');
+    const [choice] = discovery.observation.models;
+    assert.equal(choice.state, 'loaded-eligible');
+    assert.deepEqual(choice.reasons, ['busy']);
+    const resolved = resolveLocalConnection(
+      {
+        endpoint: plan.endpoint,
+        connectionRevision: 1,
+        observation: discovery.observation,
+        selectionId: choice.selectionId,
+      },
+      { platform: 'darwin', arch: 'arm64', secretConfigured: true },
+    );
+    assert(resolved.connection !== null);
+  }
   for (const [format, catalog] of [
     ['gguf', 'exact'],
     ['safetensors', 'exact'],
