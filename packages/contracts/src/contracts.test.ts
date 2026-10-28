@@ -3805,7 +3805,7 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
         taskId,
         planId: 'plan-1',
         sliceId: 2,
-        overrides: [{ sliceId: 2, family: 'local', model: 'qwen' }],
+        overrides: [{ sliceId: 2, family: 'local', model: 'model-q' }],
       },
       true,
     ],
