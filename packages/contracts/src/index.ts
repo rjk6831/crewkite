@@ -261,6 +261,10 @@ export const LocalModelChoiceSchema = z
      * catalog can say so before any connect. Missing when the runtime did not say.
      */
     vision: z.boolean().optional(),
+    /** The largest context the model file supports, from a downloaded entry. Missing when unreported. */
+    maxContextLength: RevisionSchema.min(1).optional(),
+    /** The runtime reports the model is trained for tool use. Missing when unreported. */
+    trainedForToolUse: z.boolean().optional(),
   })
   .refine(
     (choice) =>

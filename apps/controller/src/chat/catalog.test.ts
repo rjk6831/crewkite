@@ -31,7 +31,7 @@ const observation = {
   residentLlms: 1,
   embeddingInstances: 0,
 };
-const localSetup = (loaded: boolean) =>
+const localSetup = (loaded: boolean, vision?: boolean) =>
   LocalSetupSchema.parse({
     revision: 1,
     connectionRevision: 1,
@@ -42,7 +42,15 @@ const localSetup = (loaded: boolean) =>
     secretConfigured: true,
     connected: true,
     operation: null,
-    observation: loaded ? observation : null,
+    observation: loaded
+      ? {
+          ...observation,
+          models: observation.models.map((model) => ({
+            ...model,
+            ...(vision === undefined ? {} : { vision }),
+          })),
+        }
+      : null,
     selection: null,
     generation: 'idle',
     reason: null,
@@ -66,6 +74,12 @@ test('the catalog reports the file types each client said it takes, and null bef
         localVision: { modelKey: 'fixture-model', vision: true },
       },
       ['image/*', 'audio/*', '*/*'],
+      ['image/*', ...text],
+    ],
+    [
+      'a cached observation that says the model takes images, before any connect',
+      { googlePrompt: none, local: localSetup(true, true) },
+      [],
       ['image/*', ...text],
     ],
     [

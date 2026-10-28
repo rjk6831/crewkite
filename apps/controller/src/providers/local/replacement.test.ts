@@ -502,7 +502,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     ['selected reports 1,048,576', 1_048_576, 'selected', true],
   ] as const) {
     const f = fixture();
-    const reported = { ...info, contextLength };
+    const reported = {
+      ...info,
+      contextLength,
+      vision: true,
+      trainedForToolUse: false,
+      maxContextLength: 131072,
+    };
     f.model.getModelInfo = async () => reported;
     const second = {
       ...f.model,
@@ -539,6 +545,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     assert.equal(resolved.connection !== null, qualifies, label);
     assert.equal(resolved.facts.contextLength, qualifies ? contextLength : null, label);
     if (qualifies) assert.equal(choice.contextLength, contextLength, label);
+    // The capability flags the runtime reports ride on the choice and stay out of its identity.
+    if (loaded !== 'other')
+      assert.deepEqual(
+        [choice.vision, choice.trainedForToolUse, choice.maxContextLength],
+        [true, false, 131072],
+        label,
+      );
     else assert.equal(choice.state, 'installed-unloaded', label);
   }
   for (const [format, catalog] of [

@@ -170,11 +170,13 @@ function local(input: ChatCatalogInput): Entry {
   // cannot be picked until then.
   const connected = open && !input.local.observationStale;
   // Text files are inlined for any model. Images need a model the runtime says has vision.
-  // shortcut: vision comes from the last connect, so it is unknown until a turn runs. Upgrade:
-  // a vision field on LocalModelChoice, read with getModelInfo at discovery.
-  const model = (selected ?? loaded[0])?.identity.modelKey;
+  // A turn's connect reports the flag for its model. Before any turn the discovery has it on the
+  // cached choice, so the answer is there before Local connects.
+  const picked = selected ?? loaded[0];
+  const model = picked?.identity.modelKey;
   const vision =
-    model !== undefined && input.localVision?.modelKey === model && input.localVision.vision;
+    model !== undefined &&
+    (input.localVision?.modelKey === model ? input.localVision.vision : picked?.vision === true);
   return {
     family: 'local',
     connected,

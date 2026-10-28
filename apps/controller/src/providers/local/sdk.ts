@@ -125,6 +125,10 @@ const metadataSchema = z.object({
     .object({ name: identifier(64), bits: z.number().int().min(1).max(64) })
     .optional(),
   selectedVariant: identifier(200).optional(),
+  // Capability flags the runtime reports. They describe the model and stay out of its identity.
+  vision: z.boolean().optional(),
+  trainedForToolUse: z.boolean().optional(),
+  maxContextLength: z.number().int().positive().safe().optional(),
   variants: z
     .array(identifier(200))
     .max(64)
@@ -161,6 +165,12 @@ function metadataIdentity(value: z.output<typeof metadataSchema>) {
     metadataHash: hashCanonical(metadata),
   };
 }
+
+const capabilities = (value: z.output<typeof metadataSchema>) => ({
+  ...(value.vision === undefined ? {} : { vision: value.vision }),
+  ...(value.trainedForToolUse === undefined ? {} : { trainedForToolUse: value.trainedForToolUse }),
+  ...(value.maxContextLength === undefined ? {} : { maxContextLength: value.maxContextLength }),
+});
 
 /** Inventory is runtime metadata. It does not establish model-file identity or qualification. */
 export type LocalDiscoveryResult =
@@ -270,6 +280,7 @@ export async function discoverLocalModels(
           state: reasons.length ? 'incompatible' : 'installed-unloaded',
           reasons,
           qualification: 'unqualified',
+          ...capabilities(value),
         });
       }
       const instances = new Set<string>();
@@ -340,6 +351,7 @@ export async function discoverLocalModels(
             state: 'incompatible',
             reasons: ['not-downloaded'],
             qualification: 'unqualified',
+            ...capabilities(info),
           };
           choices.set(identity.metadataHash, choice);
           if (choices.size > 64) {
@@ -358,6 +370,7 @@ export async function discoverLocalModels(
         matched.add(identity.metadataHash);
         choice.instanceReference = info.instanceReference;
         choice.contextLength = info.contextLength;
+        Object.assign(choice, capabilities(info));
         if (
           !['gguf', 'safetensors'].includes(info.format) &&
           !choice.reasons.includes('unsupported-format')
