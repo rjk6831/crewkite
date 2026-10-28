@@ -367,6 +367,18 @@ export class ChatService {
     const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
     const free = !thread.activeTurnId && !left.length;
+    // One running turn per family across threads. The message waits in this thread's queue and
+    // starts when the other thread's turn on that family ends.
+    const waiting = this.waitsOnFamily(task, thread, thread.queued[0] ?? message);
+    if (free && waiting) {
+      const queued = this.enqueue(task, message);
+      return queued.outcome === 'applied'
+        ? {
+            ...queued,
+            next: `${familyName[waiting]} is answering in another thread. This message starts when that reply ends.`,
+          }
+        : queued;
+    }
     if (free && !thread.queued.length) return this.begin(task, thread, message, effects);
     if (free) {
       // The oldest queued message goes first. One that cannot start any more, say on a family
@@ -1579,8 +1591,41 @@ export class ChatService {
     if (result.stopReason === 'limit' && !live.stopRequested && !this.closed)
       this.continueOnLimit(turnId);
     if (turn && !this.closed) this.advanceCrew(turnId);
-    // A handoff above opens the rerun first. The queue waits for that turn to settle.
-    if (turn && !this.closed) this.continueQueue(turn.taskId);
+    // A handoff above opens the rerun first. The queue waits for that turn to settle. The family
+    // is free now, so a thread that waited on it may start too.
+    if (turn && !this.closed) this.wakeQueues();
+  }
+
+  /**
+   * Start the first queued message of every free thread whose family is free, the thread that
+   * has waited longest first, so one busy thread cannot keep a family to itself.
+   */
+  private wakeQueues() {
+    const rows = this.deps.store.db
+      .prepare(
+        "SELECT task_id FROM chat_threads WHERE json_array_length(body,'$.queued')>0 ORDER BY json_extract(body,'$.queued[0].at'), task_id",
+      )
+      .all() as { task_id: string }[];
+    for (const row of rows) this.continueQueue(row.task_id);
+  }
+
+  /**
+   * The family a message would run on, when another thread has an open turn there. Null when it
+   * can start now, or when its pick fails, so the refusal comes from the usual path.
+   */
+  private waitsOnFamily(
+    task: Task,
+    thread: ChatThread,
+    message: Pick<Message, 'selection'>,
+  ): ChatFamily | null {
+    const selection = this.pick(task, thread, message.selection);
+    if ('outcome' in selection) return null;
+    const busy = this.deps.store.db
+      .prepare(
+        "SELECT 1 FROM chat_turns WHERE task_id<>? AND json_extract(body,'$.selection.family')=? AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') LIMIT 1",
+      )
+      .get(task.id, selection.family);
+    return busy ? selection.family : null;
   }
 
   private settle(turnId: string, end: Ending) {
@@ -2008,6 +2053,7 @@ export class ChatService {
           return;
         const newest = this.newestTurn(taskId);
         if (newest && (newest.state === 'failed' || endedOnLimit(newest))) return;
+        if (this.waitsOnFamily(task, thread, thread.queued[0])) return;
         const started = this.startQueued(task, effects);
         if (started.outcome !== 'applied')
           this.appendEntry(task, {
