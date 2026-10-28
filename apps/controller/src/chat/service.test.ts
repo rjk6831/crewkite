@@ -62,6 +62,7 @@ import {
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
+import { redact } from './thread-reader.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
 
@@ -1018,6 +1019,10 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.match(back.prompt, /^Local, builder \(local-model\):\nNot chosen\.$/m);
   assert.match(back.prompt, /^Anthropic, builder \(anthropic-model\):\nNot chosen\.$/m);
   assert.match(back.prompt, /^No files changed in the scratch copy since then\.$/m);
+  assert.match(
+    back.prompt,
+    /^Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live\.$/m,
+  );
   assert.doesNotMatch(back.prompt, /Go on\.|Fix the rounding\./);
   assert.match(back.prompt, /New message from the person:\nBack to you\.$/);
 
@@ -2536,4 +2541,120 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
       table,
     );
   assert.equal(remove(restarted).reason, 'task-not-found');
+});
+
+test('the thread reader returns bounded, redacted reads of its own thread only', {
+  timeout: 30000,
+}, async (t) => {
+  const secret = 'sk-live0123456789abcdef';
+  const long = `${'Plain words. '.repeat(3000)}API_KEY=hunter2 ${secret}`;
+  const scripted = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [
+      [{ kind: 'text', itemId: 'reply', chunks: [long] }],
+      [
+        { kind: 'text', itemId: 'live', chunks: [`Working. TOKEN: abc123 ${'x'.repeat(9000)}`] },
+        { kind: 'wait' },
+      ],
+    ],
+  });
+  const adapter = {
+    ...scripted,
+    startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+      if (scripted.requests.length === 0) {
+        writeFileSync(join(request.scratch.directory, 'big.txt'), `${'line\n'.repeat(30_000)}`);
+        const tool = (callId: string, kind: ChatToolKind, title: string, input: object) => {
+          emit({ type: 'tool.started', turnId: request.turnId, callId, kind, title, input });
+          emit({ type: 'tool.completed', turnId: request.turnId, callId, status: 'ok' });
+        };
+        tool('c1', 'edit', 'Write big.txt', { file_path: 'big.txt' });
+        tool('c2', 'command', 'Fetch', {
+          command: `curl -H "Authorization: Bearer ${secret}" https://example.invalid`,
+          stdin: 'stdin-body-never-shown',
+        });
+      }
+      return scripted.startTurn(request, emit);
+    },
+  };
+  const thread = standalone(t, {
+    adapters: new Map([['openai', adapter]]),
+    resolveEnvironment: () => ({ CREWKITE_SECRET: 'env-value-never-shown' }),
+  });
+  const done = turnReaches(thread, 'done');
+  thread.send('Write it.');
+  const first = await done;
+  const reads = thread.service.threadReads(thread.taskId);
+  const all: unknown[] = [];
+  const keep = <T>(value: T) => {
+    all.push(value);
+    return value;
+  };
+
+  const listed = keep(reads.turns({ limit: 50 })).turns;
+  assert.deepEqual(
+    listed.map((turn) => [turn.id, turn.role, turn.status, turn.changedFiles]),
+    [[first.id, 'assistant', 'done', 1]],
+  );
+  assert.equal(listed[0].reply.length, 300);
+  assert.deepEqual(keep(reads.turns({ since: first.sequence, limit: 50 })).turns, []);
+
+  const one = keep(reads.turn({ id: first.id }));
+  assert.equal(one.truncated, true);
+  assert.ok(Buffer.byteLength(one.reply) <= 32 * 1024);
+  assert.match(one.reply, /\n\[truncated\]$/);
+  assert.deepEqual(one.files, ['big.txt']);
+  assert.deepEqual(
+    one.trace.map((entry) => [entry.kind, entry.target, entry.outcome]),
+    [
+      ['edit', 'big.txt', 'ok'],
+      ['command', 'curl -H "Authorization: Bearer [redacted]" https://example.invalid', 'ok'],
+    ],
+  );
+  assert.throws(() => reads.turn({ id: `trn_${'9'.repeat(26)}` }), /No turn with that id/);
+
+  // The diff pages at 64 KiB on a line, and the pages put together are the whole diff.
+  const pages: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = keep(reads.diff({ path: 'big.txt', ...(cursor ? { cursor } : {}) }));
+    assert.ok(Buffer.byteLength(page.diff) <= 64 * 1024);
+    pages.push(page.diff);
+    cursor = page.more ?? undefined;
+  } while (cursor);
+  assert.ok(pages.length > 1);
+  assert.equal(pages.join('').split('\n+line').length - 1, 30_000);
+  assert.equal(keep(reads.live()).state, 'none');
+  assert.deepEqual(keep(reads.checks()).lines, []);
+
+  const streaming = next(
+    thread,
+    (event) => event.type === 'agent.event' && event.payload.type === 'text.delta',
+  );
+  thread.send('Keep going.');
+  await streaming;
+  const live = keep(reads.live());
+  assert.equal(live.state, 'running');
+  if (live.state === 'running') {
+    assert.ok(Buffer.byteLength(live.text) <= 8 * 1024);
+    assert.equal(live.role, 'assistant');
+  }
+  // Rows: what the redaction catches before any text leaves.
+  for (const [raw, shown] of [
+    [`key ${secret} here`, 'key [redacted] here'],
+    ['Authorization: Bearer abc.def-ghi', 'Authorization: Bearer [redacted]'],
+    ['export OPENAI_API_KEY=abc123', 'export OPENAI_API_KEY=[redacted]'],
+    ['"client_secret": "s3cr3t"', '"client_secret": [redacted]'],
+    ['GITHUB_TOKEN: ghp_x1', 'GITHUB_TOKEN: [redacted]'],
+    ['monkey business = fine', 'monkey business = fine'],
+  ] as const)
+    assert.equal(redact(raw), shown, raw);
+  // The reads never carry the secrets, stdin or environment values.
+  const text = JSON.stringify(all);
+  for (const hidden of [secret, 'hunter2', 'stdin-body-never-shown', 'env-value-never-shown'])
+    assert.equal(text.includes(hidden), false, hidden);
+  const running = thread.read().thread.activeTurnId as string;
+  act(thread.store, (effects) =>
+    thread.service.stopTurn({ taskId: thread.taskId, turnId: running }, effects),
+  );
+  await turnReaches(thread, 'stopped');
 });

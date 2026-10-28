@@ -340,6 +340,7 @@ export function handoffPacket(input: {
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
+    THREAD_TOOLS_LINE,
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
     `Files changed in the scratch copy against the base commit:\n${files}`,
     ...(input.instructions?.length
@@ -369,6 +370,10 @@ export function earlierReach(family: ChatFamily, path: string): string {
   if (family === 'google') return 'sent as a file link below';
   return family === 'local' ? 'not sent to Local' : `Path: ${path}`;
 }
+
+/** The packet names the read-only thread tools, so a model knows it can ask for more. */
+export const THREAD_TOOLS_LINE =
+  'Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live.';
 
 /**
  * The message text under its heading. The request carries it once. A message of files alone has
@@ -480,6 +485,7 @@ export function deltaPacket(input: {
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
+    THREAD_TOOLS_LINE,
     `Turns since then, oldest first:\n\n${turns.join('\n\n')}`,
     input.changes.join('\n'),
     input.checks.length
