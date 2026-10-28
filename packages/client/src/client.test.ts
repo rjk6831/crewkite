@@ -20,7 +20,12 @@ import {
 } from '@crewkite/contracts';
 import { checkOwner } from '../../../apps/controller/src/host/check-ownership.ts';
 import { encodeFrame, FrameDecoder, ProtocolError } from './index.ts';
-import { connectController, controllerSocketPath, ownSocketDirectory } from './node.ts';
+import {
+  connectController,
+  controllerSocketPath,
+  ownSocketDirectory,
+  publishControllerSocket,
+} from './node.ts';
 
 const token = 'a'.repeat(64);
 const actor = { id: 'terminal', kind: 'cli' as const };
@@ -101,6 +106,7 @@ async function serve(
   try {
     server.listen(socketPath);
     await once(server, 'listening');
+    publishControllerSocket(home, socketPath);
   } catch (error) {
     rmSync(base, { recursive: true, force: true });
     throw error;

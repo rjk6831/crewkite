@@ -63,8 +63,6 @@ test('a new thread streams a reply, asks before editing and lists the edited fil
   test.setTimeout(90000);
   mkdirSync(internal, { recursive: true });
   const home = mkdtempSync(join(internal, 'thread-'));
-  if (Buffer.byteLength(join(home, 'control.sock')) > 100)
-    throw Error('The journey home is too long for a control socket.');
   const environment = {
     ...checkEnvironment(),
     PATH: process.env.PATH ?? '',

@@ -29,6 +29,7 @@ import {
 import { scratchPath } from '../../chat/local-tools.ts';
 import { attachedLine, attachedSection, withoutThreadToolsLine } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
+import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
@@ -69,7 +70,11 @@ export type OpenAiChatDeps = Readonly<{
 export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
   return {
     family: 'openai',
-    startTurn: (request, emit) => new OpenAiChatTurn(deps, request, emit).handle,
+    startTurn: (request, emit) => {
+      const turn = turnTools(deps.threadTools, request, emit);
+      return new OpenAiChatTurn({ ...deps, threadTools: () => turn.server }, turn.request, emit)
+        .handle;
+    },
   };
 }
 

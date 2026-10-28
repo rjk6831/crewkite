@@ -5,7 +5,11 @@ import { createServer, type Socket } from 'node:net';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { encodeFrame, FrameDecoder } from '@crewkite/client';
-import { controllerSocketPath, ownSocketDirectory } from '@crewkite/client/node';
+import {
+  controllerSocketPath,
+  ownSocketDirectory,
+  publishControllerSocket,
+} from '@crewkite/client/node';
 import {
   type Command,
   type CommandResult,
@@ -120,6 +124,7 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
   ownSocketDirectory(dirname(controllerSocketPath(home)));
   server.listen(controllerSocketPath(home));
   await once(server, 'listening');
+  publishControllerSocket(home, controllerSocketPath(home));
   const execute = async (args: string[]) => {
     let out = '',
       err = '';
@@ -305,6 +310,7 @@ test('CLI operation actions keep exact review bindings and bounded continuation'
   ownSocketDirectory(dirname(controllerSocketPath(home)));
   server.listen(controllerSocketPath(home));
   await once(server, 'listening');
+  publishControllerSocket(home, controllerSocketPath(home));
   const execute = async (args: string[]) => {
     let out = '',
       err = '';

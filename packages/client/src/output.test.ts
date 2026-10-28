@@ -1,7 +1,18 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -11,6 +22,7 @@ import { ArtifactFiles } from '../../../apps/controller/src/artifacts/index.ts';
 import { Controller } from '../../../apps/controller/src/commands/controller.ts';
 import { serve } from '../../../apps/controller/src/server/index.ts';
 import {
+  checkControllerSocket,
   connectController,
   controllerSocketPath,
   ownSocketDirectory,
@@ -162,4 +174,59 @@ test('native output reads verify large retained bytes with cancellation and expl
     ),
     /checksum/,
   );
+});
+
+test('a client finds the controller socket through the home record, and refuses a socket it should not trust', async (t) => {
+  const uid = process.getuid?.() ?? 0;
+  const temporary = process.env.TMPDIR;
+  const base = mkdtempSync(join(tmpdir(), 'ck-record-'));
+  const first = join(base, 'first');
+  const second = join(base, 'second');
+  const real = join(base, 'real');
+  for (const path of [first, second, real]) mkdirSync(path);
+  // The home is reached through a link, and a folder of the per-user name is already taken by
+  // somebody else (mode 0755 stands in for another owner).
+  symlinkSync(real, join(base, 'link'));
+  const home = join(base, 'link', 'home');
+  mkdirSync(join(real, 'home'), { mode: 0o700 });
+  process.env.TMPDIR = first;
+  t.after(() => {
+    if (temporary === undefined) delete process.env.TMPDIR;
+    else process.env.TMPDIR = temporary;
+    rmSync(base, { recursive: true, force: true });
+  });
+  mkdirSync(join(first, `crewkite-${uid}`), { mode: 0o755 });
+  chmodSync(join(first, `crewkite-${uid}`), 0o755);
+  assert.equal(controllerSocketPath(home), controllerSocketPath(join(real, 'home')));
+  const controller = new Controller({
+    home,
+    nativeProfiles: () => [],
+    googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+  });
+  t.after(() => controller.close());
+  const server = await serve(controller);
+  t.after(() => server.close());
+  // The controller bound in a fresh private folder, and the home records where.
+  assert.ok(server.socketPath.startsWith(`${first}/`));
+  assert.notEqual(dirname(server.socketPath), join(first, `crewkite-${uid}`));
+  assert.equal(lstatSync(dirname(server.socketPath)).mode & 0o777, 0o700);
+  assert.equal(readFileSync(join(real, 'home', 'control-socket'), 'utf8'), server.socketPath);
+  // A client whose temporary directory differs, and one that names the home by its real path,
+  // find the same socket.
+  process.env.TMPDIR = second;
+  for (const path of [home, join(real, 'home')]) {
+    const endpoint = readControllerEndpoint(path);
+    assert.equal(endpoint.socketPath, server.socketPath);
+    const client = await connectController({ ...endpoint, actor: { id: 'terminal', kind: 'cli' } });
+    assert.equal((await client.workspaceState()).kind, 'workspace-state');
+    client.close();
+  }
+  // A folder or socket that is not this user's gets no token.
+  assert.throws(() => checkControllerSocket(server.socketPath, uid + 1), /not private to you/);
+  chmodSync(dirname(server.socketPath), 0o755);
+  assert.throws(() => readControllerEndpoint(home), /not private to you/);
+  chmodSync(dirname(server.socketPath), 0o700);
+  // A cleaner took the socket file while the controller ran.
+  unlinkSync(server.socketPath);
+  assert.throws(() => readControllerEndpoint(home), /Restart CrewKite/);
 });

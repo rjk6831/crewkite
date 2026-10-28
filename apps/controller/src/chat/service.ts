@@ -123,6 +123,7 @@ import {
   withAttachments,
 } from './prompt.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
+import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
 
 export type ChatServiceDeps = {
   store: Store;
@@ -1396,8 +1397,7 @@ export class ChatService {
       type: 'provider.notice',
       turnId: turn.id,
       level: 'info',
-      message:
-        'Thread tools absent for this turn: thread_turns, thread_turn, thread_diff, thread_checks and thread_live.',
+      message: THREAD_TOOLS_ABSENT,
       trace: true,
     });
   }
