@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ChatChecksEditSchema, ChatChecksStateSchema } from './checks.ts';
 
 // Shared shape of a chat thread, its turns and the live agent stream.
 // Every provider adapter translates its native protocol into these events.
@@ -596,6 +597,8 @@ export const ChatThreadSchema = z.strictObject({
   skippedTotal: z.number().int().nonnegative().max(100_000).optional(),
   /** The plan card of the last orchestrator turn. Null or missing when no plan was proposed. */
   plan: ChatPlanStateSchema.nullable().optional(),
+  /** The project checks the thread knows and the latest runs. Missing until the first read. */
+  checks: ChatChecksStateSchema.optional(),
 });
 export type ChatThread = z.infer<typeof ChatThreadSchema>;
 
@@ -635,6 +638,8 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
   /** Null clears the crew; the thread goes back to manual. */
   crew: ChatCrewSchema.nullable().optional(),
   flightMode: ChatFlightModeSchema.optional(),
+  /** One edit to the thread's project checks. */
+  checks: ChatChecksEditSchema.optional(),
 });
 /** Stop the running turn cleanly and start a queued message now, with the stopped turn's packet. */
 export const SteerChatMessagePayloadSchema = z.strictObject({

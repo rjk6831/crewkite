@@ -2,6 +2,8 @@ import { join } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
+  type ChatCheckRun,
+  ChatChecksStateSchema,
   type ChatTurn,
   ChatTurnSchema,
   ConversationEntrySchema,
@@ -57,6 +59,7 @@ const TRACE_ENTRIES = 200;
 const TRACE_CHARACTERS = 500;
 const FILES = 200;
 const CHECK_LINES = 64;
+const RUN_OUTPUT_LINES = 6;
 const TRUNCATED = '\n[truncated]';
 const OPEN = new Set<ChatTurn['state']>(['queued', 'running', 'waiting-permission']);
 
@@ -72,6 +75,22 @@ export function redact(text: string): string {
       /\b([A-Za-z_][A-Za-z0-9_.-]*(?:TOKEN|SECRET|KEY)[A-Za-z0-9_]*)(["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/gi,
       '$1$2[redacted]',
     );
+}
+
+/** The newest run of each check as lines: a summary, then the last lines of its output. */
+function runLines(runs: readonly ChatCheckRun[]): string[] {
+  const latest = new Map<string, ChatCheckRun>();
+  for (const run of runs) latest.set(run.checkId, run);
+  return [...latest.values()].flatMap((run) => {
+    const seconds = run.durationMs === null ? '' : ` in ${(run.durationMs / 1000).toFixed(1)} s`;
+    const head = `${run.label} (${run.command}): ${run.status}${seconds}${run.reason ? `. ${run.reason}` : ''}`;
+    const output = redact(run.tail)
+      .split('\n')
+      .filter((line) => line.trim())
+      .slice(-RUN_OUTPUT_LINES)
+      .map((line) => `  ${line}`);
+    return [head, ...output].map((line) => clipped(line, TRACE_CHARACTERS));
+  });
 }
 
 /** The newest text that fits the byte budget, cut at a character. */
@@ -263,11 +282,16 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
     },
 
     checks() {
+      const row = store.db.prepare('SELECT body FROM chat_threads WHERE task_id=?').get(taskId);
+      const state = ChatChecksStateSchema.safeParse(
+        row ? (JSON.parse(row.body as string) as { checks?: unknown }).checks : undefined,
+      );
+      const runs = state.success ? runLines(state.data.runs).slice(-CHECK_LINES) : [];
       const lines = store.db
         .prepare(
           "SELECT body FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='chat-system' AND json_extract(body,'$.text') LIKE '%check%' ORDER BY sequence DESC LIMIT ?",
         )
-        .all(taskId, CHECK_LINES)
+        .all(taskId, Math.max(0, CHECK_LINES - runs.length))
         .reverse()
         .map((row) =>
           clipped(
@@ -275,7 +299,7 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
             TRACE_CHARACTERS,
           ),
         );
-      return ThreadChecksResultSchema.parse({ lines });
+      return ThreadChecksResultSchema.parse({ lines: [...lines, ...runs] });
     },
 
     live() {

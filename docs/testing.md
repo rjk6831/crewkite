@@ -94,3 +94,11 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## Project checks in the loop
+
+The detection table builds small project directories and checks which checks the controller reads from them: package.json scripts with the package manager chosen by the lock file, pyproject.toml tool tables, Makefile targets, a Cargo.toml, a broken manifest and an empty project. Shell syntax in a command is refused in the same table. A detected check starts switched off.
+
+The crew chain row runs a real Node script as a check after a fix turn. The first run fails, and its output reaches the next fixer turn as the whole message. The second run passes, and the chain finishes with two fixes. The row reads the run records, the output artifact bytes and the lines `thread_checks` returns. The stop row opens a check that runs until stopped. A message sent meanwhile waits, Stop ends the process, the run shows as stopped and the chain stops with that reason. The same row then writes a run still marked running into the thread and starts a second service on the same store. The run reads as failed with the restart reason, and no turn starts. The permission row shows that a thread which has not allowed commands runs nothing, and that `runCombinedChecks` reports a failure, a pass and no switched-on check against merged copies. These are real local processes with no network, installed dependencies or provider.
+
+Output is read from each process as it starts, so a check that exits before the artifact store has opened its file keeps its output. The tail on the card is redacted and holds the last 1000 characters. The full output is in the artifact store. No claim covers the checks of a real project, a package manager or a toolchain.

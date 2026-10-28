@@ -53,7 +53,7 @@ type Dependencies = {
   event: (record: OperationRecord) => void;
 };
 
-function executablePin(input: string) {
+export function executablePin(input: string) {
   const candidates = isAbsolute(input)
     ? [input]
     : (process.env.PATH ?? '')

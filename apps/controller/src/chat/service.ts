@@ -83,6 +83,7 @@ import {
   writeDiscardMark,
   writeThreadBaseRef,
 } from './changes.ts';
+import { commandsAllowed, enabledChecks, ThreadChecks } from './checks.ts';
 import {
   dropStaged,
   FileRefused,
@@ -178,6 +179,8 @@ export type ChatServiceDeps = {
   localContext?: () => number | null;
   /** Whether a slice's files fit a Local prompt. The default is the Local budget rule. */
   localSliceFits?: PlanInputs['localSliceFits'];
+  /** The most one project check may run. The default is ten minutes. */
+  checkDeadlineMs?: number;
 };
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
@@ -356,6 +359,8 @@ export class ChatService {
   private readonly live = new Map<string, LiveTurn>();
   /** Orchestrator plans: proposal, assignment and the slice chain (ADR 0045). */
   private readonly plans: PlanRunner;
+  /** Project checks the crew chain runs after a fix and after the last slice. */
+  private readonly checks: ThreadChecks;
   private closed = false;
   /** The copy `importing` made, for the import command it commits next. */
   private staged:
@@ -365,6 +370,22 @@ export class ChatService {
   constructor(deps: ChatServiceDeps) {
     this.deps = deps;
     this.plans = new PlanRunner(this.planHost());
+    this.checks = new ThreadChecks({
+      store: deps.store,
+      artifacts: deps.artifacts,
+      home: deps.home,
+      now: deps.now,
+      task: (taskId) => this.task(taskId),
+      thread: (taskId) => this.thread(taskId),
+      update: (taskId, change) =>
+        deps.store.transaction(() => {
+          const task = this.task(taskId);
+          if (task) this.putThread(task, change(this.thread(taskId)));
+        }),
+      scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      projectPath: deps.projectPath,
+      deadlineMs: deps.checkDeadlineMs,
+    });
   }
 
   /**
@@ -386,7 +407,7 @@ export class ChatService {
       return blocked('file-not-found', 'Attach the file again, then send.');
     const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
-    const free = !thread.activeTurnId && !left.length;
+    const free = !thread.activeTurnId && !left.length && !this.checks.running(task.id);
     // One running turn per family across threads. The message waits in this thread's queue and
     // starts when the other thread's turn on that family ends.
     const waiting = this.waitsOnFamily(
@@ -437,14 +458,15 @@ export class ChatService {
 
   stopTurn(payload: Payload<'StopChatTurn'>, effects: Effects): CommandResult {
     const live = this.activeLive(payload.taskId, payload.turnId);
-    if (!live) return blocked('no-active-turn');
+    // Between a fix turn and the next step the chain may be running the project checks.
+    if (!live && !this.checks.stop(payload.taskId)) return blocked('no-active-turn');
     // The turn result marks the row stopped once the provider has let go.
-    live.stopRequested = true;
+    if (live) live.stopRequested = true;
     // Stop ends the wait too. The cleared messages go back so the composer can offer the text.
     const task = this.task(payload.taskId);
     const thread = this.thread(payload.taskId);
     if (task && thread.queued.length) this.putThread(task, { ...thread, queued: [] });
-    effects.push(() => this.call(() => live.handle?.stop()));
+    if (live) effects.push(() => this.call(() => live.handle?.stop()));
     return { outcome: 'applied', data: { kind: 'chat-queue', messages: thread.queued } };
   }
 
@@ -465,6 +487,12 @@ export class ChatService {
       return blocked('selection-unavailable', 'Pick a model the provider lists.');
     if (payload.dequeue && !thread.queued.some((message) => message.id === payload.dequeue))
       return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
+    let checks = thread.checks;
+    if (payload.checks) {
+      const edited = this.checks.edit(task, thread, payload.checks);
+      if ('error' in edited) return blocked('checks-invalid', edited.error);
+      checks = edited.state;
+    }
     // A thread with no crew is manual.
     const crew = payload.crew === undefined ? thread.crew : payload.crew;
     if (!crew && payload.flightMode && payload.flightMode !== 'manual')
@@ -484,6 +512,7 @@ export class ChatService {
       handoffMode: payload.handoffMode ?? thread.handoffMode,
       crew,
       flightMode,
+      ...(checks ? { checks } : {}),
     });
     if (payload.permissionPolicy && thread.activeTurnId) {
       const answer = () => this.answerCovered(task.id);
@@ -1145,6 +1174,8 @@ export class ChatService {
    */
   recover() {
     this.sweepDeleted();
+    // A check still marked running belonged to the process that is gone.
+    this.checks.recover();
     const rows = this.deps.store.db
       .prepare(
         "SELECT id,task_id FROM chat_turns WHERE json_extract(body,'$.state') IN ('queued','running','waiting-permission') OR json_array_length(body,'$.groups')>0 ORDER BY task_id,sequence",
@@ -1254,6 +1285,7 @@ export class ChatService {
 
   close(): Promise<void> | undefined {
     this.closed = true;
+    this.checks.close();
     const running = [...this.live.values()];
     for (const live of running) {
       live.stopRequested = true;
@@ -1974,13 +2006,11 @@ export class ChatService {
           return this.stopCrew(task, thread, chain, `the ${chain.step} failed`);
         if (thread.flightMode === 'manual')
           return this.stopCrew(task, thread, chain, 'the thread is in manual mode');
-        if (chain.step === 'fix')
-          return this.crewStep(
-            task,
-            thread,
-            { ...chain, step: 'review', fixes: chain.fixes + 1 },
-            effects,
-          );
+        if (chain.step === 'fix') {
+          const next = { ...chain, step: 'review', fixes: chain.fixes + 1 } as const;
+          if (this.startChecks(task, thread, next, 'fix', effects)) return;
+          return this.crewStep(task, thread, next, effects);
+        }
         if (chain.step === 'challenge') return this.finishCrew(task, thread, chain);
         const review = turn.assistantMessageId
           ? this.findEntry(task.id, turn.assistantMessageId)?.text
@@ -2013,10 +2043,20 @@ export class ChatService {
     chain: ChatCrewChain,
     effects: Effects,
     review?: string,
+    checked = false,
+    brief?: string,
   ) {
     const step = chain.step as CrewStep;
     // A plan with slices left runs the next one, and the challenger waits for the last.
     if (step === 'challenge' && this.plans.beforeChallenge(task, thread, chain, effects)) return;
+    // After the last slice the project checks run before the challenger.
+    if (
+      step === 'challenge' &&
+      !checked &&
+      thread.plan?.phase === 'running' &&
+      this.startChecks(task, thread, chain, 'plan', effects)
+    )
+      return;
     const members = thread.crew?.members ?? [];
     const member = (role: string) => members.find((entry) => entry.role === role)?.selection;
     const selection =
@@ -2026,7 +2066,11 @@ export class ChatService {
       return this.stopCrew(task, thread, chain, `the crew has no ${CREW_ROLES[step]}`);
     const saved = this.putThread(task, { ...thread, crewChain: chain });
     const text =
-      step === 'review' ? CREW_REVIEW : step === 'fix' ? fixerBrief(review ?? '') : CREW_CHALLENGE;
+      step === 'review'
+        ? CREW_REVIEW
+        : step === 'fix'
+          ? (brief ?? fixerBrief(review ?? ''))
+          : CREW_CHALLENGE;
     const started = this.begin(
       task,
       saved,
@@ -2035,6 +2079,98 @@ export class ChatService {
     );
     if (started.outcome !== 'applied')
       this.stopCrew(task, this.thread(task.id), chain, `the ${step} could not start`, started.next);
+  }
+
+  /**
+   * Run the thread's enabled checks before the chain goes on. The chain waits with its step
+   * unchanged and no open turn, so a restart stops it like any other chain left mid-step. True
+   * when the run was queued; false when no check is on or the thread does not allow commands.
+   */
+  private startChecks(
+    task: Task,
+    thread: ChatThread,
+    next: ChatCrewChain,
+    trigger: 'fix' | 'plan',
+    effects: Effects,
+  ): boolean {
+    if (!enabledChecks(thread).length) return false;
+    if (!commandsAllowed(thread)) {
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: null },
+        text: 'The project checks did not run. This thread does not allow commands yet. Allow commands for this thread, and the checks run after the next fix.',
+      });
+      return false;
+    }
+    const before = thread.crewChain;
+    // The run starts right after this transaction commits, in the same tick, so a rollback leaves
+    // no reservation behind.
+    effects.push(() => {
+      const entry = this.checks.reserve(task.id);
+      this.checks.run(task.id, trigger, undefined, entry).then(
+        (result) => this.checksDone(task.id, before, next, result),
+        () => this.checksDone(task.id, before, next, null),
+      );
+    });
+    return true;
+  }
+
+  /** The checks ended. Feed a failure to the fixer while fixes remain, otherwise go on. */
+  private checksDone(
+    taskId: string,
+    before: ChatCrewChain | null,
+    next: ChatCrewChain,
+    result: Awaited<ReturnType<ThreadChecks['run']>> | null,
+  ) {
+    const effects: Effects = [];
+    try {
+      this.deps.store.transaction(() => {
+        const task = this.task(taskId);
+        if (!task || !before || this.closed) return;
+        const thread = this.thread(taskId);
+        // A new builder turn or another step took the chain over while the checks ran.
+        if (thread.activeTurnId || canonicalJson(thread.crewChain) !== canonicalJson(before))
+          return;
+        const line = (text: string) =>
+          this.appendEntry(task, {
+            kind: 'chat-system',
+            author: { kind: 'system', turnId: null },
+            text,
+          });
+        if (!result) return this.stopCrew(task, thread, before, 'the checks could not run');
+        if (result.outcome === 'stopped')
+          return this.stopCrew(task, thread, before, 'you stopped the checks');
+        if (sentMessage(thread))
+          return this.stopCrew(task, thread, before, 'you sent a new message');
+        const labels = (status: 'passed' | 'failed') =>
+          result.runs
+            .filter((run) => run.status === status)
+            .map((run) => run.label)
+            .join(', ');
+        if (result.outcome === 'failed') {
+          const room = next.fixes < MAX_FIXES;
+          line(
+            `Checks failed: ${labels('failed')}.${room ? ' The fixer runs on their output.' : ` They still fail after ${next.fixes} ${next.fixes === 1 ? 'fix' : 'fixes'}, so the chain goes on.`}`,
+          );
+          if (room)
+            return this.crewStep(
+              task,
+              thread,
+              { ...next, step: 'fix' },
+              effects,
+              undefined,
+              true,
+              result.brief ?? undefined,
+            );
+        } else if (result.outcome === 'passed') line(`Checks passed: ${labels('passed')}.`);
+        return this.crewStep(task, thread, next, effects, undefined, true);
+      });
+    } catch {
+      // The chain stays where it was. The person can still run each step from the thread.
+      return;
+    }
+    for (const effect of effects) this.call(effect);
+    if (!this.closed) this.wakeQueues();
   }
 
   private finishCrew(task: Task, thread: ChatThread, chain: ChatCrewChain) {
@@ -2215,7 +2351,13 @@ export class ChatService {
       this.deps.store.transaction(() => {
         const task = this.task(taskId);
         const thread = this.thread(taskId);
-        if (!task || !thread.queued.length || thread.activeTurnId || thread.ownershipUnknown)
+        if (
+          !task ||
+          !thread.queued.length ||
+          thread.activeTurnId ||
+          thread.ownershipUnknown ||
+          this.checks.running(taskId)
+        )
           return;
         const newest = this.newestTurn(taskId);
         const sentAfter = newest?.endedAt && (thread.queued.at(-1)?.at ?? '') > newest.endedAt;

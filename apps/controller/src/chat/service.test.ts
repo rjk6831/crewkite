@@ -14,6 +14,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -60,6 +61,7 @@ import {
   chatFailure,
 } from './adapter.ts';
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
+import { runCombinedChecks } from './checks.ts';
 import { detectType } from './files.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
@@ -1817,6 +1819,22 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       chain: { step: 'finished', reviewRounds: 2, fixes: 1, reason: null },
     },
     {
+      name: 'a failing check goes to the fixer as its message, then the chain goes on',
+      reviews: [reply(twoFindings), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      gate: true,
+      turns: [
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['fixer', 'openai'],
+        ['fixer', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 2 review rounds, 2 fixes.',
+      chain: { step: 'finished', reviewRounds: 2, fixes: 2, reason: null },
+    },
+    {
       name: 'findings 0 at once',
       reviews: [reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
@@ -1989,7 +2007,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           family: 'openai',
           turns: planned
             ? [...row.plan, ...row.builds]
-            : [reply('Built it.'), reply('Fixed both.')],
+            : [reply('Built it.'), reply('Fixed both.'), reply('Fixed the gate.')],
         }),
       ],
       ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: row.reviews })],
@@ -2030,6 +2048,28 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     assert.equal(thread.read().thread.autoHandoff, !balanced, row.name);
     if (row.autoHandoff === false)
       store.transaction(() => service.configure({ taskId, autoHandoff: false }));
+    // The gate fails the first time it runs and passes after, so the first fix does not satisfy it.
+    const gate = mkdtempSync(join(tmpdir(), 'crewkite-gate-'));
+    t.after(() => rmSync(gate, { recursive: true, force: true }));
+    writeFileSync(
+      join(gate, 'gate.mjs'),
+      [
+        "import { existsSync, writeFileSync } from 'node:fs';",
+        "const marker = new URL('ran', import.meta.url);",
+        'if (existsSync(marker)) process.exit(0);',
+        "writeFileSync(marker, 'x');",
+        "console.log('gate: expected 3 got 2');",
+        'process.exitCode = 1;',
+      ].join('\n'),
+    );
+    if ('gate' in row)
+      store.transaction(() =>
+        service.configure({
+          taskId,
+          permissionPolicy: 'allow-all',
+          checks: { add: `node ${join(gate, 'gate.mjs')}` },
+        }),
+      );
     const ended = next(
       thread,
       (event) =>
@@ -2145,6 +2185,34 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     }
     // The person's pick stays on the builder whatever the crew borrowed.
     assert.equal(read.thread.selection?.family, 'openai', row.name);
+    if ('gate' in row) {
+      const requests = adapters.get('openai')?.requests ?? [];
+      assert.equal(requests[2]?.role, 'fixer');
+      assert.match(requests[2]?.prompt ?? '', /^The project checks failed in the scratch copy\./);
+      assert.match(requests[2]?.prompt ?? '', /gate: expected 3 got 2/);
+      // The second fix is the last one the chain allows, and the second run passes.
+      const runs = read.thread.checks?.runs ?? [];
+      assert.deepEqual(
+        runs.map((run) => [run.status, run.exitCode, run.reason, run.trigger]),
+        [
+          ['failed', 1, 'Exit code 1.', 'fix'],
+          ['passed', 0, null, 'fix'],
+        ],
+      );
+      assert.equal(runs[0].tail, 'gate: expected 3 got 2');
+      const files = new ArtifactFiles(join(dirname(thread.root), 'artifacts'));
+      assert.equal(
+        files.read(runs[0].stdout?.hash ?? '').toString('utf8'),
+        'gate: expected 3 got 2\n',
+      );
+      const lines = read.messages.map((message) => message.text);
+      assert.ok(lines.some((line) => line.startsWith('Checks failed: node ')));
+      assert.ok(lines.some((line) => line.startsWith('Checks passed: node ')));
+      // A provider reads the newest run of each check through thread_checks.
+      const seen = service.threadReads(taskId).checks().lines;
+      assert.match(seen.join('\n'), /\): passed in \d+\.\d s$/);
+      continue;
+    }
     const reviewed = adapters.get('anthropic')?.requests[0];
     assert.match(reviewed?.systemContext ?? '', /reads exactly `Findings: N`/, row.name);
     assert.equal(reviewed?.prompt, 'Review the current changes.', row.name);
@@ -2990,4 +3058,181 @@ test('the thread reader returns bounded, redacted reads of its own thread only',
     thread.service.stopTurn({ taskId: thread.taskId, turnId: running }, effects),
   );
   await turnReaches(thread, 'stopped');
+});
+
+const textReply = (text: string): ChatScriptStep[] => [
+  { kind: 'text', itemId: 'r', chunks: [text] },
+];
+
+// Claim: Stop ends an open project check, the chain stops with the reason, and a message sent
+// meanwhile waits. A check that was running when the controller stopped reads as failed after a
+// restart, with the reason, and nothing starts again.
+test('stop during a check ends it and the chain, and a restart reads an open check as failed', {
+  timeout: 30000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const adapters = new Map([
+    [
+      'openai',
+      createScriptedChatAdapter({
+        family: 'openai',
+        turns: [textReply('Built it.'), textReply('Fixed it.')],
+      }),
+    ],
+    [
+      'anthropic',
+      createScriptedChatAdapter({
+        family: 'anthropic',
+        turns: [textReply('Rounding drops a cent.\nFindings: 1')],
+      }),
+    ],
+  ] as const);
+  const families = [familyEntry('openai', 10, null, now), familyEntry('anthropic', 50, null, now)];
+  const thread = standalone(t, { adapters, catalog: () => ({ families }) });
+  const { store, service, taskId } = thread;
+  const dir = mkdtempSync(join(tmpdir(), 'crewkite-block-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  // The check runs until the controller stops it.
+  writeFileSync(join(dir, 'block.mjs'), 'setInterval(() => {}, 60_000);\n');
+  store.transaction(() =>
+    service.configure({
+      taskId,
+      crew: {
+        name: 'Pair',
+        members: [
+          { role: 'builder', selection: pick('openai') },
+          { role: 'reviewer', selection: pick('anthropic') },
+        ],
+      },
+      flightMode: 'glide',
+      permissionPolicy: 'allow-all',
+      checks: { add: `node ${join(dir, 'block.mjs')}` },
+    }),
+  );
+  const open = next(
+    thread,
+    (event) =>
+      event.type === 'chat.thread' &&
+      (event.payload as ChatThread).checks?.runs.some((run) => run.status === 'running') === true,
+  );
+  thread.send('Fix the rounding.', pick('openai'));
+  await open;
+  // The thread takes no turn while the check runs.
+  assert.equal(thread.send('One more thing.', pick('openai')).outcome, 'applied');
+  assert.equal(thread.read().thread.queued.length, 1);
+  assert.equal(thread.read().turns.length, 3);
+
+  const ended = next(
+    thread,
+    (event) =>
+      event.type === 'conversation.entry' &&
+      /^Crew stopped/.test((event.payload as { text: string }).text),
+  );
+  const stopped = act(store, (effects) =>
+    service.stopTurn({ taskId, turnId: thread.read().turns.at(-1)?.id as string }, effects),
+  );
+  assert.equal(stopped.outcome, 'applied');
+  assert.equal(stopped.data?.kind === 'chat-queue' && stopped.data.messages.length, 1);
+  await ended;
+  const after = thread.read();
+  assert.equal(after.messages.at(-1)?.text, 'Crew stopped: you stopped the checks.');
+  assert.equal(after.thread.crewChain?.step, 'stopped');
+  assert.equal(after.thread.queued.length, 0);
+  const [run] = after.thread.checks?.runs ?? [];
+  assert.deepEqual([run.status, run.reason], ['stopped', 'You stopped it.']);
+  assert.equal(after.turns.length, 3);
+  // Nothing is left to stop.
+  assert.equal(
+    act(store, (effects) => service.stopTurn({ taskId, turnId: after.turns[0].id }, effects))
+      .reason,
+    'no-active-turn',
+  );
+
+  // The controller stopped with a check open: the record says running, and nobody owns it.
+  const row = store.db.prepare('SELECT body FROM chat_threads WHERE task_id=?').get(taskId);
+  const body = JSON.parse(row?.body as string);
+  body.checks.runs.push({
+    ...run,
+    id: `chk_${'a'.repeat(32)}`,
+    status: 'running',
+    reason: null,
+    durationMs: null,
+    exitCode: null,
+  });
+  store.db
+    .prepare('UPDATE chat_threads SET body=? WHERE task_id=?')
+    .run(JSON.stringify(body), taskId);
+  const restarted = thread.start();
+  restarted.recover();
+  const [, open2] = thread.read(restarted).thread.checks?.runs ?? [];
+  assert.equal(open2.status, 'failed');
+  assert.match(open2.reason ?? '', /^CrewKite restarted while this check ran\./);
+  assert.equal(thread.read(restarted).turns.length, 3);
+});
+
+// Claim: a check is plain words the controller resolves itself, it runs only when the thread
+// allows commands, and the same checks run on a merged copy for the combined review.
+test('checks refuse shell lines, wait for command permission and run on a merged copy', {
+  timeout: 30000,
+}, async (t) => {
+  const thread = standalone(t, {
+    adapters: new Map([
+      ['openai', createScriptedChatAdapter({ family: 'openai', turns: [textReply('Built.')] })],
+    ]),
+  });
+  const { store, service, taskId } = thread;
+  const dir = mkdtempSync(join(tmpdir(), 'crewkite-merged-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const merged = (name: string, ok: boolean) => {
+    mkdirSync(join(dir, name));
+    if (ok) writeFileSync(join(dir, name, 'ok'), '');
+    return realpathSync(join(dir, name));
+  };
+  writeFileSync(
+    join(dir, 'gate.mjs'),
+    "import { existsSync } from 'node:fs';\nif (existsSync('ok')) process.exit(0);\nconsole.log('broken total');\nprocess.exitCode = 1;\n",
+  );
+  const done = turnReaches(thread, 'done');
+  thread.send('Build it.');
+  await done;
+  const configure = (patch: object) =>
+    store.transaction(() => service.configure({ taskId, ...patch }));
+  for (const add of ['sh -c x', 'npm test | cat', 'node "a b"'])
+    assert.deepEqual(
+      [configure({ checks: { add } }).outcome, configure({ checks: { add } }).reason],
+      ['blocked', 'checks-invalid'],
+      add,
+    );
+  assert.equal(configure({ checks: { add: `node ${join(dir, 'gate.mjs')}` } }).outcome, 'applied');
+  assert.equal(
+    configure({ checks: { add: `node ${join(dir, 'gate.mjs')}` } }).reason,
+    'checks-invalid',
+  );
+  assert.equal(
+    configure({ checks: { switch: { id: 'nothing:test', enabled: true } } }).reason,
+    'checks-invalid',
+  );
+
+  // Ask is the default policy: no command is allowed yet, so nothing runs.
+  const first = merged('first', false);
+  assert.deepEqual((await runCombinedChecks(taskId, first)).outcome, 'denied');
+  assert.equal(thread.read().thread.checks?.runs.length, 0);
+  configure({ permissionPolicy: 'allow-all' });
+  const failed = await runCombinedChecks(taskId, first);
+  assert.equal(failed.outcome, 'failed');
+  assert.match(failed.brief ?? '', /broken total/);
+  assert.deepEqual(
+    failed.runs.map((run) => [run.status, run.trigger]),
+    [['failed', 'combined']],
+  );
+  const passed = await runCombinedChecks(taskId, merged('second', true));
+  assert.equal(passed.outcome, 'passed');
+  configure({ checks: { switch: { id: 'custom:1', enabled: false } } });
+  assert.equal((await runCombinedChecks(taskId, first)).outcome, 'none');
+  assert.equal(configure({ checks: { remove: 'custom:1' } }).outcome, 'applied');
 });
