@@ -415,14 +415,16 @@ export type DeltaTurn = Readonly<{
   tools: readonly string[];
 }>;
 
-const roleVerb: Record<ChatRole, string> = {
-  assistant: 'answered',
-  fixer: 'fixed the review findings',
-  reviewer: 'reviewed the changes',
-  advisor: 'gave a second opinion',
-  challenger: 'challenged the last answer',
-  orchestrator: 'proposed a plan',
-  ask: 'answered a side question',
+// Each delta line names the family and the role, so a reviewer's words never read as the
+// builder's answer.
+const roleName: Record<ChatRole, string> = {
+  assistant: 'builder',
+  fixer: 'fixer',
+  reviewer: 'reviewer',
+  advisor: 'advisor',
+  challenger: 'challenger',
+  orchestrator: 'orchestrator',
+  ask: 'ask',
 };
 
 /**
@@ -451,7 +453,7 @@ export function deltaPacket(input: {
     const reply = turn.reply && (full.has(index) ? turn.reply : cut(turn.reply, 600));
     return [
       ...(turn.message === null ? [] : [`Person:\n${capped(turn.message)}`]),
-      `${familyName[turn.family]} (${turn.model}) ${roleVerb[turn.role]}:\n${reply ? capped(reply) : 'No reply.'}`,
+      `${familyName[turn.family]}, ${roleName[turn.role]} (${turn.model}):\n${reply ? capped(reply) : 'No reply.'}`,
       ...(turn.early ? [`The turn ended early. Reason: ${turn.early}.`] : []),
       ...(turn.tools.length
         ? [`Tool activity:\n${turn.tools.map((line) => `- ${line}`).join('\n')}`]

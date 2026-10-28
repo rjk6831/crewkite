@@ -122,7 +122,12 @@ export type ChatServiceDeps = {
   home: string;
   now: () => string;
   id: (prefix: 'msg' | 'trn') => string;
-  emit: (type: Event['type'], taskId: string, revision: number, payload: Event['payload']) => void;
+  emit: (
+    type: Event['type'],
+    taskId: string | null,
+    revision: number,
+    payload: Event['payload'],
+  ) => void;
   adapters: ReadonlyMap<ChatFamily, ChatAdapter>;
   /** HOME, PATH and whatever the provider profile resolved for its client. */
   resolveEnvironment: (family: ChatFamily) => NodeJS.ProcessEnv;
@@ -879,6 +884,8 @@ export class ChatService {
     this.deps.store.db
       .prepare('DELETE FROM receipts WHERE substr(command_key,1,length(?))=?')
       .run(files, files);
+    // The task's own events went with it. This one has no task, so the rail hears it.
+    this.deps.emit('task.removed', null, task.revision, { taskId: task.id });
     this.deps.store.saveReceipt(
       `chat-deleted:${task.id}`,
       hashCanonical({ taskId: task.id }),
@@ -968,7 +975,10 @@ export class ChatService {
       this.messages(payload.taskId, payload.beforeCursor, payload.limit),
       READ_BYTES - used,
     );
-    return ChatThreadReadSchema.parse({ thread, turns, messages, liveEvents, cursor });
+    // Load earlier shows only when something older than the oldest message here exists.
+    const oldest = messages[0]?.cursor ?? payload.beforeCursor;
+    const more = oldest !== undefined && this.messages(payload.taskId, oldest, 1).length > 0;
+    return ChatThreadReadSchema.parse({ thread, turns, messages, liveEvents, cursor, more });
   }
 
   readChanges(payload: Payload<'ReadChatChanges'>): ChatChangesRead {
@@ -1271,6 +1281,19 @@ export class ChatService {
       kept && this.sessionModel(task.id, kept, turn.sequence) === turn.selection.model
         ? kept
         : null;
+    // A session dropped at the cap and never replaced, say because that turn failed, still needs
+    // the full packet. The line about it was already written once.
+    if (
+      writer &&
+      !fresh &&
+      !carries &&
+      RESUMING.has(family) &&
+      !thread.sessions.some((value) => value.family === family) &&
+      this.droppedSession(task.id, family)
+    ) {
+      carries = true;
+      reason = 'session';
+    }
     // The thread is the source of truth. A resumed session hears what happened since it last ran,
     // and a session that fell too far behind gives way to a new one with the full packet. Send now
     // keeps its full packet, which tells the model what the stopped reply left behind.
@@ -1290,13 +1313,20 @@ export class ChatService {
       session = null;
       carries = true;
       if (!turn.handoffFrom) reason = 'session';
-      this.deps.store.transaction(() =>
+      // The saved session goes now, so a turn that fails here cannot bring the decision and its
+      // line back on the next message.
+      this.deps.store.transaction(() => {
+        const current = this.thread(task.id);
+        this.putThread(task, {
+          ...current,
+          sessions: current.sessions.filter((value) => value.family !== family),
+        });
         this.appendEntry(task, {
           kind: 'chat-system',
           author: { kind: 'system', turnId: turn.id },
-          text: `Started a new ${familyName[family]} session. The thread moved past what the old session could carry.`,
-        }),
-      );
+          text: droppedLine(family),
+        });
+      });
     }
     const caught = delta && delta !== 'over' ? delta : null;
     if (caught) carries = false;
@@ -1356,16 +1386,23 @@ export class ChatService {
     const source = committedFiles(root, thread.base, { scratch: true });
     materialize(directory, source.files, source.links);
     this.pinBase(task, root, thread.base);
-    // The thread record travels in every chat.thread event, so it keeps the first 64 entries.
-    // shortcut: a longer list shows as 64 or more. Upgrade: a total count on the thread record.
+    // The thread record travels in every chat.thread event, so it keeps the first 64 entries and
+    // the total. The first turn says once what the copy left out.
     const skipped = source.skipped.slice(0, 64);
-    return this.deps.store.transaction(() =>
-      this.putThread(task, {
+    const total = source.skipped.length;
+    return this.deps.store.transaction(() => {
+      if (total)
+        this.appendEntry(task, {
+          kind: 'chat-system',
+          author: { kind: 'system', turnId: null },
+          text: `The scratch copy skipped ${total.toLocaleString('en-US')} ${total === 1 ? 'entry' : 'entries'} it cannot hold, such as submodules and links that lead outside. Changes lists them.`,
+        });
+      return this.putThread(task, {
         ...this.thread(task.id),
         scratchReady: true,
-        ...(skipped.length ? { skipped } : {}),
-      }),
-    );
+        ...(total ? { skipped, skippedTotal: Math.min(total, 100_000) } : {}),
+      });
+    });
   }
 
   /**
@@ -2602,6 +2639,15 @@ export class ChatService {
     return turn?.selection.family === session.family ? turn.selection.model : session.model;
   }
 
+  /** True when the thread dropped this family's session at the packet cap. */
+  private droppedSession(taskId: string, family: ChatFamily): boolean {
+    return !!this.deps.store.db
+      .prepare(
+        "SELECT 1 FROM conversation_entries WHERE task_id=? AND json_extract(body,'$.kind')='chat-system' AND json_extract(body,'$.text')=? LIMIT 1",
+      )
+      .get(taskId, droppedLine(family));
+  }
+
   /** The newest assistant or fixer turn on a family before a sequence. */
   private writtenOn(taskId: string, family: ChatFamily, before: number): ChatTurn | undefined {
     const row = this.deps.store.db
@@ -3035,6 +3081,9 @@ function endedOnLimit(turn: ChatTurn): boolean {
     ? turn.stopReason === 'limit'
     : turn.state === 'failed' && turn.failure?.kind === 'usage-limit';
 }
+
+const droppedLine = (family: ChatFamily) =>
+  `Started a new ${familyName[family]} session. The thread moved past what the old session could carry.`;
 
 const clip = (text: string, characters: number) =>
   text.length > characters ? `${text.slice(0, characters).toWellFormed()} [trimmed]` : text;
