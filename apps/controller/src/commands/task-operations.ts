@@ -28,6 +28,7 @@ import { type GitHubExecutable, githubReadArgv, startGitHubRead } from '../githu
 import { committedFiles, git, inspectSource, materialize } from '../host/source.ts';
 import { groupAbsent, verifyOwnedCommandExecutable } from '../host/worker.ts';
 import type { Store } from '../store/index.ts';
+import { liveOperations } from './live-operations.ts';
 import { type OperationRecord, OperationStore } from './operation-store.ts';
 import { createOwnedProjectCommandRunner } from './owned-runner.ts';
 import { type OwnedProjectCommandLifecycle, startProjectCommand } from './project-command.ts';
@@ -53,7 +54,7 @@ type Dependencies = {
   event: (record: OperationRecord) => void;
 };
 
-function executablePin(input: string) {
+export function executablePin(input: string) {
   const candidates = isAbsolute(input)
     ? [input]
     : (process.env.PATH ?? '')
@@ -126,7 +127,7 @@ export class TaskOperations {
     this.journal = new OperationStore(options.store, options.now, options.event);
   }
   recover() {
-    this.journal.recover(groupAbsent, new Set(this.active.keys()));
+    this.journal.recover(groupAbsent, new Set([...this.active.keys(), ...liveOperations]));
   }
   busyTask(taskId: string): boolean {
     return !!this.options.store.db

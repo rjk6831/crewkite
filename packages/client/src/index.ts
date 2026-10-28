@@ -55,6 +55,8 @@ export interface DesktopSource {
   attachFiles?(input: DesktopAttachInput): Promise<DesktopFile[]>;
   /** Preview, reveal or save a file the controller stored for a thread. Main builds the path. */
   openAttachment?(target: DesktopAttachmentTarget): Promise<'done' | 'cancelled'>;
+  /** Save the controller's saved prompts as a JSON file. Main reads them and shows the dialog. */
+  savePrompts?(): Promise<'saved' | 'cancelled'>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;
@@ -175,3 +177,6 @@ export class FrameDecoder {
       throw new ProtocolError('invalid-frame');
   }
 }
+
+export * from './mentions.ts';
+export * from './slash-commands.ts';

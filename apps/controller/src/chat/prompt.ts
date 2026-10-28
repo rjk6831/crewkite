@@ -153,6 +153,8 @@ export function reviewContext(
   base: string,
   files: readonly ReviewFile[] | null,
   statesFindings = false,
+  /** Why the changes could not be read, when the cause was their size. */
+  unreadable?: string,
 ): string {
   const lines = [
     `You are reviewing changes in the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
@@ -165,7 +167,7 @@ export function reviewContext(
         ]
       : []),
   ];
-  if (files === null) return [...lines, 'The changes could not be read.'].join('\n');
+  if (files === null) return [...lines, unreadable ?? 'The changes could not be read.'].join('\n');
   if (files.length === 0)
     return [...lines, 'No files have changed since the base commit.'].join('\n');
   let budget = REVIEW_PATCH_BYTES;

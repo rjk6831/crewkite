@@ -6,6 +6,11 @@
   "exports": "./src/main.ts",
   "dependencies": {
     "@crewkite/client": "workspace:*",
-    "@crewkite/contracts": "workspace:*"
+    "@crewkite/contracts": "workspace:*",
+    "ink": "8.0.0",
+    "react": "19.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "19.3.0"
   }
 }

@@ -26,6 +26,7 @@ import {
 } from '@crewkite/client/node';
 import {
   ArtifactSchema,
+  CLI_EXIT,
   type Command,
   type CommandResult,
   CommandSchema,
@@ -50,11 +51,16 @@ import {
   TaskSchema,
   type WorkspaceContinuation,
 } from '@crewkite/contracts';
+import { connectChat } from './chat/connect.ts';
+import { type Connect, notDone, runPrint, runThreadCommand } from './chat/scripting.ts';
 
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
 
-const help = `Usage: crewkite project add <path> [--json] [--home path]
+const help = `Usage: crewkite                     interactive mode in a terminal [--no-animation]
+       crewkite -p <message> [--thread task-id | --project project-id] [--model family[/model]] [--json]
+       crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show> ... (crewkite thread --help)
+       crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite artifact <read|verify|save> <artifact-id> [--output new-file] [--json] [--home path]
@@ -124,7 +130,13 @@ const terminalOutput: Output = {
     process.stderr.write(text);
   },
 };
-export async function runCli(args: string[], output: Output = terminalOutput): Promise<number> {
+export async function runCli(
+  args: string[],
+  output: Output = terminalOutput,
+  connect: Connect = connectChat,
+): Promise<number> {
+  if (args[0] === 'thread') return runThreadCommand(args.slice(1), output, connect);
+  if (printRequested(args)) return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
   const streamWrite = async (text: string) => {
     if (output === terminalOutput) {
@@ -1966,7 +1978,8 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
     return succeeded(result) ? 0 : 2;
   } catch (error) {
     output.err(`${terminalText(error instanceof Error ? error.message : 'CLI command failed.')}\n`);
-    return 1;
+    // Arguments that do not parse did nothing. Other errors keep the task commands' status 1.
+    return notDone(error) ? CLI_EXIT.notDone : CLI_EXIT.failed;
   } finally {
     client?.close();
   }
@@ -2074,5 +2087,58 @@ function succeeded(result: CommandResult) {
   return result.outcome === 'applied' || result.outcome === 'already-applied';
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
-  process.exitCode = await runCli(process.argv.slice(2));
+// Options of print mode that take a value, so the word after them is not a positional.
+const printValueOptions = new Set([
+  '--home',
+  '--model',
+  '--file',
+  '--thread',
+  '--project',
+  '--permission-policy',
+]);
+
+/** Print mode only when -p or --print comes before the first positional argument. */
+export function printRequested(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '-p' || arg === '--print' || /^(-p.|--print=)/.test(arg)) return true;
+    if (!arg.startsWith('-') || arg === '--') return false;
+    if (printValueOptions.has(arg)) index++;
+  }
+  return false;
+}
+
+/** No subcommand on a terminal opens the interactive mode. It takes --home and --no-animation. */
+export function interactiveArgs(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--no-animation' || arg.startsWith('--home=')) continue;
+    if (arg === '--home' && index + 1 < args.length) {
+      index++;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const args = process.argv.slice(2);
+  if (process.stdout.isTTY && process.stdin.isTTY && interactiveArgs(args)) {
+    // Ink and the renderer modules load only here, so the commands and print mode run without them.
+    const { startInteractive } = await import('./interactive/start.ts').catch((error) => {
+      // Only a missing Ink, React or renderer module means a package without the interactive mode.
+      const missing =
+        (error as NodeJS.ErrnoException).code === 'ERR_MODULE_NOT_FOUND' &&
+        /'(?:ink|react)'|apps\/desktop\/src\/renderer\//.test(String((error as Error).message));
+      if (!missing) throw error;
+      return { startInteractive: null };
+    });
+    if (!startInteractive) {
+      process.stderr.write(
+        'Interactive mode needs a source checkout with its dependencies installed. The thread commands and crewkite -p work here.\n',
+      );
+      process.exitCode = 2;
+    } else process.exitCode = await startInteractive(args);
+  } else process.exitCode = await runCli(args);
+}

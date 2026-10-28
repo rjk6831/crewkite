@@ -1,6 +1,7 @@
+import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
@@ -14,6 +15,8 @@ import {
   ChatFailureSchema,
   type ChatFamily,
   ChatFamilySchema,
+  type ChatInstructionsRead,
+  type ChatMentionsRead,
   type ChatMessage,
   type ChatModelSelection,
   type ChatOutputLimit,
@@ -57,12 +60,16 @@ import {
   refValue,
 } from '../host/publication.ts';
 import {
-  committedFiles,
-  type FileContent,
+  blobToFile,
+  type CandidateHash,
   git,
-  type KeptEntry,
-  materialize,
-  readCandidateFiles,
+  hashCandidateFiles,
+  type PlannedFile,
+  readPlannedBlobs,
+  type ScratchPlan,
+  ScratchTooLarge,
+  scratchPlan,
+  treeFromScratch,
 } from '../host/source.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../host/worker.ts';
 import { localSliceFits } from '../providers/local/budget.ts';
@@ -76,14 +83,17 @@ import {
   chatFailure,
 } from './adapter.ts';
 import {
+  changeCounts,
   type DiscardOutcome,
   deleteThreadBaseRef,
   discardScratchPath,
+  LISTED_FILES,
   readDiscardMark,
   scratchChanges,
   writeDiscardMark,
   writeThreadBaseRef,
 } from './changes.ts';
+import { type ChecksOutcome, commandsAllowed, enabledChecks, ThreadChecks } from './checks.ts';
 import {
   dropStaged,
   FileRefused,
@@ -102,6 +112,7 @@ import {
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
 import type { McpRegistry } from './mcp-servers.ts';
+import { createMentionIndex, readInstructions as readInstructionFiles } from './mentions.ts';
 import type { PlanInputs } from './plan.ts';
 import { PlanRunner, sentMessage } from './plan-runner.ts';
 import {
@@ -124,6 +135,7 @@ import {
   systemContext,
   withAttachments,
 } from './prompt.ts';
+import { copyScratch } from './scratch-copy.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
 import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
 
@@ -186,10 +198,13 @@ export type ChatServiceDeps = {
   localContext?: () => number | null;
   /** Whether a slice's files fit a Local prompt. The default is the Local budget rule. */
   localSliceFits?: PlanInputs['localSliceFits'];
+  /** The most one project check may run. The default is ten minutes. */
+  checkDeadlineMs?: number;
 };
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
 type Effects = (() => void)[];
+type CheckAnswer = 'allow' | 'allow-thread' | 'deny' | 'stop';
 type EntryDraft = ConversationEntry extends infer Entry
   ? Entry extends ConversationEntry
     ? Omit<Entry, 'id' | 'taskId' | 'revision' | 'cursor' | 'at'>
@@ -366,6 +381,13 @@ export class ChatService {
   private readonly live = new Map<string, LiveTurn>();
   /** Orchestrator plans: proposal, assignment and the slice chain (ADR 0045). */
   private readonly plans: PlanRunner;
+  /** Project checks the crew chain runs after a fix and after the last slice. */
+  private readonly checks: ThreadChecks;
+  /** The question each thread waits on before its checks run, with what to do with the answer. */
+  private readonly checkAsk = new Map<
+    string,
+    { requestId: string; settle: (answer: CheckAnswer, effects: Effects) => void }
+  >();
   private closed = false;
   /** The copy `importing` made, for the import command it commits next. */
   private staged:
@@ -375,6 +397,28 @@ export class ChatService {
   constructor(deps: ChatServiceDeps) {
     this.deps = deps;
     this.plans = new PlanRunner(this.planHost());
+    this.checks = new ThreadChecks({
+      store: deps.store,
+      artifacts: deps.artifacts,
+      home: deps.home,
+      now: deps.now,
+      task: (taskId) => this.task(taskId),
+      thread: (taskId) => this.thread(taskId),
+      update: (taskId, change) =>
+        deps.store.transaction(() => {
+          const task = this.task(taskId);
+          if (task) this.putThread(task, change(this.thread(taskId)));
+        }),
+      scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      projectPath: deps.projectPath,
+      groupAbsent: deps.groupAbsent ?? groupAbsent,
+      holdOwnership: (taskId) =>
+        deps.store.transaction(() => {
+          const task = this.task(taskId);
+          if (task) this.putThread(task, { ...this.thread(taskId), ownershipUnknown: true });
+        }),
+      deadlineMs: deps.checkDeadlineMs,
+    });
   }
 
   /**
@@ -396,7 +440,7 @@ export class ChatService {
       return blocked('file-not-found', 'Attach the file again, then send.');
     const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
-    const free = !thread.activeTurnId && !left.length;
+    const free = !thread.activeTurnId && !left.length && !this.checksBusy(task.id);
     // One running turn per family across threads. The message waits in this thread's queue and
     // starts when the other thread's turn on that family ends.
     const waiting = this.waitsOnFamily(
@@ -426,6 +470,17 @@ export class ChatService {
   }
 
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
+    const asked = this.checkAsk.get(payload.taskId);
+    if (asked?.requestId === payload.requestId) {
+      if (!['allow', 'allow-thread', 'deny'].includes(payload.choice))
+        return blocked(
+          'permission-not-pending',
+          'Choose allow once, allow for this thread or deny.',
+        );
+      this.dropCheckAsk(payload.taskId);
+      asked.settle(payload.choice as CheckAnswer, effects);
+      return { outcome: 'applied' };
+    }
     const live = this.activeLive(payload.taskId, payload.turnId);
     if (!live) return blocked('no-active-turn');
     const open = live.permissions.get(payload.requestId);
@@ -447,7 +502,17 @@ export class ChatService {
 
   stopTurn(payload: Payload<'StopChatTurn'>, effects: Effects): CommandResult {
     const live = this.activeLive(payload.taskId, payload.turnId);
-    if (!live) return blocked('no-active-turn');
+    if (!live) {
+      // Between a fix turn and the next step the chain may wait on the person's answer or run
+      // the project checks. Stop ends that and leaves the queue alone; the queue starts once
+      // the chain has stopped.
+      const asked = this.checkAsk.get(payload.taskId);
+      if (asked) {
+        this.dropCheckAsk(payload.taskId);
+        asked.settle('stop', effects);
+      } else if (!this.checks.stop(payload.taskId)) return blocked('no-active-turn');
+      return { outcome: 'applied', data: { kind: 'chat-queue', messages: [] } };
+    }
     // The turn result marks the row stopped once the provider has let go.
     live.stopRequested = true;
     // Stop ends the wait too. The cleared messages go back so the composer can offer the text.
@@ -475,6 +540,12 @@ export class ChatService {
       return blocked('selection-unavailable', 'Pick a model the provider lists.');
     if (payload.dequeue && !thread.queued.some((message) => message.id === payload.dequeue))
       return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
+    let checks = thread.checks;
+    if (payload.checks) {
+      const edited = this.checks.edit(task, thread, payload.checks);
+      if ('error' in edited) return blocked('checks-invalid', edited.error);
+      checks = edited.state;
+    }
     // A thread with no crew is manual.
     const crew = payload.crew === undefined ? thread.crew : payload.crew;
     if (!crew && payload.flightMode && payload.flightMode !== 'manual')
@@ -494,6 +565,7 @@ export class ChatService {
       handoffMode: payload.handoffMode ?? thread.handoffMode,
       crew,
       flightMode,
+      ...(checks ? { checks } : {}),
     });
     if (payload.permissionPolicy && thread.activeTurnId) {
       const answer = () => this.answerCovered(task.id);
@@ -585,22 +657,31 @@ export class ChatService {
       return blocked('git-identity-missing', 'Configure a Git name and email before acceptance.');
     const scratch = this.scratchDirectory(task.id);
     let fileCount: number;
-    let files: FileContent[];
-    let kept: KeptEntry[];
+    let plan: ScratchPlan;
+    let candidates: CandidateHash[];
     try {
-      const source = committedFiles(root, base, { scratch: true });
-      kept = source.kept;
+      plan = scratchPlan(root, base);
+      candidates = hashCandidateFiles(scratch, root, plan);
       // The Changes tab count, so the system line matches what the person reviewed. A base link
       // the copy changed is listed there and comes from the base, so it is not counted.
-      const links = new Set(source.links.map((link) => link.path));
-      fileCount = scratchChanges(root, scratch, base, false).filter(
-        (file) => !links.has(file.path),
-      ).length;
-      files = readCandidateFiles(scratch, root, base, source);
-    } catch {
+      const counts = changeCounts(plan, candidates, scratch);
+      fileCount = counts.files;
+      // Changes lists a bounded number of entries. A file the person could not see is not published.
+      if (counts.listed > LISTED_FILES)
+        return blocked(
+          'too-many-changes',
+          `${fileCount.toLocaleString('en-US')} files changed, and Changes lists the first ${LISTED_FILES.toLocaleString('en-US')} entries. Accept only publishes files you can review, so discard changes until the list is complete, then accept again.`,
+        );
+    } catch (error) {
+      if (error instanceof ScratchTooLarge) return blocked('scratch-unreadable', error.message);
+      if (/unsupported (symlink|special file|file mode)/.test((error as Error).message))
+        return blocked(
+          'scratch-unreadable',
+          'Remove new links and special files from the scratch copy.',
+        );
       return blocked(
         'scratch-unreadable',
-        'Remove new links and special files from the scratch copy.',
+        `The scratch copy could not be compared. ${plain(error)}`,
       );
     }
     if (!fileCount) return blocked('no-changes', 'Ask for a change in this thread first.');
@@ -608,29 +689,49 @@ export class ChatService {
     const work = mkdtempSync(join(this.deps.home, 'chat', task.id, 'accept-'));
     let commit: string;
     try {
-      const prepared = preparePublication({
-        source: root,
-        repository: work,
-        base,
-        files,
-        kept,
-        identity,
-        at,
-        message: payload.message?.trim()
-          ? `${payload.message.trimEnd()}\n`
-          : `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
-      });
-      applyPublication({
-        source: root,
-        pack: prepared.pack,
-        destinationRef: ref,
-        treeOid: prepared.treeOid,
-        commitOid: prepared.commitOid,
-        base,
-      });
+      let prepared: { treeOid: string; commitOid: string; pack: { file: string } };
+      try {
+        prepared = preparePublication({
+          source: root,
+          repository: work,
+          base,
+          tree: treeFromScratch({
+            repository: work,
+            source: root,
+            scratch,
+            plan,
+            candidates,
+          }),
+          identity,
+          at,
+          message: payload.message?.trim()
+            ? `${payload.message.trimEnd()}\n`
+            : `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
+        });
+      } catch (error) {
+        return blocked(
+          'branch-not-created',
+          `The branch could not be built from the scratch copy. ${plain(error)}`,
+        );
+      }
+      try {
+        applyPublication({
+          source: root,
+          pack: prepared.pack,
+          destinationRef: ref,
+          treeOid: prepared.treeOid,
+          commitOid: prepared.commitOid,
+          base,
+        });
+      } catch (error) {
+        return blocked(
+          'branch-not-created',
+          /already exists/.test((error as Error).message)
+            ? 'Choose another branch name and accept again.'
+            : `The branch could not be added to the repository. ${plain(error)}`,
+        );
+      }
       commit = prepared.commitOid;
-    } catch {
-      return blocked('branch-not-created', 'Choose another branch name and accept again.');
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -1096,6 +1197,8 @@ export class ChatService {
       },
       free: (task) => !this.checkedThread(task).left.length,
       scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      runCombinedChecks: (taskId, directory) => this.runCombinedChecks(taskId, directory),
+      stopCombinedChecks: (taskId) => this.stopCombinedChecks(taskId),
       localContext: () => this.deps.localContext?.() ?? null,
       localSliceFits: this.deps.localSliceFits ?? localSliceFits,
     };
@@ -1126,11 +1229,53 @@ export class ChatService {
     const root = task && this.deps.projectPath(task.projectId);
     if (!thread.scratchReady || !thread.base || !root)
       return { taskId: payload.taskId, base: thread.base, files: [] };
-    return {
-      taskId: payload.taskId,
-      base: thread.base,
-      files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
-    };
+    try {
+      return {
+        taskId: payload.taskId,
+        base: thread.base,
+        files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
+      };
+    } catch (error) {
+      if (!(error instanceof ScratchTooLarge)) throw error;
+      // The read has no field for a cause, so one entry says why the list is empty.
+      return {
+        taskId: payload.taskId,
+        base: thread.base,
+        files: [
+          {
+            // A backslash cannot sit in a scratch path, so Discard can never match this note.
+            path: '\\Changes could not be listed',
+            additions: 0,
+            deletions: 0,
+            patch: `${error.message}\n`,
+          },
+        ],
+      };
+    }
+  }
+
+  private readonly mentionIndex = createMentionIndex(() => Date.now());
+
+  /** Ranked files and folders of the scratch copy for the text typed after an at sign. */
+  completeMention(payload: Payload<'CompleteChatMention'>): ChatMentionsRead {
+    const thread = this.thread(payload.taskId);
+    const mentions = thread.scratchReady
+      ? this.mentionIndex.complete(
+          this.scratchDirectory(payload.taskId),
+          this.deps.resolveEnvironment('local'),
+          payload.query,
+          payload.limit,
+        )
+      : [];
+    return { taskId: payload.taskId, mentions };
+  }
+
+  /** The instruction files at the copy root, and the text of one the person opens. */
+  readInstructions(payload: Payload<'ReadChatInstructions'>): ChatInstructionsRead {
+    const thread = this.thread(payload.taskId);
+    return thread.scratchReady
+      ? readInstructionFiles(payload.taskId, this.scratchDirectory(payload.taskId), payload.name)
+      : { taskId: payload.taskId, files: [], name: null, text: null, truncated: false };
   }
 
   readCatalog(payload: Payload<'ReadChatCatalog'>): ChatCatalogRead {
@@ -1155,6 +1300,8 @@ export class ChatService {
    */
   recover() {
     this.sweepDeleted();
+    // A check still marked running belonged to the process that is gone.
+    this.checks.recover();
     const rows = this.deps.store.db
       .prepare(
         "SELECT id,task_id FROM chat_turns WHERE json_extract(body,'$.state') IN ('queued','running','waiting-permission') OR json_array_length(body,'$.groups')>0 ORDER BY task_id,sequence",
@@ -1243,6 +1390,8 @@ export class ChatService {
       if (present.length !== turn.groups?.length) this.putTurn(task, withGroups(turn, present));
       left.push(...present);
     }
+    // A project check the journal cannot prove gone holds the thread like a provider process.
+    left.push(...this.checks.orphans(task.id));
     const { ownershipUnknown: flagged, ...thread } = this.thread(task.id);
     if (flagged && !left.length) this.putThread(task, thread);
     return left;
@@ -1264,6 +1413,9 @@ export class ChatService {
 
   close(): Promise<void> | undefined {
     this.closed = true;
+    for (const asked of [...this.checkAsk.values()]) asked.settle('stop', []);
+    this.checkAsk.clear();
+    this.checks.close();
     const running = [...this.live.values()];
     for (const live of running) {
       live.stopRequested = true;
@@ -1586,8 +1738,20 @@ export class ChatService {
     const directory = this.scratchDirectory(task.id);
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
-    const source = committedFiles(root, thread.base, { scratch: true });
-    materialize(directory, source.files, source.links);
+    const source = scratchPlan(root, thread.base);
+    copyScratch(directory, source.files, source.links, {
+      read: (files) => readPlannedBlobs(root, files as PlannedFile[]),
+      stream: (file, target) => blobToFile(root, (file as PlannedFile).oid, target),
+      checkout: { root, base: thread.base },
+      name: basename(root),
+      onProgress: (progress) => {
+        try {
+          this.deps.onImportProgress?.(task.id, progress);
+        } catch {
+          // A progress update that fails to send changes nothing about the copy.
+        }
+      },
+    });
     this.pinBase(task, root, thread.base);
     // The thread record travels in every chat.thread event, so it keeps the first 64 entries and
     // the total. The first turn says once what the copy left out.
@@ -2016,13 +2180,11 @@ export class ChatService {
           return this.stopCrew(task, thread, chain, `the ${chain.step} failed`);
         if (thread.flightMode === 'manual')
           return this.stopCrew(task, thread, chain, 'the thread is in manual mode');
-        if (chain.step === 'fix')
-          return this.crewStep(
-            task,
-            thread,
-            { ...chain, step: 'review', fixes: chain.fixes + 1 },
-            effects,
-          );
+        if (chain.step === 'fix') {
+          const next = { ...chain, step: 'review', fixes: chain.fixes + 1 } as const;
+          if (this.startChecks(task, thread, next, 'fix', effects)) return;
+          return this.crewStep(task, thread, next, effects);
+        }
         if (chain.step === 'challenge') return this.finishCrew(task, thread, chain);
         const review = turn.assistantMessageId
           ? this.findEntry(task.id, turn.assistantMessageId)?.text
@@ -2055,10 +2217,20 @@ export class ChatService {
     chain: ChatCrewChain,
     effects: Effects,
     review?: string,
+    checked = false,
+    brief?: string,
   ) {
     const step = chain.step as CrewStep;
     // A plan with slices left runs the next one, and the challenger waits for the last.
     if (step === 'challenge' && this.plans.beforeChallenge(task, thread, chain, effects)) return;
+    // After the last slice the project checks run before the challenger.
+    if (
+      step === 'challenge' &&
+      !checked &&
+      thread.plan?.phase === 'running' &&
+      this.startChecks(task, thread, chain, 'plan', effects)
+    )
+      return;
     const members = thread.crew?.members ?? [];
     const member = (role: string) => members.find((entry) => entry.role === role)?.selection;
     const selection =
@@ -2068,7 +2240,11 @@ export class ChatService {
       return this.stopCrew(task, thread, chain, `the crew has no ${CREW_ROLES[step]}`);
     const saved = this.putThread(task, { ...thread, crewChain: chain });
     const text =
-      step === 'review' ? CREW_REVIEW : step === 'fix' ? fixerBrief(review ?? '') : CREW_CHALLENGE;
+      step === 'review'
+        ? CREW_REVIEW
+        : step === 'fix'
+          ? (brief ?? fixerBrief(review ?? ''))
+          : CREW_CHALLENGE;
     const started = this.begin(
       task,
       saved,
@@ -2077,6 +2253,198 @@ export class ChatService {
     );
     if (started.outcome !== 'applied')
       this.stopCrew(task, this.thread(task.id), chain, `the ${step} could not start`, started.next);
+  }
+
+  /** The thread waits on a check question or runs checks, so no turn may start. */
+  private checksBusy(taskId: string): boolean {
+    return this.checkAsk.has(taskId) || this.checks.running(taskId);
+  }
+
+  private dropCheckAsk(taskId: string) {
+    this.checkAsk.delete(taskId);
+    const task = this.task(taskId);
+    const thread = this.thread(taskId);
+    if (task && thread.checks?.ask)
+      this.putThread(task, { ...thread, checks: { ...thread.checks, ask: null } });
+  }
+
+  /**
+   * Whether the person must answer before these checks run. A check whose command or script
+   * changed since it was turned on asks in every mode. Otherwise a command set the person
+   * allowed for the thread runs. Failing that, Balanced asks as it does for a command outside the
+   * read-only set, and Glide runs them when the thread's policy covers commands.
+   */
+  private checksNeedAsk(
+    thread: ChatThread,
+    assessed: Pick<ReturnType<ThreadChecks['assess']>, 'changed' | 'set'>,
+  ): boolean {
+    if (assessed.changed.length > 0) return true;
+    if (thread.checks?.approved === assessed.set) return false;
+    return thread.flightMode !== 'glide' || !commandsAllowed(thread);
+  }
+
+  /** Put the question on the thread. The answer arrives as ResolveChatPermission. */
+  private raiseCheckAsk(
+    task: Task,
+    thread: ChatThread,
+    trigger: 'fix' | 'plan' | 'combined',
+    assessed: ReturnType<ThreadChecks['assess']>,
+    settle: (answer: CheckAnswer, effects: Effects) => void,
+  ) {
+    const requestId = `chkask_${randomBytes(16).toString('hex')}`;
+    this.checkAsk.set(task.id, { requestId, settle });
+    const current = thread.checks;
+    if (!current) return;
+    this.putThread(task, {
+      ...thread,
+      checks: {
+        ...current,
+        ask: {
+          requestId,
+          trigger,
+          commands: assessed.commands,
+          changed: assessed.changed,
+        },
+      },
+    });
+  }
+
+  /**
+   * Run the thread's enabled checks before the chain goes on, after the person has answered when
+   * the thread needs an answer. The chain waits with its step unchanged and no open turn, so a
+   * restart stops it like any other chain left mid-step. True when the checks were queued or the
+   * question was raised; false when no check is on.
+   */
+  private startChecks(
+    task: Task,
+    thread: ChatThread,
+    next: ChatCrewChain,
+    trigger: 'fix' | 'plan',
+    effects: Effects,
+  ): boolean {
+    if (!enabledChecks(thread).length) return false;
+    const before = thread.crewChain;
+    const assessed = this.checks.assess(task, thread);
+    // The run starts right after this transaction commits, in the same tick, so a rollback leaves
+    // no reservation behind.
+    const go = (fx: Effects, repin: boolean, approve: boolean) =>
+      fx.push(() => {
+        if (repin) this.checks.repin(task);
+        if (approve) this.checks.approve(task.id, assessed.set);
+        const entry = this.checks.reserve(task.id);
+        this.checks.run(task.id, trigger, undefined, entry).then(
+          (result) => this.checksDone(task.id, before, next, result),
+          () => this.checksDone(task.id, before, next, null),
+        );
+      });
+    if (!this.checksNeedAsk(thread, assessed)) {
+      go(effects, false, false);
+      return true;
+    }
+    this.raiseCheckAsk(task, thread, trigger, assessed, (answer, fx) => {
+      if (answer === 'allow' || answer === 'allow-thread')
+        go(fx, assessed.changed.length > 0, answer === 'allow-thread');
+      else
+        fx.push(() =>
+          this.checksDone(task.id, before, next, {
+            outcome: answer === 'stop' ? 'stopped' : 'denied',
+            runs: [],
+            brief: null,
+          }),
+        );
+    });
+    return true;
+  }
+
+  /**
+   * Run the enabled checks on a merged copy, for the combined review before the challenger. The
+   * same question comes first when the thread needs one. `denied` means the person said no.
+   */
+  async runCombinedChecks(taskId: string, directory: string): Promise<ChecksOutcome> {
+    if (this.closed) throw new Error('The chat service is closed.');
+    const task = this.task(taskId);
+    if (!task) throw new Error('No thread has that task.');
+    const thread = this.thread(taskId);
+    const none = { outcome: 'none', runs: [], brief: null } as const;
+    if (!enabledChecks(thread).length) return none;
+    const assessed = this.checks.assess(task, thread, directory);
+    if (this.checksNeedAsk(thread, assessed)) {
+      if (this.checkAsk.has(taskId)) return { outcome: 'denied', runs: [], brief: null };
+      const answer = await new Promise<CheckAnswer>((resolve) =>
+        this.deps.store.transaction(() =>
+          this.raiseCheckAsk(task, this.thread(taskId), 'combined', assessed, resolve),
+        ),
+      );
+      if (answer === 'allow-thread') this.checks.approve(taskId, assessed.set);
+      if (answer !== 'allow' && answer !== 'allow-thread')
+        return { outcome: answer === 'stop' ? 'stopped' : 'denied', runs: [], brief: null };
+    }
+    return this.checks.run(taskId, 'combined', directory);
+  }
+
+  /** Stop the runs on a merged copy. Only the plan step that started them calls it. */
+  stopCombinedChecks(taskId: string): boolean {
+    return this.checks.stopCombined(taskId);
+  }
+
+  /** The checks ended. Feed a failure to the fixer while fixes remain, otherwise go on. */
+  private checksDone(
+    taskId: string,
+    before: ChatCrewChain | null,
+    next: ChatCrewChain,
+    result: ChecksOutcome | null,
+  ) {
+    const effects: Effects = [];
+    try {
+      this.deps.store.transaction(() => {
+        const task = this.task(taskId);
+        if (!task || !before || this.closed) return;
+        const thread = this.thread(taskId);
+        // A new builder turn or another step took the chain over while the checks ran.
+        if (thread.activeTurnId || canonicalJson(thread.crewChain) !== canonicalJson(before))
+          return;
+        const line = (text: string) =>
+          this.appendEntry(task, {
+            kind: 'chat-system',
+            author: { kind: 'system', turnId: null },
+            text,
+          });
+        if (!result) return this.stopCrew(task, thread, before, 'the checks could not run');
+        if (result.outcome === 'stopped')
+          return this.stopCrew(task, thread, before, 'you stopped the checks');
+        if (sentMessage(thread))
+          return this.stopCrew(task, thread, before, 'you sent a new message');
+        if (result.outcome === 'denied')
+          line('The project checks did not run. The commands were not allowed.');
+        const labels = (status: 'passed' | 'failed') =>
+          result.runs
+            .filter((run) => run.status === status)
+            .map((run) => run.label)
+            .join(', ');
+        if (result.outcome === 'failed') {
+          const room = next.fixes < MAX_FIXES;
+          line(
+            `Checks failed: ${labels('failed')}.${room ? ' The fixer runs on their output.' : ` They still fail after ${next.fixes} ${next.fixes === 1 ? 'fix' : 'fixes'}, so the chain goes on.`}`,
+          );
+          if (room)
+            return this.crewStep(
+              task,
+              thread,
+              { ...next, step: 'fix' },
+              effects,
+              undefined,
+              true,
+              result.brief ?? undefined,
+            );
+        } else if (result.outcome === 'passed') line(`Checks passed: ${labels('passed')}.`);
+        return this.crewStep(task, thread, next, effects, undefined, true);
+      });
+    } catch {
+      // The chain stays where it was. The person can still run each step from the thread.
+      return;
+    }
+    for (const effect of effects) this.call(effect);
+    if (!this.closed) this.wakeQueues();
   }
 
   private finishCrew(task: Task, thread: ChatThread, chain: ChatCrewChain) {
@@ -2257,7 +2625,13 @@ export class ChatService {
       this.deps.store.transaction(() => {
         const task = this.task(taskId);
         const thread = this.thread(taskId);
-        if (!task || !thread.queued.length || thread.activeTurnId || thread.ownershipUnknown)
+        if (
+          !task ||
+          !thread.queued.length ||
+          thread.activeTurnId ||
+          thread.ownershipUnknown ||
+          this.checksBusy(taskId)
+        )
           return;
         const newest = this.newestTurn(taskId);
         const sentAfter = newest?.endedAt && (thread.queued.at(-1)?.at ?? '') > newest.endedAt;
@@ -2449,13 +2823,9 @@ export class ChatService {
     if (role === 'orchestrator') return orchestratorContext(name, directory);
     if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';
-    let files: ChatChangesRead['files'] | null = null;
-    try {
-      files = scratchChanges(root, directory, base);
-    } catch {
-      // The brief says the changes could not be read, and the model works from the files.
-    }
-    return reviewContext(name, directory, base, files, crew);
+    // The brief says why the changes could not be read, and the model works from the files.
+    const files = this.scratchDiff(turn.taskId, root, base);
+    return reviewContext(name, directory, base, files, crew, this.unreadable.get(turn.taskId));
   }
 
   /** The newest reply from a turn that wrote to the scratch copy. */
@@ -2470,11 +2840,18 @@ export class ChatService {
 
   private scratchDiff(taskId: string, root: string, base: string): FileDiff[] | null {
     try {
-      return scratchChanges(root, this.scratchDirectory(taskId), base);
-    } catch {
+      const files = scratchChanges(root, this.scratchDirectory(taskId), base);
+      this.unreadable.delete(taskId);
+      return files;
+    } catch (error) {
+      if (error instanceof ScratchTooLarge) this.unreadable.set(taskId, error.message);
+      else this.unreadable.delete(taskId);
       return null;
     }
   }
+
+  // Why the last Changes read of a thread failed when the cause was size, for the prompts.
+  private unreadable = new Map<string, string>();
 
   /**
    * The next provider starts cold, so the packet states what the scratch copy holds and where
@@ -2505,7 +2882,12 @@ export class ChatService {
         to: turn.selection.family,
         reason: input.reason,
         history,
-        files: [...changeList(changes), ...stopped, ...patches, ...checks],
+        files: [
+          ...changeList(changes, this.unreadable.get(turn.taskId)),
+          ...stopped,
+          ...patches,
+          ...checks,
+        ],
         prompt: input.prompt,
         threadTools: input.threadTools,
         instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
@@ -2801,7 +3183,11 @@ export class ChatService {
     base: string,
   ): { lines: string[]; changed: FileDiff[] } {
     const now = this.scratchDiff(taskId, root, base);
-    if (now === null) return { lines: ['The scratch changes could not be read.'], changed: [] };
+    if (now === null)
+      return {
+        lines: [this.unreadable.get(taskId) ?? 'The scratch changes could not be read.'],
+        changed: [],
+      };
     const record = this.readSeen(taskId, family);
     if (record?.sequence !== seen)
       return {
@@ -3366,8 +3752,8 @@ const clip = (text: string, characters: number) =>
 /** Two records of a changed file match when their counts and patch match. */
 const fileDigest = (file: FileDiff) => hashCanonical([file.additions, file.deletions, file.patch]);
 
-function changeList(files: readonly FileDiff[] | null): string[] {
-  if (files === null) return ['The scratch changes could not be read.'];
+function changeList(files: readonly FileDiff[] | null, why?: string): string[] {
+  if (files === null) return [why ?? 'The scratch changes could not be read.'];
   if (files.length === 0) return ['No files changed yet.'];
   return [
     ...files
@@ -3599,4 +3985,11 @@ function newest<T>(items: readonly T[], budget: number): T[] {
 
 function size(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value));
+}
+
+/** What a failed git call or check says, without the command line. */
+function plain(error: unknown): string {
+  const stderr = (error as { stderr?: Buffer | string })?.stderr?.toString().trim();
+  const text = stderr || (error instanceof Error ? error.message : String(error));
+  return `${text.split('\n')[0].slice(0, 300)}`;
 }

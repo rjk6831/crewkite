@@ -115,3 +115,84 @@ Three claims from the thread MCP servers change. Each lives in a test.
 | A server's policy never exceeds the thread's, a listed read runs unasked only under the reads policy, and a server's annotations or an unlisted name never widen it | `chat/mcp-servers.test.ts`, with a scripted stdio server in `chat/mcp-fixture-server.mjs` |
 | Each family gets the servers the thread turned on only where the controller's gate sees their calls: Anthropic in the one strict config, Google only while every call asks, OpenAI, Local and read only turns never | `chat/mcp-servers.test.ts`, the Anthropic config and permission rows, the queue row in `chat/service.test.ts` |
 | A stored secret is sealed on disk, never returned to the window, kept across an edit, refused without a keychain and removed from a turn's events | `apps/desktop/src/main/mcp-vault.test.ts`, `apps/desktop/src/main/grants.test.ts` |
+
+## Scratch copy clones
+
+The first turn on a thread fills its scratch directory through `copyScratch` in `apps/controller/src/chat/scratch-copy.ts`. `scratchPlan` in `host/source.ts` lists the base tree with each regular file's size and no bytes, and it applies the same link, submodule and non-UTF-8 path rules as `committedFiles` with `scratch: true`, because both run one classifier. No byte limit applies to the regular files. When the project's checkout sits on the thread's base and git sees no change to a tracked file, each regular file whose parent folders are real folders and whose size matches the committed size is cloned from the checkout with `fs.copyFileSync` and `COPYFILE_FICLONE_FORCE`. The clone is then stream-hashed as a git blob with no filters and compared with the committed oid. A mismatch, such as a same-size edit git was told to ignore with assume-unchanged or skip-worktree, or a checkout that changed during the copy, removes the clone and writes the committed bytes. Every other file is read from git in runs of at most 32 MiB and written. A file larger than a run streams from `git cat-file blob` straight to its target. The first EXDEV, ENOTSUP or similar error ends the clone attempts and the rest is written. `materialize` still checks every path and link before it writes, and `copyScratch` calls it with a write hook, so a clone never skips a check. Progress uses the same `ImportProgress` update as a file import, one per 4 MiB and a final one.
+
+Two tests protect these claims in `scratch-copy.test.ts`. A checkout on the base is cloned, reports progress and leaves out the base's outside link. It holds a same-size edit that git was told to ignore, and the copy still has the committed bytes and the checkout's committed tree hash. A volume that cannot clone, and an edited checkout, both fall back to writing and produce that same tree hash. The fallback test lowers the run limit to 1 MiB over a fixture that holds a 66 MiB random file, and asserts the big blob streams to its target and the small blobs arrive as one 16 byte read, so a base larger than a run still copies. Both inject the clone primitive, so they run on Linux with no reflink support, no network and no waits. Deleting a thread removes its `chat/<task>` folder, which holds the scratch copy, so a clone adds nothing to delete; the existing delete test in `service.test.ts` covers it.
+
+Measurement on a 1 GiB repository, 256 files of 4 MiB random bytes in 16 folders, generated outside the repository by this script and never committed:
+
+```sh
+dir=$1; mkdir -p "$dir" && cd "$dir" && git init -q
+i=0; while [ $i -lt 256 ]; do
+  d=$(printf 'part%02d' $((i % 16))); mkdir -p "$d"
+  head -c 4194304 /dev/urandom > "$d/blob$i.bin"; i=$((i+1))
+done
+git add -A && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
+```
+
+A throwaway test built the controller fixture, committed the 1 GiB tree on top of its repository, sent one message to a scripted adapter and timed the send until the turn finished. That span covers `ensureScratch` and a one-word turn.
+
+| Where | Path taken | Send to done | Bytes |
+|-------|------------|--------------|-------|
+| Linux 6.18 container, ext4 on a virtual disk | clone attempted, first call fails, 256 files read from git and written | 14.4 s and 14.3 s in two runs | 1,073,741,824 written |
+| APFS on the Mac | clone | still to be measured on the Mac | still to be measured on the Mac |
+
+ext4 has no reflink, so this container could not exercise a successful clone, and I have no figure for it. Before this change the same repository could not start a turn at all, because the whole-read path stopped at 64 MiB. The write path now works at 1 GiB with memory held to one run. The APFS figure, and the bytes it leaves unshared on disk, come from running the same script on the Mac.
+
+Changes, Discard and Accept read the base the same way, by oid. The object format comes from `git rev-parse --show-object-format`. `hashCandidateFiles` streams every scratch file through git's blob hash and compares it with the oid in `scratchPlan`, under the same link, special file, ignore and collision rules as before. Only changed files are read: Changes reads the base blob and the scratch file of each changed path, Discard reads one blob, and Accept writes only changed files into a repository that borrows the project's objects, so the pack holds the new trees and changed blobs. On the 1 GiB fixture with one edited file, hashing the scratch took 1.07 s, the Changes read took 1.17 s, and building the Accept tree took 0.27 s, at 121 MiB resident, warm cache, same ext4 container.
+
+A comparison reads at most 64 MiB of changed files for patches. A changed file past that shows a "Not compared" note in place of a patch, with the sizes that caused it, and Accept still takes it. A scratch copy of more than 100,000 files raises `ScratchTooLarge` with its own message. Accept answers with that message, `readChanges` and the thread diff tool return it as text, and the reviewer brief and handoff packet carry it in place of the change list. Only an unreadable scratch for another cause, such as a special file, keeps the "remove new links and special files" message.
+
+The fallback test also covers the over-limit case. Its fixture holds a 66 MiB file, over the 64 MiB the whole-base read allowed. It edits the copy, lists the changes, builds the Accept tree, publishes it as a branch (the new 66 MiB of random bytes is more than a pack buffer holds, so the pack goes through a file) and discards each change. The accept test in `service.test.ts` adds 2,001 files and expects Accept to refuse and name both counts, since it only publishes files that Changes can list. On the earlier code, Changes and Discard on such a base stop with "A committed blob is unavailable locally. Fetch it outside this workspace and prepare again." The 100,000 file case was checked by hand with a throwaway script, since a test that writes that many files costs more than it protects.
+
+One limit stays. A patch still reads the changed file into memory, so one file near the Buffer limit fails there.
+
+For the Mac check: the clone path uses `COPYFILE_FICLONE_FORCE`, which maps to `clonefile`. Node does not expose file flags or extended attributes, so a clone keeps whatever flags and quarantine attributes the checkout file carries. Check on the Mac that a cloned file carries none that the committed bytes would not, and measure the clone time with the verification read included, since each clone is now read once to hash it.
+
+## Extension seam
+
+Three claims cover the extension seam in [ADR 0047](adr/0047-extensions-attach-through-one-versioned-seam.md). They live in `apps/controller/src/extensions/extensions.test.ts`.
+
+- The manifest table refuses a version that is not three numbers, a contract that is not a version, an authority outside the closed list, an older or newer contract major, a newer contract minor, a slot that runs an undeclared command, event kinds without the event authority, an entry outside the folder, an unknown field and a folder that names another extension. A contract major bump reads as one plain line.
+- An extension command passes the built-in checks: another principal is denied, an unknown task is refused before the extension runs, an undeclared command is refused, a reused key with changed content is refused and a retry with the same key answers from its receipt without a second event. The probe extension's context holds only its declared authority. Its thread reader returns the thread the command ran on whatever it is asked, the frozen context cannot be pointed at another thread, a result that carries limits is refused, a built-in event kind cannot be emitted, and an asynchronous command or a `then` getter that throws is refused. A context the module kept reads and emits nothing once its command returned. The task record stays byte for byte the same, and a configure whose commit fails changes no on or off choice.
+- The reference extension from the testkit is listed off with its manifest. Its thread action and command appear only while it is on, and turning it off removes both. A new sibling module or `package.json` in its folder turns it off until the file goes, a link or a folder over 256 files is refused, and a contract major bump in its manifest turns it off with the plain line. A folder that changes while its module loads stays off, and a module fixed after a failed load needs a restart.
+
+These run against a real controller and real SQLite with synthetic extension modules. They make no claim about the behavior of a separately licensed extension.
+
+## Project checks in the loop
+
+The detection table builds small project directories and checks which checks the controller reads from them: package.json scripts with the package manager chosen by the lock file, pyproject.toml tool tables, Makefile targets, a Cargo.toml, a broken manifest and an empty project. It also checks the resolved text, which names the pre and post scripts npm runs, and the rule for commands a person adds: shells, wrappers such as env, inline code flags and paths outside the scratch copy are refused. A detected check starts switched off.
+
+The crew chain rows run a real Node script as a check after a fix turn. The script lives in the scratch copy and the row turns the check on from there. The first run fails, and its output reaches the next fixer turn as the whole message. The second run passes, and the chain finishes with two fixes. The rows read the run records, the output artifact bytes and the lines `thread_checks` returns. A second row has the fixer edit the script. The chain then raises the permission question even though the thread allows commands, nothing runs before the answer, and the answer renews the pin so the next run needs no question.
+
+The stop row opens a check that runs until stopped. A message sent meanwhile waits, Stop ends the process and the chain, and the queue is kept: the message runs afterwards and its own chain reaches a check again. A second service on the same store then reads that open check as failed with the restart reason. Its process is still present, so the operation journal cannot prove it gone and the thread takes no turn. Once the process table shows the group gone, the next command lifts the hold and the queue runs. The permission row shows that Glide with Allow all runs without a question, that Balanced asks with the exact commands, that a denial runs nothing, that Allow for this thread covers the same command set afterwards, that a changed script asks again, and that the same checks run on merged copies. A closed service refuses and an unknown thread throws. These are real local processes with no network, installed dependencies or provider.
+
+Output is read from each process as it starts, so a check that exits before the artifact store has opened its file keeps its output. The tail on the card is redacted and holds the last 1000 characters. The full output is in the artifact store. A pin covers the command, the script text behind it and files of the copy named in a custom command. It does not cover files a script goes on to read. No claim covers the checks of a real project, a package manager or a toolchain.
+
+## Composer parity
+
+Three claims cover the composer additions, and each runs at the lowest layer that can see it.
+
+The mention ranking table runs in the client package on a synthetic file list. It checks that exact and prefix name matches outrank looser ones, that case is ignored, that a subsequence still finds a file, that an empty query lists the shallowest entries, that every answer stays within the limit and that the order does not depend on the input order. The same table checks that an at sign inside an email address starts no mention and that insertion writes the path the provider's tools open: relative to the copy root, a trailing slash on a folder and backticks around a path with white space.
+
+The controller table builds a scratch copy with ignored folders, a link to a file outside and instruction files, then asks for completions. Nothing under `node_modules` or `.git`, no link and no path outside the copy comes back, and the limit bounds the answer. The same table checks the instruction chip source: plain instruction files at the copy root are listed, a link to an outside file is not, a folder swapped for a link to somewhere else offers none of its old files, only a listed name can be read, and a copy with none lists none.
+
+The saved prompt table covers the controller home. Prompts persist, a repeated name replaces its body, the export is the versioned JSON file in name order, and a damaged file is refused and left as it is. The same table parses `/prompt name key=value` and checks that insertion fills the values given and names the placeholders still open. A message that starts with a command word, such as `/new endpoint returns 500`, or a path such as `/usr/bin` stays a message, and an exact command name such as `/pr` is chosen before longer names that start with it.
+
+These tables use synthetic files and no network. They do not exercise the composer's keyboard handling or the Settings card, which a manual desktop check covers.
+
+## CLI
+
+Six claims cover the interactive CLI and its scripting path. Each runs a real controller on a private socket with the scripted chat adapter, or a pure module, and no provider client.
+
+- Print mode streams the reply to stdout and exits with the status of its turn: 0 when done, 1 when it failed on a usage limit or the controller went away, and 3 when another command stopped it. It finds the registered project from `INIT_CWD` with a misleading `GIT_DIR` set, refuses an unregistered checkout with status 2 and registers nothing until `--register`. A permission policy in `cli.json` leaves a new thread on ask; `--permission-policy` sets it for the run. Arguments that do not parse exit 2 in every command.
+- The thread commands with `--json` write only lines `CliJsonLineSchema` accepts, whose full shape matches the pinned hash for `v: 1`, through a new thread, a watched permission answered by `thread permit`, Accept, `list` and `show`. Push without `--confirm` sends nothing and says what it would push.
+- Each interactive view draws a scripted thread: the wordmark at both sizes, the folded reads, Markdown, the open permission with its options and the thread policy, the answered thread, Changes with the diff and the accepted branch, the crew, the plan card in Balanced and after a stop, Settings with provider cards and a dotted stale gauge, the thread list and help. Under `NO_COLOR` every view keeps its text and draws no colour. The kite panels and gauges take the desktop's colours, yellow at 40 percent and red at empty, and the spinner moves only with full animation.
+- Slash commands parse only from the shared list, and the message box keeps multi-line editing, history on Up and Down, slash and mention completion, and absolute paths after `@` as attachments.
+- `cli.json` is checked with the schemas the desktop saves its defaults with, falls back to defaults with a named field, is written private to its owner, and backs the renderer's preference functions. Key bindings match their modifiers exactly.
+- The interactive app preselects the project from `INIT_CWD`, offers the saved policy and keeps ask when the person declines, keeps a digit as text until Tab gives the request focus, answers it with a digit, asks before Ctrl+C leaves a running reply, stops it with Escape and leaves on the next Ctrl+C.
+
+These tests establish the CLI's own wiring. The controller's permission, acceptance and push rules keep their existing claims, and the CLI test adds none of its own.

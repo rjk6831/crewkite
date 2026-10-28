@@ -2,7 +2,9 @@ import type { ChatCatalogRead, ChatModelSelection, WorkspaceState } from '@crewk
 import { GitBranch, PanelRight } from 'lucide-react';
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { ExtensionThreadActions } from '../extension-slots.tsx';
 import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
+import { ChecksCard } from './checks-card.tsx';
 import {
   cancelPlan,
   configureThread,
@@ -78,6 +80,8 @@ export function ThreadView({
   preview,
   connection,
   refresh,
+  onNewThread,
+  onOpenSettings,
 }: {
   source: ThreadSource;
   task: ThreadTask;
@@ -86,6 +90,8 @@ export function ThreadView({
   preview: boolean;
   connection: string;
   refresh?: () => Promise<WorkspaceState>;
+  onNewThread?: () => void;
+  onOpenSettings?: () => void;
 }) {
   const {
     state,
@@ -259,6 +265,20 @@ export function ThreadView({
       }}
     />
   );
+  const checked = thread?.checks && (thread.checks.runs.length > 0 || thread.checks.ask) && (
+    <ChecksCard
+      checks={thread.checks}
+      onStop={async () => {
+        const last = newestTurnId(state);
+        if (last) await stopTurn(source, { taskId: task.id, turnId: last });
+      }}
+      onAnswer={async (requestId, choice) => {
+        const last = newestTurnId(state);
+        if (last)
+          await resolvePermission(source, { taskId: task.id, turnId: last, requestId, choice });
+      }}
+    />
+  );
   const replyId = useMemo(
     () => (activeTurn ? null : lastReply(state, items)),
     [activeTurn, state, items],
@@ -365,6 +385,7 @@ export function ThreadView({
           )}
           <ThreadTitle source={source} task={task} />
           <span className="th-project">{projectName}</span>
+          <ExtensionThreadActions source={source} taskId={task.id} />
           <span className="th-badge" title={thread?.base ?? 'No base commit yet'}>
             <GitBranch size={11} aria-hidden="true" />
             {badge}
@@ -385,9 +406,10 @@ export function ThreadView({
           items={items}
           empty={empty}
           footer={
-            (planned || offer) && (
+            (planned || checked || offer) && (
               <>
                 {planned}
+                {checked}
                 {offer && (
                   <LimitOfferCard
                     key={offer.turnId}
@@ -433,6 +455,9 @@ export function ThreadView({
           onCatalog={setCatalog}
           localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
           lastMessage={lastMessage}
+          onNewThread={onNewThread}
+          onOpenSettings={onOpenSettings}
+          onOpenChanges={() => setInspector({ open: true, tab: 'changes', focus: null })}
         />
         {/* A zero-width mark on alternate lines lets the same sentence be read twice in a row. */}
         <p className="th-sr" role="status" aria-live="polite" aria-atomic="true">

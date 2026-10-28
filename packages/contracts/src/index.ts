@@ -41,6 +41,24 @@ import {
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
+import {
+  ChatInstructionsReadSchema,
+  ChatMentionsReadSchema,
+  CompleteChatMentionPayloadSchema,
+  DeleteChatPromptPayloadSchema,
+  ReadChatInstructionsPayloadSchema,
+  ReadChatPromptsPayloadSchema,
+  SaveChatPromptPayloadSchema,
+  SavedPromptsSchema,
+} from './composer.ts';
+import {
+  ConfigureExtensionPayloadSchema,
+  ExtensionCommandResultSchema,
+  ExtensionEventSchema,
+  ExtensionsReadSchema,
+  ReadExtensionsPayloadSchema,
+  RunExtensionCommandPayloadSchema,
+} from './extensions.ts';
 import { McpSupplySchema } from './mcp.ts';
 
 export const PROTOCOL_VERSION = 1;
@@ -2486,6 +2504,11 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatThread', ReadChatThreadPayloadSchema),
   read('ReadChatChanges', ReadChatChangesPayloadSchema),
   read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
+  read('CompleteChatMention', CompleteChatMentionPayloadSchema),
+  read('ReadChatInstructions', ReadChatInstructionsPayloadSchema),
+  read('ReadChatPrompts', ReadChatPromptsPayloadSchema),
+  mutate('SaveChatPrompt', SaveChatPromptPayloadSchema),
+  mutate('DeleteChatPrompt', DeleteChatPromptPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
   mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
@@ -2500,6 +2523,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('AskChatFamily', AskChatFamilyPayloadSchema),
   mutate('RunChatPlan', RunChatPlanPayloadSchema),
   mutate('CancelChatPlan', CancelChatPlanPayloadSchema),
+  read('ReadExtensions', ReadExtensionsPayloadSchema),
+  mutate('ConfigureExtension', ConfigureExtensionPayloadSchema),
+  mutate('RunExtensionCommand', RunExtensionCommandPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -3551,6 +3577,9 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
   ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
   ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
+  ChatMentionsReadSchema.extend({ kind: z.literal('chat-mentions') }),
+  ChatInstructionsReadSchema.extend({ kind: z.literal('chat-instructions') }),
+  SavedPromptsSchema.extend({ kind: z.literal('chat-prompts') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
@@ -3562,6 +3591,8 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatPullRequestResultSchema.extend({ kind: z.literal('chat-pull-request') }),
   ChatBranchStatusSchema.extend({ kind: z.literal('chat-branch-status') }),
   ChatAttachmentSchema.extend({ kind: z.literal('chat-attachment') }),
+  ExtensionsReadSchema.extend({ kind: z.literal('extensions') }),
+  ExtensionCommandResultSchema.extend({ kind: z.literal('extension-result') }),
   // The byte check on the page stays with the kind tag.
   ChatTurnEventsReadSchema.safeExtend({ kind: z.literal('chat-turn-events') }),
   /** What a stop took out of the thread's queue, so the composer can give the text back. */
@@ -3684,6 +3715,7 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('chat.turn', ChatTurnSchema),
   event('chat.thread', ChatThreadSchema),
   event('chat.catalog', ChatCatalogChangeSchema),
+  event('extension.event', ExtensionEventSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   // A deleted thread's task is gone. Views drop it from the rail.
@@ -3818,6 +3850,10 @@ export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export { canonicalJson } from './canonical.ts';
 export * from './chat.ts';
+export * from './checks.ts';
+export * from './cli.ts';
+export * from './composer.ts';
+export * from './extensions.ts';
 export * from './mcp.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;

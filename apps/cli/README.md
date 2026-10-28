@@ -1,6 +1,130 @@
 # CLI
 
-The CLI connects to the same controller as the desktop. It reads `CREWKITE_HOME`, defaults to `~/.crewkite`, and accepts `--home path` for isolated state.
+`crewkite` is the terminal client of CrewKite. It connects to the same controller as the desktop, over the same socket and with the same commands, so a thread started in one shows in the other. It reads `CREWKITE_HOME`, defaults to `~/.crewkite`, and accepts `--home path` for isolated state. The controller has to be running: the desktop starts one, and `pnpm controller` starts one on its own.
+
+Run with no subcommand on a terminal, it opens the interactive mode. With a subcommand, or when stdout is not a terminal, it runs that command and exits.
+
+```sh
+pnpm crewkite                                   # interactive mode
+pnpm crewkite -p "Why can the total go negative?"   # one reply to stdout
+pnpm crewkite thread list --json                # scripting
+```
+
+The CLI adds no authority. Every action it offers is a command the controller checks the same way it checks the desktop's: a permission answer must name an open request and an option it offered, Accept builds one new local branch, and Push needs your confirmation. No setting grants a permission, raises a limit or accepts a result: a thread's permission policy changes only when you name it for that thread, with a flag for one run or by answering the question in the interactive mode.
+
+A recorded session is in [docs/images/cli-session.txt](../../docs/images/cli-session.txt).
+
+## Interactive mode
+
+The screen opens with the kite wordmark, in block letters at 72 columns and wider and in two rows below that. Under it sit the thread, the message box, the model the next message goes to and one gauge per provider.
+
+A new thread goes to the registered project of the checkout you started in. The CLI takes that directory from `INIT_CWD` when pnpm set it, else the current directory, and a project matches when its folder name, HEAD commit and branch are the checkout's. When none or several match, the first send opens the thread list and asks which project to use.
+
+A reply streams into the thread as it arrives. Markdown renders as terminal text: headings, lists, quotes, tables and fenced code. Thinking shows as a card with its latest line; Alt+T shows all of it. Tool calls show as cards, and a run of finished reads and searches folds into one line such as "Read 14 files", the way the desktop folds them. While a reply runs, the kite spinner turns beside the model name.
+
+A permission request appears inline with the options the provider offered, numbered: allow once, allow for this thread and deny. Press Tab to give the request focus, then the number. While the message box has focus, a digit is text. Tab or Escape gives the focus back. The prompt names the thread's permission policy, which you change on the crew screen. A message you send while a reply runs waits in the queue; Alt+S sends the first one now and Alt+X takes it back.
+
+A failed turn shows its cause, the provider's own message and the next step, with Alt+R to retry and Alt+1 to Alt+4 to try it with another connected family, in the order the desktop's Try with uses. Alt+G regenerates the last reply.
+
+| Key | Action |
+|-----|--------|
+| Enter | Send, or take the highlighted completion |
+| Alt+Enter, Shift+Enter, or a line ending in `\` | New line |
+| Up, Down | Move between lines; on the first or last line, walk the history of sent messages |
+| Tab | Take the highlighted completion |
+| Escape | Stop the running reply, close a list or go back to the thread |
+| Ctrl+T | Threads, and the project a new thread goes to |
+| Ctrl+G | Changes |
+| Ctrl+O | Settings |
+| Ctrl+K | Keys and slash commands |
+| Ctrl+C | Leave; while a reply runs it asks first, and the reply keeps running in the controller |
+
+### Slash commands and mentions
+
+Type `/` for the list. `/new`, `/model [model[:effort]]`, `/provider family`, `/crew`, `/plan`, `/ask question`, `/handoff family`, `/changes`, `/accept [branch]`, `/push`, `/pr`, `/settings`, `/help` and `/prompt name` do what the same entries do in the desktop. `/ask` sends a read-only question to the best ranked family other than the thread's own. `/prompt` needs the saved prompts the controller adds with the composer update and says so until then.
+
+`@` followed by part of a path offers the project's files and folders, ranked by the shared mention rules, and inserts the path. A path that starts with `/` or `~/`, such as `@~/Desktop/shot.png`, attaches that file from disk: the controller copies it into the thread's files and sends it the way each provider takes it.
+
+### Changes, Accept, Push and pull requests
+
+Ctrl+G opens Changes: the changed files with their line counts and the diff of the selected file. A accepts the scratch copy on a new local branch, with a name you can edit. P pushes the accepted branch after you answer the question that names the branch, the remote and that your own git credentials are used. O opens a pull request through gh, or gives the compare link without it. While the branch is pushed, the CI runs for it refresh every thirty seconds. D discards one file's changes after asking.
+
+### Crew, plan and handoff
+
+`/crew` shows the crew, the flight mode, the permission policy and the handoff mode. 1, 2 and 3 apply the Solo, Pair and Full crew presets; F, P and H cycle the flight mode, permission policy and handoff mode; A turns automatic handoff on or off. `/plan` shows the orchestrator's plan card with each slice's state and assignment. R runs the plan, C cancels it, S stops it, and a slice number runs that slice once its dependencies are done.
+
+### Settings and appearance
+
+Ctrl+O opens Settings: theme, animation, the model new threads start on, the handoff mode new threads get and the permission policy to offer them, followed by one card per provider with its connection, its gauge and its models. C checks the Anthropic sign-in or reads the Google or OpenAI quota for the provider of the default model you picked, and does nothing until you pick one.
+
+Gauges use the desktop's colour rule: green with plenty left, yellow at 40 percent and red when empty. A reading older than 60 minutes draws dotted. Provider marks are O, A, G and L in the kite panel colours. `NO_COLOR` turns every colour off and keeps the shapes. `--no-animation`, or `"animation": "reduced"` or `"off"` in the settings file, keeps the spinner still; the desktop follows the system's reduced motion setting, which a terminal does not expose, so the CLI takes it from the settings file.
+
+### Settings file
+
+The CLI keeps its own settings in `cli.json` in the CrewKite home. Settings writes it for you; a file you edit by hand is checked with `CliSettingsSchema`, which reuses the schemas the desktop saves its thread defaults with. A value the schema refuses leaves the defaults in force, and the CLI says which field. While it does, Settings saves nothing, so the file stays as you wrote it until you fix it.
+
+A setting never grants a permission. Every new thread starts on ask each time. When `permissionPolicy` names another policy, the interactive mode asks after the first message whether to switch that thread to it; print mode and `thread new` ignore it and take `--permission-policy` for the one run.
+
+```json
+{
+  "theme": "system",
+  "animation": "full",
+  "keybindings": { "threads": ["ctrl+t"], "newline": ["alt+enter", "shift+enter"] },
+  "selection": { "family": "openai", "model": "<model-id>", "effort": "default" },
+  "permissionPolicy": "ask",
+  "handoffMode": "most-left",
+  "familyModels": {},
+  "crewPresets": {}
+}
+```
+
+Key bindings exist for send, newline, stop, threads, changes, settings and help. A binding is a list of keys such as `ctrl+t` or `alt+enter`. `system` follows `COLORFGBG` when the terminal sets it and assumes a dark background otherwise.
+
+### Packaged builds
+
+The package carries the interactive mode. [scripts/cli-runtime.ts](../../scripts/cli-runtime.ts) copies Ink, React and their pinned closure into a private store under `apps/cli`, laid out so that the two ansi-styles versions in that closure each reach only the packages that asked for them, and copies the renderer modules the views import. The package build itself runs on macOS arm64.
+
+## Thread commands and print mode
+
+```sh
+pnpm crewkite thread new <project-id> "Clamp the discount" [--permission-policy policy] --watch
+pnpm crewkite thread send <task-id> "Add a test" --model openai --watch --json
+pnpm crewkite thread watch <task-id> [--follow]
+pnpm crewkite thread permit <task-id> <request-id> [--thread]
+pnpm crewkite thread deny <task-id> <request-id>
+pnpm crewkite thread stop <task-id>
+pnpm crewkite thread accept <task-id> <branch> [--message text]
+pnpm crewkite thread push <task-id> [--remote origin] --confirm
+pnpm crewkite thread pr <task-id> [--title text] [--body text]
+pnpm crewkite thread list
+pnpm crewkite thread show <task-id>
+pnpm crewkite -p "message" [--thread task-id | --project project-id | --register] [--model family[/model[:effort]]] [--permission-policy policy] [--file path ...]
+```
+
+`--model` takes a family, which runs its default model, a family and model, or a family, model and effort. Without it the CLI uses the `selection` from `cli.json`, then the connected family with the most allowance left. `--file` attaches a file from disk.
+
+`permit` answers with allow once, or with allow for this thread when you add `--thread`. `push` without `--confirm` prints what it would push and sends nothing.
+
+Print mode sends one message and streams the reply to stdout; tool lines, permission requests and failures go to stderr. Without `--thread` it starts a new thread in the registered project of the Git checkout you ran it in, found the way the interactive mode finds it, with every `GIT_` variable left out. It registers nothing on its own: a checkout the controller does not hold needs `--project`, or `--register` to register it, and the refusal names both. `-p` counts only before the first positional argument.
+
+`--permission-policy ask`, `allow-edits` or `allow-all` sets the new thread's policy for this run, and print mode prints the policy in use to stderr. A permission request waits for an answer from `thread permit` or `thread deny` in another terminal, the interactive mode or the desktop. If the connection to the controller ends and does not come back, print mode and `thread watch` say so and exit 1; the turn may still run in the controller. After a gap in the stream they read the thread again. `thread watch --follow` prints each later turn as its record arrives.
+
+### Exit status
+
+Every command, the task commands included, uses one table.
+
+| Status | Meaning |
+|--------|---------|
+| 0 | The request applied, or the followed turn finished |
+| 1 | It failed: an error, a failed read, a lost connection, an incomplete list, a followed turn that failed, or a value a task command rejects after reading its arguments |
+| 2 | Nothing was done: arguments that do not parse, arguments a thread command or print mode rejects, or a request the controller refused, with its reason printed |
+| 3 | The followed turn was stopped |
+
+With `--json` every line is one object that `CliJsonLineSchema` in `packages/contracts/src/cli.ts` accepts. `kind` says which: `event` for a thread event (agent events, turn and thread records, stored messages), `result` for the controller's answer to a command with its reason and next step, `turn-end` with the status of the followed turn, `thread` for a thread read, `threads` for the list and `error`. Every line carries `v: 1`. That number names one fixed shape, the embedded thread, turn, message and event shapes included: the CLI's schema test pins a hash of the whole shape, so a change to any of them moves `v`.
+
+## Task commands
+
+These commands predate the chat thread and keep working as they did. They take `--home path` like every other command.
 
 ```sh
 pnpm crewkite task list
@@ -53,11 +177,11 @@ Other `--json` reads and actions produce one JSON object. Watch emits one object
 
 Watch retains its cursor while the controller is offline. If the bounded reconnect window ends, it prints the next action and exits with status 1. Start the controller and run watch again to reconnect explicitly.
 
-## Task conversations
+### Task conversations
 
-`conversation show <task-id> [--before-cursor cursor]` reads a task's retained conversation state and one bounded history page. New messages go through the chat thread in the desktop app.
+`conversation show <task-id> [--before-cursor cursor]` reads a task's retained conversation state and one bounded history page. New messages go through the chat thread, in the desktop app, the interactive mode or the thread commands.
 
-## Saved task lifecycle
+### Saved task lifecycle
 
 Amend requires the complete explicit title, outcome and criteria on every call. Omitted fields are rejected. The controller permits amendment only in `draft`, `stopped`, `interrupted` or `failed`, with proven quiescence and no conflicting ownership or combined membership. It keeps the task ID, advances its revision and clears the current run binding. Inspect the result, then prepare explicitly when ready. Amendment starts no work and grants no authority.
 
@@ -67,7 +191,7 @@ A combined parent Pause records its current phase. Child Pause and Resume refuse
 
 Blocked and unknown outcomes remain visible in the action receipt. Save JSON output when a result is uncertain and use `retry <receipt-file>` only for that exact receipt. Retry retains the original command key, payload and expected revision, including the full amendment contract or exact paused run binding. It does not refresh the revision or reread contract flags. No automatic retry, preparation or follow-up action runs after amend or pause.
 
-## Provider quota
+### Provider quota
 
 ```sh
 pnpm crewkite usage show --json
@@ -94,7 +218,7 @@ The reader calls the pinned Google CLI's headless `/usage` metadata command with
 
 Admission rechecks every bucket applicable to the frozen selected model and every configured reserve. A known separate model pool does not consume that selection's allowance. Required selected-model windows must be present; third-party and unknown buckets retain conservative checks. Missing client or invalid output cannot become known allowance. The provider-boundaries link above records the exact mapping.
 
-## Google ACP setup
+### Google ACP setup
 
 Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.
 
@@ -125,7 +249,7 @@ Google ACP permits guided or balanced authority, ordinary subscription billing a
 
 `--confirm-quota-account` records that the separate CLI quota login and ACP sign-in use the same Google account. Shared native home does not prove identity. Admission rechecks every applicable quota pool and configured reserve for the frozen selected model; required windows must be present, and unknown pools remain conservative. Missing, stale or unknown quota must be resolved before admission. The headless Google file profile remains blocked.
 
-## Local setup
+### Local setup
 
 Local uses one configured loopback endpoint and the same controller state as the desktop. Dedicated token is the default authentication mode. Configure the endpoint, then request the native connection prompt:
 
@@ -168,7 +292,7 @@ pnpm crewkite task stop <task-id> --json
 
 Preparation freezes the current selected model, setup, source and policy. It sends no provider request. Start rechecks controller admission and ownership. Local preparation accepts no cloud billing, effort, model override or handoff option. Changes and explicit export use the ordinary task commands. Repository writing, automatic handoff and Local review remain unavailable. Available model metadata still leaves qualification pending.
 
-## Native single-file runs
+### Native single-file runs
 
 Create the project and draft task through the commands above or the desktop. List the controller's supported native profiles:
 
@@ -238,7 +362,7 @@ A saved patch can be carried to a provider's native app manually. CrewKite does 
 
 Export reads bounded artifact pages and verifies identity, offsets, length and checksum before creating the destination. Existing files are never overwritten. Plain diff output escapes terminal control characters. If export needs approval, its receipt includes the next approval command. Approve that export with `task approve <approval-id> --output new.patch`, or retry the saved export approval receipt with `--output new.patch` after inspecting its result.
 
-## Manual native file transfers
+### Manual native file transfers
 
 This path currently has offline fixture coverage only. Connected manual transfer remains unqualified, and each recipient still needs its own supported authentication and provider permission. Google consumer CLI launch is unavailable and cannot serve as a transfer recipient.
 
@@ -264,7 +388,7 @@ Preparation freezes the retained unverified file and task packet. It launches no
 
 Task show reports allowed recipients, current generation, pending recipient, expiry and preparation/start reasons. Reopening submits nothing. Stop cancels an unstarted transfer. If an outcome is uncertain, inspect the task and retry its exact saved receipt; no automatic retry or fallback occurs. Selecting a recipient establishes no provider entitlement or permission to use a subscription through another application. The [provider boundaries](../../docs/providers.md) retain their separate qualification limits.
 
-## Native repository work
+### Native repository work
 
 Repository work uses the `openai-repository-v1` profile and the committed repository. It accepts no target path or execution override:
 
@@ -280,7 +404,7 @@ The native client can edit independent scratch and run local commands. Its fixed
 
 Task show reports the frozen committed base, manifest hash, file and byte counts, execution settings and expiry. Inspect retained changes and export through the same commands as file proposals. A native command's exit status or summary establishes no check evidence. Resume and handoff remain unavailable.
 
-## Candidate checks and review
+### Candidate checks and review
 
 The default `node-tests-v1` recipe covers the synthetic `net.mjs` project. The `project-node-tests-v1` recipe uses 1 to 32 explicit committed Node test files. The saved run must select one `keep-it-simple` review cycle and retain enough of its original budget for a local check and a separate native review. Preparation does not lower the saved quality floor.
 
@@ -341,7 +465,7 @@ Preparation starts no checks or native review. Verification preparation first in
 
 Task show reports the controller's evaluation stage, selected recipe and test files, exact file and hashes, saved reviewer and process-only independence, expiry, current start availability and remaining total attempts and minutes. The supplemental allowance permits one local check and one additional native review beneath those original run limits. Completed evidence remains visible after start permission expires. A failed or blocked check cannot authorize review. Task show also reports current local acceptance availability and its reason. Completed checks and review can make acceptance available. The destination still needs its own current grant or approval; inspection and export remain available.
 
-## Combined tasks
+### Combined tasks
 
 Prepare a parent and two existing draft tasks from the same project. Save the complete `PrepareCombinedRun` payload in a bounded JSON file. The CLI validates the shared schema before connecting. It preserves the child revisions you supplied and uses the current parent revision. This example names two existing text targets and three committed check files:
 
@@ -395,7 +519,7 @@ pnpm crewkite combined status <parent-task-id> --json
 
 Assembly binds the saved parent run and preparation. It takes no patches, candidate list, Git ref or command. The controller checks the serial replays before advancing its private integration ref. Final combined checks and independent review remain separate existing evaluation actions. Only the parent can be accepted after the complete barrier passes. Preserve uncertain prepare or assembly receipts and use `retry` with the original command. Reopening status starts nothing. These commands establish no connected provider or combined-work qualification.
 
-## Local branch acceptance
+### Local branch acceptance
 
 Inspect Changes and the retained evidence before requesting a branch:
 
@@ -412,7 +536,7 @@ pnpm crewkite task approve <approval-id> --json
 
 Acceptance creates one local branch without checking it out. It preserves the original checkout and index. Existing refs are never overwritten, and nothing is merged or pushed. Expired inference consent or an unavailable provider does not erase completed evidence. Source changes or incomplete ownership proof can still block publication. Keep an uncertain action receipt and retry its exact saved command after inspection.
 
-## Uncertain actions
+### Uncertain actions
 
 Action JSON contains `command` and `result`. Keep that receipt when the result is `outcome-unknown`. The saved command includes the original key, revision and approval binding. Inspect current state before choosing a retry:
 
@@ -424,7 +548,7 @@ Retry validates the bounded receipt file and resends its command unchanged. It n
 
 Exit status is 0 for an applied action or a successful read, 2 for a controller refusal or uncertain result, and 1 for local input or connection errors. JSON preserves typed provider output. Plain output escapes terminal controls. Plain watch output contains event identities and revisions.
 
-## Project commands and GitHub reads
+### Project commands and GitHub reads
 
 Operations belong to one task. List one bounded page of up to twenty operations, then use its explicit continuation to inspect older entries. JSON preserves the exact page, including `nextBeforeId`; a non-null value means more history remains.
 
