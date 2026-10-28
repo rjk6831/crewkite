@@ -23,6 +23,8 @@ import {
   type Event,
   type ProjectPage,
   type ProjectPageRequest,
+  type SavedPrompts,
+  SavedPromptsSchema,
   type Task,
   type TaskPage,
   type TaskPageRequest,
@@ -118,6 +120,7 @@ export function chatClient(
       ) as Promise<ChatTurnEventsRead>,
     readChanges: (taskId: string): Promise<ChatChangesRead> =>
       read('ReadChatChanges', { taskId }, ChatChangesReadSchema),
+    readPrompts: (): Promise<SavedPrompts> => read('ReadChatPrompts', {}, SavedPromptsSchema),
     readCatalog: (taskId?: string): Promise<ChatCatalogRead> =>
       read('ReadChatCatalog', taskId ? { taskId } : {}, ChatCatalogReadSchema),
     readBranchStatus: (taskId: string, branch: string): Promise<ChatBranchStatus> =>

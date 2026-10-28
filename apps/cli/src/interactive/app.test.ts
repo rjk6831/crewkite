@@ -105,6 +105,19 @@ test('the interactive app sends a typed message, answers a permission by digit a
   const [thread] = (await client.listThreads()).threads;
   assert.equal((await client.readThread(thread.id)).thread.permissionPolicy, 'ask');
 
+  // A saved prompt lands in the box, unsent, with an unfilled placeholder named in the note.
+  await client.run('SaveChatPrompt', { name: 'review', body: 'Review {{area}} for {{risk}}.' });
+  screen.type('/prompt review area="the parser"');
+  await screen.shows('/prompt review area="the parser"');
+  screen.type('\r');
+  await screen.shows('Review the parser for {{risk}}.');
+  await screen.shows('Fill in risk.');
+  for (let i = 0; i < 'Review the parser for {{risk}}.'.length; i++) screen.type('\u007f');
+  screen.type('/prompt nothing');
+  await screen.shows('│ /prompt nothing');
+  screen.type('\r');
+  await screen.shows('No saved prompt is named nothing.');
+
   // A running reply: Ctrl+C asks first, n keeps the app, Escape stops the reply.
   screen.type('Wait here');
   await screen.shows('Wait here');

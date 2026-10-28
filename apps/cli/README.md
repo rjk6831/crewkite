@@ -41,7 +41,7 @@ A failed turn shows its cause, the provider's own message and the next step, wit
 
 ### Slash commands and mentions
 
-Type `/` for the list. `/new`, `/model [model[:effort]]`, `/provider family`, `/crew`, `/plan`, `/ask question`, `/handoff family`, `/changes`, `/accept [branch]`, `/push`, `/pr`, `/settings`, `/help` and `/prompt name` do what the same entries do in the desktop. `/ask` sends a read-only question to the best ranked family other than the thread's own. `/prompt` needs the saved prompts the controller adds with the composer update and says so until then.
+Type `/` for the list. `/new`, `/model [model[:effort]]`, `/provider family`, `/crew`, `/plan`, `/ask question`, `/handoff family`, `/changes`, `/accept [branch]`, `/push`, `/pr`, `/settings`, `/help` and `/prompt name` do what the same entries do in the desktop. `/ask` sends a read-only question to the best ranked family other than the thread's own. `/prompt name [key="value" ...]` puts the saved prompt of that name into the message box with the values filled in, for you to edit and send; a placeholder without a value stays in the text and a note names it, and an unknown name lists the saved prompts.
 
 `@` followed by part of a path offers the project's files and folders, ranked by the shared mention rules, and inserts the path. A path that starts with `/` or `~/`, such as `@~/Desktop/shot.png`, attaches that file from disk: the controller copies it into the thread's files and sends it the way each provider takes it.
 
