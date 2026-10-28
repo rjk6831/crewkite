@@ -272,7 +272,7 @@ export function PermissionPrompt({
       : h(
           Text,
           { color: colors.muted },
-          `Thread policy: ${policyLabels[policy]}. Press 1 to ${block.options.length} to answer.`,
+          `Thread policy: ${policyLabels[policy]}. Press ${block.options.length === 2 ? '1 or 2' : `1 to ${block.options.length}`} to answer.`,
         ),
   );
 }
