@@ -812,6 +812,8 @@ export function materialize(
   root: string,
   files: readonly FileContent[],
   links: readonly LinkEntry[] = [],
+  /** Puts one file's bytes at its path. The default writes them. A caller may clone them instead. */
+  write: (file: FileContent, target: string) => void = writeScratchFile,
 ) {
   mkdirSync(root, { recursive: true, mode: 0o700 });
   if (
@@ -832,16 +834,17 @@ export function materialize(
     if (createHash('sha256').update(file.content).digest('hex') !== file.hash)
       throw new Error('Source content identity changed.');
     mkdirSync(dirname(join(root, file.path)), { recursive: true, mode: 0o700 });
-    writeFileSync(join(root, file.path), file.content, {
-      flag: 'wx',
-      mode: file.mode === '100755' ? 0o755 : 0o644,
-    });
+    write(file, join(root, file.path));
     chmodSync(join(root, file.path), file.mode === '100755' ? 0o755 : 0o644);
   }
   for (const link of links) {
     mkdirSync(dirname(join(root, link.path)), { recursive: true, mode: 0o700 });
     symlinkSync(link.target, join(root, link.path));
   }
+}
+
+function writeScratchFile(file: FileContent, target: string) {
+  writeFileSync(target, file.content, { flag: 'wx', mode: file.mode === '100755' ? 0o755 : 0o644 });
 }
 
 /**

@@ -1,6 +1,6 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
@@ -60,7 +60,6 @@ import {
   type FileContent,
   git,
   type KeptEntry,
-  materialize,
   readCandidateFiles,
 } from '../host/source.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../host/worker.ts';
@@ -122,6 +121,7 @@ import {
   systemContext,
   withAttachments,
 } from './prompt.ts';
+import { copyScratch } from './scratch-copy.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
 
 export type ChatServiceDeps = {
@@ -1548,7 +1548,17 @@ export class ChatService {
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
     const source = committedFiles(root, thread.base, { scratch: true });
-    materialize(directory, source.files, source.links);
+    copyScratch(directory, source.files, source.links, {
+      checkout: { root, base: thread.base },
+      name: basename(root),
+      onProgress: (progress) => {
+        try {
+          this.deps.onImportProgress?.(task.id, progress);
+        } catch {
+          // A progress update that fails to send changes nothing about the copy.
+        }
+      },
+    });
     this.pinBase(task, root, thread.base);
     // The thread record travels in every chat.thread event, so it keeps the first 64 entries and
     // the total. The first turn says once what the copy left out.

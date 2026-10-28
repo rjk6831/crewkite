@@ -94,3 +94,33 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## Scratch copy clones
+
+The first turn on a thread fills its scratch directory through `copyScratch` in `apps/controller/src/chat/scratch-copy.ts`. When the project's checkout sits on the thread's base and git sees no change to a tracked file, each regular file whose size matches the committed size is cloned from the checkout with `fs.copyFileSync` and `COPYFILE_FICLONE_FORCE`. Every other file is written from the committed bytes. The first EXDEV, ENOTSUP or similar error ends the clone attempts and the rest is written. The path, link, submodule and non-UTF-8 rules stay in `materialize`, which `copyScratch` calls with a write hook, so a clone never skips a check. Progress uses the same `ImportProgress` update as a file import, one per 4 MiB and a final one.
+
+Two tests protect these claims in `scratch-copy.test.ts`. A clean checkout on the base is cloned, reports progress and produces the same tree hash as a plain copy. A volume that cannot clone, and an edited checkout, both fall back to writing and produce that same tree hash. Both inject the clone primitive, so they run on Linux with no reflink support, no network and no waits. Deleting a thread removes its `chat/<task>` folder, which holds the scratch copy, so a clone adds nothing to delete; the existing delete test in `service.test.ts` covers it.
+
+Measurement on a 1 GiB repository, 256 files of 4 MiB random bytes in 16 folders, generated outside the repository by this script and never committed:
+
+```sh
+dir=$1; mkdir -p "$dir" && cd "$dir" && git init -q
+i=0; while [ $i -lt 256 ]; do
+  d=$(printf 'part%02d' $((i % 16))); mkdir -p "$d"
+  head -c 4194304 /dev/urandom > "$d/blob$i.bin"; i=$((i+1))
+done
+git add -A && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
+```
+
+A script then read the files into memory and timed `copyScratch` into an empty directory, once without a checkout and once with one.
+
+| Where | Path taken | Time | Bytes |
+|-------|------------|------|-------|
+| Linux 6.18 container, ext4 on a virtual disk, warm cache | write only | 2.90 s | 1,073,741,824 written |
+| Same | clone attempted, first call fails, 256 files written | 3.32 s | 1,073,741,824 written |
+| Same, cold cache | write only | 8.33 s | 1,073,741,824 written |
+| APFS on the Mac | clone | still to be measured on the Mac | still to be measured on the Mac |
+
+ext4 has no reflink, so this container could not exercise a successful clone, and I have no figure for it. The second row shows what the fallback costs on a volume that cannot clone: the status check and one failed call add well under half a second. The APFS figure, and the bytes it leaves unshared on disk, come from running the same script on the Mac.
+
+Two limits stay. The service still reads every committed blob into memory before it copies, and `committedFiles` caps that at 64 MiB, so a 1 GiB repository does not reach the clone path through the service yet. The Changes and Accept paths read the whole base the same way. Lifting that needs a lazy source that reads only links and skipped entries, which is a separate change.
