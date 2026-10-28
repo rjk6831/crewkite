@@ -66,6 +66,8 @@ test('the interactive app sends a typed message, answers a permission by digit a
       settings: {
         ...defaultSettings(),
         selection: { family: 'anthropic', model: 'fixture-model', effort: 'default' },
+        // Only offered: the new thread keeps asking unless the person says yes.
+        permissionPolicy: 'allow-all',
       },
       settingsProblem: null,
       saveSettings: (next) => {
@@ -73,7 +75,8 @@ test('the interactive app sends a typed message, answers a permission by digit a
         return next;
       },
       animation: 'off',
-      env: { NO_COLOR: '1' },
+      // The terminal started inside the project, as pnpm reports it through INIT_CWD.
+      env: { NO_COLOR: '1', PATH: process.env.PATH, INIT_CWD: repository },
     }),
     {
       stdin: screen.stdin as never,
@@ -88,9 +91,19 @@ test('the interactive app sends a typed message, answers a permission by digit a
   screen.type('Clamp the discount');
   await screen.shows('Clamp the discount');
   screen.type('\r');
-  await screen.shows('[1] Allow once');
+  await screen.shows('Switch it to Allow all? (y/n)');
+  screen.type('n');
+  await screen.shows('Press Tab to answer.');
+  // A digit typed in the message box stays text; Tab gives the request focus, then 1 answers.
+  screen.type('1');
+  await screen.shows('│ 1');
+  screen.type('\u007f');
+  screen.type('\t');
+  await screen.shows('Press 1 or 2 to answer, Tab to go back.');
   screen.type('1');
   await screen.shows('Edited net.mjs.');
+  const [thread] = (await client.listThreads()).threads;
+  assert.equal((await client.readThread(thread.id)).thread.permissionPolicy, 'ask');
 
   // A running reply: Ctrl+C asks first, n keeps the app, Escape stops the reply.
   screen.type('Wait here');

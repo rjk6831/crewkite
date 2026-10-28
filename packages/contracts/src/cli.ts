@@ -15,8 +15,10 @@ import {
 } from './chat.ts';
 
 // The lines `crewkite thread ... --json` and `crewkite -p ... --json` write, one JSON object per
-// line. A script reads `kind` first. Every line carries `v`, so a later shape can be told apart.
-// The lines describe what the controller said; none of them is an instruction to it.
+// line. A script reads `kind` first. `v` names one fixed shape of every line, the chat shapes it
+// embeds included: CLI_JSON_LINE_SHAPE pins the hash of that shape, and a change to any of them
+// fails the CLI's schema test until `v` and the hash move together. The lines describe what the
+// controller said; none of them is an instruction to it.
 
 const cursor = z.string().regex(/^(0|[1-9][0-9]{0,19})$/);
 const taskId = z.string().regex(/^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
@@ -73,8 +75,18 @@ export const CliJsonLineSchema = z.discriminatedUnion('kind', [
 ]);
 export type CliJsonLine = z.infer<typeof CliJsonLineSchema>;
 
-/** Exit codes of print mode and `thread watch`: the status of the turn they followed. */
-export const CLI_TURN_EXIT = { done: 0, failed: 1, usage: 2, stopped: 3 } as const;
+/** The `v` of every line, and the hash of the shape it names. Change them together. */
+export const CLI_JSON_LINE_VERSION = 1;
+export const CLI_JSON_LINE_SHAPE =
+  '812f00297f6c6db0a183134fcd580ae785d31f59f083ef91ccb782093598ecfa';
+
+/**
+ * Exit codes of every CLI command. 0: the request applied, or the followed turn finished. 1: it
+ * failed while running: an error, a failed read, a lost connection, or a followed turn that failed.
+ * 2: nothing was done: arguments that do not parse or that the command rejects, or a request the
+ * controller refused, with its reason printed. 3: the followed turn was stopped.
+ */
+export const CLI_EXIT = { done: 0, failed: 1, notDone: 2, stopped: 3 } as const;
 
 /** What a key binding can do in the interactive CLI. */
 export const CliKeyActionSchema = z.enum([
@@ -107,6 +119,10 @@ export const CliSettingsSchema = z.strictObject({
   keybindings: z.partialRecord(CliKeyActionSchema, z.array(CliKeySchema).min(1).max(4)).default({}),
   /** The provider and model a new thread starts on. Null lets the CLI pick a connected one. */
   selection: ChatModelSelectionSchema.nullable().default(null),
+  /**
+   * The policy the interactive mode offers for a new thread. It applies only after the person
+   * confirms it for that thread; a new thread starts on the controller's default, ask each time.
+   */
   permissionPolicy: ChatPermissionPolicySchema.default('ask'),
   handoffMode: ChatSavedHandoffModeSchema.default('most-left'),
   /** A family's default model, as the provider cards in Settings save it. */

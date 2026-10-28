@@ -1,4 +1,3 @@
-import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
@@ -8,9 +7,10 @@ import {
   type ChatFailure,
   ChatFamilySchema,
   type ChatModelSelection,
+  ChatPermissionPolicySchema,
   type ChatThreadRead,
   type ChatTurn,
-  CLI_TURN_EXIT,
+  CLI_EXIT,
   type CliJsonLine,
   CliJsonLineSchema,
   type CliThreadEvent,
@@ -20,6 +20,7 @@ import {
   rankFamilies,
 } from '@crewkite/contracts';
 import { crewkiteHome, loadSettings } from '../settings.ts';
+import { callerDirectory, checkoutAt, projectsForCheckout } from './checkout.ts';
 import { applied, type ChatClient, CommandRefused, threadMessage } from './client.ts';
 
 // `crewkite thread ...` and `crewkite -p`. Every command goes through the chat client, so the
@@ -29,8 +30,8 @@ import { applied, type ChatClient, CommandRefused, threadMessage } from './clien
 export type Io = { out: (text: string) => void | Promise<void>; err: (text: string) => void };
 export type Connect = (home: string) => Promise<ChatClient>;
 
-export const threadHelp = `Usage: crewkite thread new <project-id> <message> [--model family[/model[:effort]]] [--file path ...] [--watch] [--json]
-       crewkite thread send <task-id> <message> [--model ...] [--file path ...] [--watch] [--json]
+export const threadHelp = `Usage: crewkite thread new <project-id> <message> [--model family[/model[:effort]]] [--permission-policy ask|allow-edits|allow-all] [--file path ...] [--watch] [--json]
+       crewkite thread send <task-id> <message> [--model ...] [--permission-policy ...] [--file path ...] [--watch] [--json]
        crewkite thread watch <task-id> [--follow] [--json]
        crewkite thread permit <task-id> <request-id> [--thread] [--json]
        crewkite thread deny <task-id> <request-id> [--json]
@@ -40,11 +41,12 @@ export const threadHelp = `Usage: crewkite thread new <project-id> <message> [--
        crewkite thread pr <task-id> [--title text] [--body text] [--json]
        crewkite thread list [--json]
        crewkite thread show <task-id> [--json]
-       crewkite -p <message> [--thread task-id | --project project-id] [--model ...] [--file path ...] [--json]
+       crewkite -p <message> [--thread task-id | --project project-id | --register] [--model ...] [--permission-policy ...] [--file path ...] [--json]
 
-Every command takes --home path. Print mode streams the reply to stdout and exits 0 when the turn
-is done, 1 when it failed and 3 when it was stopped. A permission request waits for an answer from
-crewkite thread permit or deny, the interactive CLI or the desktop.
+Every command takes --home path. Exit status: 0 done, 1 failed (an error, a lost connection or a
+failed turn), 2 nothing was done (arguments or a refusal), 3 the followed turn was stopped. A new
+thread asks before each action unless --permission-policy names another policy for this run. A
+permission request waits for crewkite thread permit or deny, the interactive CLI or the desktop.
 `;
 
 /** Control characters in model or tool text never reach the terminal as control characters. */
@@ -190,12 +192,12 @@ export function followThread(
     status: 'done' | 'stopped' | 'failed';
     turnId: string | null;
   }>();
-  let finished = false;
+  const finishedTurns = new Set<string>();
   const thinking = new Set<string>();
   const early = new Map<string, AgentEvent[]>();
   const finish = (status: 'done' | 'stopped' | 'failed', failure: ChatFailure | null) => {
-    if (finished || !turnId) return;
-    finished = true;
+    if (!turnId || finishedTurns.has(turnId)) return;
+    finishedTurns.add(turnId);
     if (follow.json)
       void io.out(jsonLine({ v: 1, kind: 'turn-end', taskId, turnId, status, failure }));
     else if (failure)
@@ -239,48 +241,70 @@ export function followThread(
     }
   };
   let unsubscribe: (() => void) | null = null;
+  const lost = () =>
+    settled.reject(
+      new Error(
+        `The connection to the controller ended. The turn may still be running; read it with crewkite thread show ${taskId}.`,
+      ),
+    );
+  const stopLost = client.transport.onReconnectExhausted?.(lost);
+  // After a gap in the stream the thread is read again, so a turn that ended meanwhile settles.
+  const resynced = () =>
+    void client.readThread(taskId).then((fresh) => {
+      const turn = fresh.turns.find(
+        (value) => value.id === turnId || (!turnId && value.userMessageId === messageId),
+      );
+      if (turn && !turnId) turnId = turn.id;
+      if (turn && ended(turn)) finish(turn.state as 'done' | 'stopped' | 'failed', turn.failure);
+    }, lost);
   void client.transport
-    .subscribe(read.cursor, (event) => {
-      const line = threadEvent(event, taskId);
-      if (!line) return;
-      if (follow.json) void io.out(jsonLine({ v: 1, kind: 'event', taskId, event: line }));
-      if (line.type === 'message' && follow.text !== null && !messageId) {
-        const message = line.payload;
-        if (
-          message.author.kind === 'user' &&
-          !known.has(message.id) &&
-          message.text === follow.text
-        )
-          messageId = message.id;
-      } else if (line.type === 'chat.thread' && follow.text !== null && !messageId) {
-        const queued = line.payload.queued.find((item) => item.text === follow.text);
-        if (queued) messageId = queued.id;
-      } else if (line.type === 'chat.turn') {
-        const turn = line.payload;
-        if (!turnId && messageId && turn.userMessageId === messageId) {
-          turnId = turn.id;
-          // The record of a turn can follow its first events. Those wait here until it names it.
-          for (const event of early.get(turn.id) ?? []) onAgent(event);
-          early.clear();
+    .subscribe(
+      read.cursor,
+      (event) => {
+        const line = threadEvent(event, taskId);
+        if (!line) return;
+        if (follow.json) void io.out(jsonLine({ v: 1, kind: 'event', taskId, event: line }));
+        if (line.type === 'message' && follow.text !== null && !messageId) {
+          const message = line.payload;
+          if (
+            message.author.kind === 'user' &&
+            !known.has(message.id) &&
+            message.text === follow.text
+          )
+            messageId = message.id;
+        } else if (line.type === 'chat.thread' && follow.text !== null && !messageId) {
+          const queued = line.payload.queued.find((item) => item.text === follow.text);
+          if (queued) messageId = queued.id;
+        } else if (line.type === 'chat.turn') {
+          const turn = line.payload;
+          // Following a thread, each new turn's record names the turn to print next.
+          const next = follow.forever && !ended(turn) && turn.id !== turnId;
+          if (next || (!turnId && messageId && turn.userMessageId === messageId)) {
+            turnId = turn.id;
+            // The record of a turn can follow its first events. Those wait here until it names it.
+            for (const event of early.get(turn.id) ?? []) onAgent(event);
+            early.clear();
+          }
+          if (turn.id === turnId && ended(turn))
+            finish(turn.state as 'done' | 'stopped' | 'failed', turn.failure);
+        } else if (line.type === 'agent.event') {
+          const event = line.payload;
+          if ((!turnId || (follow.forever && event.turnId !== turnId)) && !follow.json)
+            early.set(event.turnId, [...(early.get(event.turnId) ?? []), event].slice(-10_000));
+          onAgent(event);
+          if (event.type === 'turn.completed' && event.turnId === turnId)
+            finish(
+              event.stopReason === 'stopped' || event.failure?.kind === 'stopped'
+                ? 'stopped'
+                : event.stopReason === 'done' && !event.failure
+                  ? 'done'
+                  : 'failed',
+              event.failure?.kind === 'stopped' ? null : event.failure,
+            );
         }
-        if (turn.id === turnId && ended(turn))
-          finish(turn.state as 'done' | 'stopped' | 'failed', turn.failure);
-      } else if (line.type === 'agent.event') {
-        const event = line.payload;
-        if (!turnId && !follow.json)
-          early.set(event.turnId, [...(early.get(event.turnId) ?? []), event].slice(-10_000));
-        onAgent(event);
-        if (event.type === 'turn.completed' && event.turnId === turnId)
-          finish(
-            event.stopReason === 'stopped' || event.failure?.kind === 'stopped'
-              ? 'stopped'
-              : event.stopReason === 'done' && !event.failure
-                ? 'done'
-                : 'failed',
-            event.failure?.kind === 'stopped' ? null : event.failure,
-          );
-      }
-    })
+      },
+      resynced,
+    )
     .then(
       (stop) => {
         unsubscribe = stop;
@@ -289,36 +313,70 @@ export function followThread(
     );
   return {
     done: settled.promise,
-    stop: () => unsubscribe?.(),
+    stop: () => {
+      unsubscribe?.();
+      stopLost?.();
+    },
   };
 }
 
-const exitFor = (status: 'done' | 'stopped' | 'failed') => CLI_TURN_EXIT[status];
-
-/** The checkout this shell is in, by its Git top level. */
-function checkoutRoot(directory: string): string | null {
-  const found = spawnSync('git', ['rev-parse', '--show-toplevel'], {
-    cwd: directory,
-    encoding: 'utf8',
-    timeout: 10_000,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0' },
-  });
-  return found.status === 0 ? found.stdout.trim() : null;
-}
+const exitFor = (status: 'done' | 'stopped' | 'failed') => CLI_EXIT[status];
 
 /**
- * The project for this shell's checkout. Registration returns the existing project for a path it
- * already holds, so this reads the ID; for a new checkout it registers it, which starts no work.
+ * The registered project of the checkout the command ran in. Only a project the controller
+ * already holds is used. A checkout it does not know needs --project, or --register to register
+ * it, which starts no work.
  */
-export async function projectHere(client: ChatClient, cwd: string, io: Io): Promise<string> {
-  const root = checkoutRoot(cwd);
-  if (!root)
-    throw new UsageError('Run print mode inside a Git checkout, or pass --project or --thread.');
-  const result = await client.send('RegisterProject', { path: root });
-  const project = ProjectSchema.safeParse(result.entity);
-  if (!applied(result) || !project.success) throw new CommandRefused(result);
-  if (result.outcome === 'applied') io.err(`Registered ${root} as project ${project.data.id}.\n`);
-  return project.data.id;
+export async function projectHere(
+  client: ChatClient,
+  directory: string,
+  env: NodeJS.ProcessEnv,
+  register: boolean,
+  io: Io,
+): Promise<string> {
+  const checkout = checkoutAt(directory, env);
+  if (!checkout)
+    throw new UsageError(
+      `${directory} is not inside a Git checkout. Pass --project <project-id> or --thread <task-id>.`,
+    );
+  if (register) {
+    const result = await client.send('RegisterProject', { path: checkout.root });
+    const project = ProjectSchema.safeParse(result.entity);
+    if (!applied(result) || !project.success) throw new CommandRefused(result);
+    if (result.outcome === 'applied')
+      io.err(`Registered ${checkout.root} as project ${project.data.id}.\n`);
+    return project.data.id;
+  }
+  const matching = await projectsForCheckout(client, checkout);
+  if (matching.length === 1) return matching[0].id;
+  if (matching.length > 1)
+    throw new UsageError(
+      `More than one project matches ${checkout.root}: ${matching.map((project) => project.id).join(', ')}. Pass --project <project-id>.`,
+    );
+  throw new UsageError(
+    `${checkout.root} is not a registered project. Pass --register to register it, or --project <project-id>.`,
+  );
+}
+
+/** Reads the permission policy flag. Nothing applies a policy the person did not name for this run. */
+function policyFlag(value: string | undefined) {
+  if (value === undefined) return null;
+  const parsed = ChatPermissionPolicySchema.safeParse(value);
+  if (!parsed.success)
+    throw new UsageError('Use --permission-policy ask, allow-edits or allow-all.');
+  return parsed.data;
+}
+
+/** Applies a policy named on the command line, then says which policy the thread runs with. */
+async function applyPolicy(
+  client: ChatClient,
+  io: Io,
+  taskId: string,
+  policy: ReturnType<typeof policyFlag>,
+) {
+  if (policy) await client.configure({ taskId, permissionPolicy: policy });
+  const read = await client.readThread(taskId);
+  io.err(`Permission policy: ${read.thread.permissionPolicy}\n`);
 }
 
 /** Starts one message and, with `watch`, follows its turn. Returns the exit code. */
@@ -353,7 +411,7 @@ async function sendAndFollow(
     else if (!input.watch) await io.out(`${input.taskId}\n`);
     if (!applied(result)) {
       if (!input.json) io.err(`${result.next ?? result.reason ?? 'The message was not sent.'}\n`);
-      return CLI_TURN_EXIT.failed;
+      return CLI_EXIT.notDone;
     }
     if (!follow) return 0;
     if (!input.json && result.next) io.err(`${result.next}\n`);
@@ -415,6 +473,7 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
         follow: { type: 'boolean' },
         thread: { type: 'boolean' },
         message: { type: 'string' },
+        'permission-policy': { type: 'string' },
         remote: { type: 'string' },
         confirm: { type: 'boolean' },
         title: { type: 'string' },
@@ -441,7 +500,7 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
       if (json) await io.out(jsonLine(resultLine(command, result, taskId)));
       if (!applied(result)) {
         if (!json) io.err(`${result.next ?? result.reason ?? 'The controller refused.'}\n`);
-        return CLI_TURN_EXIT.failed;
+        return CLI_EXIT.notDone;
       }
       return 0;
     };
@@ -460,8 +519,8 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
           action === 'new'
             ? (await client.createThread(need(first, 'project ID'), text)).id
             : need(first, 'thread ID');
-        if (action === 'new' && settings.settings.permissionPolicy !== 'ask')
-          await client.configure({ taskId, permissionPolicy: settings.settings.permissionPolicy });
+        if (action === 'new' || values['permission-policy'] !== undefined)
+          await applyPolicy(client, io, taskId, policyFlag(values['permission-policy']));
         return await sendAndFollow(client, io, {
           taskId,
           text,
@@ -580,7 +639,7 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
             await io.out(`${task.id} ${task.chatActivity.padEnd(7)} ${terminalText(task.title)}\n`);
           if (!complete) io.err('The list is incomplete. Run it again.\n');
         }
-        return complete ? 0 : CLI_TURN_EXIT.failed;
+        return complete ? 0 : CLI_EXIT.failed;
       }
       case 'show': {
         const read = await client.readThread(need(first, 'thread ID'));
@@ -597,13 +656,18 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
   }
 }
 
+/** Arguments that do not parse or that the command rejects, or a refusal: nothing was done. */
+export const notDone = (error: unknown) =>
+  error instanceof UsageError ||
+  error instanceof CommandRefused ||
+  /^ERR_PARSE_ARGS_/.test((error as NodeJS.ErrnoException | null)?.code ?? '');
+
 function failure(error: unknown, io: Io, json: boolean): number {
   const message =
     error instanceof Error && error.message ? error.message : 'The command could not run.';
   if (json) void io.out(jsonLine({ v: 1, kind: 'error', message: message.slice(0, 4096) }));
   else io.err(`${terminalText(message)}\n`);
-  if (error instanceof CommandRefused) return CLI_TURN_EXIT.failed;
-  return error instanceof UsageError ? CLI_TURN_EXIT.usage : CLI_TURN_EXIT.failed;
+  return notDone(error) ? CLI_EXIT.notDone : CLI_EXIT.failed;
 }
 
 /** `crewkite -p message`: one message, its reply on stdout, and the turn's status as exit code. */
@@ -612,6 +676,7 @@ export async function runPrint(
   io: Io,
   connect: Connect,
   cwd = process.cwd(),
+  env: NodeJS.ProcessEnv = process.env,
 ): Promise<number> {
   let client: ChatClient | undefined;
   let json = false;
@@ -627,14 +692,17 @@ export async function runPrint(
         file: { type: 'string', multiple: true },
         thread: { type: 'string' },
         project: { type: 'string' },
+        register: { type: 'boolean' },
+        'permission-policy': { type: 'string' },
       },
     });
     json = values.json === true;
     const text = values.print ?? '';
     if (text.trim() === '' || positionals.length > 0)
       throw new UsageError('Use crewkite -p "message". Quote a message that has spaces.');
-    if (values.thread && values.project)
-      throw new UsageError('Give --thread or --project, not both.');
+    if ([values.thread, values.project, values.register].filter(Boolean).length > 1)
+      throw new UsageError('Give one of --thread, --project or --register.');
+    const policy = policyFlag(values['permission-policy']);
     const home = crewkiteHome(values.home);
     client = await connect(home);
     const settings = loadSettings(home);
@@ -648,12 +716,13 @@ export async function runPrint(
     );
     let taskId = values.thread;
     if (!taskId) {
-      const projectId = values.project ?? (await projectHere(client, cwd, io));
+      const projectId =
+        values.project ??
+        (await projectHere(client, callerDirectory(env, cwd), env, values.register === true, io));
       taskId = (await client.createThread(projectId, text)).id;
-      if (settings.settings.permissionPolicy !== 'ask')
-        await client.configure({ taskId, permissionPolicy: settings.settings.permissionPolicy });
       if (!json) io.err(`Thread ${taskId}\n`);
     }
+    await applyPolicy(client, io, taskId, policy);
     return await sendAndFollow(client, io, {
       taskId,
       text,

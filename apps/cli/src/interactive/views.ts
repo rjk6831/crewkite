@@ -233,10 +233,13 @@ export function PermissionPrompt({
   block,
   policy,
   colors,
+  focused = false,
 }: {
   block: Extract<Block, { kind: 'permission' }>;
   policy: ChatThread['permissionPolicy'] | null;
   colors: Palette;
+  /** Digits answer only while the prompt has focus; Tab moves it there from the message box. */
+  focused?: boolean;
 }) {
   const answered = block.choice !== null;
   const chosen = block.options.find((option) => option.id === block.choice);
@@ -244,7 +247,7 @@ export function PermissionPrompt({
     Box,
     {
       flexDirection: 'column',
-      borderStyle: 'round',
+      borderStyle: focused ? 'double' : 'round',
       borderColor: answered ? colors.border : colors.amber,
       paddingX: 1,
     },
@@ -272,7 +275,9 @@ export function PermissionPrompt({
       : h(
           Text,
           { color: colors.muted },
-          `Thread policy: ${policyLabels[policy]}. Press ${block.options.length === 2 ? '1 or 2' : `1 to ${block.options.length}`} to answer.`,
+          focused
+            ? `Thread policy: ${policyLabels[policy]}. Press ${block.options.length === 2 ? '1 or 2' : `1 to ${block.options.length}`} to answer, Tab to go back.`
+            : `Thread policy: ${policyLabels[policy]}. Press Tab to answer.`,
         ),
   );
 }
@@ -323,7 +328,9 @@ export function TurnCard({
   animation,
   policy,
   showThinking,
+  promptFocus = false,
 }: {
+  promptFocus?: boolean;
   turn: TurnView;
   colors: Palette;
   width: number;
@@ -365,6 +372,7 @@ export function TurnCard({
           block: item,
           policy: turn.ended ? null : policy,
           colors,
+          focused: promptFocus && !turn.ended && item.choice === null,
         });
       case 'notice':
         return item.trace
@@ -963,7 +971,9 @@ export function ThreadRows({
   animation,
   showThinking,
   tryWith,
+  promptFocus = false,
 }: {
+  promptFocus?: boolean;
   items: readonly ThreadItem[];
   thread: ChatThread | null;
   colors: Palette;
@@ -993,6 +1003,7 @@ export function ThreadRows({
           animation,
           policy: thread?.permissionPolicy ?? null,
           showThinking,
+          promptFocus,
         });
       case 'failure':
         return h(FailureLine, {

@@ -41,6 +41,7 @@ import {
   triedFamilies,
   turnFiles,
 } from '../../../desktop/src/renderer/thread/thread-state.ts';
+import { callerDirectory, checkoutAt, projectsForCheckout } from '../chat/checkout.ts';
 import { applied, type ChatClient } from '../chat/client.ts';
 import { parseSlash } from '../chat/composer-shared.ts';
 import { chooseSelection } from '../chat/scripting.ts';
@@ -97,6 +98,8 @@ export type AppProps = {
   settingsProblem: string | null;
   animation: Animation;
   env: NodeJS.ProcessEnv;
+  /** The directory the CLI started in, when INIT_CWD does not name one. */
+  cwd?: string;
   now?: () => number;
 };
 
@@ -131,9 +134,14 @@ export function App(props: AppProps) {
   const [settings, setSettings] = useState(props.settings);
   const settingsRef = useRef(settings);
   settingsRef.current = settings;
+  // A settings file with a problem stays as it is until the person fixes it by hand.
   const save = useCallback(
-    (next: CliSettings) => setSettings(props.saveSettings(next)),
-    [props.saveSettings],
+    (next: CliSettings) => {
+      if (props.settingsProblem)
+        throw new Error(`${props.settingsProblem} Nothing was saved; fix cli.json first.`);
+      setSettings(props.saveSettings(next));
+    },
+    [props.saveSettings, props.settingsProblem],
   );
   const store = useMemo(() => settingsStore(() => settingsRef.current, save), [save]);
   const colors = useMemo(
@@ -154,7 +162,9 @@ export function App(props: AppProps) {
   });
   const [threadIndex, setThreadIndex] = useState(0);
   const [projects, setProjects] = useState<{ id: string; name: string }[]>([]);
-  const [projectIndex, setProjectIndex] = useState(0);
+  /** Null until the checkout matches one project, or the person picks one. */
+  const [projectIndex, setProjectIndex] = useState<number | null>(null);
+  const [promptFocus, setPromptFocus] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
   const taskRef = useRef<string | null>(null);
   taskRef.current = taskId;
@@ -190,9 +200,18 @@ export function App(props: AppProps) {
       try {
         const header = await client.transport.workspaceState();
         setCatalog(await client.readCatalog());
-        const listed = await client.listThreads();
-        setThreads({ list: listed.threads, complete: listed.complete });
-        setProjects((await client.listProjects()).map(({ id, name }) => ({ id, name })));
+        const known = await client.listThreads();
+        setThreads({ list: known.threads, complete: known.complete });
+        const listed = await client.listProjects();
+        setProjects(listed.map(({ id, name }) => ({ id, name })));
+        // New threads go to the project this terminal is in, when exactly one matches it.
+        const checkout = checkoutAt(
+          callerDirectory(props.env, props.cwd ?? process.cwd()),
+          props.env,
+        );
+        const here = checkout ? await projectsForCheckout(client, checkout, listed) : [];
+        if (here.length === 1)
+          setProjectIndex(listed.findIndex((project) => project.id === here[0].id));
         if (cancelled) return;
         stop = await client.transport.subscribe(header.cursor, (event: Event) => {
           if (
@@ -216,7 +235,7 @@ export function App(props: AppProps) {
       cancelled = true;
       stop?.();
     };
-  }, [client, say]);
+  }, [client, say, props.env, props.cwd]);
 
   // The spinner turns only while a reply runs and motion is allowed.
   useEffect(() => {
@@ -269,7 +288,7 @@ export function App(props: AppProps) {
   }, [client, view, taskId, thread?.lastPush?.branch, say]);
 
   // Mentions come from the controller as the person types after an at sign.
-  const projectId = projects[projectIndex]?.id ?? null;
+  const projectId = projectIndex === null ? null : (projects[projectIndex]?.id ?? null);
   const mentionText = mentionQuery(composer)?.query ?? null;
   useEffect(() => {
     if (mentionText === null || /^[/~]/.test(mentionText)) return;
@@ -302,17 +321,30 @@ export function App(props: AppProps) {
     let id = taskId;
     const selection = selectionFor();
     if (!id) {
-      if (!projectId) throw new Error('Register a project first: crewkite project add <path>.');
+      if (!projectId) {
+        setView('threads');
+        throw new Error(
+          projects.length
+            ? 'Which project is this thread for? Pick it with Left and Right, then Esc and send again.'
+            : 'Register a project first: crewkite project add <path>.',
+        );
+      }
       const created = await client.createThread(projectId, text || paths.join(', '));
       id = created.id;
-      const patch = {
-        ...(settings.permissionPolicy !== 'ask'
-          ? { permissionPolicy: settings.permissionPolicy }
-          : {}),
-        ...(settings.handoffMode !== 'most-left' ? { handoffMode: settings.handoffMode } : {}),
-      };
-      if (Object.keys(patch).length) await client.configure({ taskId: id, ...patch });
+      if (settings.handoffMode !== 'most-left')
+        await client.configure({ taskId: id, handoffMode: settings.handoffMode });
       await openThread(id);
+      // A setting never grants a permission. The thread starts on Ask each time, and the policy
+      // in cli.json is only offered for the person to confirm.
+      const offered = settings.permissionPolicy;
+      const newThread = id;
+      if (offered !== 'ask')
+        setConfirm({
+          question: `This thread asks before each action. Switch it to ${policyLabels[offered]}? (y/n)`,
+          yes: async () => {
+            await client.configure({ taskId: newThread, permissionPolicy: offered });
+          },
+        });
     }
     dispatch({
       type: 'sending',
@@ -339,7 +371,7 @@ export function App(props: AppProps) {
         setView('thread');
         setNotice(
           projects.length > 1
-            ? `New thread in ${projects[projectIndex]?.name}. Ctrl+T lists threads and projects.`
+            ? `New thread in ${projectIndex === null ? 'a project you pick' : projects[projectIndex]?.name}. Ctrl+T lists threads and projects.`
             : 'New thread.',
         );
         break;
@@ -533,10 +565,12 @@ export function App(props: AppProps) {
   };
 
   function threadKeys(input: string, key: Key) {
-    // An open request takes the digit keys while the box is empty.
-    if (openRequest && composer.text === '' && /^[1-9]$/.test(input)) {
-      const option = openRequest.block.options[Number(input) - 1];
-      if (option && taskId)
+    // Tab moves focus to an open request, and only then do the digit keys answer it.
+    if (openRequest && promptFocus) {
+      if (key.tab || key.escape) return setPromptFocus(false);
+      const option = /^[1-9]$/.test(input) ? openRequest.block.options[Number(input) - 1] : null;
+      if (option && taskId) {
+        setPromptFocus(false);
         run(() =>
           client.resolvePermission(
             taskId,
@@ -545,8 +579,10 @@ export function App(props: AppProps) {
             option.id,
           ),
         );
+      }
       return;
     }
+    if (openRequest && key.tab && !composer.completion) return setPromptFocus(true);
     if (key.meta && taskId) {
       if (input === 'r' && failedTurn?.kind === 'failure')
         return run(() => client.retry({ taskId, turnId: failedTurn.turnId, mode: 'retry' }));
@@ -761,7 +797,9 @@ export function App(props: AppProps) {
       );
     }
     if (input === 'c') {
-      const family = settings.selection?.family ?? 'anthropic';
+      const family = settings.selection?.family;
+      if (!family)
+        return setNotice('Pick the model new threads start on first. C checks that provider.');
       return run(async () => {
         // The Google terms gate runs before any Google connection the CLI starts.
         if (family === 'google' && !(await beforeGoogleConnection()))
@@ -789,6 +827,16 @@ export function App(props: AppProps) {
         setConfirm(null);
       return;
     }
+    if (key.ctrl && input === 'c') {
+      setLinePrompt(null);
+      if (running)
+        return setConfirm({
+          question:
+            'A reply is running. Leave CrewKite? The reply keeps running in the controller. (y/n)',
+          yes: () => app.exit(),
+        });
+      return app.exit();
+    }
     if (linePrompt) {
       if (key.escape) return setLinePrompt(null);
       if (key.return) {
@@ -806,15 +854,6 @@ export function App(props: AppProps) {
         setLinePrompt({ ...linePrompt, value: linePrompt.value + input.replace(/[\r\n]/g, '') });
       return;
     }
-    if (key.ctrl && input === 'c') {
-      if (running)
-        return setConfirm({
-          question:
-            'A reply is running. Leave CrewKite? The reply keeps running in the controller. (y/n)',
-          yes: () => app.exit(),
-        });
-      return app.exit();
-    }
     if (matches(settings, 'threads', input, key)) return setView('threads');
     if (matches(settings, 'changes', input, key)) return taskId ? setView('changes') : undefined;
     if (matches(settings, 'settings', input, key)) return setView('settings');
@@ -828,9 +867,10 @@ export function App(props: AppProps) {
         if (key.downArrow)
           return setThreadIndex((value) => Math.min(threads.list.length - 1, value + 1));
         if (key.leftArrow || key.rightArrow)
-          return setProjectIndex(
-            (value) =>
-              (value + (key.rightArrow ? 1 : projects.length - 1)) % Math.max(1, projects.length),
+          return setProjectIndex((value) =>
+            value === null
+              ? 0
+              : (value + (key.rightArrow ? 1 : projects.length - 1)) % Math.max(1, projects.length),
           );
         if (key.return && threads.list[threadIndex])
           return run(() => openThread(threads.list[threadIndex].id));
@@ -887,7 +927,7 @@ export function App(props: AppProps) {
       return null;
     }
   })();
-  const project = projects[projectIndex];
+  const project = projectIndex === null ? undefined : projects[projectIndex];
 
   const body = (() => {
     switch (view) {
@@ -901,11 +941,11 @@ export function App(props: AppProps) {
             colors,
             complete: threads.complete,
           }),
-          projects.length > 1
+          projects.length > 0
             ? h(
                 Text,
                 { color: colors.muted },
-                `New threads go to ${project?.name ?? 'no project'}. Left and Right change it.`,
+                `New threads go to ${project?.name ?? 'a project you pick'}. Left and Right change it.`,
               )
             : null,
         );
@@ -938,6 +978,7 @@ export function App(props: AppProps) {
         return h(HelpView, { settings, colors });
       default:
         return h(ThreadRows, {
+          promptFocus,
           items: live,
           thread,
           colors,

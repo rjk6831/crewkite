@@ -61,10 +61,18 @@ export async function startScriptedController(
   });
   chmodSync(home, 0o700);
   const server = await serve(controller);
+  let closing: Promise<void> | undefined;
+  // Stops the controller once, whether a test ends it early or the test ends.
+  const stop = () => {
+    closing ??= (async () => {
+      await server.close();
+      await controller.close();
+    })();
+    return closing;
+  };
   t.after(async () => {
-    await server.close();
-    await controller.close();
+    await stop();
     rmSync(directory, { recursive: true, force: true });
   });
-  return { home, repository, controller };
+  return { home, repository, controller, directory, stop };
 }

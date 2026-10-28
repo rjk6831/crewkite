@@ -39,13 +39,21 @@ import { completeMentionLocally, type MentionCandidate } from './composer-shared
 /** The part of the controller client the chat commands use. Tests pass the real socket client. */
 export type ChatTransport = {
   command(input: Command): Promise<CommandResult>;
-  subscribe(after: string, onEvent: (event: Event) => void): Promise<() => void>;
+  subscribe(
+    after: string,
+    onEvent: (event: Event) => void,
+    onResync?: () => void,
+  ): Promise<() => void>;
+  /** Called once the client stops trying to reconnect. Returns the call that removes it. */
+  onReconnectExhausted?(listener: () => void): () => void;
   workspaceState(): Promise<WorkspaceState>;
   projectPage(input: ProjectPageRequest): Promise<ProjectPage>;
   taskPage(input: TaskPageRequest): Promise<TaskPage>;
   close(): void;
 };
 
+// Reads carry no revision. Their names start with Read, apart from these.
+const readCommands = new Set(['CompleteChatMention', 'InspectSource']);
 // Chat mutations carry revision zero, as the desktop's do. The controller does not race chat
 // commands on the task revision.
 const CHAT_REVISION = 0;
@@ -76,7 +84,7 @@ export function chatClient(
         actor: options.actor,
         command,
         payload,
-        ...(command.startsWith('Read') || command === 'CompleteChatMention'
+        ...(command.startsWith('Read') || readCommands.has(command)
           ? {}
           : { expectedRevision: CHAT_REVISION }),
       }),
