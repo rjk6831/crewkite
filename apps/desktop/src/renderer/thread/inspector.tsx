@@ -24,6 +24,12 @@ import {
   useState,
 } from 'react';
 import { familyName } from '../components.tsx';
+import {
+  ExtensionInspectorTab,
+  extensionTabId,
+  slotsOf,
+  useExtensions,
+} from '../extension-slots.tsx';
 import { clientFor } from '../settings/client-status.tsx';
 import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
 import {
@@ -47,7 +53,7 @@ import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
 
-export type InspectorTab = 'changes' | 'usage' | 'crew' | 'thread';
+export type InspectorTab = 'changes' | 'usage' | 'crew' | 'thread' | `ext:${string}`;
 const tabs: { id: InspectorTab; label: string }[] = [
   { id: 'changes', label: 'Changes' },
   { id: 'usage', label: 'Usage' },
@@ -717,6 +723,16 @@ export function Inspector({
 }) {
   const panel = useRef<HTMLElement>(null);
   const size = useInspectorWidth(panel);
+  const extensionRead = useExtensions(source).read;
+  const extensionTabs = slotsOf(extensionRead, 'inspector-tab');
+  // An extension tab whose extension turned off falls back to Changes once the read is in.
+  const missingTab =
+    tab.startsWith('ext:') &&
+    extensionRead !== null &&
+    !extensionTabs.some((slot) => extensionTabId(slot) === tab);
+  useEffect(() => {
+    if (missingTab) onTab('changes');
+  }, [missingTab, onTab]);
   // Escape closes the panel unless a picker or field inside it already took the key, or a dialog
   // such as search is open and owns it.
   useEffect(() => {
@@ -744,7 +760,10 @@ export function Inspector({
       />
       <div className="th-inspector-head">
         <div role="tablist" aria-label="Inspector sections">
-          {tabs.map((item) => (
+          {[
+            ...tabs,
+            ...extensionTabs.map((slot) => ({ id: extensionTabId(slot), label: slot.title })),
+          ].map((item) => (
             <button
               key={item.id}
               type="button"
@@ -796,6 +815,11 @@ export function Inspector({
             onConfigure={onConfigure}
           />
         )}
+        {extensionTabs
+          .filter((slot) => tab === extensionTabId(slot))
+          .map((slot) => (
+            <ExtensionInspectorTab key={tab} source={source} taskId={taskId} slot={slot} />
+          ))}
       </div>
     </aside>
   );

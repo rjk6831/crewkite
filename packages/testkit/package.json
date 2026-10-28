@@ -7,7 +7,8 @@
     ".": "./src/index.ts",
     "./chat-adapter": "./src/chat-adapter.ts",
     "./repository": "./src/repository.ts",
-    "./worker": "./src/worker.ts"
+    "./worker": "./src/worker.ts",
+    "./extensions": "./src/extensions.ts"
   },
   "dependencies": {
     "@crewkite/contracts": "workspace:*"

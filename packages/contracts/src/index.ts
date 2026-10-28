@@ -41,6 +41,14 @@ import {
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
+import {
+  ConfigureExtensionPayloadSchema,
+  ExtensionCommandResultSchema,
+  ExtensionEventSchema,
+  ExtensionsReadSchema,
+  ReadExtensionsPayloadSchema,
+  RunExtensionCommandPayloadSchema,
+} from './extensions.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -2499,6 +2507,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('AskChatFamily', AskChatFamilyPayloadSchema),
   mutate('RunChatPlan', RunChatPlanPayloadSchema),
   mutate('CancelChatPlan', CancelChatPlanPayloadSchema),
+  read('ReadExtensions', ReadExtensionsPayloadSchema),
+  mutate('ConfigureExtension', ConfigureExtensionPayloadSchema),
+  mutate('RunExtensionCommand', RunExtensionCommandPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -3559,6 +3570,8 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatPullRequestResultSchema.extend({ kind: z.literal('chat-pull-request') }),
   ChatBranchStatusSchema.extend({ kind: z.literal('chat-branch-status') }),
   ChatAttachmentSchema.extend({ kind: z.literal('chat-attachment') }),
+  ExtensionsReadSchema.extend({ kind: z.literal('extensions') }),
+  ExtensionCommandResultSchema.extend({ kind: z.literal('extension-result') }),
   // The byte check on the page stays with the kind tag.
   ChatTurnEventsReadSchema.safeExtend({ kind: z.literal('chat-turn-events') }),
   /** What a stop took out of the thread's queue, so the composer can give the text back. */
@@ -3681,6 +3694,7 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('chat.turn', ChatTurnSchema),
   event('chat.thread', ChatThreadSchema),
   event('chat.catalog', ChatCatalogChangeSchema),
+  event('extension.event', ExtensionEventSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   // A deleted thread's task is gone. Views drop it from the rail.
@@ -3815,6 +3829,7 @@ export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export { canonicalJson } from './canonical.ts';
 export * from './chat.ts';
+export * from './extensions.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

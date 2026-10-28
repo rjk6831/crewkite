@@ -3,6 +3,7 @@ import { useEffect } from 'react';
 import type { Workspace } from '../source.ts';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { AnthropicCard } from './anthropic-card.tsx';
+import { ExtensionsCard } from './extensions-card.tsx';
 import { GeneralCard } from './general-card.tsx';
 import { GoogleCard } from './google-card.tsx';
 import { LocalCard } from './local-card.tsx';
@@ -62,6 +63,7 @@ export function SettingsPage({
         <AnthropicCard {...card} entry={entry('anthropic')} />
         <GoogleCard {...card} entry={entry('google')} />
         <LocalCard {...card} entry={entry('local')} />
+        <ExtensionsCard source={workspace.source} />
       </div>
     </main>
   );

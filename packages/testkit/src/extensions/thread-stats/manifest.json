@@ -1,0 +1,11 @@
+{
+  "id": "thread-stats",
+  "name": "Thread stats",
+  "version": "1.0.0",
+  "contract": "1.0.0",
+  "description": "Counts the recent messages in a thread by author. Reads the thread it runs on and changes nothing.",
+  "entry": "index.mjs",
+  "authority": ["thread.read"],
+  "commands": [{ "id": "count-messages", "title": "Count messages" }],
+  "threadActions": [{ "id": "count", "title": "Count messages", "command": "count-messages" }]
+}
