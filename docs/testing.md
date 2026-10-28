@@ -94,3 +94,13 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## Extension seam
+
+Three claims cover the extension seam in [ADR 0047](adr/0047-extensions-attach-through-one-versioned-seam.md). They live in `apps/controller/src/extensions/extensions.test.ts`.
+
+- The manifest table refuses a version that is not three numbers, a contract that is not a version, an authority outside the closed list, an older or newer contract major, a newer contract minor, a slot that runs an undeclared command, event kinds without the event authority, an entry outside the folder, an unknown field and a folder that names another extension. A contract major bump reads as one plain line.
+- An extension command passes the built-in checks: another principal is denied, an unknown task is refused before the extension runs, an undeclared command is refused, a reused key with changed content is refused and a retry with the same key answers from its receipt without a second event. The probe extension's context holds only its declared authority. Its thread reader returns the thread the command ran on whatever it is asked, the frozen context cannot be pointed at another thread, a result that carries limits is refused, a built-in event kind cannot be emitted, and an asynchronous command is refused. The task record stays byte for byte the same.
+- The reference extension from the testkit is listed off with its manifest. Its thread action and command appear only while it is on, turning it off removes both, and a contract major bump in its manifest turns it off with the plain line.
+
+These run against a real controller and real SQLite with synthetic extension modules. They make no claim about the behavior of a separately licensed extension.
