@@ -23,13 +23,15 @@ export const familyName: Record<ChatFamily, string> = {
 // rerun: Retry or Regenerate on the family that already answered the message, in a new session.
 // model: the person picked another model of the same family, which starts a new native session.
 // session: the turns since the family last ran do not fit its session, so a new one starts.
-export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model' | 'session';
+// ask: a read-only side question to one family, which reads the thread from the packet.
+export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model' | 'session' | 'ask';
 
 export function handoffReason(reason: HandoffReason): string {
   if (reason === 'rerun') return 'the person asked for the reply again';
   if (reason === 'steer') return 'the person sent a new message during the reply';
   if (reason === 'model') return 'model changed in the composer';
   if (reason === 'session') return 'the thread moved past what the old session could carry';
+  if (reason === 'ask') return 'the person asked a side question';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
@@ -215,6 +217,15 @@ export function adviceContext(
   return [...lines, `The last answer:\n\n${text}`].join('\n');
 }
 
+/** Brief for an ask turn: a read-only answer to one side question about the thread. */
+export function askContext(projectName: string, directory: string): string {
+  return [
+    `You are answering a side question in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    'Do not edit, create or delete files, and do not run commands. You may read and search files to answer.',
+    'Answer the question directly. The thread goes on without you, so do not offer to make changes.',
+  ].join('\n');
+}
+
 /** Brief for a challenger turn: the assumptions the last answer rests on, and which may not hold. */
 export function challengeContext(
   projectName: string,
@@ -232,6 +243,76 @@ export function challengeContext(
       ? `${answer.slice(0, ADVICE_ANSWER_CHARACTERS).toWellFormed()} [trimmed]`
       : answer;
   return [...lines, `The last answer:\n\n${text}`].join('\n');
+}
+
+/** The example in the orchestrator brief. A test parses it with the plan schema. */
+export const PLAN_EXAMPLE =
+  '{"planId": "p1", "goal": "Add tax to the order total.", "slices": [{"id": 1, "title": "Add the tax rate", "brief": "Add TAX_RATE to src/config.ts and export it.", "files": ["src/config.ts"], "depends": [], "difficulty": "easy", "readOnly": false}, {"id": 2, "title": "Apply tax in totals", "brief": "Use TAX_RATE in orderTotal in src/totals.ts and round to the cent.", "files": ["src/totals.ts", "src/config.ts"], "depends": [1], "difficulty": "medium", "readOnly": false, "hint": {"family": "openai"}}]}';
+
+/**
+ * Brief for an orchestrator turn. It reads, then answers with one plan block the controller
+ * validates. The controller picks the model for each slice, so the brief asks for difficulty and
+ * leaves the choice of family out.
+ */
+export function orchestratorContext(projectName: string, directory: string): string {
+  return [
+    `You are the orchestrator in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    'Do not edit, create or delete files, and do not run commands. You may read and search files to plan the work.',
+    'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan, picks the model for each slice and runs the slices one at a time in dependency order, with a review after each.',
+    'Reply with a short summary, then exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
+    PLAN_EXAMPLE,
+    'Rules:',
+    '- planId: letters, digits, dot, underscore or hyphen, at most 64 characters.',
+    '- goal: at most 2,000 characters.',
+    '- slices: 1 to 8. Each id is a number from 1 to 8, used once.',
+    '- title: at most 120 characters. brief: at most 4,000 characters, written so a model can do the slice without reading this reply.',
+    '- files: at most 40 paths the slice reads or changes, relative to the root of the scratch copy, with forward slashes, no leading slash and no `..`. Name a file the slice creates by the path it will have.',
+    '- depends: ids of the slices that must finish first. No cycles.',
+    '- difficulty: easy for a small change a small local model can make from the named files alone; medium for a change across a few files that needs judgment; hard for design work or a change that needs much of the codebase in view.',
+    '- readOnly: true when the slice only reads, such as an investigation, and changes no file.',
+    '- hint is optional. hint.family (openai, anthropic, google or local) only breaks a tie between families CrewKite already ranks.',
+  ].join('\n');
+}
+
+/** The message that sends a plan that failed validation back to the orchestrator, once. */
+export const PLAN_RETRY = 'The plan did not pass validation.';
+/**
+ * The retry runs in a fresh session on clients that read no history, so it carries the request.
+ */
+export const planRetryText = (error: string, request: string) =>
+  [
+    `${PLAN_RETRY} ${error}`,
+    'Reply again with one corrected plan block for this request:',
+    request
+      .trim()
+      .split('\n')
+      .map((line) => `> ${line}`)
+      .join('\n'),
+  ].join('\n\n');
+
+/**
+ * The message a slice's builder turn answers. It may resume the builder's native session, which
+ * skips the system context, so the slice travels in the message with its assignment line.
+ */
+export function sliceBrief(
+  plan: { planId: string; goal: string; slices: readonly unknown[] },
+  slice: { id: number; title: string; brief: string; files: readonly string[]; readOnly: boolean },
+  assignment: string,
+): string {
+  return [
+    `Slice ${slice.id} of ${plan.slices.length} in plan ${plan.planId}: ${slice.title}`,
+    `The plan's goal: ${plan.goal}`,
+    assignment,
+    slice.brief,
+    slice.files.length
+      ? `Files for this slice, relative to the scratch copy:\n${slice.files.join('\n')}`
+      : '',
+    slice.readOnly
+      ? 'This slice only reads. Do not edit, create or delete files. Report what you found.'
+      : 'Do only this slice. Later slices cover the rest of the plan. Say which files you changed and why.',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
 }
 
 const FIXER_REVIEW_CHARACTERS = 16_000;
@@ -279,7 +360,7 @@ export function withAttachments(
   const kept = attachments.map(inProject).filter(inside);
   const dropped = attachments.filter((path) => !inside(inProject(path)));
   return [
-    text,
+    ...(text ? [text] : []),
     ...(kept.length ? [`Attached paths:\n${kept.join('\n')}`] : []),
     ...(dropped.length
       ? [
@@ -330,16 +411,19 @@ export function handoffPacket(input: {
   // holds the reply it replaces. A model change or a session that fell too far behind starts a new
   // session on the same family, and nothing was stopped.
   const opening =
-    input.reason === 'rerun'
-      ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-      : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
-        ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-        : input.from === input.to
-          ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-          : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+    input.reason === 'ask'
+      ? `This is a side question to ${familyName[input.to]} about the thread below. Answer it from the thread and the scratch copy, and change nothing.`
+      : input.reason === 'rerun'
+        ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+        : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
+          ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+          : input.from === input.to
+            ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+            : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
+    THREAD_TOOLS_LINE,
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
     `Files changed in the scratch copy against the base commit:\n${files}`,
     ...(input.instructions?.length
@@ -370,9 +454,24 @@ export function earlierReach(family: ChatFamily, path: string): string {
   return family === 'local' ? 'not sent to Local' : `Path: ${path}`;
 }
 
-/** The message text under its heading. The request carries it once. */
+/** The packet names the read-only thread tools, so a model knows it can ask for more. */
+export const THREAD_TOOLS_LINE =
+  'Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live.';
+
+/**
+ * The message text under its heading. The request carries it once. A message of files alone has
+ * no text, and the file section the adapter adds below is its body.
+ */
 export function newMessageBlock(text: string): string {
-  return `New message from the person:\n${text}`;
+  return text
+    ? `New message from the person:\n${text}`
+    : 'New message from the person: the files attached to this message, with no text.';
+}
+
+/** What a transcript shows for a person's message. A message of files alone names them. */
+export function spokenText(text: string, files: readonly Pick<ChatAttachment, 'name'>[]): string {
+  if (text || !files.length) return text;
+  return `(Files only: ${files.map((file) => file.name).join(', ')})`;
 }
 
 /** One line for a file: name, type, size, then the tail. */
@@ -389,7 +488,8 @@ export function attachedSection(lines: readonly string[]): string {
 }
 
 export function earlierFileLine(file: EarlierFile): string {
-  return attachedLine(file.attachment, `came with "${file.came}", ${file.reach}`);
+  const came = file.came ? `came with "${file.came}"` : 'came with a message with no text';
+  return attachedLine(file.attachment, `${came}, ${file.reach}`);
 }
 
 /** Files from before the new message, listed once, or nothing. The packet and the delta packet both use it. */
@@ -415,12 +515,16 @@ export type DeltaTurn = Readonly<{
   tools: readonly string[];
 }>;
 
-const roleVerb: Record<ChatRole, string> = {
-  assistant: 'answered',
-  fixer: 'fixed the review findings',
-  reviewer: 'reviewed the changes',
-  advisor: 'gave a second opinion',
-  challenger: 'challenged the last answer',
+// Each delta line names the family and the role, so a reviewer's words never read as the
+// builder's answer.
+const roleName: Record<ChatRole, string> = {
+  assistant: 'builder',
+  fixer: 'fixer',
+  reviewer: 'reviewer',
+  advisor: 'advisor',
+  challenger: 'challenger',
+  orchestrator: 'orchestrator',
+  ask: 'ask',
 };
 
 /**
@@ -449,7 +553,7 @@ export function deltaPacket(input: {
     const reply = turn.reply && (full.has(index) ? turn.reply : cut(turn.reply, 600));
     return [
       ...(turn.message === null ? [] : [`Person:\n${capped(turn.message)}`]),
-      `${familyName[turn.family]} (${turn.model}) ${roleVerb[turn.role]}:\n${reply ? capped(reply) : 'No reply.'}`,
+      `${familyName[turn.family]}, ${roleName[turn.role]} (${turn.model}):\n${reply ? capped(reply) : 'No reply.'}`,
       ...(turn.early ? [`The turn ended early. Reason: ${turn.early}.`] : []),
       ...(turn.tools.length
         ? [`Tool activity:\n${turn.tools.map((line) => `- ${line}`).join('\n')}`]
@@ -464,6 +568,7 @@ export function deltaPacket(input: {
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
+    THREAD_TOOLS_LINE,
     `Turns since then, oldest first:\n\n${turns.join('\n\n')}`,
     input.changes.join('\n'),
     input.checks.length

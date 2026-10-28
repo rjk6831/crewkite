@@ -86,6 +86,29 @@ export type TurnView = {
   failure: ChatFailure | null;
 };
 
+/** The badge a role shows on its reply. The builder's own reply has none. */
+export const roleLabels: Record<ChatRole, string | null> = {
+  assistant: null,
+  reviewer: 'Reviewer',
+  advisor: 'Advisor',
+  challenger: 'Challenger',
+  fixer: 'Fixer',
+  orchestrator: 'Orchestrator',
+  ask: 'Ask',
+};
+
+/**
+ * The Markdown a reply was written in: its text blocks in order, as the model wrote them. Copy
+ * reply puts this on the clipboard, so a table or a code fence pastes as source and not as the
+ * rendered view.
+ */
+export function replySource(blocks: readonly Block[]): string {
+  return blocks
+    .flatMap((block) => (block.kind === 'text' && block.text.trim() !== '' ? [block.text] : []))
+    .join('\n\n')
+    .trim();
+}
+
 export const blankTurn = (id: string): TurnView => ({
   id,
   identity: null,

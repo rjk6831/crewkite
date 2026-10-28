@@ -51,6 +51,13 @@ export function foldActivity(live: LiveActivity, event: RailEvent): LiveActivity
   return next;
 }
 
+/** The thread a `task.removed` event deletes. Null for any other event. */
+export function removedThread(event: RailEvent): string | null {
+  if (event.type !== 'task.removed') return null;
+  const taskId = record(event.payload)?.taskId ?? event.taskId;
+  return typeof taskId === 'string' ? taskId : null;
+}
+
 /** The page read wins when it is newer than the last turn event for the thread. */
 export function shownActivity(
   live: LiveActivity,

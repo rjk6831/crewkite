@@ -1,0 +1,108 @@
+/* The plan card: goal, one row per slice, and the actions the flight mode allows. */
+.th-plan {
+  display: grid;
+  gap: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  font-size: 13px;
+}
+.th-plan-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 12px;
+}
+.th-plan-head h3 {
+  font-size: 13px;
+  font-weight: 600;
+}
+.th-plan-summary {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.th-plan-goal {
+  display: -webkit-box;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+.th-plan-slices {
+  display: grid;
+  gap: 8px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-plan-slice {
+  display: grid;
+  gap: 4px;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 9px;
+}
+.th-plan-line {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+}
+.th-plan-id {
+  display: inline-grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.th-plan-title {
+  flex: 1 1 160px;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.th-plan-difficulty {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-plan-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--text-muted);
+  font-size: 11.5px;
+}
+.th-plan-status.is-running {
+  color: var(--accent);
+}
+.th-plan-status.is-done {
+  color: var(--green);
+}
+.th-plan-status.is-failed {
+  color: var(--red);
+}
+.th-plan-where {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.th-plan-reason {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.th-plan-pick select {
+  max-width: 100%;
+}
+.th-plan-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}

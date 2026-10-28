@@ -6,10 +6,13 @@ import type {
   ChatThread,
 } from '@crewkite/contracts';
 import { type KeyboardEvent, useEffect, useRef, useState } from 'react';
-import { sendMessage, type ThreadSource } from './commands.ts';
+import { familyName } from '../components.tsx';
+import { askFamily, sendMessage, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 
-export type RoleAction = Exclude<ChatRole, 'assistant' | 'fixer'>;
+export type RoleAction = Exclude<ChatRole, 'assistant' | 'fixer' | 'orchestrator' | 'ask'>;
+/** The actions the row can open: the three role runs, and Ask for a side question. */
+export type RowAction = RoleAction | 'ask';
 export const roleActions: Record<RoleAction, { label: string; prompt: string }> = {
   reviewer: { label: 'Review changes', prompt: 'Review the current changes.' },
   advisor: { label: 'Second opinion', prompt: 'Give a second opinion on the last answer.' },
@@ -18,6 +21,11 @@ export const roleActions: Record<RoleAction, { label: string; prompt: string }> 
     prompt: 'Challenge the assumptions behind the last answer.',
   },
 };
+
+export const ASK_NEEDS_TEXT = 'Type the question in the box first.';
+/** The Ask button names the family it will ask. */
+export const askLabel = (selection: ChatModelSelection | null) =>
+  selection ? `Ask ${familyName(selection.family)}` : 'Ask another model';
 
 // The default is a family other than the one that answered last, so the second look is
 // independent. With one connected family, that family is the only choice.
@@ -29,9 +37,10 @@ function roleDefault(
 }
 
 /**
- * The Review changes, Second opinion and Challenge assumptions actions. `row` is the one-line
- * picker under the text box while an action is open. The model is picked for this one turn and the
- * thread keeps its own.
+ * The Review changes, Second opinion and Challenge assumptions actions, and Ask. `row` is the
+ * one-line picker under the text box while an action is open. The model is picked for this one turn
+ * and the thread keeps its own. Ask sends the text in the box as a read-only question to the picked
+ * family and posts the answer as a side reply, so it also works while a turn runs.
  */
 export function useRoleRun({
   source,
@@ -43,6 +52,8 @@ export function useRoleRun({
   blocked,
   onOpenCatalog,
   onNote,
+  question,
+  onAsked,
 }: {
   source: ThreadSource;
   taskId: string | null;
@@ -53,8 +64,12 @@ export function useRoleRun({
   blocked: string | null;
   onOpenCatalog: () => void;
   onNote: (note: string | null) => void;
+  /** The text in the box, which Ask sends. */
+  question: string;
+  /** Ask went out, so the box can clear. */
+  onAsked: () => void;
 }) {
-  const [role, setRole] = useState<RoleAction | null>(null);
+  const [role, setRole] = useState<RowAction | null>(null);
   const [pick, setPick] = useState<ChatModelSelection | null>(null);
   const picked = pick ?? roleDefault(catalog, currentFamily);
   const rowRef = useRef<HTMLDivElement>(null);
@@ -64,16 +79,17 @@ export function useRoleRun({
     if (role) rowRef.current?.querySelector('button')?.focus();
   }, [role]);
 
-  function why(action: RoleAction): string | null {
+  function why(action: RowAction): string | null {
     if (blocked) return blocked;
-    if (running) return 'Wait for the current turn to finish.';
+    if (running && action !== 'ask') return 'Wait for the current turn to finish.';
     if (!defaultSelection(catalog)) return 'No connected provider has allowance left.';
+    if (action === 'ask') return null;
     if (action === 'reviewer' && !thread?.scratchReady)
       return 'There is no scratch copy to review yet.';
     if (action !== 'reviewer' && !currentFamily) return 'There is no answer to look at yet.';
     return null;
   }
-  function toggle(action: RoleAction) {
+  function toggle(action: RowAction) {
     if (role === action) return setRole(null);
     onOpenCatalog();
     setPick(null);
@@ -81,14 +97,24 @@ export function useRoleRun({
     setRole(action);
   }
   async function run() {
-    if (!role || !taskId || !picked || running || blocked) return;
+    if (!role || !taskId || !picked || blocked) return;
+    if (role !== 'ask' && running) return;
     try {
-      await sendMessage(source, {
-        taskId,
-        text: roleActions[role].prompt,
-        selection: picked,
-        role,
-      });
+      if (role === 'ask') {
+        await askFamily(source, {
+          taskId,
+          family: picked.family,
+          model: picked.model,
+          question,
+        });
+        onAsked();
+      } else
+        await sendMessage(source, {
+          taskId,
+          text: roleActions[role].prompt,
+          selection: picked,
+          role,
+        });
       setRole(null);
       onNote(null);
     } catch (failure) {
@@ -116,15 +142,30 @@ export function useRoleRun({
           nowMs={Date.now()}
           onOpen={onOpenCatalog}
           onSelect={setPick}
-          label={`${roleActions[role].label}: provider and model`}
+          label={`${role === 'ask' ? askLabel(picked) : roleActions[role].label}: provider and model`}
         />
-        <button type="button" disabled={!picked || running || !!blocked} onClick={() => void run()}>
-          Run
-        </button>
+        {role === 'ask' ? (
+          <button
+            type="button"
+            disabled={!picked || question.trim() === '' || !!blocked}
+            title={question.trim() === '' ? ASK_NEEDS_TEXT : undefined}
+            onClick={() => void run()}
+          >
+            {askLabel(picked)}
+          </button>
+        ) : (
+          <button
+            type="button"
+            disabled={!picked || running || !!blocked}
+            onClick={() => void run()}
+          >
+            Run
+          </button>
+        )}
         <button type="button" onClick={() => setRole(null)}>
           Cancel
         </button>
       </div>
     ) : null;
-  return { role, why, toggle, row };
+  return { role, why, toggle, row, askLabel: askLabel(picked) };
 }

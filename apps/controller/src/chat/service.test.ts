@@ -62,6 +62,7 @@ import {
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
+import { redact } from './thread-reader.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
 
@@ -506,6 +507,8 @@ test('a message sent during a turn waits and starts when the turn ends', {
   const users = (read: ChatThreadRead) => read.messages.filter((m) => m.author.kind === 'user');
   for (const row of cases) {
     const thread = standalone(t, {
+      // The thread tools socket failed to open: every cloud turn says so and runs without them.
+      threadToolsDown: () => true,
       adapters: new Map([
         [
           'openai',
@@ -586,7 +589,138 @@ test('a message sent during a turn waits and starts when the turn ends', {
       started,
       row.name,
     );
+    const ran = after.turns.map((turn) => turn.id);
+    assert.deepEqual(
+      after.messages
+        .filter((message) => message.text.startsWith('Thread tools are unavailable'))
+        .map((message) => message.author.kind === 'system' && message.author.turnId),
+      ran,
+      row.name,
+    );
+    assert.deepEqual(
+      agentEvents(thread).flatMap((event) =>
+        event.type === 'provider.notice' && event.trace && /thread_live/.test(event.message)
+          ? [event.turnId]
+          : [],
+      ),
+      ran,
+      row.name,
+    );
   }
+
+  // One running turn per family: a second thread's message on the same family waits in its own
+  // queue and starts when the first thread's turn ends. Another family starts at once, and here
+  // it stops on its limit.
+  const shared = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [
+      [{ kind: 'wait' }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Second.'] }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Answered.'] }],
+    ],
+  });
+  const other = createScriptedChatAdapter({
+    family: 'google',
+    turns: [
+      [
+        {
+          kind: 'fail',
+          stopReason: 'limit',
+          failure: chatFailure({
+            stage: 'stream',
+            kind: 'usage-limit',
+            message: 'The weekly limit is reached.',
+          }),
+        },
+      ],
+    ],
+  });
+  const one = standalone(t, {
+    adapters: new Map<ChatFamily, ChatAdapter>([
+      ['openai', shared],
+      ['google', other],
+    ]),
+  });
+  const [second, third] = ['1', '2'].map((digit) => ({
+    ...(one.store.get<Task>('task', one.taskId) as Task),
+    id: `tsk_${digit.repeat(26)}`,
+  }));
+  one.store.transaction(() => {
+    for (const task of [second, third]) one.store.put('task', task.id, 0, task);
+  });
+  const sendTo = (taskId: string, text: string, choice: ChatModelSelection) =>
+    act(one.store, (effects) =>
+      one.service.sendMessage(
+        { taskId, text, selection: choice, role: 'assistant', attachments: [], files: [] },
+        effects,
+      ),
+    );
+  const busy = turnReaches(one, 'running');
+  const launched = next(
+    one,
+    (event) => event.type === 'agent.event' && event.payload.type === 'turn.started',
+  );
+  one.send('First thread.');
+  const held = await busy;
+  await launched;
+  const queued = sendTo(second.id, 'Second thread.', selection);
+  assert.deepEqual(
+    [queued.outcome, queued.next],
+    ['applied', 'OpenAI is answering in another thread. This message starts when that reply ends.'],
+  );
+  assert.equal(shared.requests.length, 1);
+  const google = { family: 'google', model: 'google-model', effort: 'default' } as const;
+  const elsewhere = turnReaches(one, 'failed');
+  assert.equal(sendTo(third.id, 'On Google.', google).next, undefined);
+  await elsewhere;
+  assert.equal(other.requests.length, 1);
+  // An ask on a busy family waits like a message, behind the thread that waited first. It was
+  // sent after the limit stopped this thread, so that stop does not hold it.
+  one.clock.advance(1000);
+  const asked = act(one.store, (effects) =>
+    one.service.ask(
+      { taskId: third.id, family: 'openai', model: 'fixture-model', question: 'Why?' },
+      effects,
+    ),
+  );
+  assert.equal(
+    asked.next,
+    'OpenAI is answering in another thread. This message starts when that reply ends.',
+  );
+  assert.deepEqual(
+    one.service
+      .readThread({ taskId: third.id, limit: 100 })
+      .thread.queued.map((message) => [message.role, message.text]),
+    [['ask', 'Why?']],
+  );
+  const answered = next(
+    one,
+    (event) =>
+      event.type === 'chat.turn' &&
+      event.taskId === third.id &&
+      (event.payload as ChatTurn).role === 'ask' &&
+      (event.payload as ChatTurn).state === 'done',
+  );
+  const freed = next(
+    one,
+    (event) =>
+      event.type === 'chat.turn' &&
+      event.taskId === second.id &&
+      (event.payload as ChatTurn).state === 'done',
+  );
+  act(one.store, (effects) =>
+    one.service.stopTurn({ taskId: one.taskId, turnId: held.id }, effects),
+  );
+  await freed;
+  await answered;
+  assert.deepEqual(
+    shared.requests.map((request) => [request.role, request.prompt.split('\n').at(-1)]),
+    [
+      ['assistant', 'First thread.'],
+      ['assistant', 'Second thread.'],
+      ['ask', 'Why?'],
+    ],
+  );
 });
 
 test('a thread read returns messages in cursor order and the live events of the open turn', {
@@ -630,11 +764,13 @@ test('a thread read returns messages in cursor order and the live events of the 
     thread.turns.map((turn) => turn.state),
     ['done', 'running'],
   );
+  assert.equal(thread.more, false);
   const earlier = await read({ beforeCursor: thread.messages[2].cursor, limit: 1 });
   assert.deepEqual(
     earlier.messages.map((message) => message.text),
     ['First reply.'],
   );
+  assert.equal(earlier.more, true);
 
   // A turn's stored events read back whole, oldest first, a page at a time under the cap.
   const [done, running] = thread.turns;
@@ -713,7 +849,12 @@ test('a thread read returns messages in cursor order and the live events of the 
 // A limit stop needs a second connected family, so these tests bring a catalog of their own.
 function limitThread(
   t: TestContext,
-  options: { autoHandoff: boolean; resetsAt: string | null; handoffMode?: ChatHandoffMode },
+  options: {
+    autoHandoff: boolean;
+    resetsAt: string | null;
+    handoffMode?: ChatHandoffMode;
+    google?: ChatScriptStep[][];
+  },
 ) {
   const limit = chatFailure({
     stage: 'stream',
@@ -747,7 +888,13 @@ function limitThread(
   const adapters = new Map([
     ['openai', stopped],
     ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: reply('Not chosen.') })],
-    ['google', createScriptedChatAdapter({ family: 'google', turns: reply('Carrying on.') })],
+    [
+      'google',
+      createScriptedChatAdapter({
+        family: 'google',
+        turns: options.google ?? reply('Carrying on.'),
+      }),
+    ],
     ['local', createScriptedChatAdapter({ family: 'local', turns: reply('Not chosen.') })],
   ] as const);
   // The test clock starts at the same fixed time in every service it builds.
@@ -762,10 +909,12 @@ function limitThread(
     familyEntry('local', 60, inHours(1), now),
   ];
   const settled: [string, string][] = [];
+  const ended: string[] = [];
   const thread = standalone(t, {
     adapters,
     catalog: () => ({ families }),
     onTurnSettled: (family, taskId) => settled.push([family, taskId]),
+    onTurnEnded: (turnId) => ended.push(turnId),
   });
   const { store, service, taskId } = thread;
   store.transaction(() =>
@@ -775,7 +924,7 @@ function limitThread(
       ...(options.handoffMode ? { handoffMode: options.handoffMode } : {}),
     }),
   );
-  return { ...thread, adapters, limit, settled };
+  return { ...thread, adapters, limit, settled, ended };
 }
 
 test('a usage limit writes a system line, and auto handoff runs the same message once on the next family', {
@@ -821,6 +970,11 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     ['google', on.taskId],
     ['google', on.taskId],
   ]);
+  // Each turn's thread tools token ends with the turn, the failed one too.
+  assert.deepEqual(
+    on.ended,
+    thread.turns.map((turn) => turn.id),
+  );
   assert.equal(thread.thread.selection?.model, 'google-model');
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${thread.turns[2].id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];
@@ -937,9 +1091,13 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     'Person:\nKeep going.',
     'Person:\nThen the tests.',
   ]);
-  assert.match(back.prompt, /^Local \(local-model\) answered:\nNot chosen\.$/m);
-  assert.match(back.prompt, /^Anthropic \(anthropic-model\) answered:\nNot chosen\.$/m);
+  assert.match(back.prompt, /^Local, builder \(local-model\):\nNot chosen\.$/m);
+  assert.match(back.prompt, /^Anthropic, builder \(anthropic-model\):\nNot chosen\.$/m);
   assert.match(back.prompt, /^No files changed in the scratch copy since then\.$/m);
+  assert.match(
+    back.prompt,
+    /^Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live\.$/m,
+  );
   assert.doesNotMatch(back.prompt, /Go on\.|Fix the rounding\./);
   assert.match(back.prompt, /New message from the person:\nBack to you\.$/);
 
@@ -977,6 +1135,44 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(
     changed.messages.at(-2)?.text,
     'Continued on Google (google-model-2) from Google (google-model). Reason: model changed in the composer.',
+  );
+
+  // The cap decision clears the saved session before the turn runs. When that turn fails, the
+  // next one starts fresh with the full packet and the thread says so only once.
+  const broke = chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' });
+  const capped = limitThread(t, {
+    autoHandoff: false,
+    resetsAt: null,
+    google: [
+      [{ kind: 'text', itemId: 'reply', chunks: ['Carrying on.'] }],
+      [{ kind: 'fail', stopReason: 'error', failure: broke }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Back.'] }],
+    ],
+  });
+  const step = (text: string, choice: ChatModelSelection, state: ChatTurn['state'] = 'done') => {
+    const ended = turnReaches(capped, state);
+    capped.send(text, choice);
+    return ended;
+  };
+  await step('Start here.', pick('google'));
+  for (let index = 0; index < 5; index++) await step(`${index} ${long}`, pick('anthropic'));
+  await step('Still there?', pick('google'), 'failed');
+  assert.deepEqual(
+    capped.read().thread.sessions.map((value) => value.family),
+    ['anthropic'],
+  );
+  await step('Try again.', pick('google'));
+  const retried = capped.adapters.get('google')?.requests[2];
+  assert.equal(retried?.session, null);
+  assert.match(
+    retried?.prompt ?? '',
+    /^This thread continues on Google in a new session\. Reason: the thread moved past what the old session could carry\.$/m,
+  );
+  assert.equal(
+    capped
+      .read()
+      .messages.filter((message) => message.text.startsWith('Started a new Google session')).length,
+    1,
   );
 });
 
@@ -1050,6 +1246,7 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   const { controller, adapter, task, run, send, read } = await chat(t, [
     [{ kind: 'text', itemId: 'answer', chunks: ['Changed net.mjs.'] }],
     [{ kind: 'text', itemId: 'review', chunks: ['One finding.'] }],
+    [{ kind: 'text', itemId: 'ask', chunks: ['It rounds half up.'] }],
   ]);
   const configure = { permissionPolicy: 'allow-all' };
   assert.equal((await run('ConfigureChatThread', configure, task.revision)).outcome, 'applied');
@@ -1079,6 +1276,34 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   assert.equal(thread.thread.permissionPolicy, 'allow-all');
   assert.equal(thread.thread.sessions.length, 1);
   assert.equal(thread.turns.at(-1)?.role, 'reviewer');
+
+  // Ask: a read-only side question with the thread packet, posted as a turn with the ask role.
+  // The thread keeps its own pick and its builder session.
+  const asked = turnReaches(controller, 'done');
+  const question = { family: 'openai', model: 'fixture-model', question: 'How does it round?' };
+  assert.equal((await run('AskChatFamily', question, task.revision)).outcome, 'applied');
+  await asked;
+  const side = requests[2];
+  assert.equal(side.role, 'ask');
+  assert.equal(side.readOnly, true);
+  assert.equal(side.permissionPolicy, 'ask');
+  assert.equal(side.session, null);
+  assert.match(side.systemContext, /answering a side question/);
+  assert.match(side.prompt, /^This is a side question to OpenAI about the thread below\./);
+  assert.match(side.prompt, /^Person:\nChange net\.mjs\.$/m);
+  assert.match(side.prompt, /New message from the person:\nHow does it round\?$/);
+  const after = await read();
+  assert.equal(after.turns.at(-1)?.role, 'ask');
+  assert.deepEqual(after.messages.at(-1)?.author, {
+    kind: 'assistant',
+    turnId: after.turns.at(-1)?.id,
+    family: 'openai',
+    model: 'fixture-model',
+    role: 'ask',
+    effort: 'default',
+  });
+  assert.deepEqual(after.thread.selection, selection);
+  assert.deepEqual(after.thread.sessions, thread.thread.sessions);
 });
 
 // The scripted adapter has no allow-thread option and no tool event, so this one plays what a real
@@ -1222,6 +1447,10 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const pinned = () => repo('rev-parse', threadBaseRef(task.id));
   const started = await read();
   assert.deepEqual(started.thread.skipped, [{ path: 'vendor/lib', reason: 'submodule' }]);
+  assert.equal(started.thread.skippedTotal, 1);
+  const skippedLine =
+    'The scratch copy skipped 1 entry it cannot hold, such as submodules and links that lead outside. Changes lists them.';
+  assert.equal(started.messages.filter((message) => message.text === skippedLine).length, 1);
   assert.equal(pinned(), started.thread.base);
   const scratch = adapter.requests[0].scratch.directory;
   // The edit goes through the link. The file under the skipped submodule is never accepted.
@@ -1556,6 +1785,22 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
   const limit = chatFailure({ stage: 'stream', kind: 'usage-limit', message: 'Limit.' });
   const limited: ChatScriptStep[] = [{ kind: 'fail', stopReason: 'limit', failure: limit }];
   const twoFindings = 'Rounding drops a cent in net.mjs.\nTotals skip tax.\nFindings: 2';
+  const slice = (id: number, difficulty: string, depends: number[]) => ({
+    id,
+    title: `Part ${id}`,
+    brief: `Do part ${id}.`,
+    files: ['src/net.mjs'],
+    depends,
+    difficulty,
+    readOnly: false,
+  });
+  const twoSlices = {
+    planId: 'p1',
+    goal: 'Fix the rounding.',
+    slices: [slice(1, 'medium', []), slice(2, 'hard', [1])],
+  };
+  const planReply = (plan: object) =>
+    reply(`Two parts.\n\n\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``);
   const cases = [
     {
       name: 'findings 2 then 0',
@@ -1628,19 +1873,133 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         reason: 'Anthropic reached its usage limit.',
       },
     },
+    {
+      name: 'a plan runs each slice with its review, then one challenge',
+      plan: [planReply(twoSlices)],
+      builds: [reply('Built part 1.'), reply('Built part 2.')],
+      reviews: [reply('Clean.\nFindings: 0'), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      // An Ask sent while the orchestrator reads stops neither the plan nor a chain. It runs last.
+      ask: 'Why two parts?',
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+        ['ask', 'google'],
+      ],
+      line: 'Crew finished: 2 slices, 2 reviews, 0 fixes.',
+      // The challenge follows the last slice's own review chain.
+      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      builderAt: 3,
+      card: ['finished', 'done', 'done'],
+    },
+    {
+      name: 'a read-only slice runs as an ask with no review, and the challenge follows the last write',
+      plan: [
+        planReply({
+          ...twoSlices,
+          slices: [twoSlices.slices[0], { ...twoSlices.slices[1], readOnly: true }],
+        }),
+      ],
+      builds: [reply('Built part 1.'), reply('Part 2 reads fine.')],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['ask', 'openai'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 2 slices, 1 review, 0 fixes.',
+      chain: { step: 'finished', reviewRounds: 0, fixes: 0, reason: null },
+      builderAt: 1,
+      card: ['finished', 'done', 'done'],
+      // The adapter request that carried the read-only slice.
+      readOnlyAt: 2,
+    },
+    {
+      name: 'balanced waits for Run plan, and an override moves a slice to a ranked family',
+      plan: [planReply({ ...twoSlices, slices: [twoSlices.slices[0]] })],
+      // OpenAI would build the slice without the override.
+      builds: [reply('Unused.')],
+      reviews: [reply('Built on Anthropic.'), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      balanced: true,
+      builtOn: 'anthropic',
+      picked: 'Slice 1 (medium) assigned to Anthropic: picked on the plan card.',
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'anthropic'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 1 slice, 1 review, 0 fixes.',
+      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      builderAt: 1,
+      card: ['finished', 'done'],
+    },
+    {
+      name: 'a failed slice stops the plan and the rest do not run',
+      plan: [planReply(twoSlices)],
+      builds: [
+        [
+          {
+            kind: 'fail',
+            stopReason: 'error',
+            failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
+          },
+        ],
+      ],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'openai'],
+      ],
+      line: 'Plan stopped: slice 1 failed. Run it again from the plan card.',
+      chain: null,
+      card: ['stopped', 'failed', 'not-run'],
+    },
+    {
+      name: 'a plan that fails validation goes back once, then stops',
+      plan: [reply('Here is my plan in prose.'), reply('Still prose.')],
+      builds: [reply('Unused.')],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['orchestrator', 'openai'],
+        ['orchestrator', 'openai'],
+      ],
+      line: 'Plan stopped: the plan did not pass validation. The reply has no fenced json block tagged plan.',
+      chain: null,
+      card: null,
+    },
   ] as const;
   for (const row of cases) {
     const now = createTestClock().now();
+    const planned = 'plan' in row;
     const adapters = new Map([
       [
         'openai',
         createScriptedChatAdapter({
           family: 'openai',
-          turns: [reply('Built it.'), reply('Fixed both.')],
+          turns: planned
+            ? [...row.plan, ...row.builds]
+            : [reply('Built it.'), reply('Fixed both.')],
         }),
       ],
       ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: row.reviews })],
-      ['google', createScriptedChatAdapter({ family: 'google', turns: [reply('It holds.')] })],
+      [
+        'google',
+        createScriptedChatAdapter({
+          family: 'google',
+          turns: [reply('It holds.'), reply('One part waits on the other.')],
+        }),
+      ],
       [
         'local',
         createScriptedChatAdapter({ family: 'local', turns: [reply('Clean.\nFindings: 0')] }),
@@ -1660,21 +2019,77 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         { role: 'builder', selection: pick('openai') },
         { role: 'reviewer', selection: pick('anthropic') },
         { role: 'challenger', selection: pick('google') },
+        ...(planned ? [{ role: 'orchestrator', selection: pick('openai') } as const] : []),
       ],
     };
-    store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+    const balanced = 'balanced' in row;
+    store.transaction(() =>
+      service.configure({ taskId, crew, flightMode: balanced ? 'balanced' : 'glide' }),
+    );
     // Entering glide turns automatic handoff on. The person may turn it off again.
-    assert.equal(thread.read().thread.autoHandoff, true, row.name);
+    assert.equal(thread.read().thread.autoHandoff, !balanced, row.name);
     if (row.autoHandoff === false)
       store.transaction(() => service.configure({ taskId, autoHandoff: false }));
     const ended = next(
       thread,
       (event) =>
         event.type === 'conversation.entry' &&
-        (event.payload as { text: string }).text.startsWith('Crew '),
+        /^(Crew|Plan) (finished|stopped)/.test((event.payload as { text: string }).text),
     );
-    thread.send('Fix the rounding.', pick('openai'));
+    if (balanced) {
+      const proposed = next(
+        thread,
+        (event) =>
+          event.type === 'chat.thread' && (event.payload as ChatThread).plan?.phase === 'proposed',
+      );
+      thread.send('Fix the rounding.', pick('openai'));
+      const shown = (await proposed).payload as ChatThread;
+      const card = shown.plan;
+      // Balanced runs nothing until Run plan: the card arrives on a free thread.
+      assert.equal(shown.activeTurnId, null, row.name);
+      assert.equal(thread.read().turns.length, 1, row.name);
+      const run = (overrides: { sliceId: number; family: ChatFamily; model: string }[]) => {
+        const effects: (() => void)[] = [];
+        const result = store.transaction(() =>
+          service.runPlan({ taskId, planId: 'p1', overrides }, effects),
+        );
+        for (const effect of effects) effect();
+        return result;
+      };
+      // Only a ranked candidate on the card can take a slice.
+      assert.equal(
+        run([{ sliceId: 1, family: 'google', model: 'google-unranked' }]).reason,
+        'override-not-ranked',
+        row.name,
+      );
+      const other = card?.slices[0].candidates.find((value) => value.family === 'anthropic');
+      assert.ok(other, row.name);
+      assert.equal(
+        run([{ sliceId: 1, family: other.family, model: other.model }]).outcome,
+        'applied',
+        row.name,
+      );
+    } else thread.send('Fix the rounding.', pick('openai'));
+    const answered =
+      'ask' in row &&
+      next(
+        thread,
+        (event) =>
+          event.type === 'chat.turn' &&
+          (event.payload as ChatTurn).role === 'ask' &&
+          (event.payload as ChatTurn).state === 'done',
+      );
+    if ('ask' in row) {
+      const asked = act(store, (effects) =>
+        service.ask(
+          { taskId, family: 'google', model: 'google-model', question: row.ask },
+          effects,
+        ),
+      );
+      assert.equal(asked.outcome, 'applied', row.name);
+    }
     await ended;
+    await answered;
 
     const read = thread.read();
     assert.deepEqual(
@@ -1682,10 +2097,52 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       row.turns,
       row.name,
     );
-    assert.equal(read.messages.at(-1)?.text, row.line, row.name);
-    const { builderTurnId, ...chain } = read.thread.crewChain ?? {};
-    assert.equal(builderTurnId, read.turns[0].id, row.name);
-    assert.deepEqual(chain, row.chain, row.name);
+    // The Ask's question and answer follow the closing line.
+    assert.equal(read.messages.at('ask' in row ? -3 : -1)?.text, row.line, row.name);
+    if (row.chain === null) assert.equal(read.thread.crewChain, null, row.name);
+    else {
+      const { builderTurnId, ...chain } = read.thread.crewChain ?? {};
+      assert.equal(builderTurnId, read.turns['builderAt' in row ? row.builderAt : 0].id, row.name);
+      assert.deepEqual(chain, row.chain, row.name);
+    }
+    if (planned) {
+      const card = read.thread.plan;
+      assert.deepEqual(
+        card ? [card.phase, ...card.slices.map((value) => value.status)] : null,
+        row.card,
+        row.name,
+      );
+      const asked = adapters.get('openai')?.requests ?? [];
+      assert.equal(asked[0]?.role, 'orchestrator', row.name);
+      assert.match(asked[0]?.systemContext ?? '', /```json plan/, row.name);
+      if (row.card === null) {
+        assert.match(asked[1]?.prompt ?? '', /^The plan did not pass validation\. /, row.name);
+        assert.match(asked[1]?.prompt ?? '', /^> Fix the rounding\.$/m, row.name);
+        continue;
+      }
+      const lines = read.messages.map((message) => message.text);
+      assert.ok(
+        lines.includes(
+          'Slice 1 (medium) assigned to OpenAI: the crew builder, ranked 2 of 3 by Most allowance left.',
+        ),
+        row.name,
+      );
+      // An override keeps the controller's line and adds the person's pick after it.
+      if ('picked' in row) assert.ok(lines.includes(row.picked), row.name);
+      const builtOn = 'builtOn' in row ? row.builtOn : 'openai';
+      assert.equal(card?.slices[0].assignment?.family, builtOn, row.name);
+      const brief = (builtOn === 'openai' ? asked[1] : adapters.get(builtOn)?.requests[0])?.prompt;
+      const of = `Slice 1 of ${row.card.length - 1} in plan p1: Part 1`;
+      assert.match(brief ?? '', new RegExp(`^${of}$`, 'm'), row.name);
+      assert.match(brief ?? '', /^Do part 1\.$/m, row.name);
+      if ('readOnlyAt' in row) {
+        const readOnly = asked[row.readOnlyAt] as unknown as ChatTurnRequest | undefined;
+        assert.match(readOnly?.prompt ?? '', /^Slice 2 of 2 in plan p1: Part 2$/m, row.name);
+        assert.equal(readOnly?.role, 'ask', row.name);
+        assert.equal(readOnly?.readOnly, true, row.name);
+      }
+      continue;
+    }
     // The person's pick stays on the builder whatever the crew borrowed.
     assert.equal(read.thread.selection?.family, 'openai', row.name);
     const reviewed = adapters.get('anthropic')?.requests[0];
@@ -1704,6 +2161,15 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     assert.match(fix?.prompt ?? '', /Fix each one in the scratch copy/);
     // The fixer is the builder again: it resumes the builder's session.
     assert.equal(fix?.session?.sessionId, `session-${read.turns[0].id}`);
+    // The builder's next message hears the reviews and the challenge, each named by family
+    // and role.
+    store.transaction(() => service.configure({ taskId, flightMode: 'manual' }));
+    const after = turnReaches(thread, 'done');
+    thread.send('Ship it.', pick('openai'));
+    await after;
+    const delta = adapters.get('openai')?.requests[2]?.prompt ?? '';
+    assert.match(delta, /^Anthropic, reviewer \(anthropic-model\):\nClean\.\nFindings: 0$/m);
+    assert.match(delta, /^Google, challenger \(google-model\):\nIt holds\.$/m);
   }
 });
 
@@ -2018,6 +2484,40 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
     assert.equal((await importing({ path })).reason, 'file-refused', path);
   assert.deepEqual(partials(), []);
 
+  // A large copy reports progress every 4 MiB and holds no transaction while it runs, so another
+  // command commits mid-copy. The command answers with the stored file as its receipt.
+  const big = join(outside, 'big.log');
+  writeFileSync(big, Buffer.alloc(9 * 1024 * 1024, 97));
+  const seen: [string, number, number][] = [];
+  const slow = standalone(t, {
+    onImportProgress: (id, progress) => {
+      seen.push([progress.name, progress.bytes, progress.total]);
+      if (seen.length === 1)
+        assert.equal(
+          slow.store.transaction(() => slow.service.renameThread({ taskId: id, title: 'Mid copy' }))
+            .outcome,
+          'applied',
+        );
+    },
+  });
+  const large = { taskId: slow.taskId, source: { path: big } };
+  const receipt = await slow.service.importing(large, () =>
+    slow.store.transaction(() => slow.service.importAttachment(large)),
+  );
+  const MiB = 1024 * 1024;
+  assert.deepEqual(seen, [
+    ['big.log', 4 * MiB, 9 * MiB],
+    ['big.log', 8 * MiB, 9 * MiB],
+    ['big.log', 9 * MiB, 9 * MiB],
+  ]);
+  assert.equal(slow.store.get<Task>('task', slow.taskId)?.title, 'Mid copy');
+  assert.equal((receipt.data as ChatAttachment).bytes, 9 * MiB);
+  assert.equal(
+    slow.store.receipt(`chat-file:${slow.taskId}:${(receipt.data as ChatAttachment).id}:big.log`)
+      ?.result.outcome,
+    'applied',
+  );
+
   const { kind: _, ...file } = first.data as ChatAttachment & { kind: 'chat-attachment' };
   const ask = (files: ChatAttachment[]) =>
     act(store, (effects) =>
@@ -2203,6 +2703,37 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
       packetText.indexOf('New message from the person:'),
   );
   assert.doesNotMatch(packetText, /^n33\.txt/m);
+  // Files alone: the request text is empty, the file goes in the request's files, and a later
+  // packet names the files where the message would be.
+  const silent = async (files: ChatAttachment[], choice: ChatModelSelection, text = '') => {
+    const done = turnReaches({ store: carry.store }, 'done');
+    act(carry.store, (effects) =>
+      carry.service.sendMessage(
+        {
+          taskId: carry.taskId,
+          text,
+          selection: choice,
+          role: 'assistant',
+          attachments: [],
+          files,
+        },
+        effects,
+      ),
+    );
+    await done;
+  };
+  await silent([notes[0]], selection);
+  const filesOnly = families.get('openai')?.requests.at(-1) as unknown as ChatTurnRequest;
+  assert.equal(filesOnly.prompt, '');
+  assert.deepEqual(
+    filesOnly.files?.map((entry) => entry.attachment.name),
+    ['n0.txt'],
+  );
+  await silent([], google, 'And now?');
+  assert.match(
+    families.get('google')?.requests.at(-1)?.prompt ?? '',
+    /^Person:\n\(Files only: n0\.txt\)$/m,
+  );
   // A Local reply that stops at its output limit writes the counts, and Continue asks the same
   // model for the rest in a new message. The partial reply stays in the thread.
   const local = { family: 'local', model: 'local-model', effort: 'default' } as const;
@@ -2275,6 +2806,13 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   const rename = (title: string) =>
     store.transaction(() => service.renameThread({ taskId, title }));
   assert.equal(rename(' \n ').reason, 'title-empty');
+  // A plan command for a plan the thread does not hold changes nothing.
+  for (const planned of [
+    act(store, (effects) => service.runPlan({ taskId, planId: 'plan-1' }, effects)),
+    act(store, (effects) => service.runPlan({ taskId, planId: 'plan-1', sliceId: 1 }, effects)),
+    act(store, (effects) => service.cancelPlan({ taskId, planId: 'plan-1' }, effects)),
+  ])
+    assert.equal(planned.reason, 'plan-not-found');
   const renamed = rename('  Sales\n chart ').entity as Task;
   assert.deepEqual([renamed.title, renamed.revision], ['Sales chart', 1]);
   assert.deepEqual(store.get<Task>('task', taskId), renamed);
@@ -2311,6 +2849,12 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   const ref = `refs/crewkite/threads/${taskId}`;
   git(root, ['update-ref', ref, scripted.requests[0].scratch.base]);
   assert.equal(store.transaction(() => service.deleteThread({ taskId }, [])).outcome, 'applied');
+  assert.deepEqual(
+    store
+      .eventsAfter('0')
+      .flatMap((event) => (event.type === 'task.removed' ? [[event.taskId, event.payload]] : [])),
+    [[null, { taskId }]],
+  );
   assert.ok(existsSync(join(folder, 'files')));
   const restarted = start();
   restarted.recover();
@@ -2330,4 +2874,120 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
       table,
     );
   assert.equal(remove(restarted).reason, 'task-not-found');
+});
+
+test('the thread reader returns bounded, redacted reads of its own thread only', {
+  timeout: 30000,
+}, async (t) => {
+  const secret = 'sk-live0123456789abcdef';
+  const long = `${'Plain words. '.repeat(3000)}API_KEY=hunter2 ${secret}`;
+  const scripted = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [
+      [{ kind: 'text', itemId: 'reply', chunks: [long] }],
+      [
+        { kind: 'text', itemId: 'live', chunks: [`Working. TOKEN: abc123 ${'x'.repeat(9000)}`] },
+        { kind: 'wait' },
+      ],
+    ],
+  });
+  const adapter = {
+    ...scripted,
+    startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+      if (scripted.requests.length === 0) {
+        writeFileSync(join(request.scratch.directory, 'big.txt'), `${'line\n'.repeat(30_000)}`);
+        const tool = (callId: string, kind: ChatToolKind, title: string, input: object) => {
+          emit({ type: 'tool.started', turnId: request.turnId, callId, kind, title, input });
+          emit({ type: 'tool.completed', turnId: request.turnId, callId, status: 'ok' });
+        };
+        tool('c1', 'edit', 'Write big.txt', { file_path: 'big.txt' });
+        tool('c2', 'command', 'Fetch', {
+          command: `curl -H "Authorization: Bearer ${secret}" https://example.invalid`,
+          stdin: 'stdin-body-never-shown',
+        });
+      }
+      return scripted.startTurn(request, emit);
+    },
+  };
+  const thread = standalone(t, {
+    adapters: new Map([['openai', adapter]]),
+    resolveEnvironment: () => ({ CREWKITE_SECRET: 'env-value-never-shown' }),
+  });
+  const done = turnReaches(thread, 'done');
+  thread.send('Write it.');
+  const first = await done;
+  const reads = thread.service.threadReads(thread.taskId);
+  const all: unknown[] = [];
+  const keep = <T>(value: T) => {
+    all.push(value);
+    return value;
+  };
+
+  const listed = keep(reads.turns({ limit: 50 })).turns;
+  assert.deepEqual(
+    listed.map((turn) => [turn.id, turn.role, turn.status, turn.changedFiles]),
+    [[first.id, 'assistant', 'done', 1]],
+  );
+  assert.equal(listed[0].reply.length, 300);
+  assert.deepEqual(keep(reads.turns({ since: first.sequence, limit: 50 })).turns, []);
+
+  const one = keep(reads.turn({ id: first.id }));
+  assert.equal(one.truncated, true);
+  assert.ok(Buffer.byteLength(one.reply) <= 32 * 1024);
+  assert.match(one.reply, /\n\[truncated\]$/);
+  assert.deepEqual(one.files, ['big.txt']);
+  assert.deepEqual(
+    one.trace.map((entry) => [entry.kind, entry.target, entry.outcome]),
+    [
+      ['edit', 'big.txt', 'ok'],
+      ['command', 'curl -H "Authorization: Bearer [redacted]" https://example.invalid', 'ok'],
+    ],
+  );
+  assert.throws(() => reads.turn({ id: `trn_${'9'.repeat(26)}` }), /No turn with that id/);
+
+  // The diff pages at 64 KiB on a line, and the pages put together are the whole diff.
+  const pages: string[] = [];
+  let cursor: string | undefined;
+  do {
+    const page = keep(reads.diff({ path: 'big.txt', ...(cursor ? { cursor } : {}) }));
+    assert.ok(Buffer.byteLength(page.diff) <= 64 * 1024);
+    pages.push(page.diff);
+    cursor = page.more ?? undefined;
+  } while (cursor);
+  assert.ok(pages.length > 1);
+  assert.equal(pages.join('').split('\n+line').length - 1, 30_000);
+  assert.equal(keep(reads.live()).state, 'none');
+  assert.deepEqual(keep(reads.checks()).lines, []);
+
+  const streaming = next(
+    thread,
+    (event) => event.type === 'agent.event' && event.payload.type === 'text.delta',
+  );
+  thread.send('Keep going.');
+  await streaming;
+  const live = keep(reads.live());
+  assert.equal(live.state, 'running');
+  if (live.state === 'running') {
+    assert.ok(Buffer.byteLength(live.text) <= 8 * 1024);
+    assert.equal(live.role, 'assistant');
+  }
+  // Rows: what the redaction catches before any text leaves.
+  for (const [raw, shown] of [
+    [`key ${secret} here`, 'key [redacted] here'],
+    ['Authorization: Bearer abc.def-ghi', 'Authorization: Bearer [redacted]'],
+    ['export OPENAI_API_KEY=abc123', 'export OPENAI_API_KEY=[redacted]'],
+    ['"client_secret": "s3cr3t"', '"client_secret": [redacted]'],
+    ['GITHUB_TOKEN: ghp_x1', 'GITHUB_TOKEN: [redacted]'],
+    ['monkey business = fine', 'monkey business = fine'],
+  ] as const)
+    assert.equal(redact(raw), shown, raw);
+  // The reads never carry the secrets, stdin or environment values.
+  const text = JSON.stringify(all);
+  for (const hidden of [secret, 'hunter2', 'stdin-body-never-shown', 'env-value-never-shown'])
+    assert.equal(text.includes(hidden), false, hidden);
+  const running = thread.read().thread.activeTurnId as string;
+  act(thread.store, (effects) =>
+    thread.service.stopTurn({ taskId: thread.taskId, turnId: running }, effects),
+  );
+  await turnReaches(thread, 'stopped');
 });

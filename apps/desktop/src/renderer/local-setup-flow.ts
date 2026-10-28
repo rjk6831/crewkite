@@ -1,12 +1,13 @@
 import type { DesktopCommand } from '@crewkite/client';
 import type { CommandResult, LocalSetup } from '@crewkite/contracts';
+import { formatSize } from './format-size.ts';
 
 /** Why the saved setup is where it is. The card and the rail say the same sentence. */
 export const setupReasons: Record<NonNullable<LocalSetup['reason']>, string> = {
   unconfigured: 'Configure a loopback endpoint first.',
-  'connection-required': 'Connect through the native input window.',
+  'connection-required': 'Press Connect. CrewKite checks whether the runtime wants a token.',
   'connection-unavailable':
-    'Local connection failed. Confirm the server authentication setting matches this connection.',
+    'Local connection failed. Check that the runtime is running, then press Connect.',
   'input-active': 'The native connection input window is open.',
   'input-unknown': 'Connection input ownership is unknown. Reconnect before continuing.',
   'discovery-required': 'Read the connected runtime to find its loaded model.',
@@ -54,7 +55,6 @@ export function lastSeen(
 }
 
 const GIB = 1024 ** 3;
-const gigabytes = (bytes: number) => `${(bytes / GIB).toFixed(1)} GB`;
 
 /**
  * The warning when memory runs short with models resident: under 4 GiB available, or under a tenth
@@ -72,7 +72,37 @@ export function lowMemory(
   const loaded = setup?.observation?.residentLlms ?? 0;
   if (available === null || loaded === 0) return null;
   if (available >= 4 * GIB && (total === null || available >= total / 10)) return null;
-  return `Low memory: ${gigabytes(available)} available with ${loaded} ${loaded === 1 ? 'model' : 'models'} loaded. Replies may slow.`;
+  return `Low memory: ${formatSize(available)} available with ${loaded} ${loaded === 1 ? 'model' : 'models'} loaded. Replies may slow.`;
+}
+
+/**
+ * The one status line under the card heading. A lost selection comes first, then the message from
+ * the last action, then a confirmed selection, then the reason the saved setup is where it is. A
+ * read the card started on its own changes nothing the person asked for, so while one runs the
+ * reason line stays as it was before the read began (`held`).
+ */
+export function statusLine({
+  setup,
+  message,
+  lost,
+  confirmed,
+  quiet,
+  held,
+}: {
+  setup: Pick<LocalSetup, 'reason'> | null | undefined;
+  message: string | null;
+  lost: string | null;
+  confirmed: boolean;
+  quiet: boolean;
+  held: string | null;
+}): string {
+  if (lost) return lost;
+  if (message) return message;
+  if (confirmed) return 'Model selection confirmed';
+  if (!setup) return 'Local setup is unavailable. Reconnect to recover current status.';
+  if (!setup.reason) return 'Inspect the saved connection and model state.';
+  if (quiet && setup.reason === 'discovery-active' && held) return held;
+  return setupReasons[setup.reason];
 }
 
 /**
@@ -177,7 +207,10 @@ export async function connectInPlace({
         message: now.reason ? setupReasons[now.reason] : 'Local did not connect.',
       };
     if (now.observation && !now.observationStale && (discovered || !setup.connected))
-      return { kind: 'connected', withoutToken: !now.secretConfigured };
+      return {
+        kind: 'connected',
+        withoutToken: now.connectedWithoutToken ?? !now.secretConfigured,
+      };
     if (!discovered) {
       discovered = true;
       const read = await command({

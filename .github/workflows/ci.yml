@@ -68,11 +68,22 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Install pinned desktop runtime
         run: pnpm desktop:install
+      # The test runner prints each file's start and end, so the log shows which file hung or
+      # failed on a runner I cannot reach. tee keeps the live log and pipefail keeps the exit code.
       - name: Verify workspace and desktop journey
         timeout-minutes: 12
-        run: pnpm verify
+        shell: bash
+        run: pnpm verify 2>&1 | tee "$RUNNER_TEMP/verify-output.log"
         env:
           PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
+      - name: Keep the verify output
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: verify-output-macos
+          path: ${{ runner.temp }}/verify-output.log
+          if-no-files-found: warn
+          retention-days: 14
 
   # Single required check. It fails unless every predecessor succeeded,
   # so a skipped or cancelled job never counts as coverage.

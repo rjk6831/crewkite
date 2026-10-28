@@ -258,14 +258,17 @@ test('Local secret input returns one current private result after helper cleanup
       selected.connection.modelBinding.setupHash,
     );
   }
+  // The probe at connect decides. A saved mode with no connect is unavailable, and a probe that
+  // connected makes token mode available while the token is held in memory with no stored secret.
   assert.equal(
-    resolveLocalConnection({ ...selection, authMode: 'none' }, capability).facts.available,
+    resolveLocalConnection({ ...selection, authMode: 'none' }, { ...capability, connected: false })
+      .facts.available,
     false,
   );
   assert.equal(
     resolveLocalConnection(selection, { ...capability, secretConfigured: false, connected: true })
       .facts.available,
-    false,
+    true,
   );
   assert(!('artifactSha256' in selected.connection.modelBinding));
   assert.equal(

@@ -1,13 +1,15 @@
 import type { ChatCatalogRead, ChatModelSelection, WorkspaceState } from '@crewkite/contracts';
 import { GitBranch, PanelRight } from 'lucide-react';
-import { type ReactNode, useCallback, useMemo, useRef, useState } from 'react';
+import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
 import {
+  cancelPlan,
   configureThread,
   handoffThread,
   resolvePermission,
   retryTurn,
+  runPlan,
   sendMessage,
   steerMessage,
   stopTurn,
@@ -22,11 +24,16 @@ import { limitOffer } from './handoff-offer.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { outputLimitLine } from './output-limit.ts';
+import { PlanCard } from './plan-card.tsx';
 import { QueuedList } from './queued-list.tsx';
 import {
+  announcements,
+  type LiveSignals,
   lastFamily,
   lastReply,
+  lastUserMessage,
   latestContext,
+  liveSignals,
   newestTurnId,
   type ThreadItem,
   type ThreadSettings,
@@ -108,6 +115,20 @@ export function ThreadView({
   const changesKey = useMemo(() => changeCount(items), [items]);
   const turns = useMemo(() => Object.values(state.turnMeta), [state.turnMeta]);
   const offer = useMemo(() => limitOffer(state), [state]);
+
+  // One polite live region says a reply finished or a permission request arrived. The first view
+  // of a thread is the baseline and says nothing.
+  const signals = useMemo(() => liveSignals(items), [items]);
+  const seen = useRef<LiveSignals | null>(null);
+  const [said, setSaid] = useState({ count: 0, text: '' });
+  useEffect(() => {
+    if (!state.loaded) return;
+    const lines = announcements(seen.current, signals);
+    seen.current = signals;
+    if (lines.length > 0)
+      setSaid((previous) => ({ count: previous.count + 1, text: lines.join(' ') }));
+  }, [state.loaded, signals]);
+  const lastMessage = useMemo(() => lastUserMessage(state), [state]);
 
   const queued = thread?.queued;
   // The controller queues a message while the thread is busy. The queued list shows that one, so
@@ -216,6 +237,27 @@ export function ThreadView({
       setNotice(null);
     },
     [source, task.id],
+  );
+  // The plan card reads thread.plan. Each button is one command, and the controller answers with
+  // the plan's new state on its chat.thread event.
+  const plan = thread?.plan ?? null;
+  const planned = plan && thread && (
+    <PlanCard
+      plan={plan}
+      flight={thread.flightMode}
+      onRun={async (input) => {
+        await runPlan(source, { taskId: task.id, planId: plan.planId, ...input });
+        setNotice(null);
+      }}
+      onCancel={async () => {
+        await cancelPlan(source, { taskId: task.id, planId: plan.planId });
+        setNotice(null);
+      }}
+      onStop={async () => {
+        if (activeTurn) await stop();
+        else await cancelPlan(source, { taskId: task.id, planId: plan.planId });
+      }}
+    />
   );
   const replyId = useMemo(
     () => (activeTurn ? null : lastReply(state, items)),
@@ -343,8 +385,18 @@ export function ThreadView({
           items={items}
           empty={empty}
           footer={
-            offer && (
-              <LimitOfferCard key={offer.turnId} source={source} taskId={task.id} offer={offer} />
+            (planned || offer) && (
+              <>
+                {planned}
+                {offer && (
+                  <LimitOfferCard
+                    key={offer.turnId}
+                    source={source}
+                    taskId={task.id}
+                    offer={offer}
+                  />
+                )}
+              </>
             )
           }
           actions={actions}
@@ -380,7 +432,13 @@ export function ThreadView({
           onOpenCrew={() => setInspector({ open: true, tab: 'crew', focus: null })}
           onCatalog={setCatalog}
           localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
+          lastMessage={lastMessage}
         />
+        {/* A zero-width mark on alternate lines lets the same sentence be read twice in a row. */}
+        <p className="th-sr" role="status" aria-live="polite" aria-atomic="true">
+          {said.text}
+          {said.count % 2 === 0 ? '' : '\u200b'}
+        </p>
       </section>
       {inspector.open && (
         <Inspector

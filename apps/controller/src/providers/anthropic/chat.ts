@@ -32,6 +32,7 @@ import {
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
@@ -40,7 +41,7 @@ import { armOwnedCleanup } from './native-discovery.ts';
 // so the user message goes in on stdin, permission asks come back as control requests, and the
 // answers go out on the same stdin while the turn runs.
 
-type Spawn = (
+export type Spawn = (
   executable: string,
   args: string[],
   options: {
@@ -76,6 +77,9 @@ const TRACE_LIMITS = { lines: 5000, bytes: 256 * 1024 };
 const id = z.string().min(1).max(200);
 // Session IDs and models go into argv, so neither may start with a dash or carry whitespace.
 const sessionId = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/);
+// The client writes this marker to stderr for a model ID the API does not know. The result frame
+// says the same with a 404, and its subtype stays success, so neither is read from the subtype.
+const UNRECOGNIZED_MODEL = /\bunrecognized_model\b/;
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,199}$/;
 const tokens = z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER);
 const usage = z.object({
@@ -178,6 +182,7 @@ const result = z.object({
   result: loose(z.string()),
   errors: loose(z.array(z.unknown())),
   api_error: loose(z.string()),
+  api_error_status: loose(z.number().int()),
   usage: loose(usage),
   modelUsage: loose(
     z.record(z.string(), z.object({ contextWindow: loose(z.number().int().positive()) }).catch({})),
@@ -270,7 +275,7 @@ const options: ChatPermissionOption[] = [
 // Copied from startReplacement in replacement.ts. The profile verified this build when it
 // resolved, and hashing again right before spawn keeps a binary replaced since then from
 // running under the old identity.
-function verifiedExecutable(path: string, sha256: string) {
+export function verifiedExecutable(path: string, sha256: string) {
   if (!isAbsolute(path) || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('identity');
   const executable = realpathSync(path);
   const fd = openSync(executable, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
@@ -292,7 +297,7 @@ function verifiedExecutable(path: string, sha256: string) {
 // would strip the tools a chat turn needs. Updates stay off so the verified build is the one
 // that runs, and nothing else from the controller's environment, keys included, reaches the
 // client.
-function chatEnvironment(source: NodeJS.ProcessEnv, temporary: string): NodeJS.ProcessEnv {
+export function chatEnvironment(source: NodeJS.ProcessEnv, temporary: string): NodeJS.ProcessEnv {
   if (!source.HOME || !isAbsolute(source.HOME)) throw new Error('environment');
   return {
     HOME: source.HOME,
@@ -476,8 +481,22 @@ function userMessage(text: string, files: readonly TurnFile[], staging: string) 
   };
 }
 
-function chatArguments(request: ChatTurnRequest, resume: string | null, folders: string[]) {
+function chatArguments(
+  request: ChatTurnRequest,
+  resume: string | null,
+  folders: string[],
+  tools: ThreadToolsServer | null,
+) {
   const { effort, model } = request.selection;
+  // The thread tools are the one MCP server a turn gets. Strict mode keeps the person's own
+  // servers, project files and plugins out, and the allow rule answers the tools without an ask.
+  const allowed = [
+    ...(request.readOnly ? ['Read', 'Grep', 'Glob'] : []),
+    ...(tools ? [`mcp__${tools.name}__*`] : []),
+  ];
+  const server = tools && {
+    [tools.name]: { type: 'stdio', command: tools.command, args: tools.args },
+  };
   return [
     '--print',
     '--output-format',
@@ -491,14 +510,21 @@ function chatArguments(request: ChatTurnRequest, resume: string | null, folders:
     // Settings files carry allow rules that answer before CrewKite is asked, in the scratch
     // copy's own file and in the person's user file. No source loads; hooks stay off too. The
     // usage read runs the same way and signs in fine, so sign-in does not depend on settings.
+    // Empty commit and pr attribution keep a trailer or a generated-with line out of any commit
+    // or pull request text the model writes.
     '--setting-sources',
     '',
     '--settings',
-    '{"disableAllHooks":true}',
+    '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
     '--permission-mode',
     request.permissionPolicy === 'ask' ? 'default' : 'acceptEdits',
-    // Review and advice turns read only.
-    ...(request.readOnly ? ['--allowedTools', 'Read,Grep,Glob'] : []),
+    // Review and advice turns read only. The thread tools only read, on every turn.
+    ...(allowed.length ? ['--allowedTools', allowed.join(',')] : []),
+    // The config option takes several values, so the flag after it closes the list. Strict mode
+    // goes on every turn: with no thread tools the config is empty and no other server loads.
+    '--mcp-config',
+    JSON.stringify({ mcpServers: server ?? {} }),
+    '--strict-mcp-config',
     '--model',
     model,
     // The client documents low, medium, high, xhigh and max. It has no minimal level.
@@ -515,6 +541,8 @@ export function anthropicChatAdapter(deps: {
   schedule?: Schedule;
   /** Each rate limit frame that reports a window. The last one in a turn is the newest. */
   onUsage?: (reading: UsageReading) => void;
+  /** The thread tools server for this turn, with its own token. Null runs the turn without. */
+  threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }): ChatAdapter {
   return { family: 'anthropic', startTurn: (request, emit) => startTurn(deps, request, emit) };
 }
@@ -637,7 +665,12 @@ function startTurn(
   }
   let child: ChildProcessWithoutNullStreams;
   try {
-    const args = chatArguments(request, prior, message.folders);
+    const args = chatArguments(
+      request,
+      prior,
+      message.folders,
+      deps.threadTools?.(request) ?? null,
+    );
     child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,
       env: environment,
@@ -686,6 +719,15 @@ function startTurn(
     resolveResult = resolve;
   });
 
+  // A model the API does not know fails on the first request. The line names the model the
+  // person picked, which the init frame echoes back unchanged.
+  const modelRefusal = (base: Pick<ChatFailure, 'stage' | 'providerMessage' | 'method'>) =>
+    chatFailure({
+      ...base,
+      kind: 'model-unavailable',
+      message: `Anthropic does not serve the model ${clip(request.selection.model, 120)} to this account.`,
+      nextAction: 'Pick another model or type a different model ID.',
+    });
   const decide = (stopReason: Outcome['stopReason'], failure: ChatFailure | null = null) => {
     outcome ??= { stopReason, failure };
   };
@@ -926,7 +968,7 @@ function startTurn(
       };
     else if (data.error === 'authentication_failed' || data.error === 'oauth_org_not_allowed')
       apiError = { kind: 'signed-out', resetsAt: null };
-    else if (data.error === 'model_not_found')
+    else if (data.error === 'model_not_found' || data.api_error_status === 404)
       apiError = { kind: 'model-unavailable', resetsAt: null };
     // A turn without file blocks gets the same answer for other reasons, such as a prompt over
     // the context window, so only a turn that sent blocks names the files.
@@ -1184,15 +1226,12 @@ function startTurn(
               message: 'The Anthropic client is not signed in.',
             }),
           );
-        else if (apiError?.kind === 'model-unavailable')
-          decide(
-            'error',
-            chatFailure({
-              ...base,
-              kind: 'model-unavailable',
-              message: 'The Anthropic client cannot use the selected model.',
-            }),
-          );
+        else if (
+          apiError?.kind === 'model-unavailable' ||
+          data.api_error_status === 404 ||
+          UNRECOGNIZED_MODEL.test(stderr)
+        )
+          decide('error', modelRefusal(base));
         else
           decide(
             'error',
@@ -1266,20 +1305,22 @@ function startTurn(
     const signedOut = SIGNED_OUT.test(stderr);
     const { stopReason, failure }: Outcome = outcome ?? {
       stopReason: 'error',
-      failure: chatFailure({
-        stage: started ? 'stream' : 'session',
-        kind: signedOut ? 'signed-out' : 'client-exit',
-        message: signedOut
-          ? 'The Anthropic client is not signed in.'
-          : 'The Anthropic client exited before it finished the turn.',
-        providerMessage:
-          stderr
-            .split('\n')
-            .filter((line) => line.trim())
-            .at(-1)
-            ?.trim() ?? null,
-        code: exitCode,
-      }),
+      failure: UNRECOGNIZED_MODEL.test(stderr)
+        ? modelRefusal({ stage: 'session' as const, providerMessage: null, method: null })
+        : chatFailure({
+            stage: started ? 'stream' : 'session',
+            kind: signedOut ? 'signed-out' : 'client-exit',
+            message: signedOut
+              ? 'The Anthropic client is not signed in.'
+              : 'The Anthropic client exited before it finished the turn.',
+            providerMessage:
+              stderr
+                .split('\n')
+                .filter((line) => line.trim())
+                .at(-1)
+                ?.trim() ?? null,
+            code: exitCode,
+          }),
     };
     send({ type: 'turn.completed', turnId, stopReason, failure });
     const at = now();
@@ -1287,16 +1328,18 @@ function startTurn(
       stopReason,
       failure,
       assistantText: texts.join('\n\n'),
-      session: session
-        ? {
-            family: 'anthropic',
-            sessionId: session,
-            model,
-            updatedAt: new Date(Number.isFinite(at) ? at : Date.now()).toISOString(),
-          }
-        : request.session?.family === 'anthropic'
-          ? request.session
-          : null,
+      // A refused model leaves no session to resume, since the next try may name another model.
+      session:
+        session && failure?.kind !== 'model-unavailable'
+          ? {
+              family: 'anthropic',
+              sessionId: session,
+              model,
+              updatedAt: new Date(Number.isFinite(at) ? at : Date.now()).toISOString(),
+            }
+          : request.session?.family === 'anthropic'
+            ? request.session
+            : null,
       usage: usageSeen,
       changedPaths: [...changed],
     });

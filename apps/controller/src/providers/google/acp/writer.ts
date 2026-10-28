@@ -28,6 +28,7 @@ import {
   startAcpProcess,
 } from './client.ts';
 import {
+  ACP_SESSION_MODELS,
   type AcpClientIdentity,
   AcpClientPinSchema,
   AcpImportIdentitySchema,
@@ -93,7 +94,27 @@ export type AcpDependencies = {
   toolMappings?: readonly AcpToolMapping[];
 };
 
-export function decodeAcpConfiguration(raw: unknown): DecodedConfig {
+// The session reply of a client that predates config options: its models and the current one.
+const sessionModels = z
+  .object({
+    availableModels: z
+      .array(z.object({ modelId: acpIdentifier }))
+      .min(1)
+      .max(32),
+    currentModelId: acpIdentifier,
+  })
+  .refine(
+    ({ availableModels, currentModelId }) =>
+      new Set(availableModels.map((v) => v.modelId)).size === availableModels.length &&
+      availableModels.some((v) => v.modelId === currentModelId),
+  );
+
+/**
+ * Reads the model and thought level a session offers. Config options come first. A client that
+ * sends none for the model may list `models` in the session reply instead, which is read only
+ * when no model option exists and is dropped when malformed.
+ */
+export function decodeAcpConfiguration(raw: unknown, legacyModels?: unknown): DecodedConfig {
   const options = z.array(configSchema).max(32).parse(raw);
   if (new Set(options.map((v) => v.id)).size !== options.length)
     throw new AcpError('configuration');
@@ -142,11 +163,21 @@ export function decodeAcpConfiguration(raw: unknown): DecodedConfig {
     currentValue: v.currentValue,
     supported: v.supported,
   });
+  const legacy = models.length === 0 ? sessionModels.safeParse(legacyModels) : null;
+  const model = legacy?.success
+    ? {
+        optionId: ACP_SESSION_MODELS,
+        currentValue: legacy.data.currentModelId,
+        supported: legacy.data.availableModels.map((v) => v.modelId),
+      }
+    : models.length === 1
+      ? normalized(models[0])
+      : null;
   return {
     configOptions:
-      models.length === 1 && thoughts.length <= 1
+      model && thoughts.length <= 1
         ? GoogleAcpConfigurationSchema.parse({
-            model: normalized(models[0]),
+            model,
             thoughtLevel: thoughts[0] ? normalized(thoughts[0]) : null,
           })
         : null,
@@ -201,7 +232,11 @@ async function initialize(
     modeValues: [],
   });
 }
-const sessionSchema = z.object({ sessionId: acpIdentifier, configOptions: z.unknown().optional() });
+const sessionSchema = z.object({
+  sessionId: acpIdentifier,
+  configOptions: z.unknown().optional(),
+  models: z.unknown().optional(),
+});
 function bufferSessionUpdates(connection: AcpConnection) {
   const buffered: { method: string; params: Record<string, unknown> }[] = [];
   connection.onNotification = (method, params) => {
@@ -258,7 +293,7 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
       const session = sessionSchema.parse(
         await connection.request('session/new', { cwd: options.directory, mcpServers: [] }),
       );
-      let observed = decodeAcpConfiguration(session.configOptions ?? []);
+      let observed = decodeAcpConfiguration(session.configOptions ?? [], session.models);
       connection.onNotification = (method, params) => {
         if (method !== 'session/update' || params.sessionId !== session.sessionId)
           throw new AcpError('protocol');

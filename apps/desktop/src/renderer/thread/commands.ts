@@ -157,6 +157,42 @@ export const handoffThread = (
   input: Input<typeof HandoffChatThreadPayloadSchema>,
 ) => run(source, 'HandoffChatThread', HandoffChatThreadPayloadSchema.parse(input));
 
+// The plan commands. The controller validates them with its own schemas; these checks only
+// keep an empty id or question from leaving the window. Per-slice Run is RunChatPlan with a sliceId.
+const nonEmpty = (value: string, what: string) => {
+  if (value.trim() === '') throw new Error(`${what} is empty.`);
+  return value;
+};
+export type RunPlanInput = {
+  taskId: string;
+  planId: string;
+  /** Runs this one slice, once the slices it depends on are done. */
+  sliceId?: number;
+  /** The provider picked per slice in Balanced, where it differs from the assignment. */
+  overrides?: { sliceId: number; family: string; model: string }[];
+};
+export const runPlan = (source: ThreadSource, input: RunPlanInput) =>
+  run(source, 'RunChatPlan', {
+    ...input,
+    taskId: nonEmpty(input.taskId, 'The thread'),
+    planId: nonEmpty(input.planId, 'The plan'),
+  });
+export const cancelPlan = (source: ThreadSource, input: { taskId: string; planId: string }) =>
+  run(source, 'CancelChatPlan', {
+    taskId: nonEmpty(input.taskId, 'The thread'),
+    planId: nonEmpty(input.planId, 'The plan'),
+  });
+
+/** A read-only question to one family. The reply arrives as a side reply with the ask badge. */
+export const askFamily = (
+  source: ThreadSource,
+  input: { taskId: string; family: string; model?: string; question: string },
+) =>
+  run(source, 'AskChatFamily', {
+    ...input,
+    question: nonEmpty(input.question.trim(), 'The question'),
+  });
+
 export type Acceptance =
   | { accepted: true; branch: string; commit: string; fileCount: number; note: string | null }
   | { accepted: false; reason: string; next: string | null };

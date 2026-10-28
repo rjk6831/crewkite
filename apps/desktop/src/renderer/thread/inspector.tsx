@@ -60,6 +60,8 @@ const roleNames: Record<ChatRole, string> = {
   advisor: 'Advisor',
   challenger: 'Challenger',
   fixer: 'Fixer',
+  orchestrator: 'Orchestrator',
+  ask: 'Ask',
 };
 
 // The chosen width is a local preference. Storage can be blocked, and the panel falls back to the
@@ -544,6 +546,21 @@ function CrewTab({
       ...(role === 'builder' ? { selection } : {}),
     });
   }
+  // The orchestrator starts on the builder's model, and the row's select changes it. Removing it
+  // goes back to one builder turn per message.
+  function setOrchestrator(on: boolean) {
+    if (!crew) return;
+    const builder = crew.members.find((member) => member.role === 'builder');
+    if (on && !builder) return;
+    const rest = crew.members.filter((member) => member.role !== 'orchestrator');
+    onConfigure({
+      crew: {
+        ...crew,
+        members:
+          on && builder ? [...rest, { role: 'orchestrator', selection: builder.selection }] : rest,
+      },
+    });
+  }
   function start(name: string) {
     const preset = readCrewPresets().find((value) => value.name === name);
     if (!preset || !thread) return;
@@ -600,10 +617,25 @@ function CrewTab({
               ) : (
                 <span className="th-muted">{fallback ?? 'Not in this crew'}</span>
               )}
+              {role === 'orchestrator' && crew && (
+                <button
+                  type="button"
+                  className="th-pill th-outline th-crew-toggle"
+                  onClick={() => setOrchestrator(!member)}
+                >
+                  {member ? 'Remove orchestrator' : 'Add orchestrator'}
+                </button>
+              )}
             </li>
           );
         })}
       </ul>
+      {crew?.members.some((member) => member.role === 'orchestrator') && (
+        <p className="th-muted">
+          The orchestrator replaces the single builder turn with a plan of slices. The controller
+          assigns each slice to a connected family and shows the plan before it runs.
+        </p>
+      )}
       <label>
         Start from preset
         <select value="" disabled={!thread} onChange={(event) => start(event.target.value)}>

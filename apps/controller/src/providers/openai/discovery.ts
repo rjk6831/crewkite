@@ -480,17 +480,26 @@ const models = z
             // What the model takes besides text decides which files go as images or audio. A
             // list that changed shape reads as none, so it never drops the model.
             inputModalities: z.array(z.string().max(32)).max(16).nullish().catch(null),
+            // The client's own retirement date for the model, in Unix seconds. A shape that
+            // changed reads as none.
+            upgradeInfo: z
+              .object({ retirementAt: z.number().int().positive().safe().nullish().catch(null) })
+              .nullish()
+              .catch(null),
           })
-          .transform(({ supportedReasoningEfforts, hidden, inputModalities, ...value }) => ({
-            ...value,
-            supportedReasoningEfforts: supportedReasoningEfforts.map(
-              (entry) => entry.reasoningEffort,
-            ),
-            ...(hidden ? { hidden: true as const } : {}),
-            ...(inputModalities
-              ? { inputModalities: MODALITIES.filter((kind) => inputModalities.includes(kind)) }
-              : {}),
-          })),
+          .transform(
+            ({ supportedReasoningEfforts, hidden, inputModalities, upgradeInfo, ...value }) => ({
+              ...value,
+              supportedReasoningEfforts: supportedReasoningEfforts.map(
+                (entry) => entry.reasoningEffort,
+              ),
+              ...(hidden ? { hidden: true as const } : {}),
+              ...(inputModalities
+                ? { inputModalities: MODALITIES.filter((kind) => inputModalities.includes(kind)) }
+                : {}),
+              ...(upgradeInfo?.retirementAt ? { retirementAt: upgradeInfo.retirementAt } : {}),
+            }),
+          ),
       )
       .max(20),
     nextCursor: text(200).nullish(),

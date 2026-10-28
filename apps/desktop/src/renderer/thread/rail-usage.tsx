@@ -52,11 +52,13 @@ export function RailUsage({
     focusSettingsCard(family);
     onOpenSettings?.();
   };
-  // Local connects here with the saved endpoint and auth mode. Settings opens only when the runtime
-  // wants a token this window does not hold, and the token window is already up by then.
+  // Local connects here with the saved endpoint and auth mode. Settings opens only when no endpoint
+  // is saved, or when the input operation is owned, which is the token window being up. While the
+  // loopback probe holds the operation in intent, the rail stays where it is and says Connecting.
   async function connectLocal() {
     const setup = header.localSetup;
-    if (!source || !refresh || !setup || connecting) return settings('local');
+    if (connecting) return;
+    if (!source || !refresh || !setup) return settings('local');
     attempt.current += 1;
     const mine = attempt.current;
     setConnecting(true);
@@ -134,7 +136,7 @@ export function RailUsage({
               </span>
             ))
           )}
-          {!row.unlimited && (
+          {!row.unlimited && !row.setUp && (
             <span className="rail-usage-reset">
               <span>
                 {row.resetsIn !== null
@@ -151,6 +153,18 @@ export function RailUsage({
               {localNote}
             </span>
           )}
+          {row.setUp &&
+            (onOpenSettings ? (
+              <button
+                type="button"
+                className="rail-usage-connect"
+                onClick={() => settings('local')}
+              >
+                Set up
+              </button>
+            ) : (
+              <span className="rail-usage-reset">Set up in Settings</span>
+            ))}
           {row.needsConnect &&
             (onOpenSettings ? (
               <button

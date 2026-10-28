@@ -2,6 +2,8 @@ import { z } from 'zod';
 import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
+  AskChatFamilyPayloadSchema,
+  CancelChatPlanPayloadSchema,
   ChatAttachmentSchema,
   ChatBranchStatusSchema,
   ChatCatalogChangeSchema,
@@ -34,6 +36,7 @@ import {
   RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   RetryChatTurnPayloadSchema,
+  RunChatPlanPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -256,6 +259,15 @@ export const LocalModelChoiceSchema = z
       .max(8)
       .refine((values) => new Set(values).size === values.length),
     qualification: z.literal('unqualified'),
+    /**
+     * The runtime reports that the model takes images. Kept with the cached observation, so the
+     * catalog can say so before any connect. Missing when the runtime did not say.
+     */
+    vision: z.boolean().optional(),
+    /** The largest context the model file supports, from a downloaded entry. Missing when unreported. */
+    maxContextLength: RevisionSchema.min(1).optional(),
+    /** The runtime reports the model is trained for tool use. Missing when unreported. */
+    trainedForToolUse: z.boolean().optional(),
   })
   .refine(
     (choice) =>
@@ -267,7 +279,8 @@ export const LocalModelChoiceSchema = z
           ? choice.instanceReference !== null &&
             choice.contextLength !== null &&
             ['gguf', 'safetensors'].includes(choice.identity.format) &&
-            choice.reasons.length === 0
+            // A busy instance still qualifies. The turn waits for it, and the card says Busy.
+            choice.reasons.every((reason) => reason === 'busy')
           : choice.reasons.length > 0,
     'Local model state needs its observed instance and finite compatibility reasons.',
   );
@@ -386,6 +399,12 @@ export const LocalSetupSchema = z
     secretConfigured: z.boolean(),
     authMode: LocalAuthModeSchema.optional(),
     connected: z.boolean().optional(),
+    /**
+     * What the loopback probe at the start of the last connect found: true when the runtime
+     * listed its models without a token, false when it wanted one. The probe never writes
+     * `authMode`. Missing until a connect has probed.
+     */
+    connectedWithoutToken: z.boolean().optional(),
     operation: LocalOperationSchema.nullable(),
     generation: z.enum(['idle', 'active', 'unknown']),
     observation: LocalModelObservationSchema.nullable(),
@@ -456,8 +475,10 @@ export const LocalSetupSchema = z
   .refine(
     (setup) =>
       setup.authMode === 'none'
-        ? !setup.secretConfigured
-        : setup.connected === undefined || setup.connected === setup.secretConfigured,
+        ? // A saved no-token mode holds a token only when the probe found the runtime wants one.
+          !setup.secretConfigured || setup.connectedWithoutToken === false
+        : setup.connected === undefined ||
+          setup.connected === (setup.secretConfigured || setup.connectedWithoutToken === true),
     'Local connection readiness must match its explicit authentication mode.',
   )
   .refine(localProjectionFits, 'Local setup exceeds its encoded byte bound.');
@@ -489,6 +510,28 @@ export const LocalHardwareStatusSchema = z
     'Available Local memory needs a valid total memory bound.',
   );
 export type LocalHardwareStatus = z.infer<typeof LocalHardwareStatusSchema>;
+/** Tokens a Local reply leaves for the chat template's own markers. */
+export const LOCAL_REPLY_MARGIN = 256;
+/** The smallest reply budget a Local turn starts with: 2,048 or 30 percent of the context. */
+export const localReplyFloor = (contextLength: number) =>
+  Math.max(2048, Math.ceil(contextLength * 0.3));
+/**
+ * The output and reasoning caps of one Local generation. The output cap R is what the prompt
+ * leaves of the context, less the margin. Null when R is under the floor, so the request must
+ * shrink. The reasoning cap is half of R, set only when the runtime takes a reasoning budget.
+ */
+export function localBudget(
+  contextLength: number,
+  promptTokens: number,
+  takesReasoningBudget: boolean,
+): { outputTokens: number; reasoningTokens: number | null } | null {
+  const outputTokens = contextLength - promptTokens - LOCAL_REPLY_MARGIN;
+  if (outputTokens < localReplyFloor(contextLength)) return null;
+  return {
+    outputTokens,
+    reasoningTokens: takesReasoningBudget ? Math.floor(outputTokens / 2) : null,
+  };
+}
 export const LocalNativeProfileSchema = z
   .strictObject({
     id: z.literal('local-file-v1'),
@@ -500,7 +543,10 @@ export const LocalNativeProfileSchema = z
     billing: z.literal('local'),
     /** The context the bound instance reports. Null until a model is bound. */
     contextLength: RevisionSchema.min(1).nullable(),
-    maximumOutputTokens: z.union([z.literal(2048), z.literal(4096)]),
+    /** The output cap `localBudget` computed for this profile's prompt and bound context. */
+    maximumOutputTokens: RevisionSchema.min(1),
+    /** Half the output cap, present only when the runtime takes a reasoning budget. */
+    reasoningBudgetTokens: RevisionSchema.min(1).optional(),
     qualifiedAt: z.iso.date().nullable(),
     maximumTaskMs: z.literal(300000),
     maximumFileBytes: z.literal(65536),
@@ -529,6 +575,14 @@ export const LocalNativeProfileSchema = z
   .refine(
     (profile) => !profile.modelBinding || profile.contextLength !== null,
     'A bound Local profile carries the context its instance reports.',
+  )
+  .refine(
+    (profile) =>
+      (profile.contextLength === null ||
+        profile.maximumOutputTokens <= profile.contextLength - LOCAL_REPLY_MARGIN) &&
+      (profile.reasoningBudgetTokens === undefined ||
+        profile.reasoningBudgetTokens <= Math.floor(profile.maximumOutputTokens / 2)),
+    'Local output caps fit the bound context, and reasoning takes at most half.',
   );
 const acpIdentifier = label.refine(
   (value) => value.isWellFormed() && !/\p{Cc}/u.test(value),
@@ -1591,6 +1645,18 @@ export type TaskOperationsRequest = z.input<typeof TaskOperationsRequestSchema>;
 const actor = z.strictObject({ id: label, kind: z.enum(['desktop', 'cli', 'controller']) });
 const envelope = { protocol: z.literal(1), key: CommandIdSchema, actor };
 const mutation = { ...envelope, expectedRevision: RevisionSchema };
+/** The Local runtime token, one line of text as the input window accepts it. */
+export const LocalTokenSchema = z
+  .string()
+  .min(1)
+  .max(4096)
+  .refine(
+    (value) =>
+      value.isWellFormed() &&
+      value.trim().length > 0 &&
+      !/[\0\n\r\v\f\u0085\u2028\u2029]/u.test(value) &&
+      new TextEncoder().encode(value).length <= 4096,
+  );
 const read = <T extends string, S extends z.ZodType>(command: T, payload: S) =>
   z.strictObject({ ...envelope, command: z.literal(command), payload });
 export const TaskActivityRequestSchema = z.strictObject({
@@ -1944,10 +2010,10 @@ const conversationAgent = z.strictObject({
 });
 const conversationUser = z.strictObject({ kind: z.literal('user') });
 // Chat messages share the conversation log so one cursor orders every message of a thread.
-const chatEntryText = (bytes: number) =>
+const chatEntryText = (bytes: number, min = 1) =>
   z
     .string()
-    .min(1)
+    .min(min)
     .max(bytes)
     .refine(
       (value) =>
@@ -1964,8 +2030,9 @@ export const ConversationEntrySchema = z
     z.strictObject({
       ...conversationEntryFields,
       kind: z.literal('user-message'),
-      // Planning input stays bounded by its command payload. Chat input can be longer.
-      text: chatEntryText(65_536),
+      // Planning input stays bounded by its command payload. Chat input can be longer. A chat
+      // message with files may have no text; the check below holds the rest to one character.
+      text: chatEntryText(65_536, 0),
       author: conversationUser,
       context: ConversationContextRefsSchema.optional(),
       attachments: z.array(z.string().min(1).max(4096)).max(32).optional(),
@@ -2032,6 +2099,8 @@ export const ConversationEntrySchema = z
     }),
   ])
   .superRefine((entry, context) => {
+    if (entry.kind === 'user-message' && entry.text === '' && !entry.files?.length)
+      context.addIssue({ code: 'custom', message: 'A message needs text or at least one file.' });
     if (
       'binding' in entry &&
       (entry.binding.taskId !== entry.taskId ||
@@ -2427,6 +2496,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('DiscardChatChange', DiscardChatChangePayloadSchema),
   mutate('RenameChatThread', RenameChatThreadPayloadSchema),
   mutate('DeleteChatThread', DeleteChatThreadPayloadSchema),
+  mutate('AskChatFamily', AskChatFamilyPayloadSchema),
+  mutate('RunChatPlan', RunChatPlanPayloadSchema),
+  mutate('CancelChatPlan', CancelChatPlanPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -2436,6 +2508,10 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('BeginLocalConnectionInput', z.strictObject({ consent: z.literal('explicit') })),
   mutate('CancelLocalConnectionInput', z.strictObject({ operationId: CommandIdSchema })),
   mutate('DisconnectLocal', empty),
+  // The remembered token travels on these two and no other path. They carry no expected
+  // revision, so no desktop or controller record of a command ever holds the value.
+  read('SupplyLocalToken', z.strictObject({ token: LocalTokenSchema })),
+  read('ReadLocalToken', empty),
   read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
   read(
     'GetTaskConversation',
@@ -3472,6 +3548,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
   ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
   ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
+  z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
     branch: AcceptChatChangesPayloadSchema.shape.branch,
@@ -3606,6 +3683,8 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('chat.catalog', ChatCatalogChangeSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
+  // A deleted thread's task is gone. Views drop it from the rail.
+  event('task.removed', z.strictObject({ taskId: TaskIdSchema })),
   event('run.prepared', RunSchema),
   event('run.admitted', RunSchema),
   event('attempt.launched', AttemptSchema),

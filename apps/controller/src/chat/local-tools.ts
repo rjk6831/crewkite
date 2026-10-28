@@ -15,9 +15,21 @@ import {
 } from 'node:fs';
 import { basename, dirname, isAbsolute, matchesGlob, relative, resolve, sep } from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
-import type { ChatFileDiffSchema, ChatToolKind } from '@crewkite/contracts';
+import {
+  type ChatFileDiffSchema,
+  type ChatToolKind,
+  ThreadChecksResultSchema,
+  ThreadDiffArgsSchema,
+  ThreadDiffResultSchema,
+  ThreadLiveResultSchema,
+  ThreadTurnArgsSchema,
+  ThreadTurnResultSchema,
+  ThreadTurnsArgsSchema,
+  ThreadTurnsResultSchema,
+} from '@crewkite/contracts';
 import { z } from 'zod';
 import { groupAbsent } from '../host/worker.ts';
+import type { ThreadReads } from './thread-reader.ts';
 
 // The tools CrewKite runs itself for a model that has no agent loop of its own. Every result is
 // bounded so a small context window survives a few calls, and the model is told the bounds.
@@ -37,7 +49,16 @@ const WALK_FILES = 20_000;
 const KILL_MS = 1000;
 
 type FileDiff = z.output<typeof ChatFileDiffSchema>;
+
 export type ToolContext = Readonly<{
+  /**
+   * Present when this turn can read its thread. The controller supplies the thread reader per
+   * turn, scoped to that thread and redacted, and Local reaches the thread store no other way.
+   * The thread tools fail without it.
+   */
+  threads?: ThreadReads;
+  /** Most bytes a thread tool result may take, sized from the room the Local prompt has left. */
+  threadBytes?: number;
   scratch: string;
   environment: NodeJS.ProcessEnv;
   signal?: AbortSignal;
@@ -145,6 +166,74 @@ export const LOCAL_TOOLS = [
 ] as const;
 export type LocalToolName = (typeof LOCAL_TOOLS)[number]['function']['name'];
 
+/** The thread reads. A turn offers them only when it has a reader. */
+export const THREAD_TOOLS = [
+  {
+    type: 'function',
+    function: {
+      name: 'thread_turns',
+      description:
+        'List earlier turns of this thread: id, sequence, family, model, role, status, changed file count and the start of the reply. since is a sequence number. family narrows the list. limit is at most 50.',
+      parameters: {
+        type: 'object',
+        properties: {
+          since: { type: 'integer', minimum: 0 },
+          family: { type: 'string', enum: ['openai', 'anthropic', 'google', 'local'] },
+          limit: { type: 'integer', minimum: 1, maximum: 50 },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'thread_turn',
+      description:
+        'Read one earlier turn by id: its reply, the actions it ran and the files it changed.',
+      parameters: {
+        type: 'object',
+        properties: { id: { type: 'string' } },
+        required: ['id'],
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'thread_diff',
+      description:
+        'Read the thread changes as a unified diff, in pages. since is a turn sequence, path narrows to one file. When the result names a cursor, pass it to read on.',
+      parameters: {
+        type: 'object',
+        properties: {
+          since: { type: 'integer', minimum: 0 },
+          path,
+          cursor: { type: 'string' },
+        },
+      },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'thread_checks',
+      description: 'Read the latest check results for this thread.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+  {
+    type: 'function',
+    function: {
+      name: 'thread_live',
+      description:
+        'Read the turn that is running now in this thread, if any: its text and actions so far.',
+      parameters: { type: 'object', properties: {} },
+    },
+  },
+] as const;
+export const THREAD_TOOL_LINE =
+  'Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live.';
+
 // Small models send numbers as strings now and then. Coercion keeps those calls useful.
 const line = z.coerce.number().int().min(1).max(10_000_000);
 const ArgumentSchemas = {
@@ -154,6 +243,17 @@ const ArgumentSchemas = {
   write: z.object({ path: z.string(), content: z.string() }),
   run: z.object({ command: z.string().min(1).max(4096) }),
 };
+
+// Thread arguments come from the contract schemas. Small models send numbers as strings.
+const threadArguments = (args: Record<string, unknown>) =>
+  Object.fromEntries(
+    Object.entries(args).map(([key, value]) => [
+      key,
+      (key === 'since' || key === 'limit') && typeof value === 'string' && /^\d{1,9}$/.test(value)
+        ? Number(value)
+        : value,
+    ]),
+  );
 
 class ToolError extends Error {}
 
@@ -527,8 +627,85 @@ function describe(name: string, args: Record<string, unknown>) {
             ? ['edit', `Create ${target}`]
             : name === 'run'
               ? ['command', `Run ${textOf(args.command) || '(no command)'}`]
-              : ['other', `Unknown tool ${name || '(no name)'}`];
+              : name === 'thread_turns'
+                ? ['read', 'Read thread turns']
+                : name === 'thread_turn'
+                  ? ['read', `Read thread turn ${textOf(args.id) || '(no id)'}`]
+                  : name === 'thread_diff'
+                    ? ['read', `Read thread diff${args.path ? ` of ${textOf(args.path)}` : ''}`]
+                    : name === 'thread_checks'
+                      ? ['read', 'Read thread checks']
+                      : name === 'thread_live'
+                        ? ['read', 'Read the running turn']
+                        : ['other', `Unknown tool ${name || '(no name)'}`];
   return { kind, title: title.slice(0, 1024) };
+}
+
+/** A result cut to the room the Local prompt has left. The notice says so, so the model asks again. */
+const cutToRoom = (text: string, bytes: number) =>
+  Buffer.byteLength(text) <= bytes
+    ? text
+    : `${fitBytes(text, bytes - 64)}\n[cut to fit the Local context; ask for less]`;
+
+const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim();
+
+/** One thread read as compact text. Each result is checked against its contract first. */
+async function readThread(name: string, args: Record<string, unknown>, threads: ThreadReads) {
+  switch (name) {
+    case 'thread_turns': {
+      const { turns } = ThreadTurnsResultSchema.parse(
+        await threads.turns(ThreadTurnsArgsSchema.parse(args)),
+      );
+      return turns.length
+        ? turns
+            .map(
+              (turn) =>
+                `#${turn.sequence} ${turn.id} ${turn.family} ${turn.model} ${turn.role} ${turn.status}, ${turn.changedFiles} files: ${oneLine(turn.reply)}`,
+            )
+            .join('\n')
+        : 'No turns match.';
+    }
+    case 'thread_turn': {
+      const turn = ThreadTurnResultSchema.parse(
+        await threads.turn(ThreadTurnArgsSchema.parse(args)),
+      );
+      return [
+        `Turn ${turn.id}${turn.truncated ? ' (reply cut at 32 KiB)' : ''}`,
+        'Reply:',
+        turn.reply || '(empty)',
+        'Actions:',
+        ...turn.trace.map(
+          (entry) =>
+            `- ${entry.kind} ${entry.outcome}: ${entry.title}${entry.target ? ` (${entry.target})` : ''}`,
+        ),
+        `Files changed: ${turn.files.join(', ') || 'none'}`,
+      ].join('\n');
+    }
+    case 'thread_diff': {
+      const result = ThreadDiffResultSchema.parse(
+        await threads.diff(ThreadDiffArgsSchema.parse(args)),
+      );
+      return `${result.diff || 'No changes.'}${result.more ? `\n[more: call thread_diff with cursor "${result.more}"]` : ''}`;
+    }
+    case 'thread_checks': {
+      const { lines } = ThreadChecksResultSchema.parse(await threads.checks());
+      return lines.length ? lines.join('\n') : 'No checks have run.';
+    }
+    default: {
+      const live = ThreadLiveResultSchema.parse(await threads.live());
+      if (live.state === 'none') return 'No turn is running.';
+      return [
+        `Running: ${live.family} ${live.model} ${live.role}, ${Math.round(live.elapsedMs / 1000)} s.`,
+        'Text so far:',
+        live.text || '(none yet)',
+        'Actions:',
+        ...live.trace.map(
+          (entry) =>
+            `- ${entry.kind} ${entry.outcome}: ${entry.title}${entry.target ? ` (${entry.target})` : ''}`,
+        ),
+      ].join('\n');
+    }
+  }
 }
 
 /** Check a call and plan it without side effects, so a permission card can show what it does. */
@@ -673,6 +850,19 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
             changedPath: file.relative,
           };
         });
+      }
+      case 'thread_turns':
+      case 'thread_turn':
+      case 'thread_diff':
+      case 'thread_checks':
+      case 'thread_live': {
+        const threads = context.threads;
+        if (!threads) return failed('Thread tools are not available in this turn.');
+        const limit = Math.max(512, context.threadBytes ?? OUTPUT_BYTES);
+        return ready(null, async () => ({
+          status: 'ok',
+          output: cutToRoom(await readThread(name, threadArguments(args), threads), limit),
+        }));
       }
       case 'run': {
         const call = ArgumentSchemas.run.parse(args);

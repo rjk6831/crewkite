@@ -4,6 +4,11 @@ import { chipOf, FileChips } from './attach.tsx';
 
 const SHOWN_CHARACTERS = 200;
 
+// A message of files alone has no text, so the buttons name its files.
+const nameOf = (message: ChatQueuedMessage) =>
+  message.text.slice(0, 80) ||
+  `${message.files.length} ${message.files.length === 1 ? 'file' : 'files'}`;
+
 /**
  * Messages sent while a turn runs. They start in this order once the thread is free, and each one
  * joins the conversation only then. `held` says why they wait when a running turn is not the
@@ -50,7 +55,7 @@ export function QueuedList({
                 className="th-queued-remove"
                 disabled={busy !== null}
                 title="Stops the current reply and sends this message now."
-                aria-label={`Send now: ${message.text.slice(0, 80)}`}
+                aria-label={`Send now: ${nameOf(message)}`}
                 onClick={() => void act(message.id, onSendNow)}
               >
                 Send now
@@ -60,7 +65,7 @@ export function QueuedList({
               type="button"
               className="th-queued-remove"
               disabled={busy !== null}
-              aria-label={`Remove queued message: ${message.text.slice(0, 80)}`}
+              aria-label={`Remove queued message: ${nameOf(message)}`}
               onClick={() => void act(message.id, onRemove)}
             >
               Remove

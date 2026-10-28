@@ -4,6 +4,7 @@ import {
   type NoticeMemory,
   type NoticeView,
   type RailEvent,
+  removedThread,
   threadNotices,
 } from './rail-activity.ts';
 
@@ -124,4 +125,23 @@ test('a finished or failed reply, a waiting permission and a crew end post a not
     // Events the window already folded, or that came before it opened, never post again.
     assert.deepEqual(threadNotices(batch, away, first.memory).notices, [], `${claim} (replay)`);
   }
+
+  // A deleted thread leaves the rail on the controller's task.removed event, whoever deleted it,
+  // and the event posts no notice.
+  const removal = (type: string, payload: unknown): RailEvent => ({
+    type,
+    cursor: '99',
+    taskId: open,
+    payload,
+  });
+  assert.equal(removedThread(removal('task.removed', { taskId: other })), other);
+  assert.equal(removedThread(removal('task.removed', null)), open);
+  assert.equal(removedThread(removal('task.updated', { taskId: other })), null);
+  assert.deepEqual(
+    threadNotices([removal('task.removed', { taskId: open })], away, {
+      since: 10n,
+      chains: new Map(),
+    }).notices,
+    [],
+  );
 });

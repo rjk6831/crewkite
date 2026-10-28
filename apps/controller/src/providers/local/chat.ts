@@ -10,12 +10,15 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
-import type {
-  AgentEvent,
-  ChatFailure,
-  ChatOutputLimit,
-  ChatPermissionOption,
-  ChatTurnStats,
+import {
+  type AgentEvent,
+  type ChatFailure,
+  type ChatOutputLimit,
+  type ChatPermissionOption,
+  type ChatTurnStats,
+  LOCAL_REPLY_MARGIN,
+  localBudget,
+  localReplyFloor,
 } from '@crewkite/contracts';
 import type {
   ChatInput,
@@ -47,9 +50,13 @@ import {
   RUN_TAIL_LINES,
   readScratchFile,
   SEARCH_HITS,
+  THREAD_TOOLS,
 } from '../../chat/local-tools.ts';
 import { attachedLine, attachedSection, byteSize } from '../../chat/prompt.ts';
 import { cachedRepoMap } from '../../chat/repo-map.ts';
+import type { ThreadReads } from '../../chat/thread-reader.ts';
+import { frameTrace } from '../../chat/trace.ts';
+import { localPromptRoom } from './budget.ts';
 
 // Local chat over the LM Studio SDK. The model has no agent loop of its own, so CrewKite runs
 // it: a small prompt (framing, a repo map, a rolling summary, the recent turns), the SDK's
@@ -75,6 +82,8 @@ export type LocalConnect = (request: ChatTurnRequest) => Promise<{
   contextLength: number;
   /** True when the runtime takes a reasoning budget for this model, not only a thinking toggle. */
   reasoningBudget?: boolean;
+  /** What the connect's probe found: true when the runtime took the turn with no token sent. */
+  connectedWithoutToken?: boolean;
   modelKey: string;
   fellBack: boolean;
   vision: boolean;
@@ -199,19 +208,20 @@ const MAX_TOOL_CALLS = 12;
 // Each round gets tools until the last one, which must answer in text.
 const MAX_ROUNDS = MAX_TOOL_CALLS + 2;
 const CHANGING_TOOLS = new Set<string>(['edit', 'write', 'run']);
-// Review and advice turns read only.
-const offeredTools = (request: ChatTurnRequest) =>
-  LOCAL_TOOLS.filter(
+// Review and advice turns read only. The thread reads join the list when the controller gave
+// this turn a reader.
+const offeredTools = (request: ChatTurnRequest, threads = false): readonly LocalTool[] =>
+  [...LOCAL_TOOLS, ...(threads ? THREAD_TOOLS : [])].filter(
     ({ function: definition }) => !request.readOnly || !CHANGING_TOOLS.has(definition.name),
   );
+// A thread read may take a quarter of the prompt room, at three bytes a token, and never more
+// than the bound every tool result already has.
+const threadReadBytes = (contextLength: number) =>
+  Math.min(OUTPUT_BYTES, Math.floor(localPromptRoom(contextLength) * 0.25) * 3);
 // The reply budget R is what the prompt leaves of the context C the instance reports, less a
 // margin for the chat template's own tokens. A turn starts only when R is at least the larger of
-// REPLY_FLOOR and REPLY_SHARE of C, so a small window still gets a usable reply and a large one a
-// reply in proportion. Reasoning counts inside R.
-const REPLY_MARGIN = 256;
-const REPLY_FLOOR = 2048;
-const REPLY_SHARE = 0.3;
-const replyFloor = (context: number) => Math.max(REPLY_FLOOR, Math.ceil(context * REPLY_SHARE));
+// 2,048 and 30 percent of C, so a small window still gets a usable reply and a large one a reply
+// in proportion. Reasoning counts inside R. The rule lives in contracts as `localBudget`.
 const MAP_SHARE = 0.18;
 const SUMMARY_SHARE = 0.6;
 const SUMMARY_TOKENS = 300;
@@ -230,8 +240,8 @@ const PERMISSION_OPTIONS: ChatPermissionOption[] = [
 const SETTINGS_ACTION = 'Open LM Studio, load a model and connect Local in Settings.';
 const SHORTEN_ACTION = 'Shorten the request or split it into smaller steps, then send again.';
 
-function systemPrompt(request: ChatTurnRequest) {
-  const names = offeredTools(request).map((tool) => tool.function.name);
+function systemPrompt(request: ChatTurnRequest, threads: boolean) {
+  const names = offeredTools(request, threads).map((tool) => tool.function.name);
   return [
     request.systemContext,
     '',
@@ -240,6 +250,11 @@ function systemPrompt(request: ChatTurnRequest) {
     `Call one tool at a time: ${names.slice(0, -1).join(', ')} or ${names.at(-1)}. If you have no native tool calling, write the call as ${TEXT_CALL_EXAMPLE} and end your reply there.`,
     `Tool results are bounded: read_range returns at most ${READ_LINES} lines, search at most ${SEARCH_HITS} hits, and run the last ${RUN_TAIL_LINES} lines of output within ${RUN_SECONDS} seconds.`,
     'Read narrow ranges. The context window is small and every result stays in it until the turn ends.',
+    ...(threads
+      ? [
+          'The thread tools only read earlier turns, diffs and checks of this thread. Ask for one turn or one diff page at a time.',
+        ]
+      : []),
     'Use edit for exact replacements in existing files and write only for new files. The person may decline an edit or a command; continue without it.',
     `You can make at most ${MAX_TOOL_CALLS} tool calls in one turn. Your reasoning and your reply share one token budget, so keep both short.`,
   ].join('\n');
@@ -313,10 +328,11 @@ async function buildPrompt(
   summary: Summary | null,
   trim: boolean,
   warn: (message: string) => void,
+  threads: boolean,
 ): Promise<Prompt> {
-  const room = contextLength - REPLY_MARGIN - replyFloor(contextLength);
+  const room = localPromptRoom(contextLength);
   const count = async (text: string) => (await model.countTokens(text)) + MESSAGE_TOKENS;
-  let system = systemPrompt(request);
+  let system = systemPrompt(request, threads);
   let left = room - (await count(system)) - (await count(message));
   if (left < 0) return { kind: 'too-large', tokens: room - left };
 
@@ -534,7 +550,7 @@ const TEXT_CALL_PARAMETER =
   /\s*(?:<parameter=([^>]+)>([\s\S]*?)<\/parameter>|<([A-Za-z_][\w-]*)>([\s\S]*?)<\/\3>)/y;
 const NUMBER = /^-?\d+(\.\d+)?$/;
 
-type LocalTool = (typeof LOCAL_TOOLS)[number];
+type LocalTool = (typeof LOCAL_TOOLS)[number] | (typeof THREAD_TOOLS)[number];
 export type TextToolCall =
   | { ok: true; name: string; arguments: Record<string, unknown> }
   | { ok: false; error: string };
@@ -671,10 +687,18 @@ function plainMessage(message: ChatMessage): ChatMessageInput {
   return { role: 'assistant', content: [message.getText(), ...calls].filter(Boolean).join('\n') };
 }
 
-export function localChatAdapter(deps: { connect: LocalConnect }): ChatAdapter {
+export function localChatAdapter(deps: {
+  connect: LocalConnect;
+  /**
+   * The thread reads for one turn, scoped to that turn's thread. The controller supplies it.
+   * Without it, or when it answers null, the turn offers no thread tool.
+   */
+  threadReader?: (request: ChatTurnRequest) => ThreadReads | null;
+}): ChatAdapter {
   return {
     family: 'local',
-    startTurn: (request, emit) => startLocalTurn(deps.connect, request, emit),
+    startTurn: (request, emit) =>
+      startLocalTurn(deps.connect, request, emit, deps.threadReader?.(request) ?? null),
   };
 }
 
@@ -682,6 +706,7 @@ function startLocalTurn(
   connect: LocalConnect,
   request: ChatTurnRequest,
   emit: (event: AgentEvent) => void,
+  threads: ThreadReads | null,
 ): ChatTurnHandle {
   const now = request.now ?? Date.now;
   const began = now();
@@ -699,6 +724,8 @@ function startLocalTurn(
   const noticed = new Set<string>();
   let summaries = 0;
   let ending: 'stopped' | 'timeout' | null = null;
+  // Set from the instance's context once the turn connects.
+  let threadBytes = OUTPUT_BYTES;
   let connecting: ReturnType<LocalConnect> | null = null;
   let items = 0;
   let permissions = 0;
@@ -739,7 +766,7 @@ function startLocalTurn(
 
   // A model without native tool calls writes them into its reply. From the first opening tag on,
   // the round's text waits for the round to end, so markup never reaches the thread as text.
-  const offered = offeredTools(request);
+  const offered = offeredTools(request, threads !== null);
   let held = '';
   let holding = false;
   let nativeRound = false;
@@ -840,6 +867,7 @@ function startLocalTurn(
     let streamed = 0;
     // A per-call context: `permitted` turns true only after the person allows a command.
     const context = {
+      ...(threads ? { threads, threadBytes } : {}),
       scratch: request.scratch.directory,
       environment: request.environment,
       signal: abort.signal,
@@ -1045,6 +1073,18 @@ function startLocalTurn(
     }
     if (ending) return ended();
     const { model, contextLength, modelKey, fellBack } = connection;
+    threadBytes = threadReadBytes(contextLength);
+    if (connection.connectedWithoutToken !== undefined) {
+      // The trace says how this turn reached the runtime, so a failed connect can be read later.
+      const trace = frameTrace(now, { lines: 4, bytes: 1024 });
+      trace.open(join(request.work.directory, 'trace.jsonl'));
+      trace.write(() => ({
+        local: connection?.connectedWithoutToken
+          ? 'probe found auth off on loopback; no token sent'
+          : 'probe found auth on; token sent',
+      }));
+      trace.close();
+    }
     if (fellBack)
       notice(
         'warning',
@@ -1065,7 +1105,7 @@ function startLocalTurn(
         request.files ?? [],
         connection.vision,
         modelKey,
-        contextLength - REPLY_MARGIN - replyFloor(contextLength),
+        localPromptRoom(contextLength),
       );
     } catch (error) {
       return finish(
@@ -1125,8 +1165,15 @@ function startLocalTurn(
     const message = [request.prompt, attachedSection(files.texts)].filter(Boolean).join('\n\n');
     const build = (summary: Summary | null, trim: boolean) =>
       bounded(
-        buildPrompt(request, message, model, contextLength, summary, trim, (text) =>
-          notice('warning', text),
+        buildPrompt(
+          request,
+          message,
+          model,
+          contextLength,
+          summary,
+          trim,
+          (text) => notice('warning', text),
+          threads !== null,
         ),
       );
     let prompt: Prompt;
@@ -1143,16 +1190,20 @@ function startLocalTurn(
       return ending ? ended() : finish('error', connectFailure(error));
     }
     if (ending) return ended();
-    if (prompt.kind !== 'fits') {
-      const left = contextLength - prompt.tokens - REPLY_MARGIN;
+    // R, the reply budget, and half of it for reasoning when the runtime takes a reasoning budget.
+    const budget =
+      prompt.kind === 'fits'
+        ? localBudget(contextLength, prompt.tokens, connection.reasoningBudget === true)
+        : null;
+    if (prompt.kind !== 'fits' || !budget) {
+      const left = contextLength - prompt.tokens - LOCAL_REPLY_MARGIN;
       const figure = (value: number) => value.toLocaleString('en-US');
       say(
-        `This request takes ${figure(prompt.tokens)} tokens of the Local model's ${figure(contextLength)} token context and leaves ${figure(Math.max(0, left))} for the reply, short of the ${figure(replyFloor(contextLength))} it needs. Send a smaller first step, such as one file or one function.`,
+        `This request takes ${figure(prompt.tokens)} tokens of the Local model's ${figure(contextLength)} token context and leaves ${figure(Math.max(0, left))} for the reply, short of the ${figure(localReplyFloor(contextLength))} it needs. Send a smaller first step, such as one file or one function.`,
       );
       return finish('done', null);
     }
-    // R, the reply budget. The rule above keeps it at or above the floor.
-    const replyTokens = contextLength - prompt.tokens - REPLY_MARGIN;
+    const replyTokens = budget.outputTokens;
     if (prompt.carried && prompt.summary) summaries = prompt.summary.count;
 
     // `act` runs rounds until one ends without a native call. When that round wrote its calls as
@@ -1197,7 +1248,7 @@ function startLocalTurn(
           model.act(chat, tools, {
             maxTokens: replyTokens,
             // A budget the runtime takes is capped at half of R. A thinking toggle stays as set.
-            ...(connection.reasoningBudget ? { reasoningBudget: Math.floor(replyTokens / 2) } : {}),
+            ...(budget.reasoningTokens === null ? {} : { reasoningBudget: budget.reasoningTokens }),
             contextOverflowPolicy: 'stopAtLimit',
             maxPredictionRounds: MAX_ROUNDS - rounds.length,
             signal: abort.signal,

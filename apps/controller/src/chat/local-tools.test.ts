@@ -13,6 +13,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { runTool } from './local-tools.ts';
+import type { ThreadReads } from './thread-reader.ts';
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'local-tools-'));
@@ -128,6 +129,66 @@ test('tools refuse paths that leave the scratch copy', async () => {
     );
     assert.equal(absolute.status, 'ok', absolute.output);
     assert.match(absolute.output, /kept/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('thread tools read through the reader, are cut to the Local room and fail without one', async () => {
+  const { root, scratch, context } = fixture();
+  try {
+    const long = 'x'.repeat(5000);
+    const seen: unknown[] = [];
+    const threads: ThreadReads = {
+      turns: (args) => {
+        seen.push(args);
+        return {
+          turns: [
+            {
+              id: 'trn_01J00000000000000000000001',
+              sequence: 1,
+              family: 'anthropic',
+              model: 'model-a',
+              role: 'assistant',
+              status: 'done',
+              startedAt: '2026-10-28T00:00:00.000Z',
+              endedAt: null,
+              reply: 'Renamed n.',
+              changedFiles: 2,
+            },
+          ],
+        };
+      },
+      turn: () => ({
+        id: 'trn_01J00000000000000000000001',
+        reply: long,
+        truncated: false,
+        trace: [],
+        files: ['a.ts'],
+      }),
+      diff: () => ({ diff: '--- a/a.ts', more: 'c1' }),
+      checks: () => ({ lines: ['lint ok'] }),
+      live: () => ({ state: 'none' }),
+    };
+    const run = (name: string, args: Record<string, unknown>, threadBytes = 4096) =>
+      runTool(name, args, { ...context, threads, threadBytes });
+    const turns = await run('thread_turns', { since: '0', limit: 5 });
+    assert.equal(turns.status, 'ok', turns.output);
+    assert.match(turns.output, /#1 trn_01J00000000000000000000001 anthropic model-a assistant/);
+    // Numbers sent as strings reach the reader as numbers, with the schema default applied.
+    assert.deepEqual(seen, [{ since: 0, limit: 5 }]);
+    const cut = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 1024);
+    assert.match(cut.output, /\[cut to fit the Local context/);
+    assert(Buffer.byteLength(cut.output) <= 1024);
+    assert.match((await run('thread_diff', {})).output, /cursor "c1"/);
+    assert.match((await run('thread_checks', {})).output, /lint ok/);
+    assert.equal((await run('thread_live', {})).output, 'No turn is running.');
+    const bad = await run('thread_turn', { id: 'nope' });
+    assert.equal(bad.status, 'error');
+    const without = await runTool('thread_live', {}, context);
+    assert.equal(without.status, 'error');
+    assert.match(without.output, /not available/);
+    assert.equal(existsSync(scratch), true);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

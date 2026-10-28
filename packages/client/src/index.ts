@@ -62,7 +62,14 @@ export interface DesktopSource {
   threadAttention?(input: ThreadAttentionInput): Promise<void>;
   /** A clicked thread notification asks the window to open that thread. */
   onOpenThread?(listener: (taskId: string) => void): () => void;
+  /** Whether this device can keep the Local token, and whether it holds one for this endpoint. */
+  localTokenStatus?(): Promise<LocalTokenStatus>;
+  /** Keep the token the controller holds. Main reads it; the page never receives it. */
+  rememberLocalToken?(): Promise<LocalTokenStatus>;
+  /** Delete the kept token and clear the controller's copy. */
+  forgetLocalToken?(): Promise<LocalTokenStatus>;
 }
+export type LocalTokenStatus = { available: boolean; reason?: string; remembered: boolean };
 export type ThreadAttentionInput = {
   badge: number;
   notice: {

@@ -8,6 +8,7 @@ import {
   lowMemory,
   selectionConfirmed,
   selectionLost,
+  statusLine,
   WITHOUT_TOKEN,
   waitForLocalReadiness,
 } from './local-setup-flow.ts';
@@ -172,7 +173,7 @@ test('Local connect stops its command chain when component ownership changes', a
       2,
       'Low memory: 1.2 GB available with 2 models loaded. Replies may slow.',
     ],
-    [3 * gib, 128 * gib, 1, 'Low memory: 3.0 GB available with 1 model loaded. Replies may slow.'],
+    [3 * gib, 128 * gib, 1, 'Low memory: 3 GB available with 1 model loaded. Replies may slow.'],
     [6 * gib, 48 * gib, 2, null],
     [
       4.5 * gib,
@@ -276,4 +277,55 @@ test('Local connect stops its command chain when component ownership changes', a
     'blocked',
   );
   assert.match(WITHOUT_TOKEN, /^Connected without a token./);
+
+  // One status line. A background read keeps the line it interrupted, a lost selection or an
+  // action message wins over the saved reason, and a confirmed selection sits between them.
+  const line = (change: Partial<Parameters<typeof statusLine>[0]>) =>
+    statusLine({
+      setup: { reason: 'qualification-pending' },
+      message: null,
+      lost: null,
+      confirmed: false,
+      quiet: false,
+      held: null,
+      ...change,
+    });
+  const reading = { reason: 'discovery-active' as const };
+  assert.equal(line({}), 'Connected. The loaded model is eligible for chat.');
+  assert.equal(
+    line({
+      setup: reading,
+      quiet: true,
+      held: 'Connected. The loaded model is eligible for chat.',
+    }),
+    'Connected. The loaded model is eligible for chat.',
+  );
+  assert.equal(line({ setup: reading }), 'The controller is reading model metadata.');
+  assert.equal(line({ confirmed: true }), 'Model selection confirmed');
+  assert.equal(
+    line({ confirmed: true, message: 'Taking longer than expected.' }),
+    'Taking longer than expected.',
+  );
+  assert.equal(
+    line({ message: 'x', lost: 'Model A is no longer loaded. Pick a model.' }),
+    'Model A is no longer loaded. Pick a model.',
+  );
+  assert.equal(
+    line({ setup: { reason: 'connection-required' } }),
+    'Press Connect. CrewKite checks whether the runtime wants a token.',
+  );
+  // The rail reads the probe's answer, not the saved mode, for "no token".
+  assert.deepEqual(
+    await rail(
+      [
+        { ...up, secretConfigured: true, connectedWithoutToken: false },
+        { ...withModels, secretConfigured: true, connectedWithoutToken: false },
+      ],
+      idle,
+    ),
+    {
+      result: { kind: 'connected', withoutToken: false },
+      sent: ['BeginLocalConnectionInput', 'RefreshLocalModels'],
+    },
+  );
 });

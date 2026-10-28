@@ -1,7 +1,7 @@
 import type { Observation, Window } from '@crewkite/contracts';
 import { CircleAlert, CircleHelp, CircleSlash, Clock, Target } from 'lucide-react';
 import { type ReactNode, useEffect, useId, useState } from 'react';
-import { readAgo } from './usage-presentation.ts';
+import { gaugeAge, gaugeColor } from './usage-presentation.ts';
 import './usage-gauges.css';
 
 export type UsageAmount = NonNullable<Observation['remaining']>;
@@ -164,18 +164,16 @@ function describe(reading: UsageReading, nowMs: number) {
     usableReserve.value <= 100
       ? usableReserve.value
       : null;
-  const exhausted = known && state !== 'reported' && remaining.value <= 0;
+  const exhausted = known && remaining.value <= 0;
   const atReserve =
     known &&
-    state !== 'reported' &&
     !exhausted &&
     usableReserve !== null &&
     usableReserve.unit === remaining.unit &&
     remaining.value <= usableReserve.value;
-  const dated = state === 'stale' || state === 'reset-pending' || state === 'reported';
+  const dated = state === 'stale' || state === 'reset-pending';
   const observedAt = time(reading.observedAt);
   const resetsAt = time(reading.resetsAt);
-  const observed = observedAt === null ? null : nowMs - observedAt;
   const resets = resetsAt === null ? null : resetsAt - nowMs;
   const note = reading.reserveNote?.trim();
   const reserveValue = usableReserve ? `Reserve ${amountText(usableReserve)}` : null;
@@ -191,17 +189,9 @@ function describe(reading: UsageReading, nowMs: number) {
     observedAt,
     resetsAt,
     tone: !known ? 'none' : exhausted ? 'exhausted' : atReserve ? 'low' : dated ? 'dated' : 'ok',
-    observedText:
-      state === 'reported'
-        ? (readAgo(reading.readAt, nowMs) ?? 'Observation time and cache age unknown')
-        : observed === null
-          ? 'Never observed'
-          : Number.isNaN(observed)
-            ? 'Observation time unreadable'
-            : // A reading can land just after the parent's clock tick. Treat a small lead as now.
-              observed < -60_000
-              ? 'Observation time is ahead of this clock'
-              : `${state === 'fresh' ? 'Observed' : 'Last observed'} ${observed < 60_000 ? 'just now' : `${formatSpan(observed)} ago`}`,
+    age: gaugeAge(reading.observedAt ?? reading.readAt, nowMs),
+    // The fill follows the percent alone. Age and state show in the label, the dots and the chips.
+    fill: percent === null ? null : gaugeColor(percent),
     resetText:
       resets === null
         ? 'Reset time not reported'
@@ -275,19 +265,29 @@ function Chip({ tone, icon, children }: { tone: string; icon: ReactNode; childre
   );
 }
 
+// A readable percent speaks as one sentence with its age, and the markup inside stays quiet. A
+// missing value keeps its own control, so it gets no such label.
+function Face({ label, children }: { label: string | null; children: ReactNode }) {
+  return label === null ? (
+    <div className="usage-gauge-face">{children}</div>
+  ) : (
+    <div className="usage-gauge-face" role="img" aria-label={label}>
+      {children}
+    </div>
+  );
+}
+
 export function UsageGauge({
   reading,
   nowMs,
   size = 'primary',
   cluster = false,
-  observed = true,
 }: {
   reading: UsageReading;
   nowMs: number;
   size?: 'primary' | 'featured';
-  // In a cluster the card footer carries the details, and the observed time when all agree.
+  // In a cluster the card footer carries the details.
   cluster?: boolean;
-  observed?: boolean;
 }) {
   const uid = useId().replace(/[^a-zA-Z0-9]/g, '');
   const view = describe(reading, nowMs);
@@ -348,14 +348,20 @@ export function UsageGauge({
   const rows = cluster ? [] : details(reading, view).filter(([term]) => term !== 'Reserve');
   return (
     <figure
-      className={`usage-gauge is-${size} tone-${view.tone} state-${reading.state}${unscaled ? ' is-unscaled' : ''}${view.unknownValue ? ' is-unknown-value' : ''}${reading.constraining ? ' is-constraining' : ''}${cluster ? ' is-clustered' : ''}`}
+      className={`usage-gauge is-${size} tone-${view.tone} state-${reading.state}${unscaled ? ' is-unscaled' : ''}${view.unknownValue ? ' is-unknown-value' : ''}${reading.constraining ? ' is-constraining' : ''}${cluster ? ' is-clustered' : ''}${view.age.dotted ? ' is-aged' : ''}`}
       aria-labelledby={labelId}
     >
       <figcaption id={labelId} className="usage-gauge-label">
         {reading.label}
       </figcaption>
       {chips.length > 0 && <ul className="usage-gauges-chips">{chips}</ul>}
-      <div className="usage-gauge-face">
+      <Face
+        label={
+          view.percent === null
+            ? null
+            : `${reading.label}: ${percentText(view.percent)}% remaining, ${view.age.label}`
+        }
+      >
         <svg viewBox="0 0 200 200" aria-hidden="true" focusable="false">
           <defs>
             <pattern
@@ -392,14 +398,24 @@ export function UsageGauge({
           {view.reservePercent !== null && view.reservePercent > 0 && (
             <path className="usage-gauge-reserve-zone" d={arc(73, 0, view.reservePercent)} />
           )}
-          {view.percent !== null && view.percent > 0 && (
-            <path
-              className="usage-gauge-fill"
-              d={arc(82, 0, 100)}
-              pathLength={100}
-              strokeDasharray={`${view.percent} 100`}
-            />
-          )}
+          {view.percent !== null &&
+            view.percent > 0 &&
+            (view.age.dotted ? (
+              // A ring past 60 minutes is dots along the filled stretch.
+              <path
+                className="usage-gauge-fill is-dotted"
+                d={arc(82, 0, view.percent)}
+                style={{ stroke: view.fill ?? undefined }}
+              />
+            ) : (
+              <path
+                className="usage-gauge-fill"
+                d={arc(82, 0, 100)}
+                pathLength={100}
+                strokeDasharray={`${view.percent} 100`}
+                style={{ stroke: view.fill ?? undefined }}
+              />
+            ))}
           {view.reservePercent !== null &&
             (() => {
               const [x1, y1] = point(72, angle(view.reservePercent));
@@ -434,7 +450,7 @@ export function UsageGauge({
               : `${remaining.unit === 'percent' ? '' : `${remaining.unit} `}${reading.state === 'reported' ? 'reported remaining' : view.dated ? 'left when observed' : 'remaining'}`}
           </span>
         </p>
-      </div>
+      </Face>
       <ul className="usage-gauge-lines">
         <li>
           {view.resetsAt !== null && !Number.isNaN(view.resetsAt) && reading.resetsAt ? (
@@ -443,15 +459,13 @@ export function UsageGauge({
             view.resetText
           )}
         </li>
-        {observed && (
-          <li>
-            {view.observedAt !== null && !Number.isNaN(view.observedAt) && reading.observedAt ? (
-              <time dateTime={reading.observedAt}>{view.observedText}</time>
-            ) : (
-              view.observedText
-            )}
-          </li>
-        )}
+        <li className="usage-gauge-age">
+          {reading.observedAt && !Number.isNaN(view.observedAt) ? (
+            <time dateTime={reading.observedAt}>{view.age.label}</time>
+          ) : (
+            view.age.label
+          )}
+        </li>
         {view.reserveText && <li className="usage-gauge-reserve-line">{view.reserveText}</li>}
         {unscaled && remaining && (
           <li>
@@ -488,15 +502,7 @@ const flagText: Record<string, string> = {
 
 // An auxiliary allowance on one line. It keeps its own value, reset and warning, so a low or
 // exhausted pool stands out even though it is drawn smaller than the dials.
-function UsageMeter({
-  reading,
-  nowMs,
-  observed,
-}: {
-  reading: UsageReading;
-  nowMs: number;
-  observed: boolean;
-}) {
+function UsageMeter({ reading, nowMs }: { reading: UsageReading; nowMs: number }) {
   const view = describe(reading, nowMs);
   const { remaining } = view;
   const resetsIn =
@@ -508,8 +514,7 @@ function UsageMeter({
     reading.constraining ? 'constraining' : null,
     view.exhausted ? 'exhausted' : null,
     view.atReserve ? 'low' : null,
-    // A report with no age says so in Details, so its line carries no flag.
-    view.dated && reading.state !== 'reported' ? reading.state : null,
+    view.dated ? reading.state : null,
   ].filter((flag) => flag !== null);
   return (
     <li
@@ -518,7 +523,10 @@ function UsageMeter({
       <span className="usage-meter-label">{reading.label}</span>
       <span className="usage-meter-bar" aria-hidden="true">
         {view.percent !== null && view.percent > 0 && (
-          <span className="usage-meter-fill" style={{ width: `${view.percent}%` }} />
+          <span
+            className="usage-meter-fill"
+            style={{ width: `${view.percent}%`, background: view.fill ?? undefined }}
+          />
         )}
         {view.reservePercent !== null && (
           <span className="usage-meter-reserve" style={{ left: `${view.reservePercent}%` }} />
@@ -535,10 +543,10 @@ function UsageMeter({
         {view.known && (
           <span className="usage-sr-only">
             {reading.state === 'reported'
-              ? ' reported remaining, age unknown'
+              ? ` reported remaining, ${view.age.label}`
               : view.dated
-                ? ' left when observed'
-                : ' remaining'}
+                ? ` left when observed, ${view.age.label}`
+                : ` remaining, ${view.age.label}`}
           </span>
         )}
       </span>
@@ -571,7 +579,9 @@ function UsageMeter({
           ))}
         </span>
       )}
-      {observed && <span className="usage-meter-observed">{view.observedText}</span>}
+      <span className={view.age.dotted ? 'usage-meter-observed is-aged' : 'usage-meter-observed'}>
+        {view.age.label}
+      </span>
     </li>
   );
 }
@@ -585,18 +595,8 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
   const cluster = card.primary.length <= 2 && (card.primary.length > 0 || featured !== null);
   const all = [...card.primary, ...(featured ? [featured] : []), ...auxiliary];
   const views = all.map((reading) => ({ reading, view: describe(reading, nowMs) }));
-  // A card of meters alone still needs one place for the observed time and the details.
+  // A card of meters alone still needs one place for the details.
   const withFooter = views.length > 0 && (cluster || card.primary.length === 0);
-  // One report usually stamps every window with the same time. Say it once in the footer and
-  // repeat it only on a reading that differs. Grouping by the timestamp and state keeps the
-  // choice steady as the display clock ticks.
-  const group = (reading: UsageReading) => `${reading.observedAt ?? 'never'}:${reading.state}`;
-  const counts = new Map<string, number>();
-  for (const { reading } of views)
-    counts.set(group(reading), (counts.get(group(reading)) ?? 0) + 1);
-  const common = withFooter ? ([...counts].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null) : null;
-  const shared = views.find(({ reading }) => group(reading) === common) ?? null;
-  const ownTime = (reading: UsageReading) => group(reading) !== common;
   const [left, right] = card.primary;
   return (
     <article className="usage-gauges-card" aria-labelledby={titleId}>
@@ -626,17 +626,9 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
           data-count={card.primary.length}
           data-featured={featured ? 'true' : undefined}
         >
-          {left && <UsageGauge reading={left} nowMs={nowMs} cluster observed={ownTime(left)} />}
-          {featured && (
-            <UsageGauge
-              reading={featured}
-              nowMs={nowMs}
-              size="featured"
-              cluster
-              observed={ownTime(featured)}
-            />
-          )}
-          {right && <UsageGauge reading={right} nowMs={nowMs} cluster observed={ownTime(right)} />}
+          {left && <UsageGauge reading={left} nowMs={nowMs} cluster />}
+          {featured && <UsageGauge reading={featured} nowMs={nowMs} size="featured" cluster />}
+          {right && <UsageGauge reading={right} nowMs={nowMs} cluster />}
         </div>
       ) : (
         card.primary.length > 0 && (
@@ -652,29 +644,13 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
           <h4>More allowances</h4>
           <ul>
             {auxiliary.map((reading) => (
-              <UsageMeter
-                key={reading.id}
-                reading={reading}
-                nowMs={nowMs}
-                observed={ownTime(reading)}
-              />
+              <UsageMeter key={reading.id} reading={reading} nowMs={nowMs} />
             ))}
           </ul>
         </section>
       )}
       {withFooter && (
         <footer className="usage-gauges-card-footer">
-          {shared && (
-            <span>
-              {shared.view.observedAt !== null &&
-              !Number.isNaN(shared.view.observedAt) &&
-              shared.reading.observedAt ? (
-                <time dateTime={shared.reading.observedAt}>{shared.view.observedText}</time>
-              ) : (
-                shared.view.observedText
-              )}
-            </span>
-          )}
           <details className="usage-gauge-details usage-gauges-card-details">
             <summary aria-describedby={titleId}>Details</summary>
             {views.map(({ reading, view }) => {

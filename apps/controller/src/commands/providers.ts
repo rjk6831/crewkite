@@ -689,8 +689,14 @@ export class ProviderCommands {
     );
   }
 
-  saveLocal(this: Controller, control: LocalControl) {
-    const next = LocalControlSchema.parse({ ...control, revision: control.revision + 1 });
+  saveLocal(this: Controller, control: LocalControl, bump = true) {
+    // An unknown probe answer is a missing key; the stored JSON has no undefined.
+    const { connectedWithoutToken, ...rest } = control;
+    const next = LocalControlSchema.parse({
+      ...rest,
+      ...(connectedWithoutToken === undefined ? {} : { connectedWithoutToken }),
+      revision: bump ? control.revision + 1 : control.revision,
+    });
     this.store.putLocalControl(next);
     return next;
   }
@@ -714,10 +720,30 @@ export class ProviderCommands {
     );
   }
 
+  /** Connected means a token is held for this connection or the probe found auth off. */
   localConnected(this: Controller, control = this.localControl()) {
-    return control.authMode === 'none'
-      ? !!control.endpoint && control.noneConnected
-      : this.localSecretMatches(control);
+    return (
+      !!control.endpoint &&
+      (control.connectedWithoutToken === true || this.localSecretMatches(control))
+    );
+  }
+
+  /**
+   * What a Local client sends. The saved mode names the connection identity and the probe decides
+   * the credential, so the two can differ: a saved token mode meeting a runtime with auth off, or
+   * a saved none mode meeting a runtime that wants a token.
+   */
+  localCredentials(this: Controller, placeholder?: string) {
+    const control = this.localControl();
+    if (this.localSecretMatches(control))
+      return {
+        token: placeholder ?? (this.localSecret?.secret.toString('utf8') as string),
+        ...(control.authMode === 'none' ? { savedMode: 'none' as const } : {}),
+      };
+    return {
+      authMode: 'none' as const,
+      ...(control.authMode === 'token' ? { savedMode: 'token' as const } : {}),
+    };
   }
 
   localConnection(this: Controller) {
@@ -801,6 +827,9 @@ export class ProviderCommands {
       secretConfigured,
       authMode: control.authMode,
       connected,
+      ...(control.connectedWithoutToken === undefined
+        ? {}
+        : { connectedWithoutToken: control.connectedWithoutToken }),
       operation: control.operation
         ? {
             kind: control.operation.kind,
@@ -816,6 +845,51 @@ export class ProviderCommands {
       availableMemoryBytes: control.availableMemoryBytes,
       selection: control.selection,
       reason,
+    });
+  }
+
+  /**
+   * The remembered token's two commands. They carry no expected revision and take no receipt, so
+   * the value reaches the in-memory cell and nothing else: no journal row, event or snapshot.
+   */
+  localTokenCommand(
+    this: Controller,
+    command: Extract<Command, { command: 'SupplyLocalToken' | 'ReadLocalToken' }>,
+  ): CommandResult {
+    if (command.actor.kind !== 'desktop')
+      return { outcome: 'denied', reason: 'desktop-actor-only' };
+    const control = this.localControl();
+    if (command.command === 'ReadLocalToken')
+      return {
+        outcome: 'applied',
+        data: {
+          kind: 'local-token',
+          token: this.localSecretMatches(control)
+            ? (this.localSecret?.secret.toString('utf8') ?? null)
+            : null,
+        },
+      };
+    const { endpoint } = control;
+    if (!endpoint) return { outcome: 'blocked', reason: 'local-not-configured' };
+    return this.store.transaction((): CommandResult => {
+      const blocker = this.store.localStartBlocker();
+      if (blocker || control.operation)
+        return { outcome: 'blocked', reason: blocker ?? 'local-operation-active' };
+      this.revokeLocalSecret();
+      this.localSecret = {
+        connectionRevision: control.connectionRevision,
+        connectionHash: localConfiguredConnectionHash(
+          endpoint,
+          control.connectionRevision,
+          control.authMode,
+        ),
+        secret: Buffer.from(command.payload.token),
+        supplied: true,
+      };
+      // The desktop built the connect that follows on the revision it read before this hand
+      // over, so the hand over keeps that revision. That connect clears the same two marks.
+      this.saveLocal({ ...control, connectedWithoutToken: false, connectionFailed: false }, false);
+      return { outcome: 'applied' };
     });
   }
 
@@ -845,7 +919,7 @@ export class ProviderCommands {
       control = this.saveLocal({
         ...control,
         connectionRevision: control.connectionRevision + 1,
-        noneConnected: false,
+        connectedWithoutToken: undefined,
         connectionFailed: false,
         observation: null,
         observedAt: null,
@@ -907,7 +981,7 @@ export class ProviderCommands {
         ...control,
         endpoint: command.payload.endpoint,
         authMode,
-        noneConnected: false,
+        connectedWithoutToken: undefined,
         connectionFailed: false,
         connectionRevision: control.connectionRevision + 1,
         observation: null,
@@ -948,25 +1022,15 @@ export class ProviderCommands {
       });
       return applied();
     }
-    if (command.command === 'BeginLocalConnectionInput' && control.authMode === 'none') {
-      this.revokeLocalSecret();
-      // The last read stays on view, marked stale, until the first read on this connection.
-      this.saveLocal({
-        ...control,
-        noneConnected: true,
-        connectionFailed: false,
-        observationStale: !!control.observation,
-        selection: null,
-        setupHash: null,
-      });
-      return applied();
-    }
     if (control.authMode === 'token' && !this.options.localInputHelper)
       return { outcome: 'blocked', reason: 'local-input-unavailable' };
     if (command.command === 'RefreshLocalModels' && !this.localConnected(control))
       return { outcome: 'blocked', reason: 'local-connection-required' };
     const kind = command.command === 'BeginLocalConnectionInput' ? 'input' : 'discovery';
-    if (kind === 'input') this.revokeLocalSecret();
+    // A token the desktop supplied for this connection survives the connect that uses it.
+    if (kind === 'input' && !(this.localSecret?.supplied && this.localSecretMatches(control)))
+      this.revokeLocalSecret();
+    const suppliedHeld = kind === 'input' && this.localSecretMatches(control);
     const binding = {
       version: kind === 'input' ? (2 as const) : (1 as const),
       operationId: command.key,
@@ -984,6 +1048,9 @@ export class ProviderCommands {
     };
     this.saveLocal({
       ...control,
+      // A new connect starts from nothing known. The probe answers it.
+      connectedWithoutToken:
+        kind === 'input' ? (suppliedHeld ? false : undefined) : control.connectedWithoutToken,
       connectionFailed: false,
       observationStale: kind === 'input' ? !!control.observation : control.observationStale,
       selection: kind === 'discovery' ? control.selection : null,
@@ -1059,13 +1126,23 @@ export class ProviderCommands {
             ('terminal' in value
               ? value.terminal.kind === 'unavailable' && value.terminal.reason === 'ownership'
               : value.kind !== 'ready' && value.reason === 'ownership');
+          // Closing the token window by hand, or revoking it, ends in a known state. The window
+          // holds no runtime session, and the value it read is discarded either way.
+          const windowClosed =
+            current.kind === 'input' &&
+            current.group !== null &&
+            current.state !== 'unknown' &&
+            (current.revoked ||
+              (value !== null && 'kind' in value && value.kind === 'cancelled')) &&
+            !(value && 'kind' in value && value.kind === 'ready');
           const known =
-            !ownershipUnknown &&
-            clientQuiescent &&
-            (!requested ||
-              (current.group !== null &&
-                current.state !== 'unknown' &&
-                (current.kind === 'input' || current.clientQuiescent)));
+            windowClosed ||
+            (!ownershipUnknown &&
+              clientQuiescent &&
+              (!requested ||
+                (current.group !== null &&
+                  current.state !== 'unknown' &&
+                  (current.kind === 'input' || current.clientQuiescent))));
           const live =
             !this.closed &&
             !runtime.stopped &&
@@ -1081,6 +1158,7 @@ export class ProviderCommands {
             !this.store.localGenerationBlocker();
           let observation = control.observation;
           let { observedAt, observationStale, availableMemoryBytes, selectedModelKey } = control;
+          let { connectedWithoutToken } = control;
           let selection = control.selection;
           let setupHash = control.setupHash;
           if (known && live && value && 'kind' in value && value.kind === 'ready') {
@@ -1091,6 +1169,8 @@ export class ProviderCommands {
                 connectionHash: current.binding.connectionHash,
                 secret: Buffer.from(secret),
               };
+            // The probe found the runtime wants a token, and this connection now holds one.
+            if (secret) connectedWithoutToken = false;
           } else if (value && 'candidate' in value) value.candidate.discard();
           if (
             known &&
@@ -1130,9 +1210,9 @@ export class ProviderCommands {
               setupHash = null;
             }
           } else if (known && live && current.kind === 'discovery') {
-            observation = null;
-            observedAt = null;
-            observationStale = false;
+            // A read that failed leaves the last one on view, labelled, with the selection off. The
+            // model key stays, so the next read selects the same model again.
+            observationStale = !!observation;
             selection = null;
             setupHash = null;
           }
@@ -1150,14 +1230,14 @@ export class ProviderCommands {
             entity: proof,
           });
           const failedConnection =
-            control.authMode === 'none' &&
+            control.connectedWithoutToken === true &&
             known &&
             live &&
             current.kind === 'discovery' &&
             (!value || !('terminal' in value) || value.terminal.kind !== 'observed');
           this.saveLocal({
             ...control,
-            noneConnected: failedConnection ? false : control.noneConnected,
+            connectedWithoutToken: failedConnection ? undefined : connectedWithoutToken,
             connectionFailed: failedConnection,
             observation,
             observedAt,
@@ -1240,53 +1320,62 @@ export class ProviderCommands {
           const handle = runtime.handle as ReturnType<typeof startLocalSecretInput>;
           void handle.result.then(finish, () => finish(null));
         };
-        // A runtime with auth off on loopback answers without a token. Then no token window opens
-        // and the connection switches to the no-token mode. Anything else opens the window.
+        // The probe runs on every connect, in both saved modes, and writes only the connection's
+        // `connectedWithoutToken`. A runtime that answers without a token connects with none. One
+        // that does not opens the token window for this connection, whatever mode is saved. A cold
+        // runtime can miss the first probe, so a miss is tried once more before the window opens.
         const endpoint = control.endpoint;
         if (!endpoint) throw Error('Local endpoint is unavailable.');
-        void (this.options.localProbe ?? probeLocalWithoutToken)(endpoint)
-          .catch(() => false)
-          .then((open) => {
-            if (!open || runtime.stopped || this.closed) {
-              try {
-                if (runtime.stopped || this.closed) return finish(null);
-                this.localOperationCurrent(operationId);
-                launchInput();
-              } catch {
-                finish(null);
-              }
-              return;
+        const probe = this.options.localProbe ?? probeLocalWithoutToken;
+        void (async () => {
+          let open = await probe(endpoint).catch(() => false);
+          if (!open && !runtime.stopped && !this.closed)
+            open = await probe(endpoint).catch(() => false);
+          return open;
+        })().then((open) => {
+          const supplied =
+            this.localSecret?.supplied && this.localSecretMatches(this.localControl());
+          if (!open && supplied && !runtime.stopped && !this.closed) {
+            // The desktop supplied the token for this connect. No window opens.
+            if (this.localSecret) this.localSecret.supplied = false;
+            return finish(null);
+          }
+          if (!open || runtime.stopped || this.closed) {
+            try {
+              if (runtime.stopped || this.closed) return finish(null);
+              this.localOperationCurrent(operationId);
+              this.revokeLocalSecret();
+              launchInput();
+            } catch {
+              finish(null);
             }
-            finish(null);
-            this.store.transaction(() => {
-              const current = this.localControl();
-              if (
-                current.operation ||
-                current.endpoint !== endpoint ||
-                current.authMode !== 'token' ||
-                current.connectionRevision !== control.connectionRevision
-              )
-                return;
-              this.saveLocal({
-                ...current,
-                authMode: 'none',
-                noneConnected: true,
-                connectionFailed: false,
-                connectionRevision: current.connectionRevision + 1,
-                observationStale: !!current.observation,
-                selection: null,
-                setupHash: null,
-              });
+            return;
+          }
+          finish(null);
+          this.store.transaction(() => {
+            const current = this.localControl();
+            if (
+              current.operation ||
+              current.endpoint !== endpoint ||
+              current.connectionRevision !== control.connectionRevision
+            )
+              return;
+            this.revokeLocalSecret();
+            this.saveLocal({
+              ...current,
+              connectedWithoutToken: true,
+              connectionFailed: false,
+              observationStale: !!current.observation,
+              selection: null,
+              setupHash: null,
             });
           });
+        });
       } else {
         if (!this.localConnected(control)) throw Error('Local connection is unavailable.');
         // Read once per observation. The read is far shorter than discovery, so it lands first.
         void refreshAvailableMemory();
-        const credentials =
-          control.authMode === 'none'
-            ? { authMode: 'none' as const }
-            : { token: this.localSecret?.secret.toString('utf8') as string };
+        const credentials = this.localCredentials();
         const handle = startLocalDiscovery(
           {
             kind: 'discovery',

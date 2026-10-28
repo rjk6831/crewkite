@@ -33,6 +33,7 @@ import {
 } from './client.ts';
 import { type AcpImportDependencies, importGoogleAcp } from './import.ts';
 import {
+  ACP_SESSION_MODELS,
   type AcpReviewMapping,
   type AcpSetupProof,
   acpClientPin,
@@ -972,6 +973,32 @@ test('the acp writer binds an imported client and observed configuration before 
       decodeAcpConfiguration([
         { id: 'unknown', name: 'Unknown', type: 'future', currentValue: null },
       ]).configOptions,
+      null,
+    );
+    // A client that lists models in the session reply gets them as the configuration, config
+    // options win when both exist, and a malformed list is dropped.
+    const listed = {
+      availableModels: [{ modelId: 'm-1' }, { modelId: 'm-2' }],
+      currentModelId: 'm-2',
+    };
+    assert.deepEqual(decodeAcpConfiguration([], listed).configOptions, {
+      model: { optionId: ACP_SESSION_MODELS, currentValue: 'm-2', supported: ['m-1', 'm-2'] },
+      thoughtLevel: null,
+    });
+    const option = {
+      id: 'model-slot',
+      name: 'Model',
+      type: 'select',
+      category: 'model',
+      currentValue: 'a',
+      options: [{ value: 'a', name: 'A' }],
+    };
+    assert.equal(
+      decodeAcpConfiguration([option], listed).configOptions?.model.optionId,
+      'model-slot',
+    );
+    assert.equal(
+      decodeAcpConfiguration([], { ...listed, currentModelId: 'gone' }).configOptions,
       null,
     );
   } finally {

@@ -5,7 +5,9 @@ import {
   AcpApprovalTargetSchema,
   AgentEventSchema,
   ApprovalBindingSchema,
+  AskChatFamilyPayloadSchema,
   AttemptOutputSchema,
+  CancelChatPlanPayloadSchema,
   CandidateEvaluationPreviewSchema,
   ChatAttachmentSchema,
   ChatBranchStatusSchema,
@@ -15,8 +17,12 @@ import {
   ChatCrewSchema,
   ChatFlightModeSchema,
   type ChatHandoffMode,
+  ChatPlanSchema,
+  ChatPlanStateSchema,
   ChatQueuedMessageSchema,
   ChatSessionSchema,
+  ChatThreadReadSchema,
+  ChatThreadSchema,
   ChatTurnEventsReadSchema,
   ChatTurnStatsSchema,
   CheckEventSchema,
@@ -42,6 +48,7 @@ import {
   canonicalJson,
   DesktopNoticeSchema,
   DiscardChatChangePayloadSchema,
+  EventSchema,
   FakeWorkerEventSchema,
   FakeWorkerInputSchema,
   formatReviewTarget,
@@ -77,15 +84,21 @@ import {
   ReviewJobSchema,
   RoleSchema,
   RouteSchema,
+  RunChatPlanPayloadSchema,
   RuntimeManifestSchema,
   rankFamilies,
   requiredReviewMethodIds,
+  SendChatMessagePayloadSchema,
   SnapshotSchema,
   SourceDetailsSchema,
   SourceSchema,
   SteerChatMessagePayloadSchema,
   TaskConversationStateSchema,
   TaskModelCatalogSchema,
+  ThreadDiffResultSchema,
+  ThreadLiveResultSchema,
+  ThreadTurnsArgsSchema,
+  ThreadTurnsResultSchema,
   TransportMessageSchema,
   UsageReaderSchema,
   windowAppliesTo,
@@ -1448,6 +1461,9 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { contextLength: 16384 },
     { contextLength: 1_048_576 },
     { available: false, modelBinding: null, reason: 'not-configured', contextLength: null },
+    // Output and reasoning caps are computed numbers, up to the context less the margin.
+    { maximumOutputTokens: 2049 },
+    { maximumOutputTokens: 7936, reasoningBudgetTokens: 3968 },
   ])
     assert(NativeProfileSchema.safeParse({ ...localProfile, ...change }).success);
   for (const change of [
@@ -1463,8 +1479,10 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     { modelBinding: { ...localModel, quantization: 'other' } },
     { contextLength: 0 },
     { contextLength: null },
-    { maximumOutputTokens: 2049 },
+    { maximumOutputTokens: 0 },
+    { maximumOutputTokens: 7937 },
     { maximumOutputTokens: 8192 },
+    { maximumOutputTokens: 4096, reasoningBudgetTokens: 2049 },
     { maximumSubmissions: 2 },
     { available: false, reason: 'available' },
     { reason: 'unbounded-error' },
@@ -1597,8 +1615,15 @@ test('process boundaries reject unknown fields and invalid command identity', ()
   };
   assert.deepEqual(LocalSetupSchema.parse(observedSetup), observedSetup);
   assert(LocalSetupSchema.safeParse({ ...localSetup, authMode: 'none', connected: true }).success);
+  // The probe result rides on the connection and never rewrites the saved mode.
+  for (const change of [
+    { authMode: 'token', connected: true, connectedWithoutToken: true },
+    { authMode: 'none', connected: true, secretConfigured: true, connectedWithoutToken: false },
+  ])
+    assert(LocalSetupSchema.safeParse({ ...localSetup, ...change }).success);
   for (const change of [
     { authMode: 'none', secretConfigured: true },
+    { authMode: 'token', connected: true, connectedWithoutToken: false },
     { authMode: 'token', connected: true },
     { authMode: 'automatic' },
   ])
@@ -1699,6 +1724,13 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     embeddingInstances: 0,
   };
   assert.deepEqual(LocalModelObservationSchema.parse(observation), observation);
+  // A cached observation says whether the model takes images, before any connect.
+  assert(
+    LocalModelObservationSchema.safeParse({
+      ...observation,
+      models: [{ ...observedChoice, vision: true }],
+    }).success,
+  );
   assert(
     LocalSetupSchema.safeParse({
       ...localSetup,
@@ -1839,6 +1871,20 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       LocalModelObservationSchema.safeParse({ ...observation, ...change }).success,
       false,
     );
+  // A busy loaded instance still qualifies. Any other reason on a loaded choice does not.
+  assert(
+    LocalModelObservationSchema.safeParse({
+      ...observation,
+      models: [{ ...observedChoice, reasons: ['busy'] }],
+    }).success,
+  );
+  assert.equal(
+    LocalModelObservationSchema.safeParse({
+      ...observation,
+      models: [{ ...observedChoice, reasons: ['busy', 'draft'] }],
+    }).success,
+    false,
+  );
   const selectedSetup = {
     ...localSetup,
     setupHash: 'a'.repeat(64),
@@ -3366,11 +3412,27 @@ test('a crew names a builder and each role once', () => {
   assert.ok(
     ChatCrewSchema.safeParse({ name: 'Solo', members: [{ role: 'builder', selection }] }).success,
   );
+  assert.ok(
+    ChatCrewSchema.safeParse({
+      name: 'Full crew',
+      members: ['builder', 'reviewer', 'challenger', 'fixer', 'orchestrator'].map((role) => ({
+        role,
+        selection,
+      })),
+    }).success,
+    'a crew with an orchestrator and every other role is valid',
+  );
   for (const members of [
     [{ role: 'reviewer', selection }],
+    [{ role: 'orchestrator', selection }],
     [
       { role: 'builder', selection },
       { role: 'builder', selection },
+    ],
+    [
+      { role: 'builder', selection },
+      { role: 'orchestrator', selection },
+      { role: 'orchestrator', selection },
     ],
   ])
     assert.equal(ChatCrewSchema.safeParse({ name: 'Bad', members }).success, false);
@@ -3407,6 +3469,58 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
     source: { name: 'paste.png', mimeType: 'image/png', base64 },
   });
   const delta = { type: 'text.delta', turnId, itemId: 'item-1', text: 'Done.' };
+  const slice = (id: number, depends: number[] = [], files: string[] = ['src/a.ts']) => ({
+    id,
+    title: `Slice ${id}`,
+    brief: 'Change the parser.',
+    files,
+    depends,
+    difficulty: 'easy',
+    readOnly: false,
+  });
+  const plan = (slices: unknown[]) => ({ planId: 'plan-1', goal: 'Split the parser.', slices });
+  const send = { taskId, text: '', files: [file] };
+  const userEntry = {
+    id: `msg_${suffix}`,
+    taskId,
+    revision: 1,
+    cursor: '3',
+    at: '2026-10-28T10:00:00.000Z',
+    kind: 'user-message',
+    text: '',
+    author: { kind: 'user' },
+  };
+  const turnsRow = {
+    id: turnId,
+    sequence: 3,
+    family: 'local',
+    model: 'small-1',
+    role: 'assistant',
+    status: 'done',
+    startedAt: '2026-10-28T10:00:00Z',
+    endedAt: null,
+    reply: 'Done.',
+    changedFiles: 1,
+  };
+  const card = {
+    planId: 'plan-1',
+    orchestratorTurnId: turnId,
+    goal: 'Split the parser.',
+    phase: 'running',
+    slices: [
+      {
+        id: 1,
+        title: 'Slice 1',
+        difficulty: 'easy',
+        depends: [],
+        readOnly: false,
+        status: 'running',
+        assignment: { family: 'local', model: 'small-1', reason: 'Local first.' },
+        candidates: [],
+        turnId,
+      },
+    ],
+  };
   const session = {
     family: 'anthropic',
     sessionId: 'session-1',
@@ -3622,6 +3736,198 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
       ChatTurnStatsSchema,
       { ...stats, reasoningTokens: -1, replyTokens: 30 },
       false,
+    ],
+    [
+      'a plan with eight slices in a chain is valid',
+      ChatPlanSchema,
+      plan([1, 2, 3, 4, 5, 6, 7, 8].map((id) => slice(id, id > 1 ? [id - 1] : []))),
+      true,
+    ],
+    [
+      'a plan with nine slices is refused',
+      ChatPlanSchema,
+      plan([1, 2, 3, 4, 5, 6, 7, 8, 9].map((id) => slice(id))),
+      false,
+    ],
+    [
+      'a plan with a duplicate slice id is refused',
+      ChatPlanSchema,
+      plan([slice(1), slice(1)]),
+      false,
+    ],
+    [
+      'a plan whose slices depend on each other in a cycle is refused',
+      ChatPlanSchema,
+      plan([slice(1, [3]), slice(2, [1]), slice(3, [2])]),
+      false,
+    ],
+    [
+      'a slice that depends on a slice the plan lacks is refused',
+      ChatPlanSchema,
+      plan([slice(1, [2])]),
+      false,
+    ],
+    [
+      'a slice file that climbs out of the scratch copy is refused',
+      ChatPlanSchema,
+      plan([slice(1, [], ['src/../../etc/passwd'])]),
+      false,
+    ],
+    [
+      'a slice file with an absolute path is refused',
+      ChatPlanSchema,
+      plan([slice(1, [], ['/etc/passwd'])]),
+      false,
+    ],
+    ['the plan card carries each slice status', ChatPlanStateSchema, card, true],
+    [
+      'a slice status outside the five is refused',
+      ChatPlanStateSchema,
+      { ...card, slices: [{ ...card.slices[0], status: 'skipped' }] },
+      false,
+    ],
+    [
+      'an ask names a family and a question',
+      AskChatFamilyPayloadSchema,
+      { taskId, family: 'google', question: 'Is the cache safe?' },
+      true,
+    ],
+    [
+      'an ask with a blank question is refused',
+      AskChatFamilyPayloadSchema,
+      { taskId, family: 'google', question: '   ' },
+      false,
+    ],
+    [
+      'a plan run can name one slice and per-slice overrides',
+      RunChatPlanPayloadSchema,
+      {
+        taskId,
+        planId: 'plan-1',
+        sliceId: 2,
+        overrides: [{ sliceId: 2, family: 'local', model: 'model-q' }],
+      },
+      true,
+    ],
+    [
+      'a plan run for a slice past the eighth is refused',
+      RunChatPlanPayloadSchema,
+      { taskId, planId: 'plan-1', sliceId: 9 },
+      false,
+    ],
+    ['a plan cancel names the plan', CancelChatPlanPayloadSchema, { taskId, planId: 'p.2' }, true],
+    ['a message with files and no text is accepted', SendChatMessagePayloadSchema, send, true],
+    [
+      'a message with no text and no files is refused',
+      SendChatMessagePayloadSchema,
+      { ...send, files: [] },
+      false,
+    ],
+    [
+      'a queued message with files and no text is accepted',
+      ChatQueuedMessageSchema,
+      { id: `msg_${suffix}`, at: '2026-10-28T10:00:00Z', text: '', files: [file] },
+      true,
+    ],
+    [
+      'a queued message with no text and no files is refused',
+      ChatQueuedMessageSchema,
+      { id: `msg_${suffix}`, at: '2026-10-28T10:00:00Z', text: '' },
+      false,
+    ],
+    [
+      'a stored user message with files and no text is accepted',
+      ConversationEntrySchema,
+      { ...userEntry, files: [file] },
+      true,
+    ],
+    [
+      'a stored user message with no text and no files is refused',
+      ConversationEntrySchema,
+      userEntry,
+      false,
+    ],
+    [
+      'a thread records how many entries the scratch copy skipped in all',
+      ChatThreadSchema,
+      { taskId, scratchReady: true, base: null, selection: null, skippedTotal: 120 },
+      true,
+    ],
+    [
+      'a read says whether older messages exist',
+      ChatThreadReadSchema,
+      {
+        thread: { taskId, scratchReady: true, base: null, selection: null },
+        turns: [],
+        messages: [],
+        liveEvents: [],
+        cursor: '4',
+        more: true,
+      },
+      true,
+    ],
+    [
+      'a removed thread names its task',
+      EventSchema,
+      {
+        protocol: 1,
+        id: `evt_${suffix}`,
+        cursor: '5',
+        at: '2026-10-28T10:00:00.000Z',
+        taskId,
+        revision: 2,
+        type: 'task.removed',
+        payload: { taskId },
+      },
+      true,
+    ],
+    ['thread turns read at most fifty', ThreadTurnsArgsSchema, { limit: 51 }, false],
+    [
+      'a thread turns row is bounded to 300 reply characters',
+      ThreadTurnsResultSchema,
+      { turns: [{ ...turnsRow, reply: 'x'.repeat(301) }] },
+      false,
+    ],
+    [
+      'a thread turns row within bounds is valid',
+      ThreadTurnsResultSchema,
+      { turns: [turnsRow] },
+      true,
+    ],
+    [
+      'a thread diff over 64 KiB is refused',
+      ThreadDiffResultSchema,
+      { diff: 'x'.repeat(65_537), more: null },
+      false,
+    ],
+    [
+      'a live thread read past 8 KiB of text is refused',
+      ThreadLiveResultSchema,
+      {
+        state: 'running',
+        turnId,
+        family: 'local',
+        model: 'small-1',
+        role: 'ask',
+        elapsedMs: 10,
+        text: 'x'.repeat(8193),
+        trace: [],
+      },
+      false,
+    ],
+    ['an idle thread reads as none', ThreadLiveResultSchema, { state: 'none' }, true],
+    [
+      'a turn started for a side question carries the ask role',
+      AgentEventSchema,
+      {
+        type: 'turn.started',
+        turnId,
+        family: 'google',
+        model: 'large-1',
+        effort: 'default',
+        role: 'ask',
+      },
+      true,
     ],
     [
       'a compaction with no summaries is refused',

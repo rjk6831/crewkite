@@ -24,6 +24,12 @@ const identifier = z
   .min(1)
   .max(200)
   .refine((value) => value.isWellFormed() && !/\p{Cc}/u.test(value));
+/**
+ * The option ID a configuration carries when the client lists its models in the session reply
+ * (`models.availableModels`) and not as a config option. The model then changes with
+ * `session/set_model`, which a config option ID cannot name.
+ */
+export const ACP_SESSION_MODELS = 'session/models';
 export const AcpClientPinSchema = z.strictObject({
   version: z.literal('1.4.0'),
   sha256: HashSchema,

@@ -14,17 +14,10 @@ import { FailureLine, PermissionCard, ThinkingCard, ToolCard, ToolRunCard } from
 import { FamilyMark } from './family-mark.tsx';
 import { Markdown } from './markdown.tsx';
 import { effortLabels } from './model-picker.tsx';
+import { ReplyMenu } from './reply-menu.tsx';
 import type { ThreadItem, TurnView } from './thread-state.ts';
-import { viewBlocks } from './turn-fold.ts';
+import { replySource, roleLabels, viewBlocks } from './turn-fold.ts';
 import { TurnStats } from './turn-stats.tsx';
-
-const roleLabels = {
-  assistant: null,
-  reviewer: 'Reviewer',
-  advisor: 'Advisor',
-  challenger: 'Challenger',
-  fixer: 'Fixer',
-} as const;
 
 /**
  * `OpenAI · large-1 · Ultra`, after the family mark. A default effort is left out: the client
@@ -73,8 +66,14 @@ const TurnRow = memo(function TurnRow({
 }: { turn: TurnView } & TurnHandlers) {
   const identity = turn.identity;
   const role = identity ? roleLabels[identity.role] : null;
+  const source = turn.ended && turn.status === 'done' ? replySource(turn.blocks) : '';
+  const copyable = source !== '';
   return (
-    <article className="th-row th-assistant" aria-busy={!turn.ended} data-turn-id={turn.id}>
+    <article
+      className={`th-row th-assistant${identity?.role === 'ask' ? ' is-side' : ''}`}
+      aria-busy={!turn.ended}
+      data-turn-id={turn.id}
+    >
       {identity && (
         <header className="th-turn-head">
           <FamilyMark family={identity.family} />
@@ -120,6 +119,11 @@ const TurnRow = memo(function TurnRow({
       <TurnTrace blocks={turn.blocks} />
       {turn.status === 'stopped' && <p className="th-stopped">Stopped.</p>}
       <TurnStats turn={turn} />
+      {copyable && (
+        <div className="th-turn-foot">
+          <ReplyMenu source={source} />
+        </div>
+      )}
       {quiet(turn) && (
         <span className="th-working" role="status" aria-label="Working">
           <i />
@@ -142,7 +146,7 @@ function UserRow({
     <div className={item.pending ? 'th-row th-user is-pending' : 'th-row th-user'}>
       {item.attachments.length > 0 && <AttachmentChips paths={item.attachments} />}
       <FileChips files={item.files.map(chipOf)} taskId={taskId} />
-      <div className="th-bubble">{item.text}</div>
+      {item.text !== '' && <div className="th-bubble">{item.text}</div>}
     </div>
   );
 }

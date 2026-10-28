@@ -12,8 +12,13 @@
 //   {"method":"initialized"}
 //   {"id":2,"method":"account/read","params":{"refreshToken":false}}
 //   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}
-//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","ephemeral":false}}
-//   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings without ephemeral,"excludeTurns":true}}
+//   {"id":4,"method":"config/read","params":{"includeLayers":false,"cwd":SCRATCH}}, only with the
+//     thread tools; the reply's config.mcp_servers names each configured server, and the ids after
+//     it move up by one
+//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","ephemeral":false}},
+//     with the thread tools also "config":{"mcp_servers.NAME.enabled":false for each other server,
+//     "mcp_servers.crewkite":{"command","args","enabled":true,"default_tools_approval_mode":"approve"}}
+//   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings and config without ephemeral,"excludeTurns":true}}
 //   {"id":4,"method":"model/list","params":{"limit":100,"includeHidden":true}}, before the thread
 //     only when the turn carries an image or audio file
 //   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}],"effort":E}}, effort left out for default,
@@ -62,9 +67,11 @@ import {
   type ChatToolKind,
 } from '@crewkite/contracts';
 import type { ChatTurnRequest } from '../../chat/adapter.ts';
+import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
+import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
-import { openAiChatAdapter } from './chat.ts';
+import { type OpenAiChatDeps, openAiChatAdapter } from './chat.ts';
 import type { OpenAiUsage } from './discovery.ts';
 
 // A scripted app-server. It logs every line it reads, answers the metadata requests, and plays
@@ -172,6 +179,8 @@ input.on('line', (line) => {
   if (value.method === 'turn/start') result = { turn: running };
   if (value.method === 'model/list') result = { data: [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', hidden: false, inputModalities: given.modalities ?? ['text', 'image'] }], nextCursor: null };
   if (value.method === 'turn/interrupt') result = {};
+  // Unknown keys come back flattened into config, mcp_servers among them.
+  if (value.method === 'config/read') result = { config: { model: null, mcp_servers: given.mcp ?? {} }, origins: {} };
   send({ id: value.id, result });
   if (value.method === 'turn/start') play(scenario);
   if (value.method === 'turn/interrupt') send({ method: 'turn/completed', params: { threadId, turn: { ...running, status: 'interrupted' } } });
@@ -223,7 +232,11 @@ function turn(
       silent?: boolean;
       /** What model/list reports the selected model takes. Text and image when left out. */
       modalities?: string[];
+      /** The servers config/read reports as configured. */
+      mcp?: Record<string, unknown>;
     };
+    threadTools?: OpenAiChatDeps['threadTools'];
+    readOnly?: boolean;
     files?: File[];
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
@@ -251,6 +264,7 @@ function turn(
       return spawn(process.execPath, [path, scenario, frames, input], spawnOptions);
     },
     schedule: options.schedule,
+    threadTools: options.threadTools,
   });
   const request: ChatTurnRequest & { files: File[] } = {
     turnId,
@@ -269,6 +283,7 @@ function turn(
     environment,
     now: () => Date.parse('2026-10-23T12:00:00.000Z'),
     files: options.files ?? [],
+    readOnly: options.readOnly,
   };
   const handle = adapter.startTurn(request, (event) => {
     events.push(event);
@@ -752,6 +767,45 @@ test('the next turn resumes the thread with its own approval policy and effort a
     },
   ]);
   assert.equal(result.session?.sessionId, 'thread-1');
+
+  // With the thread tools, config/read comes before the thread, and the thread config holds the
+  // one server and turns off each server the person configured. A read-only turn gets it too.
+  const broker = new ThreadToolsBroker({ home: root });
+  const minted: Array<readonly string[]> = [];
+  const threadTools = (request: ChatTurnRequest) => {
+    const server = broker.mint({ ...request, reader: fixtureReader() });
+    minted.push(server.args);
+    return server;
+  };
+  const mcp = { docs: { command: 'docs-server' }, crewkite: { command: 'stale' } };
+  const rows = [
+    { method: 'thread/start', options: {} },
+    { method: 'thread/resume', options: { session, readOnly: true } },
+  ];
+  for (const row of rows) {
+    const run = turn('reply', { ...row.options, threadTools, detail: { mcp } });
+    await run.settled();
+    const frames = run.frames();
+    assert.deepEqual(frames[4], {
+      id: 4,
+      method: 'config/read',
+      params: { includeLayers: false, cwd: run.scratch },
+    });
+    const opened = frames.find((frame) => frame.method === row.method);
+    assert.deepEqual(opened?.params.config, {
+      'mcp_servers.docs.enabled': false,
+      'mcp_servers.crewkite': {
+        command: process.execPath,
+        args: minted.at(-1),
+        enabled: true,
+        default_tools_approval_mode: 'approve',
+      },
+    });
+    // The launch arguments never name a server, so the token stays off the client's argv.
+    assert(!run.args().some((arg) => arg.includes('mcp_servers')));
+  }
+  const tokens = minted.map((args) => args[args.indexOf('--token') + 1]);
+  assert.equal(new Set(tokens).size, rows.length);
 });
 
 test('a client that fails before its turn runs leaves its error output and last frames in the failure', async () => {

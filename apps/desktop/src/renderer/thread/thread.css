@@ -248,6 +248,16 @@
   border-radius: 4px;
   color: var(--text-muted);
 }
+/* An Ask reply answers a side question. It sits apart from the build, set in from the column. */
+.th-assistant.is-side {
+  margin-left: 20px;
+  padding-left: 12px;
+  border-left: 2px solid var(--border-strong);
+  font-size: 13px;
+}
+.th-assistant.is-side .th-role {
+  color: var(--accent);
+}
 .th-notice {
   color: var(--text-dim);
   font-size: 12px;
@@ -995,6 +1005,33 @@
 }
 .th-menu-legacy .th-chevron {
   margin-left: 0;
+}
+.th-menu-sub {
+  margin: 6px 0 2px;
+  padding: 0 10px 0 25px;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.th-menu-id {
+  display: flex;
+  gap: 6px;
+  padding: 2px 10px 6px 25px;
+}
+.th-menu-id input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 7px;
+  background: var(--surface);
+  color: inherit;
+  font: inherit;
+  font-size: 12px;
+}
+.th-menu-id button {
+  width: auto;
+  padding: 5px 10px;
+  border: 1px solid var(--border-strong);
 }
 .th-menu .th-menu-foot {
   gap: 8px;

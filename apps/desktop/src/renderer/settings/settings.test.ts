@@ -127,6 +127,16 @@ test('saved thread defaults and crew presets survive bad storage and apply only 
     'reviewer:anthropic',
     'challenger:google',
     'fixer:openai',
+    'orchestrator:openai',
+  ]);
+  // Solo and Pair leave the orchestrator out.
+  const [solo] = readCrewPresets(store);
+  assert.deepEqual(roles(crewFromPreset(solo, three, null, 'most-left', NOW, store)), [
+    'builder:openai',
+  ]);
+  assert.deepEqual(roles(crewFromPreset(pair, three, null, 'most-left', NOW, store)), [
+    'builder:openai',
+    'reviewer:anthropic',
   ]);
   const lone: ChatCatalogRead = { families: [entry('openai', true, [])] };
   assert.deepEqual(roles(crewFromPreset(pair, lone, null, 'most-left', NOW, store)), [

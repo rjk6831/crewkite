@@ -41,6 +41,7 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
 import { ChatService } from '../chat/service.ts';
+import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
 import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
@@ -49,6 +50,7 @@ import type { GitIdentity } from '../host/publication.ts';
 import { inspectSourceDetails, projectRoot } from '../host/source.ts';
 import { groupAbsent, type OwnedCommand, type OwnedWorker, type Schedule } from '../host/worker.ts';
 import { anthropicChatAdapter } from '../providers/anthropic/chat.ts';
+import { type AnthropicLiveModel, readAnthropicModels } from '../providers/anthropic/models.ts';
 import type { NativeConnectionChecks } from '../providers/anthropic/native-connection.ts';
 import type { AnthropicUsageRefresh } from '../providers/anthropic/usage-refresh.ts';
 import type { AcpInstallDependencies } from '../providers/google/acp/install.ts';
@@ -382,12 +384,64 @@ export class Controller {
       projectPath: (projectId) => this.projectPath(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
       catalog: () => this.chatCatalog(),
+      localContext: () => this.localContext(),
       // A settled turn spent allowance, so the gauge reads again.
       onTurnSettled: (family) => {
         if (family === 'anthropic') void this.anthropicUsage().refreshWhenDue(this.id('cmd'));
       },
+      // The turn's thread tools token dies with the turn.
+      onTurnEnded: (turnId) => this.threadToolsRuntime?.broker.end(turnId),
+      threadToolsDown: () => this.threadToolsRuntime?.failed === true,
     });
     return this.chatRuntime;
+  }
+
+  // One broker for the controller's life. Its socket listens once the default adapters exist, and
+  // a turn that starts before it listens, or after listening failed, runs without the tools.
+  // After a failure every cloud turn says so in the thread.
+  private threadToolsRuntime?: {
+    broker: ThreadToolsBroker;
+    ready: boolean;
+    failed: boolean;
+    started: Promise<void>;
+  };
+  private threadToolsBroker() {
+    if (this.threadToolsRuntime) return this.threadToolsRuntime;
+    const broker = new ThreadToolsBroker({ home: this.home });
+    const runtime = { broker, ready: false, failed: false, started: Promise.resolve() };
+    runtime.started = broker.start().then(
+      () => {
+        runtime.ready = !this.closed;
+      },
+      () => {
+        runtime.failed = true;
+      },
+    );
+    this.threadToolsRuntime = runtime;
+    return runtime;
+  }
+
+  /** The thread tools server for one cloud turn, with a token scoped to its thread and turn. */
+  private threadTools(request: ChatTurnRequest): ThreadToolsServer | null {
+    const runtime = this.threadToolsRuntime;
+    if (!runtime?.ready || this.closed) return null;
+    return runtime.broker.mint({
+      taskId: request.taskId,
+      turnId: request.turnId,
+      reader: this.chat().threadReads(request.taskId),
+    });
+  }
+
+  /** The context of the Local model a turn would run on, when Local is connected. */
+  private localContext(): number | null {
+    const setup = this.localSetup();
+    if (setup.connected !== true || setup.observationStale) return null;
+    const loaded = (setup.observation?.models ?? []).filter(
+      (choice) => choice.state === 'loaded-eligible',
+    );
+    const chosen =
+      loaded.find((choice) => choice.selectionId === setup.selection?.selectionId) ?? loaded[0];
+    return chosen?.contextLength ?? null;
   }
 
   // What the Google and Local clients last reported about the files they take. Memory only: the
@@ -395,12 +449,57 @@ export class Controller {
   private googlePrompt: GooglePromptCapabilities | null = null;
   private localVision: { modelKey: string; vision: boolean } | null = null;
 
+  // The Anthropic client's picker rows, read in the background. A read that fails leaves the last
+  // rows in place, or none, and the catalog then shows the shipped list as known.
+  private anthropicModelRows: readonly AnthropicLiveModel[] | null = null;
+  private anthropicModelRead = { at: Number.NEGATIVE_INFINITY, busy: false };
+
+  /** Starts a picker read when the last one is old. A catalog read never waits for it. */
+  private refreshAnthropicModels(profiles: NativeProfileResolution[]) {
+    const read = this.anthropicModelRead;
+    const client = profiles.find(
+      (value) =>
+        ['anthropic-file-v1', 'anthropic-file-compact-v1'].includes(value.facts.id) &&
+        value.facts.available,
+    )?.client;
+    const now = Date.parse(this.now());
+    // Ten minutes after a read, one minute after a miss.
+    if (
+      !client ||
+      this.closed ||
+      read.busy ||
+      now - read.at < (this.anthropicModelRows ? 600_000 : 60_000)
+    )
+      return;
+    read.busy = true;
+    read.at = now;
+    const directory = join(this.home, 'native', 'chat-models-anthropic');
+    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    readAnthropicModels({
+      executable: client.executable,
+      sha256: client.sha256,
+      environment: this.chatEnvironment('anthropic'),
+      directory,
+      spawn: this.options.nativeSpawn as Parameters<typeof readAnthropicModels>[0]['spawn'],
+      schedule: this.options.schedule,
+    })
+      .then((rows) => {
+        if (rows && !this.closed) this.anthropicModelRows = rows;
+      })
+      .catch(() => {})
+      .finally(() => {
+        read.busy = false;
+      });
+  }
+
   private chatCatalog(): ChatCatalogRead {
     const profiles = this.resolveProfiles();
+    this.refreshAnthropicModels(profiles);
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
       anthropicModel: this.anthropicUsage().clientModel(),
+      anthropicModels: this.anthropicModelRows,
       googlePrompt: this.googlePrompt,
       local: this.localSetup(),
       localVision: this.localVision,
@@ -619,8 +718,10 @@ export class Controller {
     if (selection) {
       const models = families.find((entry) => entry.family === selection.family)?.models ?? [];
       const model = models.find((entry) => entry.model === selection.model);
-      // An empty list means no catalog was observed. The adapter then reports a bad model.
-      if (models.length && !model) return null;
+      // An empty list means no catalog was observed. The adapter then reports a bad model. A
+      // cloud family also takes an ID the list does not hold, since the person can type one and
+      // the client rejects it on the first turn. A Local model has to be on this computer.
+      if (models.length && !model && selection.family === 'local') return null;
       if (model && selection.effort !== 'default' && !model.efforts.includes(selection.effort))
         return null;
       return selection;
@@ -657,6 +758,8 @@ export class Controller {
 
   /** One adapter per family, each resolving its client from the profiles at launch time. */
   private defaultChatAdapters(): Map<ChatFamily, ChatAdapter> {
+    this.threadToolsBroker();
+    const threadTools = (request: ChatTurnRequest) => this.threadTools(request);
     const client = (ids: string[], family: string) => {
       const profile = this.resolveProfiles().find(
         (value) => ids.includes(value.facts.id) && value.facts.available && value.client,
@@ -672,17 +775,20 @@ export class Controller {
         environment: request.environment,
       }),
       spawn: this.options.nativeSpawn as Parameters<typeof openAiChatAdapter>[0]['spawn'],
+      threadTools,
     });
     const anthropic = anthropicChatAdapter({
       launch: () => client(['anthropic-file-v1', 'anthropic-file-compact-v1'], 'Anthropic'),
       spawn: this.options.nativeSpawn as Parameters<typeof anthropicChatAdapter>[0]['spawn'],
       schedule: this.options.schedule,
       onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),
+      threadTools,
     });
     const google = googleChatAdapter({
       onPromptCapabilities: (capabilities) => {
         this.googlePrompt = capabilities;
       },
+      threadTools,
       launch: (request: ChatTurnRequest) => {
         const setup = this.store.googleAcpSetup();
         const resolution = this.acpResolution();
@@ -721,16 +827,20 @@ export class Controller {
         const control = this.localControl();
         if (!control.endpoint || !this.localConnected(control))
           throw Error('Local is not connected. Open Settings, load a model and connect Local.');
-        const secret = this.localSecret?.secret.toString('utf8') ?? null;
-        if (control.authMode !== 'none' && !secret) throw Error('The Local token is unavailable.');
+        // The probe at connect decided whether a token exists. The saved mode does not.
+        const secret = this.localSecretMatches(control)
+          ? (this.localSecret?.secret.toString('utf8') ?? null)
+          : null;
         const connection = await connectLocalModel({
           endpoint: control.endpoint,
-          token: control.authMode === 'none' ? null : secret,
+          token: secret,
           model: request.selection.model,
         });
         this.localVision = { modelKey: connection.modelKey, vision: connection.vision };
-        return connection;
+        return { ...connection, connectedWithoutToken: secret === null };
       },
+      // Local runs the same five reads as functions in this process. No socket or token.
+      threadReader: (request) => this.chat().threadReads(request.taskId),
     });
     return new Map<ChatFamily, ChatAdapter>([
       ['openai', openai],
@@ -767,6 +877,9 @@ export class Controller {
       ].includes(command.command)
     )
       return this.taskOperations().execute(command as TaskOperationCommand);
+    // Before any receipt path: the token must not reach a journal row.
+    if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
+      return this.localTokenCommand(command);
     if (command.command === 'GetArtifactRange' || command.command === 'GetTaskActivityPage') {
       const reading = this.readOutput(command);
       this.outputReads.add(reading);
@@ -1021,6 +1134,15 @@ export class Controller {
     if (operationClosing) native.push(operationClosing);
     const chatClosing = this.chatRuntime?.close();
     if (chatClosing) native.push(chatClosing);
+    // The thread tools socket closes now, so a controller started next on this home binds its
+    // own. Nothing the store holds waits on it.
+    const tools = this.threadToolsRuntime;
+    if (tools) {
+      const closeTools = () => void tools.broker.close().catch(() => {});
+      if (tools.ready) closeTools();
+      else void tools.started.then(closeTools);
+      tools.ready = false;
+    }
     this.outputAbort.abort();
     native.push(...this.outputReads);
     const usageClosing = this.anthropicUsageRuntime?.close();
@@ -1173,6 +1295,9 @@ export class Controller {
         'DiscardChatChange',
         'RenameChatThread',
         'DeleteChatThread',
+        'AskChatFamily',
+        'RunChatPlan',
+        'CancelChatPlan',
       ].includes(command.command)
     ) {
       // A thread streams events many times a second. Its commands serialize on the active turn,
@@ -1335,6 +1460,12 @@ export class Controller {
         return this.chat().renameThread(command.payload);
       case 'DeleteChatThread':
         return this.chat().deleteThread(command.payload, effects);
+      case 'AskChatFamily':
+        return this.chat().ask(command.payload, effects);
+      case 'RunChatPlan':
+        return this.chat().runPlan(command.payload, effects);
+      case 'CancelChatPlan':
+        return this.chat().cancelPlan(command.payload, effects);
       case 'ReadChatTurnEvents':
         return this.chat().readTurnEvents(command.payload);
       case 'AcceptChatChanges':

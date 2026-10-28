@@ -3883,8 +3883,9 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
           },
         } satisfies Partial<ControllerOptions>)
       : {}),
-    // Every row runs against a runtime that wants a token unless it says otherwise.
-    localProbe: async () => false,
+    // The saved mode names the setup. The probe decides the connection: the none rows run
+    // against a runtime with auth off and the token rows against one that wants a token.
+    localProbe: async () => authMode === 'none',
     localInputHelper:
       authMode === 'none'
         ? undefined
@@ -3956,10 +3957,11 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
     setupState()?.revision,
   );
   assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'applied');
-  assert.equal(setupState()?.operation?.kind, authMode === 'token' ? 'input' : undefined);
+  assert.equal(setupState()?.operation?.kind, 'input');
   assert.equal((await controller.execute(begin, 'local-owner')).outcome, 'already-applied');
-  if (authMode === 'token') await operationDone();
+  await operationDone();
   assert.equal(setupState()?.secretConfigured, authMode === 'token');
+  assert.equal(setupState()?.connectedWithoutToken, authMode === 'none');
   assert.equal(setupState()?.connected, true);
   await local('RefreshLocalModels', { consent: 'explicit' });
   assert.equal(setupState()?.operation?.kind, 'discovery');
@@ -4136,12 +4138,89 @@ test('Local reads keep the selection while its model key is loaded and clear it 
   );
   await (reopened as unknown as { localOperation?: { done: Promise<void> } }).localOperation?.done;
   const open = reopened.snapshot().localSetup;
-  assert.equal(open?.authMode, 'none');
+  // The probe never writes the saved mode. It shows on the connection.
+  assert.equal(open?.authMode, 'token');
+  assert.equal(open?.connectedWithoutToken, true);
   assert.equal(open?.connected, true);
   assert.equal(open?.secretConfigured, false);
   assert.equal(open?.operation, null);
   assert.equal(open?.observation?.observationHash, last?.observation?.observationHash);
   assert.equal(open?.observationStale, true);
+
+  // A remembered token: the desktop supplies it after a disconnect, the next connect uses it with
+  // no token window, and it reaches no journal row, snapshot or file in the controller home.
+  {
+    const canary = 'remembered-token-canary-4471';
+    const supply = (actor: 'desktop' | 'cli', name: string, payload: object) =>
+      reopened.execute(
+        { ...context.command(name, payload), actor: { id: 'terminal', kind: actor } },
+        'local-owner',
+      );
+    const local = (name: string, payload: object = {}) =>
+      reopened.execute(
+        context.command(name, payload, reopened.snapshot().localSetup?.revision ?? 0),
+        'local-owner',
+      );
+    const done = () =>
+      (reopened as unknown as { localOperation?: { done: Promise<void> } }).localOperation?.done;
+    // A cold runtime misses the first probe and answers the second: no window opens.
+    const options = (reopened as unknown as { options: { localProbe: () => Promise<boolean> } })
+      .options;
+    let probes = 0;
+    options.localProbe = async () => ++probes > 1;
+    await local('BeginLocalConnectionInput', { consent: 'explicit' });
+    await done();
+    assert.equal(probes, 2);
+    assert.equal(reopened.snapshot().localSetup?.connectedWithoutToken, true);
+    assert.equal(reopened.snapshot().localSetup?.operation, null);
+    // A saved none mode meeting a runtime that wants a token opens the window and keeps the mode.
+    await local('DisconnectLocal');
+    await local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:12345', authMode: 'none' });
+    options.localProbe = async () => false;
+    await local('BeginLocalConnectionInput', { consent: 'explicit' });
+    assert.equal(reopened.snapshot().localSetup?.operation?.kind, 'input');
+    assert.equal(reopened.snapshot().localSetup?.authMode, 'none');
+    await done();
+    assert.equal(reopened.snapshot().localSetup?.authMode, 'none');
+    assert.equal(reopened.snapshot().localSetup?.connectedWithoutToken, undefined);
+    assert.equal(reopened.snapshot().localSetup?.operation, null);
+    await local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:12345', authMode: 'token' });
+    await local('DisconnectLocal');
+    (
+      reopened as unknown as { options: { localProbe: () => Promise<boolean> } }
+    ).options.localProbe = async () => false;
+    // The desktop reads the revision for its connect before it hands the token over.
+    const built = reopened.snapshot().localSetup?.revision ?? 0;
+    assert.equal((await supply('cli', 'SupplyLocalToken', { token: canary })).outcome, 'denied');
+    assert.equal(
+      (await supply('desktop', 'SupplyLocalToken', { token: canary })).outcome,
+      'applied',
+    );
+    const read = await supply('desktop', 'ReadLocalToken', {});
+    assert.deepEqual(read.data, { kind: 'local-token', token: canary });
+    const begun = await reopened.execute(
+      context.command('BeginLocalConnectionInput', { consent: 'explicit' }, built),
+      'local-owner',
+    );
+    assert.equal(begun.outcome, 'applied');
+    await done();
+    const connected = reopened.snapshot().localSetup;
+    assert.equal(connected?.connected, true);
+    assert.equal(connected?.secretConfigured, true);
+    assert.equal(connected?.connectedWithoutToken, false);
+    assert.equal(connected?.operation, null);
+    assert.equal(JSON.stringify(reopened.snapshot()).includes(canary), false);
+    // Files only: the thread tools socket lives in the home too and holds nothing at rest.
+    const held = (directory: string): string[] =>
+      readdirSync(directory, { withFileTypes: true }).flatMap((entry) =>
+        entry.isDirectory()
+          ? held(join(directory, entry.name))
+          : entry.isFile() && readFileSync(join(directory, entry.name)).includes(canary)
+            ? [entry.name]
+            : [],
+      );
+    assert.deepEqual(held(reopened.home), []);
+  }
 });
 
 test('Local preparation freezes every authority and refuses changed effects after reopen', async (t) => {
@@ -4311,6 +4390,7 @@ test('an appointed native proposal is retained and applied once after every phas
   assert.equal(withoutToken.setupState()?.reason, 'connection-unavailable');
   assert.equal(withoutToken.setupState()?.secretConfigured, false);
   await withoutToken.local('BeginLocalConnectionInput', { consent: 'explicit' });
+  await withoutToken.operationDone();
   assert.equal(withoutToken.setupState()?.connected, true);
   assert.equal(withoutToken.setupState()?.operation, null);
   const noneReopened = await withoutToken.reopen();
@@ -4340,7 +4420,9 @@ test('an appointed native proposal is retained and applied once after every phas
     .snapshot()
     .nativeProfiles.find((value) => value.id === 'local-file-v1');
   assert(currentProfile && 'maximumOutputTokens' in currentProfile);
-  assert.equal(currentProfile.maximumOutputTokens, 4096);
+  // 8,192 context: 30 percent is the floor, and reasoning takes half of it.
+  assert.equal(currentProfile.maximumOutputTokens, 2458);
+  assert.equal(currentProfile.reasoningBudgetTokens, 1229);
   assert.equal((await connectedLocal.started()).outcome, 'applied');
   connectedLocal.clock.advance(60000);
   await nativeWait('Local completed writer', connectedLocal.terminal);
@@ -6582,6 +6664,10 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
       await context.operationDone();
       assert.equal(context.setupState()?.secretConfigured, false);
       assert.equal(context.setupState()?.operation, null);
+      // Closing the token window is a known outcome: not connected, and nothing left to resolve.
+      assert.equal(context.setupState()?.connected, false);
+      assert.notEqual(context.setupState()?.reason, 'input-unknown');
+      assert.notEqual(context.setupState()?.reason, 'input-active');
       assert.equal(context.submissions(), 0);
       assert.equal(
         context.setupState()?.connectionRevision,

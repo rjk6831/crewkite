@@ -14,6 +14,7 @@ import { REOBSERVE_MS } from '../local-setup-flow.ts';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import { FamilyMark } from './family-mark.tsx';
+import { MODEL_ID, modelGroups } from './model-groups.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 
@@ -156,6 +157,9 @@ export function ModelPicker({
   const [open, setOpen] = useState(false);
   // Families whose legacy models are shown. Every opening starts with them folded away.
   const [legacy, setLegacy] = useState<ReadonlySet<ChatFamily>>(new Set());
+  // The family whose "Use a model ID" row is open for typing, and what has been typed.
+  const [typing, setTyping] = useState<ChatFamily | null>(null);
+  const [draft, setDraft] = useState('');
   const root = useRef<HTMLDivElement>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const menu = useRef<HTMLDivElement>(null);
@@ -247,6 +251,7 @@ export function ModelPicker({
           if (!open) {
             onOpen();
             setLegacy(new Set());
+            setTyping(null);
           }
           setOpen(!open);
         }}
@@ -293,13 +298,18 @@ export function ModelPicker({
                   }}
                 >
                   <span>{model.label}</span>
+                  {model.hidden && <em>hidden</em>}
                   {own && <em>{own}</em>}
                   {checked && <Check size={14} aria-hidden="true" />}
                 </button>
               );
             };
-            const older = family.models.filter((model) => model.hidden);
+            const groups = modelGroups(family, selection);
+            const older = groups.hidden;
             const shown = legacy.has(family.family);
+            // Local models must be on this computer, so only the cloud clients take a typed ID.
+            const typable = family.family !== 'local';
+            const id = draft.trim();
             // A legacy model the thread already runs on stays in view with the group folded.
             const kept = older.filter(
               (model) => selection?.family === family.family && selection.model === model.model,
@@ -323,7 +333,7 @@ export function ModelPicker({
                           : 'Not connected'}
                   </span>
                 </div>
-                {family.models.filter((model) => !model.hidden).map(item)}
+                {groups.live.map(item)}
                 {older.length > 0 && (
                   <>
                     <button
@@ -340,10 +350,62 @@ export function ModelPicker({
                       }}
                     >
                       <ChevronRight size={13} className="th-chevron" aria-hidden="true" />
-                      <span>{shown ? 'Legacy' : 'Show legacy'}</span>
+                      <span>{shown ? 'Hidden' : 'Show hidden'}</span>
                       <em>{older.length}</em>
                     </button>
                     {(shown ? older : kept).map(item)}
+                  </>
+                )}
+                {groups.known.length > 0 && (
+                  <>
+                    <p className="th-menu-sub">Known models, not confirmed for this account</p>
+                    {groups.known.map(item)}
+                  </>
+                )}
+                {typable && (
+                  <>
+                    <button
+                      type="button"
+                      role="menuitemradio"
+                      aria-checked={groups.typed !== null}
+                      aria-expanded={typing === family.family}
+                      disabled={!family.connected}
+                      onClick={() => {
+                        setDraft(groups.typed ?? '');
+                        setTyping(typing === family.family ? null : family.family);
+                      }}
+                    >
+                      <span>Use a model ID</span>
+                      {groups.typed && <em>{groups.typed}</em>}
+                      {groups.typed && <Check size={14} aria-hidden="true" />}
+                    </button>
+                    {typing === family.family && family.connected && (
+                      <form
+                        className="th-menu-id"
+                        onSubmit={(event) => {
+                          event.preventDefault();
+                          if (!MODEL_ID.test(id)) return;
+                          onSelect({ family: family.family, model: id, effort: 'default' });
+                          setOpen(false);
+                        }}
+                      >
+                        <input
+                          aria-label={`${familyName(family.family)} model ID`}
+                          value={draft}
+                          maxLength={200}
+                          spellCheck={false}
+                          autoComplete="off"
+                          // biome-ignore lint/a11y/noAutofocus: the row was opened to type here
+                          autoFocus
+                          onChange={(event) => setDraft(event.target.value)}
+                          // Arrow, Home and End move the caret here, not the menu focus.
+                          onKeyDown={(event) => event.stopPropagation()}
+                        />
+                        <button type="submit" disabled={!MODEL_ID.test(id)}>
+                          Use
+                        </button>
+                      </form>
+                    )}
                   </>
                 )}
               </div>

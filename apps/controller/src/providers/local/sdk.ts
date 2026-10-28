@@ -1,4 +1,5 @@
 import {
+  LOCAL_REPLY_MARGIN,
   type LocalModelChoiceSchema,
   LocalModelObservationSchema,
   LocalRuntimeIdentitySchema,
@@ -26,6 +27,7 @@ import {
   localDiscoveryPlan,
   localOutputTokens,
   localPlan,
+  localReasoningTokens,
   localStructuredOutput,
   MAX_STREAM_BYTES,
   ProofSchema,
@@ -123,6 +125,13 @@ const metadataSchema = z.object({
     .object({ name: identifier(64), bits: z.number().int().min(1).max(64) })
     .optional(),
   selectedVariant: identifier(200).optional(),
+  // Capability flags the runtime reports. They describe the model and stay out of its identity.
+  // The download list reports vision for every model. Only a loaded instance reports
+  // contextLength, and maxContextLength on this list is the most the model takes, never the
+  // window it runs with.
+  vision: z.boolean().optional().catch(undefined),
+  trainedForToolUse: z.boolean().optional(),
+  maxContextLength: z.number().int().positive().safe().optional(),
   variants: z
     .array(identifier(200))
     .max(64)
@@ -159,6 +168,12 @@ function metadataIdentity(value: z.output<typeof metadataSchema>) {
     metadataHash: hashCanonical(metadata),
   };
 }
+
+const capabilities = (value: z.output<typeof metadataSchema>) => ({
+  ...(value.vision === undefined ? {} : { vision: value.vision }),
+  ...(value.trainedForToolUse === undefined ? {} : { trainedForToolUse: value.trainedForToolUse }),
+  ...(value.maxContextLength === undefined ? {} : { maxContextLength: value.maxContextLength }),
+});
 
 /** Inventory is runtime metadata. It does not establish model-file identity or qualification. */
 export type LocalDiscoveryResult =
@@ -268,6 +283,7 @@ export async function discoverLocalModels(
           state: reasons.length ? 'incompatible' : 'installed-unloaded',
           reasons,
           qualification: 'unqualified',
+          ...capabilities(value),
         });
       }
       const instances = new Set<string>();
@@ -338,6 +354,7 @@ export async function discoverLocalModels(
             state: 'incompatible',
             reasons: ['not-downloaded'],
             qualification: 'unqualified',
+            ...capabilities(info),
           };
           choices.set(identity.metadataHash, choice);
           if (choices.size > 64) {
@@ -356,6 +373,7 @@ export async function discoverLocalModels(
         matched.add(identity.metadataHash);
         choice.instanceReference = info.instanceReference;
         choice.contextLength = info.contextLength;
+        Object.assign(choice, capabilities(info));
         if (
           !['gguf', 'safetensors'].includes(info.format) &&
           !choice.reasons.includes('unsupported-format')
@@ -382,7 +400,9 @@ export async function discoverLocalModels(
           confirmed.contextLength !== info.contextLength
         )
           throw new Error();
-        choice.state = choice.reasons.length ? 'incompatible' : 'loaded-eligible';
+        choice.state = choice.reasons.some((reason) => reason !== 'busy')
+          ? 'incompatible'
+          : 'loaded-eligible';
       }
       reason = 'transport';
       const currentModels = await client.llm.listLoaded();
@@ -537,7 +557,9 @@ export function startLocalPrediction(
   } = {},
 ) {
   const plan = localPlan(value);
-  const outputTokens = localOutputTokens(plan);
+  // Both caps follow the context the instance reports, which is read before the prompt is built.
+  let outputTokens = 0;
+  let reasoningTokens = 0;
   const now = options.now ?? (() => performance.now());
   const began = now();
   if (!Number.isFinite(began)) throw new Error('The Local clock is invalid.');
@@ -645,6 +667,8 @@ export function startLocalPrediction(
       )
         throw new Error();
       const contextLength = sameModel(plan, await model.getModelInfo());
+      outputTokens = localOutputTokens(plan, contextLength);
+      reasoningTokens = localReasoningTokens(plan, contextLength);
       guard();
       const state = await model.getInstanceProcessingState();
       guard();
@@ -677,9 +701,9 @@ export function startLocalPrediction(
         guard();
         if (!tokens.length || tokens.some((token) => !Number.isSafeInteger(token) || token < 0))
           throw new Error();
-        if (tokens.length + outputTokens <= contextLength) break;
+        if (tokens.length + outputTokens + LOCAL_REPLY_MARGIN <= contextLength) break;
       }
-      if (tokens.length + outputTokens > contextLength) throw new Error();
+      if (tokens.length + outputTokens + LOCAL_REPLY_MARGIN > contextLength) throw new Error();
       promptTokens = tokens.length;
       sameModel(plan, await model.getModelInfo(), contextLength);
       guard();
@@ -701,7 +725,7 @@ export function startLocalPrediction(
       const structured = localStructuredOutput(plan.binding);
       const responseOptions: LLMRespondOpts = {
         maxTokens: outputTokens,
-        reasoningBudget: 1536,
+        reasoningBudget: reasoningTokens,
         ...LOCAL_CODING_SAMPLING,
         enableThinking: true,
         contextOverflowPolicy: 'stopAtLimit',
@@ -782,7 +806,7 @@ export function startLocalPrediction(
         'llm.prediction.reasoning.budgetTokens',
         'reasoning-budget',
         z.object({ checked: z.boolean(), value: z.number().int().positive().safe() }),
-        (value) => value.checked && value.value === 1536,
+        (value) => value.checked && value.value === reasoningTokens,
       );
       // Engine protocol removes prediction-time draft keys. Its loaded configuration owns drafting.
       // SDK 2.1 defines absent load selectors as false and the absent draft model as empty.

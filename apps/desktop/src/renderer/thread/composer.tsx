@@ -27,6 +27,7 @@ import { lastSeen, observeOpenConnection } from '../local-setup-flow.ts';
 import { flightModes, preferredSelection } from '../settings/preferences.ts';
 import { type ChipFile, chipOf, FileChips, keepThumbnail } from './attach.tsx';
 import { configureThread, importAttachment, readCatalog, type ThreadSource } from './commands.ts';
+import { canSend, isMacPlatform, shortcutFor } from './composer-rules.ts';
 import { deliveryNote, deliveryOf } from './file-fit.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
@@ -86,6 +87,7 @@ export function Composer({
   onOpenCrew,
   onCatalog,
   localState,
+  lastMessage = null,
 }: {
   ref?: Ref<ComposerHandle>;
   source: ThreadSource;
@@ -106,6 +108,8 @@ export function Composer({
   onCatalog?: (catalog: ChatCatalogRead) => void;
   /** The saved Local setup, and a workspace read to get its current revision. */
   localState?: { setup: LocalSetup | null | undefined; refresh: () => Promise<WorkspaceState> };
+  /** The newest message the person sent. Up in an empty box loads it back for editing. */
+  lastMessage?: { text: string; files: readonly ChatAttachment[] } | null;
 }) {
   const draftKey = taskId ?? 'new';
   const [text, setText] = useState(() => drafts.get(draftKey) ?? '');
@@ -171,6 +175,11 @@ export function Composer({
     blocked,
     onOpenCatalog: loadCatalog,
     onNote: setNote,
+    question: text.trim(),
+    onAsked: () => {
+      setText('');
+      drafts.delete(draftKey);
+    },
   });
 
   // biome-ignore lint/correctness/useExhaustiveDependencies: the box resizes when its text changes
@@ -209,7 +218,7 @@ export function Composer({
     event?.preventDefault();
     // A message sent while a turn runs waits in the thread and starts when the turn ends.
     const body = text.trim();
-    if (!body || blocked || adding) return;
+    if (!canSend({ text: body, files: files.length, blocked, adding })) return;
     const sent = { text: body, files };
     setText('');
     setFiles([]);
@@ -288,7 +297,38 @@ export function Composer({
   const typeNote = (file: ChipFile) =>
     (delivery(file)?.warn ? delivery(file)?.title : null) ?? null;
   const typeHover = (file: ChipFile) => delivery(file)?.title ?? null;
+  function stopRunning() {
+    onStop().catch((failure: unknown) =>
+      setNote(failure instanceof Error ? failure.message : 'The turn could not be stopped.'),
+    );
+  }
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
+    const field = event.currentTarget;
+    const action = shortcutFor(event.nativeEvent, {
+      mac: isMacPlatform(),
+      composerFocused: true,
+      composerEmpty: text === '' && files.length === 0,
+      running,
+      selecting:
+        field.selectionStart !== field.selectionEnd ||
+        (window.getSelection()?.toString().length ?? 0) > 0,
+      dialogOpen: false,
+    });
+    if (action === 'stop-turn') {
+      event.preventDefault();
+      stopRunning();
+      return;
+    }
+    if (action === 'edit-last' && lastMessage) {
+      event.preventDefault();
+      setText(lastMessage.text);
+      drafts.set(draftKey, lastMessage.text);
+      setFiles(lastMessage.files.map(stored));
+      requestAnimationFrame(() =>
+        field.setSelectionRange(lastMessage.text.length, lastMessage.text.length),
+      );
+      return;
+    }
     if (event.key !== 'Enter' || event.shiftKey || event.nativeEvent.isComposing) return;
     event.preventDefault();
     void submit();
@@ -352,6 +392,20 @@ export function Composer({
                 </button>
               );
             })}
+            <button
+              type="button"
+              className="th-pill"
+              aria-expanded={roles.role === 'ask'}
+              aria-controls={roles.role === 'ask' ? 'th-role-row' : undefined}
+              disabled={roles.why('ask') !== null}
+              title={
+                roles.why('ask') ??
+                'Ask one family a read-only question. The answer posts beside the thread.'
+              }
+              onClick={() => roles.toggle('ask')}
+            >
+              {roles.askLabel}
+            </button>
           </div>
         )}
         {roles.row}
@@ -410,13 +464,7 @@ export function Composer({
                 className="th-send is-stop"
                 aria-label="Stop"
                 title="Stop"
-                onClick={() =>
-                  onStop().catch((failure: unknown) =>
-                    setNote(
-                      failure instanceof Error ? failure.message : 'The turn could not be stopped.',
-                    ),
-                  )
-                }
+                onClick={stopRunning}
               >
                 <Square size={13} fill="currentColor" aria-hidden="true" />
               </button>
@@ -429,7 +477,7 @@ export function Composer({
                 blocked ??
                 (adding ? 'Wait for the files' : running ? 'Send when this turn ends' : 'Send')
               }
-              disabled={!text.trim() || !!blocked || adding}
+              disabled={!canSend({ text, files: files.length, blocked, adding })}
             >
               <ArrowUp size={16} aria-hidden="true" />
             </button>

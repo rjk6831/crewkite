@@ -94,3 +94,9 @@
   color: var(--text-dim);
   font-size: 12px;
 }
+
+/* The add or remove button for the optional orchestrator sits under its row. */
+.th-crew-toggle {
+  grid-column: 2;
+  justify-self: start;
+}

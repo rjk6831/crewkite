@@ -27,11 +27,17 @@ import {
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
-import { type BrowserWindow, dialog, ipcMain, shell } from 'electron';
+import { type BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electron';
 import { attachRequest } from '../shared/attach.ts';
 import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
+import {
+  controllerPort,
+  LocalTokenVault,
+  RememberedLocalToken,
+  type SecretStorage,
+} from './local-token.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { assertSender, openExternalLink } from './security.ts';
@@ -42,7 +48,11 @@ const validVerificationId = (value: unknown): value is string =>
   /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 const applied = (result: CommandResult) =>
   result.outcome === 'applied' || result.outcome === 'already-applied';
-export async function installBridge(window: BrowserWindow, controller: DesktopController) {
+export async function installBridge(
+  window: BrowserWindow,
+  controller: DesktopController,
+  storage: SecretStorage = safeStorage,
+) {
   verifications.get(window)?.abort.abort();
   let client: ControllerClient | null = null;
   let listening = false;
@@ -174,6 +184,9 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
     'open-link',
     'attach',
     'open-attachment',
+    'local-token-status',
+    'local-token-remember',
+    'local-token-forget',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
@@ -353,7 +366,15 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
         )
           throw new Error('The setup operation changed. Read its current state before stopping.');
       }
+      // A remembered token goes to the controller in memory first, so the connect that follows
+      // uses it with no token window. Without one, or when the hand over fails, the window asks.
+      if (command.command === 'BeginLocalConnectionInput') {
+        await tokens.supply().catch(() => false);
+        assertSender(event, window);
+      }
       const result = await execute(command, () => assertSender(event, window));
+      if (command.command === 'ConfigureLocal' && applied(result))
+        await tokens.reconcile().catch(() => {});
       assertSender(event, window);
       return result;
     } finally {
@@ -433,6 +454,43 @@ export async function installBridge(window: BrowserWindow, controller: DesktopCo
   ipcMain.handle('crewkite:open-link', (event, url: unknown) => {
     assertSender(event, window);
     return openExternalLink(window, url);
+  });
+  // Reading the setup fails while the controller is offline. That must not look like no setup,
+  // because no setup deletes the remembered token.
+  const tokens = new RememberedLocalToken(
+    new LocalTokenVault(controller.paths.profile, storage),
+    controllerPort(async (command) => {
+      if (!client) throw new Error('The controller is offline.');
+      return client.command(command);
+    }, desktopActor),
+    async () => {
+      if (!client) throw new Error('The controller is offline.');
+      return (await client.workspaceState()).localSetup ?? null;
+    },
+    async (revision) => {
+      await send(
+        CommandSchema.parse({
+          protocol: 1,
+          key: createCommandKey(),
+          actor: desktopActor,
+          expectedRevision: revision,
+          command: 'DisconnectLocal',
+          payload: {},
+        }),
+      );
+    },
+  );
+  ipcMain.handle('crewkite:local-token-status', async (event) => {
+    assertSender(event, window);
+    return tokens.status();
+  });
+  ipcMain.handle('crewkite:local-token-remember', async (event) => {
+    assertSender(event, window);
+    return tokens.remember();
+  });
+  ipcMain.handle('crewkite:local-token-forget', async (event) => {
+    assertSender(event, window);
+    return tokens.forget();
   });
   const files = new ComposerFiles(window, grants);
   ipcMain.handle('crewkite:attach', async (event, input: unknown) => {

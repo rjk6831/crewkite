@@ -2,6 +2,7 @@ import type { ChatAttachment } from '@crewkite/contracts';
 import { Ellipsis, FileText, LoaderCircle, Paperclip, X } from 'lucide-react';
 import { type RefObject, useCallback, useEffect, useRef, useState } from 'react';
 import { ATTACHMENT_ID_PATTERN, type AttachmentAction } from '../../shared/open-file.ts';
+import { formatSize } from '../format-size.ts';
 
 export const basename = (path: string) => path.split(/[\\/]/).filter(Boolean).at(-1) ?? path;
 
@@ -30,18 +31,6 @@ export const chipOf = (file: ChatAttachment): ChipFile => ({
   mimeType: file.mimeType,
   thumbnail: thumbnails.get(file.id) ?? null,
 });
-
-export function formatBytes(bytes: number) {
-  if (bytes < 1024) return `${bytes} B`;
-  const units = ['KB', 'MB', 'GB'];
-  let value = bytes / 1024;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  return `${value < 10 ? value.toFixed(1) : Math.round(value)} ${units[unit]}`;
-}
 
 const previewable = (mimeType: string | null) =>
   mimeType !== null && (mimeType.startsWith('image/') || mimeType === 'application/pdf');
@@ -148,7 +137,7 @@ function Chip({
   const closeMenu = useCallback(() => setMenu(false), []);
   const [problem, setProblem] = useState<string | null>(null);
   const line = note?.(file) ?? null;
-  const facts = [file.mimeType, formatBytes(file.bytes)].filter(Boolean).join(' · ');
+  const facts = [file.mimeType, formatSize(file.bytes)].filter(Boolean).join(' · ');
   const title = [file.name, facts, hover?.(file)].filter(Boolean).join('\n');
   // A file the controller stored is named by its hash. One still waiting as a path has no id yet.
   const stored = !!taskId && ATTACHMENT_ID_PATTERN.test(file.key) && canOpen();

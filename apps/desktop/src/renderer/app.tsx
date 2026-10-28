@@ -36,6 +36,7 @@ import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
+import { adjacentThread, isMacPlatform, shortcutFor } from './thread/composer-rules.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { OpeningThread, ThreadView } from './thread/thread-view.tsx';
@@ -52,6 +53,29 @@ function writePreference(key: string, value: string) {
   try {
     localStorage.setItem(key, value);
   } catch {}
+}
+
+// Light, Dark or System. System follows the operating system and is the default. The key is new
+// because the old one held a theme the app wrote on first launch, not a choice.
+type ThemeMode = 'system' | 'dark' | 'light';
+const THEME_KEY = 'crewkite-theme-mode';
+function readThemeMode(): ThemeMode {
+  const saved = readPreference(THEME_KEY);
+  return saved === 'dark' || saved === 'light' ? saved : 'system';
+}
+const prefersDark = () =>
+  typeof window.matchMedia === 'function' &&
+  window.matchMedia('(prefers-color-scheme: dark)').matches;
+function useSystemTheme() {
+  const [dark, setDark] = useState(prefersDark);
+  useEffect(() => {
+    if (typeof window.matchMedia !== 'function') return;
+    const query = window.matchMedia('(prefers-color-scheme: dark)');
+    const change = () => setDark(query.matches);
+    query.addEventListener('change', change);
+    return () => query.removeEventListener('change', change);
+  }, []);
+  return dark ? 'dark' : 'light';
 }
 
 type PaletteCommand = {
@@ -512,7 +536,9 @@ export function App() {
       .find(({ id }) => !removed.has(id));
     if (first) setSelected(first.id);
   }, [selected, taskPages, removed]);
-  const [theme, setTheme] = useState(() => readPreference('crewkite-theme') ?? 'dark');
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readThemeMode);
+  const systemTheme = useSystemTheme();
+  const theme = themeMode === 'system' ? systemTheme : themeMode;
   const [collapsed, setCollapsed] = useState(
     () => readPreference('crewkite-sidebar-collapsed-v1') === '1',
   );
@@ -560,8 +586,11 @@ export function App() {
     titles,
     openThreadId: page === 'tasks' && newThread === null ? selected : null,
     onOpenThread: openThread,
+    onRemoved: (id) => removedRef.current(id),
   });
   // The rail moves to the thread after the deleted one, or the one before it, or the empty state.
+  // A thread removed elsewhere, such as from the command line, leaves the rail the same way.
+  const removedRef = useRef<(id: string) => void>(() => {});
   function threadDeleted(id: string) {
     const order = projects.flatMap((project) => railTasks(project.id).map((row) => row.id));
     const rest = order.filter((value) => value !== id);
@@ -573,6 +602,9 @@ export function App() {
     if (next) openThread(next);
     else setSelected(null);
   }
+  removedRef.current = (id) => {
+    if (!removed.has(id)) threadDeleted(id);
+  };
   // Runs before the dialog opens and after it is removed, so focus goes back where it came from.
   useLayoutEffect(() => {
     if (palette) {
@@ -588,8 +620,10 @@ export function App() {
   }, [palette]);
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
-    writePreference('crewkite-theme', theme);
   }, [theme]);
+  useEffect(() => {
+    writePreference(THEME_KEY, themeMode);
+  }, [themeMode]);
   useEffect(() => {
     writePreference('crewkite-sidebar-collapsed-v1', collapsed ? '1' : '0');
   }, [collapsed]);
@@ -602,6 +636,49 @@ export function App() {
           (dialog) => !dialog.querySelector('.palette'),
         );
         if (!other) setPalette((open) => !open);
+      }
+    };
+    window.addEventListener('keydown', keydown);
+    return () => window.removeEventListener('keydown', keydown);
+  }, []);
+  // Window shortcuts: Command N, Command comma and Command Option Up and Down. Escape and Up belong
+  // to the composer. The handler reads the latest rail through a ref and is added once.
+  const keys = useRef({
+    open: (_id: string) => {},
+    start: () => {},
+    settings: () => {},
+    order: [] as string[],
+    current: null as string | null,
+  });
+  keys.current = {
+    open: openThread,
+    start: () => startThread(),
+    settings: () => setPage('settings'),
+    order: projects.flatMap((project) => railTasks(project.id).map((row) => row.id)),
+    current: page === 'tasks' && newThread === null ? (task?.id ?? null) : null,
+  };
+  useEffect(() => {
+    const keydown = (event: KeyboardEvent) => {
+      const action = shortcutFor(event, {
+        mac: isMacPlatform(),
+        composerFocused: false,
+        composerEmpty: false,
+        running: false,
+        selecting: false,
+        dialogOpen: document.querySelector('dialog[open]') !== null,
+      });
+      if (!action || action === 'stop-turn' || action === 'edit-last') return;
+      event.preventDefault();
+      const latest = keys.current;
+      if (action === 'new-thread') latest.start();
+      else if (action === 'open-settings') latest.settings();
+      else {
+        const next = adjacentThread(
+          latest.order,
+          latest.current,
+          action === 'next-thread' ? 1 : -1,
+        );
+        if (next && next !== latest.current) latest.open(next);
       }
     };
     window.addEventListener('keydown', keydown);
@@ -821,7 +898,7 @@ export function App() {
             <button
               type="button"
               className="icon-button"
-              onClick={() => setTheme(theme === 'dark' ? 'light' : 'dark')}
+              onClick={() => setThemeMode(theme === 'dark' ? 'light' : 'dark')}
               aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
               data-tooltip={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}
             >
@@ -898,7 +975,12 @@ export function App() {
             </button>
           </div>
         ) : page === 'settings' ? (
-          <SettingsPage workspace={workspace} header={header} theme={theme} onTheme={setTheme} />
+          <SettingsPage
+            workspace={workspace}
+            header={header}
+            theme={themeMode}
+            onTheme={setThemeMode}
+          />
         ) : !threadSource ? (
           <div className="loading-workspace" role="alert">
             <p>The desktop bridge is unavailable.</p>

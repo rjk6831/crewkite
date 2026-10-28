@@ -48,7 +48,7 @@ try {
   const page = await context.newPage();
   await page.addInitScript(() => {
     try {
-      localStorage.setItem('crewkite-theme', 'dark');
+      localStorage.setItem('crewkite-theme-mode', 'dark');
     } catch {}
   });
   await page.goto(`http://127.0.0.1:${port}/index.html?preview=1`);

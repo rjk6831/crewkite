@@ -31,7 +31,7 @@ const observation = {
   residentLlms: 1,
   embeddingInstances: 0,
 };
-const localSetup = (loaded: boolean) =>
+const localSetup = (loaded: boolean, vision?: boolean) =>
   LocalSetupSchema.parse({
     revision: 1,
     connectionRevision: 1,
@@ -42,7 +42,15 @@ const localSetup = (loaded: boolean) =>
     secretConfigured: true,
     connected: true,
     operation: null,
-    observation: loaded ? observation : null,
+    observation: loaded
+      ? {
+          ...observation,
+          models: observation.models.map((model) => ({
+            ...model,
+            ...(vision === undefined ? {} : { vision }),
+          })),
+        }
+      : null,
     selection: null,
     generation: 'idle',
     reason: null,
@@ -67,6 +75,24 @@ test('the catalog reports the file types each client said it takes, and null bef
       },
       ['image/*', 'audio/*', '*/*'],
       ['image/*', ...text],
+    ],
+    [
+      'a cached observation that says the model takes images, before any connect',
+      { googlePrompt: none, local: localSetup(true, true) },
+      [],
+      ['image/*', ...text],
+    ],
+    [
+      'a Local model whose download list reports vision, with no connect reading',
+      { local: localSetup(true, true) },
+      null,
+      ['image/*', ...text],
+    ],
+    [
+      'a Local model whose download list reports none, over a connect reading that says vision',
+      { local: localSetup(true, false), localVision: { modelKey: 'fixture-model', vision: true } },
+      null,
+      text,
     ],
     [
       'no blocks, and vision reported for a model no longer loaded',

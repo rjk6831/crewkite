@@ -7,7 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PassThrough } from 'node:stream';
 import { test } from 'node:test';
-import { canonicalJson } from '@crewkite/contracts';
+import { canonicalJson, localReplyFloor } from '@crewkite/contracts';
 import type { PredictionResult } from '@lmstudio/sdk';
 import { localConfiguredConnectionHash, resolveLocalConnection } from './connection.ts';
 import {
@@ -82,9 +82,10 @@ const kv = (values: Record<string, unknown>) => ({
 });
 function terminal(
   stopReason: PredictionResult['stats']['stopReason'] = 'eosFound',
-  maximumOutputTokens = 2048,
+  maximumOutputTokens = 2458,
   input: LocalStart = plan,
   proposed = 'export const n = 2;\n',
+  reasoning?: number,
 ) {
   const content = JSON.stringify({
     version: 1,
@@ -111,7 +112,10 @@ function terminal(
       'llm.prediction.repeatPenalty': { checked: true, value: 1 },
       'llm.prediction.llama.presencePenalty': { checked: true, value: 0 },
       'llm.prediction.reasoning.enableThinking': true,
-      'llm.prediction.reasoning.budgetTokens': { checked: true, value: 1536 },
+      'llm.prediction.reasoning.budgetTokens': {
+        checked: true,
+        value: reasoning ?? Math.floor((input.maximumOutputTokens ?? 2458) / 2),
+      },
       'llm.prediction.speculativeDecoding.draftModel': '',
       'llm.prediction.structured': localStructuredOutput(input.binding).format,
     }),
@@ -276,11 +280,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
   assert.deepEqual(localPlan({ ...plan, authMode: 'token' }), { ...plan, authMode: 'token' });
   assert.deepEqual(localPlan(plan), plan);
   assert.equal(canonicalJson(localPlan(plan)), canonicalJson(plan));
-  for (const maximumOutputTokens of [2048, 4096] as const) {
+  // The output cap is a computed number. The context bound applies where the plan meets its
+  // bound instance.
+  for (const maximumOutputTokens of [2048, 2049, 4096]) {
     const explicit: LocalStart = { ...plan, maximumOutputTokens };
     assert.deepEqual(localPlan(explicit), explicit);
   }
-  for (const maximumOutputTokens of [0, 2049, 8192, false])
+  for (const maximumOutputTokens of [0, -1, 1.5, false])
     assert.throws(() => localPlan({ ...plan, maximumOutputTokens }));
   assert.equal(localClientOptions(plan).apiToken, plan.token);
   assert.throws(() => localPlan({ ...plan, authMode: 'none' }));
@@ -467,7 +473,9 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     });
     await flush();
     assert.equal(f.submitted, 1, String(contextLength));
-    const done = terminal();
+    // The output cap follows the reported context: 30 percent of it, floored at 2,048.
+    const cap = localReplyFloor(contextLength);
+    const done = terminal('eosFound', cap, plan, undefined, Math.floor(cap / 2));
     f.resolve({
       ...done,
       modelInfo: reported,
@@ -494,7 +502,13 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     ['selected reports 1,048,576', 1_048_576, 'selected', true],
   ] as const) {
     const f = fixture();
-    const reported = { ...info, contextLength };
+    const reported = {
+      ...info,
+      contextLength,
+      vision: true,
+      trainedForToolUse: false,
+      maxContextLength: 131072,
+    };
     f.model.getModelInfo = async () => reported;
     const second = {
       ...f.model,
@@ -531,7 +545,38 @@ test('Local generation binds its loopback authentication mode and loaded instanc
     assert.equal(resolved.connection !== null, qualifies, label);
     assert.equal(resolved.facts.contextLength, qualifies ? contextLength : null, label);
     if (qualifies) assert.equal(choice.contextLength, contextLength, label);
-    else assert.equal(choice.state, 'installed-unloaded', label);
+    // The capability flags the runtime reports ride on the choice and stay out of its identity.
+    if (loaded !== 'other')
+      assert.deepEqual(
+        [choice.vision, choice.trainedForToolUse, choice.maxContextLength],
+        [true, false, 131072],
+        label,
+      );
+    else {
+      // The download list reports vision for every model, and only the loaded instance a window.
+      assert.equal(choice.vision, info.vision, label);
+      assert.equal(choice.state, 'installed-unloaded', label);
+    }
+  }
+  {
+    // A loaded instance that is generating shows as busy and still qualifies: the turn waits.
+    const f = fixture();
+    f.model.getInstanceProcessingState = async () => ({ status: 'generating', queued: 1 });
+    const discovery = await discoverLocalModels(discoveryClient(f), { now: () => 0 });
+    assert(discovery.kind === 'observed');
+    const [choice] = discovery.observation.models;
+    assert.equal(choice.state, 'loaded-eligible');
+    assert.deepEqual(choice.reasons, ['busy']);
+    const resolved = resolveLocalConnection(
+      {
+        endpoint: plan.endpoint,
+        connectionRevision: 1,
+        observation: discovery.observation,
+        selectionId: choice.selectionId,
+      },
+      { platform: 'darwin', arch: 'arm64', secretConfigured: true },
+    );
+    assert(resolved.connection !== null);
   }
   for (const [format, catalog] of [
     ['gguf', 'exact'],
@@ -899,15 +944,16 @@ test('Local generation binds its loopback authentication mode and loaded instanc
 
 test('Local ownership needs the same prediction terminal after cancellation or client loss', async () => {
   for (const row of [
-    { cap: undefined, prompt: 6144, stop: 'eosFound' },
-    { cap: 2048, prompt: 3, stop: 'eosFound' },
-    { cap: 4096, prompt: 4096, stop: 'eosFound' },
-    { cap: undefined, prompt: 6145, stop: 'eosFound' },
-    { cap: 4096, prompt: 4097, stop: 'eosFound' },
-    { cap: 4096, prompt: 4096, stop: 'eosFound', tested: 4097 },
+    // The room at 8,192 is 8,192 less the 256 margin less the 2,458 floor, which is 5,478.
+    { cap: undefined, prompt: 5478, stop: 'eosFound' },
+    { cap: 2458, prompt: 3, stop: 'eosFound' },
+    { cap: 4096, prompt: 3840, stop: 'eosFound' },
+    { cap: undefined, prompt: 5479, stop: 'eosFound' },
+    { cap: 4096, prompt: 3841, stop: 'eosFound' },
+    { cap: 4096, prompt: 3840, stop: 'eosFound', tested: 3841 },
     { cap: undefined, prompt: 3, stop: 'maxPredictedTokensReached' },
     { cap: 4096, prompt: 1070, stop: 'maxPredictedTokensReached' },
-    { cap: 4096, prompt: 3, stop: 'eosFound', terminalCap: 2048 },
+    { cap: 4096, prompt: 3, stop: 'eosFound', terminalCap: 2458 },
     { cap: undefined, prompt: 3, stop: 'eosFound', terminalCap: 4096 },
   ] as const) {
     const label = JSON.stringify(row);
@@ -926,15 +972,15 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       },
     });
     await flush();
-    const cap = row.cap ?? 2048;
-    const fits = row.prompt + cap <= 8192;
+    const cap = row.cap ?? 2458;
+    const fits = row.prompt + cap + 256 <= 8192;
     assert.equal(f.submitted, fits ? 1 : 0, label);
     assert.equal(markers, fits ? 1 : 0, label);
-    assert.equal(f.renders, first + cap <= 8192 ? 1 : 2, label);
+    assert.equal(f.renders, first + cap + 256 <= 8192 ? 1 : 2, label);
     if (fits) {
       assert.equal(
         f.prompt,
-        first + cap <= 8192 ? 'rendered chat' : 'rendered chat without tests',
+        first + cap + 256 <= 8192 ? 'rendered chat' : 'rendered chat without tests',
         label,
       );
       assert.equal(f.options?.maxTokens, cap, label);
@@ -953,7 +999,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
           additionalProperties: false,
         },
       });
-      const value = terminal(row.stop, 'terminalCap' in row ? row.terminalCap : cap);
+      const value = terminal(row.stop, 'terminalCap' in row ? row.terminalCap : cap, input);
       if (row.stop === 'maxPredictedTokensReached') {
         value.nonReasoningContent = '{"version":';
         value.stats = {
@@ -992,7 +1038,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
       if (outcome.kind === 'failed') assert.equal(outcome.reason, 'limit', label);
     }
   }
-  for (const maximumOutputTokens of [2048, 4096] as const) {
+  for (const maximumOutputTokens of [2458, 4096] as const) {
     for (const row of [
       'invalid JSON',
       'fenced JSON',
@@ -1015,7 +1061,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         },
       );
       await flush();
-      const value = terminal('eosFound', maximumOutputTokens);
+      const value = terminal('eosFound', maximumOutputTokens, { ...plan, maximumOutputTokens });
       const proposal = JSON.parse(value.nonReasoningContent);
       if (row === 'invalid JSON') value.nonReasoningContent = '{"version":';
       if (row === 'fenced JSON')
@@ -1157,8 +1203,8 @@ test('Local ownership needs the same prediction terminal after cancellation or c
     assert.equal(f.submitted, 1, row);
     assert.equal(markers, 1, row);
     assert.equal(f.prompt, 'rendered chat');
-    assert.equal(f.options?.maxTokens, 2048);
-    assert.equal(f.options?.reasoningBudget, 1536);
+    assert.equal(f.options?.maxTokens, 2458);
+    assert.equal(f.options?.reasoningBudget, 1229);
     assert.equal(f.options?.temperature, 0.6);
     assert.equal(f.options?.topKSampling, 20);
     assert.equal(f.options?.topPSampling, 0.95);
@@ -1213,7 +1259,7 @@ test('Local ownership needs the same prediction terminal after cancellation or c
         value.stats = { ...value.stats, ...{ usedDraftModelKey: '', totalDraftTokensCount: 0 } };
       }
       f.resolve(value);
-    } else if (ending) f.resolve(terminal('eosFound', 2048, input, ending[1]));
+    } else if (ending) f.resolve(terminal('eosFound', 2458, input, ending[1]));
     else f.resolve(terminal(row === 'stop' ? 'userStopped' : 'eosFound'));
     const outcome = await run.result;
     const expected =

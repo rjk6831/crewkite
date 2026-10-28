@@ -552,7 +552,7 @@ export class NativePrepareCommands {
         plan,
         original.content.toString('utf8'),
         files,
-        plan.localModel.authMode === 'none' ? { authMode: 'none' } : { token: 'unsubmitted' },
+        this.localCredentials('unsubmitted'),
         300000,
       );
       const artifact = this.nativeArtifact(plan);
@@ -594,7 +594,7 @@ export class NativePrepareCommands {
     plan: LocalPrepared,
     original: string,
     files: readonly FileContent[],
-    credentials: { token: string } | { authMode: 'none' },
+    credentials: ReturnType<Controller['localCredentials']>,
     timeoutMs: number,
   ): LocalStart {
     return localPlan({
@@ -613,6 +613,9 @@ export class NativePrepareCommands {
       task: plan.context,
       tests: localTests(plan.target.path, files),
       maximumOutputTokens: plan.profile.maximumOutputTokens,
+      ...(plan.profile.reasoningBudgetTokens === undefined
+        ? {}
+        : { reasoningBudgetTokens: plan.profile.reasoningBudgetTokens }),
       timeoutMs,
     });
   }
@@ -915,16 +918,12 @@ export class NativePrepareCommands {
       if (!original || original.hash !== plan.target.baseHash) throw Error('Local target changed.');
       const directory = join(this.home, 'scratch', plan.run.id);
       materialize(directory, sourceFiles);
-      const token =
-        plan.localModel.authMode === 'none'
-          ? null
-          : Buffer.from(this.localSecret?.secret ?? Buffer.alloc(0));
-      try {
+      {
         const input = this.localStartInput(
           plan,
           original.content.toString('utf8'),
           sourceFiles,
-          token === null ? { authMode: 'none' } : { token: token.toString('utf8') },
+          this.localCredentials(),
           Math.floor(
             Math.min(
               maximumMs,
@@ -968,8 +967,6 @@ export class NativePrepareCommands {
             },
           },
         });
-      } finally {
-        token?.fill(0);
       }
       if (runtime.stopped || this.closed) runtime.handle?.stop();
       void runtime.handle?.result.then(finish, () => finish(null));

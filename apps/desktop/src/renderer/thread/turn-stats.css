@@ -29,3 +29,33 @@
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
+
+/* The row under a finished reply: the stats line and the reply menu. */
+.th-turn-foot {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.th-reply-menu {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-left: auto;
+}
+.th-reply-menu .th-icon {
+  width: 24px;
+  height: 24px;
+}
+.th-reply-menu .th-reply-items {
+  right: 0;
+  left: auto;
+  width: 150px;
+}
+.th-reply-menu .th-reply-items button {
+  padding-left: 10px;
+}
+.th-reply-said {
+  font-size: 11px;
+}
