@@ -13,6 +13,7 @@ import {
   instructionFiles,
   spokenText,
   systemContext,
+  THREAD_TOOLS_LINE,
   withAttachments,
 } from './prompt.ts';
 
@@ -166,6 +167,7 @@ test('a request holds the new message once and lists each file once, in the sect
     earlier: [{ attachment: old, came: '', reach: earlierReach('google', '/x') }],
   });
   assert.match(packet, /^Person:\n\(Files only: fresh\.pdf\)$/m);
+  assert.equal(packet.split(`\n${THREAD_TOOLS_LINE}\n`).length, 2);
   assert.match(packet, /old\.png, .*came with a message with no text, sent as a file link below$/m);
   assert.match(
     packet,

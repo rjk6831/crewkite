@@ -117,6 +117,7 @@ import {
   systemContext,
   withAttachments,
 } from './prompt.ts';
+import { createThreadReader, type ThreadReads } from './thread-reader.ts';
 
 export type ChatServiceDeps = {
   store: Store;
@@ -919,6 +920,19 @@ export class ChatService {
       this.removeFromDisk(task);
     });
     return { outcome: 'applied' };
+  }
+
+  /** The read-only thread tools for one thread, as the MCP server and the Local functions call them. */
+  threadReads(taskId: string): ThreadReads {
+    return createThreadReader(
+      {
+        store: this.deps.store,
+        home: this.deps.home,
+        projectPath: this.deps.projectPath,
+        now: () => Date.parse(this.deps.now()),
+      },
+      taskId,
+    );
   }
 
   /**
