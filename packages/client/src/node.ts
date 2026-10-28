@@ -1,7 +1,17 @@
-import { randomBytes } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  chmodSync,
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+} from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
-import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { resolve as absolute, join } from 'node:path';
 import {
   ArtifactRangeSchema,
   type Command,
@@ -54,6 +64,44 @@ export function createCommandKey(): string {
   return `cmd_${suffix}`;
 }
 
+// A Unix socket path holds 104 bytes on macOS and 108 on Linux. Staying within 100 leaves room.
+const SOCKET_PATH_BYTES = 100;
+
+/**
+ * A short socket path for one controller home: a name from a hash of the home, in this user's own
+ * directory under the temporary directory, so a deep home still binds. macOS gives a long
+ * temporary directory, so a path that would still not fit goes under /tmp. The controller's
+ * control socket and its thread tools socket share the directory and differ by suffix.
+ */
+export function homeSocketPath(
+  home: string,
+  kind: 'control' | 'thread-tools',
+  temporary = tmpdir(),
+): string {
+  const hash = createHash('sha256').update(absolute(home)).digest('hex').slice(0, 12);
+  const name = kind === 'control' ? `${hash}-control.sock` : `${hash}.sock`;
+  const directory = `crewkite-${process.getuid?.() ?? 'user'}`;
+  const path = join(temporary, directory, name);
+  return Buffer.byteLength(path) <= SOCKET_PATH_BYTES ? path : join('/tmp', directory, name);
+}
+
+/** The control socket of a controller home, as the controller, the clients and the desktop name it. */
+export const controllerSocketPath = (home: string, temporary = tmpdir()): string =>
+  homeSocketPath(home, 'control', temporary);
+
+/** Create a socket directory as this user's alone, or refuse one somebody else holds. */
+export function ownSocketDirectory(path: string): void {
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  const state = lstatSync(path);
+  if (!state.isDirectory() || state.uid !== process.getuid?.())
+    throw new Error('The socket directory is occupied.');
+  chmodSync(path, 0o700);
+}
+
 export function readControllerEndpoint(home: string): { socketPath: string; token: string } {
   const directory = lstatSync(home);
   if (
@@ -79,7 +127,7 @@ export function readControllerEndpoint(home: string): { socketPath: string; toke
       throw new Error('Controller token must be private to its owner.');
     const token = readFileSync(file, 'utf8').trim();
     if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('Controller token is invalid.');
-    return { socketPath: join(home, 'control.sock'), token };
+    return { socketPath: controllerSocketPath(home), token };
   } finally {
     closeSync(file);
   }

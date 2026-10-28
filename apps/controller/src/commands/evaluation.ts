@@ -2,6 +2,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { controllerSocketPath } from '@crewkite/client/node';
 import {
   type Artifact,
   ArtifactSchema,
@@ -1058,7 +1059,7 @@ export class EvaluationCommands {
     const attempt = this.jobAttempt(plan.run, route.id);
     const directory = join(this.home, 'verification', attempt.id);
     const stateRoot = join(realpathSync('/tmp'), `ck-${attempt.id}`);
-    if (Buffer.byteLength(join(stateRoot, 'e2e-XXXXXX', 'control.sock')) > 100)
+    if (Buffer.byteLength(controllerSocketPath(join(stateRoot, 'e2e-XXXXXX'))) > 100)
       throw Error('Verification state path is too long.');
     const owner: CheckOwner = {
       version: 1,

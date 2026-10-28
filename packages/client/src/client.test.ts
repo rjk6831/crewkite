@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
@@ -20,7 +20,7 @@ import {
 } from '@crewkite/contracts';
 import { checkOwner } from '../../../apps/controller/src/host/check-ownership.ts';
 import { encodeFrame, FrameDecoder, ProtocolError } from './index.ts';
-import { connectController } from './node.ts';
+import { connectController, controllerSocketPath, ownSocketDirectory } from './node.ts';
 
 const token = 'a'.repeat(64);
 const actor = { id: 'terminal', kind: 'cli' as const };
@@ -77,11 +77,15 @@ async function serve(
   const owner = checkOwner();
   const directory = owner?.stateRoot ?? resolve(common, '..', 'internal');
   mkdirSync(directory, { recursive: true });
-  const home = mkdtempSync(join(directory, 'client-'));
+  // The home is at least 120 characters deep: the control socket lives in the per-user temporary
+  // folder, so a deep home still serves the client.
+  const base = mkdtempSync(join(directory, 'client-'));
+  const home = join(base, 'h'.repeat(100));
+  assert.ok(home.length >= 120);
+  mkdirSync(home, { mode: 0o700 });
   writeFileSync(join(home, 'token'), token, { mode: 0o600 });
-  const socketPath = join(home, 'control.sock');
-  if (owner && Buffer.byteLength(socketPath) > 100)
-    throw Error('The verification client socket path exceeds its bound.');
+  const socketPath = controllerSocketPath(home);
+  ownSocketDirectory(dirname(socketPath));
   const sockets = new Set<Socket>();
   let connection = 0;
   const server = createServer((socket) => {
@@ -98,7 +102,7 @@ async function serve(
     server.listen(socketPath);
     await once(server, 'listening');
   } catch (error) {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true });
     throw error;
   }
   return {
@@ -107,7 +111,7 @@ async function serve(
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((done) => server.close(() => done()));
-      rmSync(home, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
     },
   };
 }

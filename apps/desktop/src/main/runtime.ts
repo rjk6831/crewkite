@@ -12,7 +12,11 @@ import {
   realpathSync,
 } from 'node:fs';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { ControllerClient, readControllerEndpoint } from '@crewkite/client/node';
+import {
+  ControllerClient,
+  controllerSocketPath,
+  readControllerEndpoint,
+} from '@crewkite/client/node';
 import { type RuntimeManifest, RuntimeManifestSchema } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 import {
@@ -79,7 +83,7 @@ export function resolveRuntime(
     !isAbsolute(home) ||
     !isAbsolute(profile) ||
     home === profile ||
-    Buffer.byteLength(join(home, 'control.sock')) > 100
+    Buffer.byteLength(controllerSocketPath(home)) > 100
   )
     throw new Error('Choose separate absolute controller home and desktop profile paths.');
   let mode: RuntimeManifest['mode'] = 'demo';
@@ -227,7 +231,7 @@ export class DesktopController {
       const readyLine =
         this.paths.mode === 'demo'
           ? 'CREWKITE_CONTROLLER_READY'
-          : `Controller ready at ${join(this.paths.home, 'control.sock')}`;
+          : `Controller ready at ${controllerSocketPath(this.paths.home)}`;
       let output = '';
       let finished = false;
       const finish = (error?: Error) => {

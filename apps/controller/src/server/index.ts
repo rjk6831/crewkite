@@ -10,9 +10,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { encodeFrame, FrameDecoder, ProtocolError } from '@crewkite/client';
-import { readControllerEndpoint } from '@crewkite/client/node';
+import {
+  controllerSocketPath,
+  ownSocketDirectory,
+  readControllerEndpoint,
+} from '@crewkite/client/node';
 import {
   type Command,
   canonicalJson,
@@ -24,7 +28,7 @@ import type { Controller } from '../commands/controller.ts';
 export async function serve(
   controller: Controller,
 ): Promise<{ close: () => Promise<void>; socketPath: string }> {
-  const socketPath = join(controller.home, 'control.sock');
+  const socketPath = controllerSocketPath(controller.home);
   const sockets = new Set<Socket>();
   const authenticated = new Set<Socket>();
   let usageTimer: ReturnType<typeof setInterval> | undefined;
@@ -46,6 +50,7 @@ export async function serve(
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
     const { token } = readControllerEndpoint(controller.home);
+    ownSocketDirectory(dirname(socketPath));
     try {
       const state = lstatSync(socketPath);
       if (!state.isSocket() || state.uid !== process.getuid?.())

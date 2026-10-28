@@ -1,10 +1,11 @@
 import { createHash, randomBytes } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, unlinkSync } from 'node:fs';
+import { chmodSync, lstatSync, unlinkSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { tmpdir } from 'node:os';
-import { resolve as absolute, dirname, join } from 'node:path';
+import { dirname } from 'node:path';
 import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
+import { homeSocketPath, ownSocketDirectory } from '@crewkite/client/node';
 import {
   TaskIdSchema,
   ThreadChecksResultSchema,
@@ -164,33 +165,9 @@ export async function answer(
   return { result: clean.data };
 }
 
-// A Unix socket path holds 104 bytes on macOS and 108 on Linux. Staying within 100 leaves room.
-const SOCKET_PATH_BYTES = 100;
-
-/**
- * One short socket per controller home: a name from a hash of the home, in this user's own
- * directory under the temporary directory, so a deep home still binds. macOS gives a long
- * temporary directory, so a path that would still not fit goes under /tmp.
- */
-export function threadToolsSocket(home: string, temporary = tmpdir()): string {
-  const name = `${createHash('sha256').update(absolute(home)).digest('hex').slice(0, 12)}.sock`;
-  const directory = `crewkite-${process.getuid?.() ?? 'user'}`;
-  const path = join(temporary, directory, name);
-  return Buffer.byteLength(path) <= SOCKET_PATH_BYTES ? path : join('/tmp', directory, name);
-}
-
-/** Create the socket's directory as this user's alone, or refuse one somebody else holds. */
-function ownDirectory(path: string) {
-  try {
-    mkdirSync(path, { mode: 0o700 });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-  }
-  const state = lstatSync(path);
-  if (!state.isDirectory() || state.uid !== process.getuid?.())
-    throw new Error('The thread tools socket directory is occupied.');
-  chmodSync(path, 0o700);
-}
+/** One short socket per controller home, in the directory the control socket shares. */
+export const threadToolsSocket = (home: string, temporary = tmpdir()): string =>
+  homeSocketPath(home, 'thread-tools', temporary);
 
 type Grant = { taskId: string; turnId: string; reader: ThreadReads; socket: Socket | null };
 const digest = (token: string) => createHash('sha256').update(token).digest('hex');
@@ -211,7 +188,7 @@ export class ThreadToolsBroker {
   }
 
   async start(): Promise<void> {
-    ownDirectory(dirname(this.socketPath));
+    ownSocketDirectory(dirname(this.socketPath));
     try {
       const state = lstatSync(this.socketPath);
       if (!state.isSocket() || state.uid !== process.getuid?.())

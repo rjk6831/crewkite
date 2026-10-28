@@ -1,19 +1,39 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { ArtifactSchema, CommandSchema } from '@crewkite/contracts';
 import { runCli } from '../../../apps/cli/src/main.ts';
 import { ArtifactFiles } from '../../../apps/controller/src/artifacts/index.ts';
 import { Controller } from '../../../apps/controller/src/commands/controller.ts';
 import { serve } from '../../../apps/controller/src/server/index.ts';
-import { connectController, readControllerEndpoint } from './node.ts';
+import {
+  connectController,
+  controllerSocketPath,
+  ownSocketDirectory,
+  readControllerEndpoint,
+} from './node.ts';
 import { transferArtifact } from './output.ts';
 
 test('native output reads verify large retained bytes with cancellation and explicit corruption failure', async (t) => {
-  const home = mkdtempSync(join(tmpdir(), 'ck-output-'));
+  // The home is 120 characters deep and a crashed run left its control socket file behind. The
+  // socket lives in the per-user temporary folder, so the next start unlinks the leftover and
+  // still serves both the client and the CLI.
+  const base = mkdtempSync(join(tmpdir(), 'ck-output-'));
+  const home = join(base, 'h'.repeat(100));
+  assert.ok(home.length >= 120);
+  mkdirSync(home, { mode: 0o700 });
+  const socketPath = controllerSocketPath(home);
+  ownSocketDirectory(dirname(socketPath));
+  spawnSync(process.execPath, [
+    '-e',
+    'require("node:net").createServer().listen(process.argv[1],()=>process.exit(0))',
+    socketPath,
+  ]);
+  assert.ok(existsSync(socketPath));
   const controller = new Controller({
     home,
     nativeProfiles: () => [],
@@ -39,6 +59,7 @@ test('native output reads verify large retained bytes with cancellation and expl
   });
   controller.store.transaction(() => controller.store.put('artifact', artifact.id, 0, artifact));
   const server = await serve(controller);
+  assert.equal(server.socketPath, socketPath);
   const client = await connectController({
     ...readControllerEndpoint(home),
     actor: { id: 'terminal', kind: 'cli' },
@@ -47,7 +68,8 @@ test('native output reads verify large retained bytes with cancellation and expl
     client.close();
     await server.close();
     await controller.close();
-    rmSync(home, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true });
+    assert.equal(existsSync(socketPath), false);
   });
   const received = createHash('sha256');
   let largest = 0;
