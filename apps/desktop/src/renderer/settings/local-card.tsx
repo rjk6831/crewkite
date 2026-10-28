@@ -1,11 +1,12 @@
 import type { WorkspaceState } from '@crewkite/contracts';
 import { Fact } from '../components.tsx';
+import { formatSize } from '../format-size.ts';
 import { LocalSetup } from '../local-setup.tsx';
 import { localFacts } from '../usage-presentation.ts';
 import { type CardProps, type CatalogEntry, ProviderCard } from './provider-card.tsx';
 
 const gib = (bytes: number | null | undefined) =>
-  bytes === null || bytes === undefined ? 'Unknown' : `${(bytes / 1024 ** 3).toFixed(1)} GiB`;
+  bytes === null || bytes === undefined ? 'Unknown' : formatSize(bytes);
 
 function Hardware({ header, entry }: { header: WorkspaceState; entry: CatalogEntry | undefined }) {
   const hardware = header.localHardware;
