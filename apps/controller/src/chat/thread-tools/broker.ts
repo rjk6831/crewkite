@@ -2,6 +2,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, lstatSync, unlinkSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
+import type { Readable } from 'node:stream';
 import { fileURLToPath } from 'node:url';
 import {
   TaskIdSchema,
@@ -112,7 +113,7 @@ export function redact(value: unknown): unknown {
 }
 
 /** Splits a stream into newline-terminated lines and gives up on one longer than the bound. */
-export function lines(socket: Socket, onLine: (line: string) => void) {
+export function lines(socket: Readable, onLine: (line: string) => void) {
   let pending = Buffer.alloc(0);
   socket.on('data', (chunk: Buffer) => {
     pending = Buffer.concat([pending, chunk]);
