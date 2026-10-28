@@ -1,4 +1,5 @@
 import { homedir } from 'node:os';
+import { expandPrompt, parsePromptArgument } from '@crewkite/client';
 import {
   type ChatBranchStatus,
   type ChatCatalogRead,
@@ -466,8 +467,25 @@ export function App(props: AppProps) {
       case 'pr':
         pullRequestFlow();
         break;
-      case 'prompt':
-        throw new Error('Saved prompts arrive with the composer update of the controller.');
+      case 'prompt': {
+        const { prompts } = await client.readPrompts();
+        const { name: wanted, values } = parsePromptArgument(argument);
+        const found = prompts.find((prompt) => prompt.name === wanted);
+        if (!found) {
+          const names = prompts.map((prompt) => prompt.name).join(', ');
+          setNotice(
+            prompts.length === 0
+              ? 'No prompts are saved yet. Add one in the desktop, Settings, Prompts.'
+              : `${wanted ? `No saved prompt is named ${wanted}. ` : ''}Saved prompts: ${names}.`,
+          );
+          break;
+        }
+        // The text goes into the box to edit. Nothing is sent from here.
+        const filled = expandPrompt(found.body, values);
+        setComposer((value) => insert(value, filled.text));
+        setNotice(filled.missing.length > 0 ? `Fill in ${filled.missing.join(', ')}.` : null);
+        break;
+      }
     }
     return true;
   }
