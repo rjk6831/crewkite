@@ -769,6 +769,26 @@ export const RetryChatTurnPayloadSchema = z.strictObject({
 /** Same bounds as a task title. */
 export const RenameChatThreadPayloadSchema = z.strictObject({ taskId: id('tsk'), title: short });
 export const DeleteChatThreadPayloadSchema = z.strictObject({ taskId: id('tsk') });
+/**
+ * Run a proposed plan, or one slice of it once the slices it depends on are done. An override
+ * sends a slice to another ranked family before it starts.
+ */
+export const RunChatPlanPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  planId: ChatPlanSchema.shape.planId,
+  sliceId: ChatPlanSliceIdSchema.optional(),
+  overrides: z
+    .array(
+      z.strictObject({ sliceId: ChatPlanSliceIdSchema, family: ChatFamilySchema, model: short }),
+    )
+    .max(MAX_PLAN_SLICES)
+    .optional(),
+});
+/** Cancel a proposed plan or stop a running one. Slices that have not run show not run. */
+export const CancelChatPlanPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  planId: ChatPlanSchema.shape.planId,
+});
 
 /** Sent when a model read ends, so open pickers read the catalog again. */
 export const ChatCatalogChangeSchema = z.strictObject({
