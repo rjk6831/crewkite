@@ -81,6 +81,7 @@ function runGit(
   input: Buffer | string | undefined,
   identity: { name: string; email: string; at: string } | undefined,
   maximumBytes: number,
+  stdio: ('pipe' | number)[] = ['pipe', 'pipe', 'pipe'],
 ): Buffer {
   return execFileSync(
     'git',
@@ -124,9 +125,40 @@ function runGit(
             }
           : {}),
       },
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio,
     },
   );
+}
+
+/** Run git with its standard output written to a new file, so no result sits in memory. */
+export function gitToFile(
+  directory: string,
+  args: string[],
+  input: Buffer | string | undefined,
+  file: string,
+) {
+  const out = openSync(file, 'wx', 0o600);
+  try {
+    runGit(directory, args, input, undefined, MAX_SOURCE_BYTES, ['pipe', out, 'pipe']);
+  } finally {
+    closeSync(out);
+  }
+}
+
+/** Run git with its standard input read from a file, so no input sits in memory. */
+export function gitFromFile(directory: string, args: string[], file: string): Buffer {
+  const input = openSync(file, 'r');
+  try {
+    return runGit(directory, args, undefined, undefined, MAX_SOURCE_BYTES, [input, 'pipe', 'pipe']);
+  } finally {
+    closeSync(input);
+  }
+}
+
+/** Write one committed blob to a new file with no filters, streamed from git. */
+export function blobToFile(repository: string, oid: string, file: string) {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(oid)) throw new Error('Invalid blob identity.');
+  gitToFile(repository, ['cat-file', 'blob', oid], undefined, file);
 }
 
 export function projectRoot(path: string): string {
@@ -711,7 +743,10 @@ export function hashCandidateFiles(
 ): CandidateHash[] {
   const rules = plan.files.filter((file) => file.path.split('/').at(-1) === '.gitignore');
   const blobs = readPlannedBlobs(repository, rules);
-  const algorithm = (plan.files[0]?.oid.length ?? 40) === 64 ? 'sha256' : 'sha1';
+  const algorithm =
+    git(repository, ['rev-parse', '--show-object-format']).toString('utf8').trim() === 'sha256'
+      ? 'sha256'
+      : 'sha1';
   const chunk = Buffer.allocUnsafe(1024 * 1024);
   return walkCandidates(
     root,
@@ -1206,7 +1241,10 @@ export function treeFromScratch(input: {
   const entries: Buffer[] = [];
   for (const file of candidates) {
     const base = held.get(file.path);
-    if (!(base && base.oid === file.oid && base.mode === file.mode)) {
+    if (
+      !(base && base.oid === file.oid && base.mode === file.mode) &&
+      !hasObject(input.repository, file.oid)
+    ) {
       const written = git(input.repository, [
         'hash-object',
         '-w',
@@ -1226,4 +1264,13 @@ export function treeFromScratch(input: {
     );
   git(input.repository, ['update-index', '-z', '--index-info'], Buffer.concat(entries));
   return git(input.repository, ['write-tree']).toString().trim();
+}
+
+function hasObject(repository: string, oid: string): boolean {
+  try {
+    git(repository, ['cat-file', '-e', oid]);
+    return true;
+  } catch {
+    return false;
+  }
 }

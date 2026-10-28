@@ -1,4 +1,15 @@
-import { constants, copyFileSync, lstatSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  copyFileSync,
+  fstatSync,
+  lstatSync,
+  openSync,
+  readSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { join } from 'node:path';
 import {
   type FileContent,
@@ -30,6 +41,8 @@ export type ScratchCopyOptions = {
   name?: string;
   /** Reads the bytes of files that came without any, such as a few planned blobs. */
   read?: (files: readonly FileEntry[]) => Buffer[];
+  /** Writes one file larger than a run straight to its target, so its bytes never sit in memory. */
+  stream?: (file: FileEntry, target: string) => void;
   /** The most bytes one `read` call asks for, apart from a single larger file. */
   chunkBytes?: number;
 };
@@ -53,6 +66,7 @@ export function copyScratch(
   let cloning = options.checkout ? onBase(options.checkout) : false;
   const total = files.reduce((sum, file) => sum + file.bytes, 0);
   const name = options.name ?? 'repository';
+  const checked = new Set<string>();
   let cloned = 0;
   let written = 0;
   let bytes = 0;
@@ -83,7 +97,9 @@ export function copyScratch(
     if (cloning && options.checkout && cloneOne(options.checkout.root, file, target)) cloned++;
     else {
       rmSync(target, { force: true });
-      writeFileSync(target, bytesOf(file), { flag: 'wx', mode: 0o600 });
+      if (!('content' in file) && options.stream && file.bytes > chunkBytes)
+        options.stream(file, target);
+      else writeFileSync(target, bytesOf(file), { flag: 'wx', mode: 0o600 });
       written++;
     }
     bytes += file.bytes;
@@ -95,18 +111,54 @@ export function copyScratch(
   options.onProgress?.({ name, bytes: total, total });
   return { cloned, written };
 
-  function cloneOne(root: string, file: FileEntry, target: string): boolean {
+  function cloneOne(root: string, file: FileEntry | FileContent, target: string): boolean {
     try {
+      // Every folder on the way is a real folder of the checkout, so a swapped link leads nowhere.
+      const parts = file.path.split('/');
+      for (let end = 1; end < parts.length; end++) {
+        const folder = parts.slice(0, end).join('/');
+        if (checked.has(folder)) continue;
+        const state = lstatSync(join(root, folder));
+        if (!state.isDirectory() || state.isSymbolicLink()) return false;
+        checked.add(folder);
+      }
       const source = join(root, file.path);
       const state = lstatSync(source);
       // A link or a file of another size is not the committed file, so it is written instead.
       if (!state.isFile() || state.size !== file.bytes) return false;
       clone(source, target);
-      return true;
+      // git may not have seen an edit (assume-unchanged, skip-worktree), and the checkout may have
+      // changed since the check. The clone is fixed now, so it must match the committed bytes.
+      if (matchesCommitted(file, target)) return true;
+      rmSync(target, { force: true });
+      return false;
     } catch (error) {
       if (UNSUPPORTED.has((error as NodeJS.ErrnoException).code ?? '')) cloning = false;
+      rmSync(target, { force: true });
       return false;
     }
+  }
+}
+
+/** Whether the file at `path` has the bytes the base holds for `file`, hashed as they stream. */
+function matchesCommitted(file: FileEntry | FileContent, path: string): boolean {
+  const fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const size = fstatSync(fd).size;
+    if (size !== file.bytes) return false;
+    const oid = 'oid' in file ? (file as FileEntry & { oid: string }).oid : null;
+    // A planned file is identified by its blob oid and a loaded one by its sha256.
+    const hash = oid
+      ? createHash(oid.length === 64 ? 'sha256' : 'sha1').update(`blob ${size}\0`)
+      : createHash('sha256');
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    for (let count = 1; count > 0; ) {
+      count = readSync(fd, chunk, 0, chunk.length, null);
+      hash.update(chunk.subarray(0, count));
+    }
+    return hash.digest('hex') === (oid ?? file.hash);
+  } finally {
+    closeSync(fd);
   }
 }
 

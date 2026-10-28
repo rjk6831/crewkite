@@ -21,6 +21,7 @@ import {
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { ChatChangesRead } from '@crewkite/contracts';
 import {
+  blobToFile,
   type CandidateHash,
   type FileContent,
   git,
@@ -60,6 +61,32 @@ export function changedPaths(
     .filter(({ old, next }) => !(old && next && old.oid === next.oid && old.mode === next.mode));
 }
 
+/** The base's links the copy changed, by path. */
+function changedLinks(scratch: string, plan: ScratchPlan) {
+  const links = new Map<string, { link: LinkEntry; change: LinkChange }>();
+  for (const link of plan.links) {
+    const change = linkChange(scratch, link);
+    if (change) links.set(link.path, { link, change });
+  }
+  return links;
+}
+
+/** The most files a Changes read lists. */
+export const LISTED_FILES = 2000;
+
+/**
+ * How many files differ from the base, and how many entries Changes would list for them. The two
+ * differ by the base links the copy changed, and `listed` stops at what one read holds.
+ */
+export function changeCounts(
+  plan: ScratchPlan,
+  candidates: readonly CandidateHash[],
+  scratch: string,
+): { files: number; listed: number } {
+  const files = changedPaths(plan, candidates).length;
+  return { files, listed: files + changedLinks(scratch, plan).size };
+}
+
 /** Compare the scratch copy with the committed base. One entry per changed path, sorted. */
 export function scratchChanges(
   repository: string,
@@ -78,11 +105,7 @@ export function scratchChanges(
   );
   // Accept takes held links from the base too. One the copy changed shows, so the person sees
   // that the copy's version stays out.
-  const links = new Map<string, { link: LinkEntry; change: LinkChange }>();
-  for (const link of plan.links) {
-    const change = linkChange(scratch, link);
-    if (change) links.set(link.path, { link, change });
-  }
+  const links = changedLinks(scratch, plan);
   const paths = [...new Set([...changed.keys(), ...links.keys()])].sort();
   const files: FileDiff[] = [];
   let budget = patches ? TOTAL_PATCH_BYTES : 0;
@@ -91,7 +114,7 @@ export function scratchChanges(
     const held = links.get(path);
     const entry = changed.get(path);
     // shortcut: the read shape holds 2000 files. Upgrade: page changes when a thread needs more.
-    if (files.length === 2000) break;
+    if (files.length === LISTED_FILES) break;
     let diff: FileDiff;
     let notice = false;
     if (held) diff = linkDiff(held.link, held.change);
@@ -251,7 +274,7 @@ export function discardScratchPath(
   const temporary = join(dirname(target), `.${basename(target)}.${randomBytes(6).toString('hex')}`);
   const mode = original.mode === '100755' ? 0o755 : 0o644;
   try {
-    writeFileSync(temporary, readPlannedBlobs(repository, [original])[0], { flag: 'wx', mode });
+    blobToFile(repository, original.oid, temporary);
     chmodSync(temporary, mode);
     renameSync(temporary, target);
   } catch (error) {

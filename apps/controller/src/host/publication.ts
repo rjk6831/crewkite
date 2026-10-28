@@ -1,8 +1,16 @@
 import { execFileSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { TimestampSchema } from '@crewkite/contracts';
-import { type FileContent, git, type KeptEntry, treeFromFiles } from './source.ts';
+import {
+  type FileContent,
+  git,
+  gitFromFile,
+  gitToFile,
+  type KeptEntry,
+  treeFromFiles,
+} from './source.ts';
 
 export type GitIdentity = { name: string; email: string };
 export function validateIdentity(identity: GitIdentity): GitIdentity {
@@ -38,20 +46,30 @@ export function configuredIdentity(directory: string): GitIdentity | undefined {
   }
 }
 
-export function preparePublication(input: {
+type PublicationInput = {
   source: string;
   repository: string;
   base: string;
   files?: FileContent[];
-  /** A tree already built in `repository`, such as `treeFromScratch` makes. */
-  tree?: string;
   /** Base entries a chat scratch copy left out. They go into the tree unchanged. */
   kept?: readonly KeptEntry[];
   identity: GitIdentity;
   at: string;
   /** Chat acceptance names the thread. Candidates keep the checked-candidate message. */
   message?: string;
-}) {
+};
+type Prepared = { treeOid: string; commitOid: string };
+
+/** With `tree`, a tree already built in `repository` such as `treeFromScratch` makes, the pack is a file. */
+export function preparePublication(
+  input: PublicationInput & { tree: string },
+): Prepared & { pack: { file: string } };
+export function preparePublication(input: PublicationInput & { tree?: undefined }): Prepared & {
+  pack: Buffer;
+};
+export function preparePublication(
+  input: PublicationInput & { tree?: string },
+): Prepared & { pack: Buffer | { file: string } } {
   if (input.base.length !== 40)
     throw new Error('Publication from this Git object format is unsupported in D0.');
   const identity = validateIdentity(input.identity);
@@ -94,11 +112,15 @@ export function preparePublication(input: {
     .filter((line) => line && !line.startsWith('commit '))
     .map((line) => line.slice(line.indexOf(' ') + 1))
     .filter((oid) => !held.has(oid));
-  const pack = git(
-    input.repository,
-    ['pack-objects', '--stdout'],
-    `${[...new Set([commitOid, treeOid, ...objects])].join('\n')}\n`,
-  );
+  const wanted = `${[...new Set([commitOid, treeOid, ...objects])].join('\n')}\n`;
+  if (input.tree) {
+    // A tree built from a large scratch copy can carry more than a buffer holds, so the pack goes
+    // to a file inside the new repository and index-pack reads it from there.
+    const file = join(mkdtempSync(join(input.repository, 'pack-')), 'publication.pack');
+    gitToFile(input.repository, ['pack-objects', '--stdout'], wanted, file);
+    return { treeOid, commitOid, pack: { file } };
+  }
+  const pack = git(input.repository, ['pack-objects', '--stdout'], wanted);
   return { treeOid, commitOid, pack };
 }
 export function refValue(source: string, ref: string): string | null {
@@ -114,7 +136,7 @@ export function refValue(source: string, ref: string): string | null {
 }
 export function applyPublication(input: {
   source: string;
-  pack: Buffer;
+  pack: Buffer | { file: string };
   destinationRef: string;
   treeOid: string;
   commitOid: string;
@@ -125,7 +147,8 @@ export function applyPublication(input: {
     if (existing === input.commitOid) return;
     throw new Error('The destination branch already exists. Choose an unused name.');
   }
-  git(input.source, ['index-pack', '--stdin'], input.pack);
+  if (Buffer.isBuffer(input.pack)) git(input.source, ['index-pack', '--stdin'], input.pack);
+  else gitFromFile(input.source, ['index-pack', '--stdin'], input.pack.file);
   const tree = git(input.source, ['rev-parse', `${input.commitOid}^{tree}`])
     .toString()
     .trim();

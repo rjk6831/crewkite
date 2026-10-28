@@ -56,6 +56,7 @@ import {
   refValue,
 } from '../host/publication.ts';
 import {
+  blobToFile,
   type CandidateHash,
   git,
   hashCandidateFiles,
@@ -78,10 +79,11 @@ import {
   chatFailure,
 } from './adapter.ts';
 import {
-  changedPaths,
+  changeCounts,
   type DiscardOutcome,
   deleteThreadBaseRef,
   discardScratchPath,
+  LISTED_FILES,
   readDiscardMark,
   scratchChanges,
   writeDiscardMark,
@@ -586,14 +588,25 @@ export class ChatService {
       plan = scratchPlan(root, base);
       candidates = hashCandidateFiles(scratch, root, plan);
       // The Changes tab count, so the system line matches what the person reviewed. A base link
-      // the copy changed is listed there and comes from the base, so it is not counted. Changes
-      // lists at most 2000 files.
-      fileCount = Math.min(changedPaths(plan, candidates).length, 2000);
+      // the copy changed is listed there and comes from the base, so it is not counted.
+      const counts = changeCounts(plan, candidates, scratch);
+      fileCount = counts.files;
+      // Changes lists a bounded number of entries. A file the person could not see is not published.
+      if (counts.listed > LISTED_FILES)
+        return blocked(
+          'too-many-changes',
+          `${fileCount.toLocaleString('en-US')} files changed, and Changes lists the first ${LISTED_FILES.toLocaleString('en-US')} entries. Accept only publishes files you can review, so discard changes until the list is complete, then accept again.`,
+        );
     } catch (error) {
       if (error instanceof ScratchTooLarge) return blocked('scratch-unreadable', error.message);
+      if (/unsupported (symlink|special file|file mode)/.test((error as Error).message))
+        return blocked(
+          'scratch-unreadable',
+          'Remove new links and special files from the scratch copy.',
+        );
       return blocked(
         'scratch-unreadable',
-        'Remove new links and special files from the scratch copy.',
+        `The scratch copy could not be compared. ${plain(error)}`,
       );
     }
     if (!fileCount) return blocked('no-changes', 'Ask for a change in this thread first.');
@@ -601,34 +614,49 @@ export class ChatService {
     const work = mkdtempSync(join(this.deps.home, 'chat', task.id, 'accept-'));
     let commit: string;
     try {
-      const prepared = preparePublication({
-        source: root,
-        repository: work,
-        base,
-        tree: treeFromScratch({
-          repository: work,
+      let prepared: { treeOid: string; commitOid: string; pack: { file: string } };
+      try {
+        prepared = preparePublication({
           source: root,
-          scratch,
-          plan,
-          candidates,
-        }),
-        identity,
-        at,
-        message: payload.message?.trim()
-          ? `${payload.message.trimEnd()}\n`
-          : `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
-      });
-      applyPublication({
-        source: root,
-        pack: prepared.pack,
-        destinationRef: ref,
-        treeOid: prepared.treeOid,
-        commitOid: prepared.commitOid,
-        base,
-      });
+          repository: work,
+          base,
+          tree: treeFromScratch({
+            repository: work,
+            source: root,
+            scratch,
+            plan,
+            candidates,
+          }),
+          identity,
+          at,
+          message: payload.message?.trim()
+            ? `${payload.message.trimEnd()}\n`
+            : `CrewKite: ${task.title.replace(/\s+/g, ' ').trim()}\n`,
+        });
+      } catch (error) {
+        return blocked(
+          'branch-not-created',
+          `The branch could not be built from the scratch copy. ${plain(error)}`,
+        );
+      }
+      try {
+        applyPublication({
+          source: root,
+          pack: prepared.pack,
+          destinationRef: ref,
+          treeOid: prepared.treeOid,
+          commitOid: prepared.commitOid,
+          base,
+        });
+      } catch (error) {
+        return blocked(
+          'branch-not-created',
+          /already exists/.test((error as Error).message)
+            ? 'Choose another branch name and accept again.'
+            : `The branch could not be added to the repository. ${plain(error)}`,
+        );
+      }
       commit = prepared.commitOid;
-    } catch {
-      return blocked('branch-not-created', 'Choose another branch name and accept again.');
     } finally {
       rmSync(work, { recursive: true, force: true });
     }
@@ -1138,7 +1166,8 @@ export class ChatService {
         base: thread.base,
         files: [
           {
-            path: 'Changes could not be listed',
+            // A backslash cannot sit in a scratch path, so Discard can never match this note.
+            path: '\\Changes could not be listed',
             additions: 0,
             deletions: 0,
             patch: `${error.message}\n`,
@@ -1575,6 +1604,7 @@ export class ChatService {
     const source = scratchPlan(root, thread.base);
     copyScratch(directory, source.files, source.links, {
       read: (files) => readPlannedBlobs(root, files as PlannedFile[]),
+      stream: (file, target) => blobToFile(root, (file as PlannedFile).oid, target),
       checkout: { root, base: thread.base },
       name: basename(root),
       onProgress: (progress) => {
@@ -3601,4 +3631,11 @@ function newest<T>(items: readonly T[], budget: number): T[] {
 
 function size(value: unknown): number {
   return Buffer.byteLength(JSON.stringify(value));
+}
+
+/** What a failed git call or check says, without the command line. */
+function plain(error: unknown): string {
+  const stderr = (error as { stderr?: Buffer | string })?.stderr?.toString().trim();
+  const text = stderr || (error instanceof Error ? error.message : String(error));
+  return `${text.split('\n')[0].slice(0, 300)}`;
 }

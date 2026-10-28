@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   appendFileSync,
   copyFileSync,
@@ -15,7 +15,9 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { applyPublication, preparePublication } from '../host/publication.ts';
 import {
+  blobToFile,
   hashCandidateFiles,
   readPlannedBlobs,
   scratchPlan,
@@ -46,7 +48,7 @@ function repository() {
   git(root, 'init', '-q');
   mkdirSync(join(root, 'src/deep'), { recursive: true });
   writeFileSync(join(root, 'src/deep/a.txt'), 'alpha\n');
-  writeFileSync(join(root, 'big.bin'), Buffer.alloc(BIG, 7));
+  writeFileSync(join(root, 'big.bin'), randomBytes(BIG));
   writeFileSync(join(root, 'run.sh'), '#!/bin/sh\n', { mode: 0o755 });
   execFileSync('ln', ['-s', 'src/deep/a.txt', join(root, 'inside')]);
   execFileSync('ln', ['-s', '../outside', join(root, 'outside')]);
@@ -81,7 +83,7 @@ function treeHash(directory: string, skip: readonly string[] = []): string {
 
 function copy(
   clone: CloneFile | undefined,
-  dirty = false,
+  dirty: false | 'visible' | 'hidden' = false,
   inspect?: (at: { root: string; base: string; target: string; out: string }) => void,
 ) {
   const { root, base } = repository();
@@ -90,14 +92,23 @@ function copy(
   try {
     // The clean checkout is the reference: the base's files, and no entry the copy leaves out.
     const expected = treeHash(root, ['.git', 'outside']);
-    if (dirty) writeFileSync(join(root, 'src/deep/a.txt'), 'edited\n');
+    // A visible edit shows in git status. A hidden one has the same size and git is told to
+    // trust the index, so only the bytes give it away.
+    if (dirty === 'hidden') git(root, 'update-index', '--assume-unchanged', 'src/deep/a.txt');
+    if (dirty)
+      writeFileSync(join(root, 'src/deep/a.txt'), dirty === 'hidden' ? 'omega\n' : 'edited\n');
     const plan = scratchPlan(root, base);
     const progress: ImportProgress[] = [];
     const reads: number[] = [];
+    const streamed: number[] = [];
     const result = copyScratch(target, plan.files, plan.links, {
       checkout: { root, base },
       clone,
       chunkBytes: 1024 * 1024,
+      stream: (file, to) => {
+        streamed.push(file.bytes);
+        blobToFile(root, (file as (typeof plan.files)[number]).oid, to);
+      },
       read: (files) => {
         reads.push(files.reduce((sum, file) => sum + file.bytes, 0));
         return readPlannedBlobs(root, files as typeof plan.files);
@@ -110,6 +121,7 @@ function copy(
       result,
       progress,
       reads,
+      streamed,
       same,
       files: plan.files,
       skipped: plan.skipped.map((entry) => entry.reason),
@@ -125,12 +137,14 @@ test('a clean checkout on the base is cloned and the copy holds the same tree as
   const { result, progress, same, files, skipped, reads } = copy((from, to) => {
     calls.push(from);
     copyFileSync(from, to);
-  });
+  }, 'hidden');
+  // git status shows nothing for the hidden same-size edit, so the clone is tried. The cloned
+  // bytes do not match the base, so that file is written from the base and the edit stays out.
   assert.equal(same, true);
-  assert.deepEqual(result, { cloned: files.length, written: 0 });
+  assert.deepEqual(result, { cloned: files.length - 1, written: 1 });
   assert.equal(calls.length, files.length);
   assert.deepEqual(skipped, ['link-outside']);
-  assert.deepEqual(reads, []);
+  assert.deepEqual(reads, [6]);
   // The 66 MiB file crosses the 4 MiB step once, then the copy reports its end.
   assert.equal(progress.length, 2);
   assert.equal(progress.at(-1)?.bytes, progress.at(-1)?.total);
@@ -166,6 +180,24 @@ test('a volume that cannot clone and an edited checkout both fall back to writin
         plan,
         candidates: hashCandidateFiles(target, root, plan),
       });
+      // The 66 MiB of new random bytes is more than a pack buffer holds. Accept still publishes it.
+      const prepared = preparePublication({
+        source: root,
+        repository: join(out, 'work'),
+        base,
+        tree,
+        identity: { name: 'Fixture', email: 'fixture@example.invalid' },
+        at: '2026-10-28T09:00:00.000Z',
+      });
+      applyPublication({
+        source: root,
+        pack: prepared.pack,
+        destinationRef: 'refs/heads/accepted',
+        treeOid: prepared.treeOid,
+        commitOid: prepared.commitOid,
+        base,
+      });
+      assert.equal(git(root, 'cat-file', '-s', 'accepted:big.bin'), String(BIG + 1));
       // Only the changed files were written. The tree holds the edit and keeps the base's links.
       const listing = git(root, 'ls-tree', '-r', base).split('\n');
       const baseOid = (path: string) =>
@@ -189,14 +221,16 @@ test('a volume that cannot clone and an edited checkout both fall back to writin
     },
   );
   assert.equal(unsupported.same, true);
-  // The 66 MiB file is over the 1 MiB run limit, so it is read alone and the small ones together.
-  assert.deepEqual(unsupported.reads, [BIG, 16]);
+  // The 66 MiB file is over the 1 MiB run limit, so git streams it to its target and the small
+  // ones are read together.
+  assert.deepEqual(unsupported.streamed, [BIG]);
+  assert.deepEqual(unsupported.reads, [16]);
   assert.equal(attempts, 1);
   assert.deepEqual(unsupported.result, { cloned: 0, written: unsupported.files.length });
   let calls = 0;
   const edited = copy(() => {
     calls++;
-  }, true);
+  }, 'visible');
   assert.equal(edited.same, true);
   assert.equal(calls, 0);
   assert.equal(edited.result.cloned, 0);
