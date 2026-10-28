@@ -482,7 +482,16 @@ export async function packageDesktop() {
       if (
         !(name.startsWith('@crewkite/') && version === 'workspace:*') &&
         name !== 'zod' &&
-        !(path === 'apps/controller' && name === '@lmstudio/sdk' && version === '2.1.0')
+        !(path === 'apps/controller' && name === '@lmstudio/sdk' && version === '2.1.0') &&
+        // shortcut: the package leaves out the CLI's terminal interface. Its closure holds two
+        // ansi-styles versions, which one flat runtime realm cannot hold, and the interactive
+        // view imports renderer modules this runtime does not copy. The packaged CLI keeps its
+        // commands and print mode and says interactive mode needs a source checkout. Upgrade
+        // path: a nested realm for apps/cli with Ink's pinned closure and its notices.
+        !(
+          path === 'apps/cli' &&
+          ((name === 'ink' && version === '8.0.0') || (name === 'react' && version === '19.3.1'))
+        )
       )
         throw new Error(`Unqualified runtime dependency: ${name}.`);
     copy(join(from, 'package.json'), join(runtime, path, 'package.json'));

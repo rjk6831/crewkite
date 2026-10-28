@@ -384,6 +384,25 @@ TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ```
 
+## Terminal interface
+
+The CLI draws its interactive mode with Ink 8.0.0, MIT licensed, on React 19.3.1, the same React the renderer uses. Ink is pinned exactly in the [CLI manifest](../apps/cli/package.json), and the [lockfile](../pnpm-lock.yaml) pins its dependency closure, which is MIT and ISC licensed. I took no Ink source into this repository; the CLI imports the published package. CrewKite stays under the Apache License 2.0. The text below comes from the installed package's license file, without edits.
+
+### ink 8.0.0
+
+```text
+MIT License
+
+Copyright (c) Vadym Demedes <vadimdemedes@hey.com> (https://github.com/vadimdemedes)
+Copyright (c) Sindre Sorhus <sindresorhus@gmail.com> (https://sindresorhus.com)
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction, including without limitation the rights to use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies of the Software, and to permit persons to whom the Software is furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+```
+
 ## Distribution scope
 
 This file records the prose adaptation and renderer assets above. It is not a complete notice inventory for an installed application. A packaged build also needs the notices for its complete dependency closure, Electron and Chromium, and the separate Node runtime. I check the actual package before claiming that inventory is complete. See [ADR 0018](adr/0018-apache-2-license.md).
