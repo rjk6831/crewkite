@@ -154,6 +154,8 @@ export type ChatServiceDeps = {
   adapters: ReadonlyMap<ChatFamily, ChatAdapter>;
   /** HOME, PATH and whatever the provider profile resolved for its client. */
   resolveEnvironment: (family: ChatFamily) => NodeJS.ProcessEnv;
+  /** True when the person acknowledged the current Google terms text (ADR 0002). */
+  googleTermsAcknowledged: () => boolean;
   projectPath: (projectId: string) => string | undefined;
   /**
    * Check an explicit selection against the catalog, or pick the default when none is given.
@@ -624,6 +626,11 @@ export class ChatService {
       return blocked('handoff-needs-another-provider', 'Pick a different provider to continue on.');
     const selection = this.deps.resolveSelection(task.id, payload.selection);
     if (!selection) return blocked('selection-unavailable', 'Pick a model the provider lists.');
+    if (selection.family === 'google' && !this.deps.googleTermsAcknowledged())
+      return blocked(
+        'google-terms-not-acknowledged',
+        'Acknowledge the Google terms in Settings > Google before using Google.',
+      );
     if (!this.deps.adapters.has(selection.family))
       return blocked('provider-unavailable', 'Connect this provider in Settings or pick another.');
     this.putThread(task, { ...thread, selection });
@@ -1572,6 +1579,8 @@ export class ChatService {
     await new Promise((resolve) => setImmediate(resolve));
     const adapter = this.deps.adapters.get(turn.selection.family);
     if (!adapter) throw Error('No adapter is registered for this provider.');
+    if (turn.selection.family === 'google' && !this.deps.googleTermsAcknowledged())
+      throw Error('Acknowledge the Google terms in Settings > Google before using Google.');
     if (this.closed || live.stopRequested) return stoppedResult;
     const request = this.request(turn);
     live.policy = request.permissionPolicy;
@@ -2632,6 +2641,11 @@ export class ChatService {
         this.deps.resolveSelection(task.id));
     if (!selection)
       return blocked('selection-unavailable', 'Pick a provider and model in the composer.');
+    if (selection.family === 'google' && !this.deps.googleTermsAcknowledged())
+      return blocked(
+        'google-terms-not-acknowledged',
+        'Acknowledge the Google terms in Settings > Google before using Google.',
+      );
     if (!this.deps.adapters.has(selection.family))
       return blocked('provider-unavailable', 'Connect this provider in Settings or pick another.');
     return selection;
@@ -2834,6 +2848,7 @@ export class ChatService {
     );
     for (const entry of ranked) {
       if (!this.deps.adapters.has(entry.family)) continue;
+      if (entry.family === 'google' && !this.deps.googleTermsAcknowledged()) continue;
       const model = entry.defaultModel ?? entry.models[0]?.model;
       if (!model) continue;
       const effort = entry.models.find((value) => value.model === model)?.defaultEffort;

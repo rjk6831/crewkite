@@ -87,7 +87,7 @@ import {
 
 type Printed = { key: string; node: ReactNode };
 type View = 'thread' | 'threads' | 'changes' | 'crew' | 'plan' | 'settings' | 'help';
-type Confirm = { question: string; yes: () => void | Promise<void> };
+type Confirm = { question: string; yes: () => void | Promise<void>; no?: () => void };
 type LinePrompt = { label: string; value: string; submit: (value: string) => void | Promise<void> };
 
 export type AppProps = {
@@ -346,6 +346,9 @@ export function App(props: AppProps) {
           },
         });
     }
+    if (selection?.family === 'google' && !(await googleGate())) {
+      throw new Error(googleTermsRefusal);
+    }
     dispatch({
       type: 'sending',
       pending: { localId: `local-${now()}`, text, files: [], at: new Date(now()).toISOString() },
@@ -554,6 +557,18 @@ export function App(props: AppProps) {
             return { turnId: item.turn.id, block };
     return null;
   })();
+
+  const googleTermsRefusal =
+    'Google stays off until you acknowledge its terms. Answer y when asked, or use Settings > Google in the desktop app.';
+  const googleGate = () =>
+    beforeGoogleConnection({
+      read: () => client.transport.workspaceState(),
+      send: (command, payload) => client.send(command, payload),
+      ask: (question) =>
+        new Promise<boolean>((resolve) =>
+          setConfirm({ question, yes: () => resolve(true), no: () => resolve(false) }),
+        ),
+    });
 
   const run = (work: () => unknown) => {
     try {
@@ -802,8 +817,7 @@ export function App(props: AppProps) {
         return setNotice('Pick the model new threads start on first. C checks that provider.');
       return run(async () => {
         // The Google terms gate runs before any Google connection the CLI starts.
-        if (family === 'google' && !(await beforeGoogleConnection()))
-          throw new Error('Google stays unconnected until its terms are acknowledged.');
+        if (family === 'google' && !(await googleGate())) throw new Error(googleTermsRefusal);
         const result = await client.send(
           family === 'anthropic' ? 'CheckNativeConnection' : 'ObserveUsage',
           family === 'anthropic' ? { family, consent: 'explicit' } : { family },
@@ -823,8 +837,10 @@ export function App(props: AppProps) {
       if (input === 'y' || input === 'Y') {
         setConfirm(null);
         run(confirm.yes);
-      } else if (input === 'n' || input === 'N' || key.escape || (key.ctrl && input === 'c'))
+      } else if (input === 'n' || input === 'N' || key.escape || (key.ctrl && input === 'c')) {
         setConfirm(null);
+        confirm.no?.();
+      }
       return;
     }
     if (key.ctrl && input === 'c') {
