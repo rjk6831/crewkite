@@ -388,6 +388,8 @@ export function handoffPacket(input: {
   instructions?: readonly string[];
   /** Files from earlier messages that travel with this request. The new message's own files are not here. */
   earlier?: readonly EarlierFile[];
+  /** True when this turn has the thread tools. The packet names them only then. */
+  threadTools: boolean;
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -423,7 +425,7 @@ export function handoffPacket(input: {
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
-    THREAD_TOOLS_LINE,
+    ...(input.threadTools ? [THREAD_TOOLS_LINE] : []),
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
     `Files changed in the scratch copy against the base commit:\n${files}`,
     ...(input.instructions?.length
@@ -457,6 +459,10 @@ export function earlierReach(family: ChatFamily, path: string): string {
 /** The packet names the read-only thread tools, so a model knows it can ask for more. */
 export const THREAD_TOOLS_LINE =
   'Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live.';
+
+/** A packet for a turn that found out late it has no thread tools, with the line taken out. */
+export const withoutThreadToolsLine = (text: string): string =>
+  text.replace(`\n\n${THREAD_TOOLS_LINE}`, '');
 
 /**
  * The message text under its heading. The request carries it once. A message of files alone has
@@ -543,6 +549,8 @@ export function deltaPacket(input: {
   earlier: readonly EarlierFile[];
   prompt: string;
   clip?: number;
+  /** True when this turn has the thread tools. The packet names them only then. */
+  threadTools: boolean;
 }): string {
   const cut = (text: string, characters: number) =>
     text.length > characters ? `${text.slice(0, characters).toWellFormed()} [trimmed]` : text;
@@ -568,7 +576,7 @@ export function deltaPacket(input: {
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
-    THREAD_TOOLS_LINE,
+    ...(input.threadTools ? [THREAD_TOOLS_LINE] : []),
     `Turns since then, oldest first:\n\n${turns.join('\n\n')}`,
     input.changes.join('\n'),
     input.checks.length

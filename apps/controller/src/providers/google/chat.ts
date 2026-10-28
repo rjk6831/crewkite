@@ -1144,7 +1144,8 @@ export function googleChatAdapter(deps: {
           stage = 'session';
           // ACP takes the session's servers on session/new and session/load. The thread tools are
           // the only one, and the agent starts it in the session's own process.
-          const tools = deps.threadTools?.(request) ?? null;
+          const tools =
+            request.threadTools === false ? null : (deps.threadTools?.(request) ?? null);
           const mcpServers = tools
             ? [{ name: tools.name, command: tools.command, args: [...tools.args], env: [] }]
             : [];

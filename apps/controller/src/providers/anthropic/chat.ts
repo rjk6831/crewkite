@@ -669,7 +669,7 @@ function startTurn(
       request,
       prior,
       message.folders,
-      deps.threadTools?.(request) ?? null,
+      request.threadTools === false ? null : (deps.threadTools?.(request) ?? null),
     );
     child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,

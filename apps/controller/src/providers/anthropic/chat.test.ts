@@ -175,6 +175,8 @@ function run(
   message = prompt,
   extra: Pick<Parameters<typeof anthropicChatAdapter>[0], 'threadTools'> & {
     readOnly?: boolean;
+    /** The controller's answer for this turn. False wins over a thread tools source. */
+    turnTools?: boolean;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
@@ -217,6 +219,7 @@ function run(
     now: () => Date.parse('2026-10-23T00:00:00.000Z'),
     files,
     readOnly: extra.readOnly,
+    threadTools: extra.turnTools,
   };
   const handle = anthropicChatAdapter({
     launch: () => ({ executable: fixture, sha256 }),
@@ -800,6 +803,19 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     // The copies go when the turn ends.
     assert.equal(existsSync(join(turn.work, 'files')), false);
   }
+  // The controller decided this turn has no tools: nothing is minted, the config is empty and
+  // strict, and the tools are not allowed, even though a source is wired.
+  const minted = launches.length;
+  const declined = run(streamed(), null, [], 'ask', undefined, [], undefined, {
+    threadTools,
+    turnTools: false,
+  });
+  t.after(declined.cleanup);
+  await declined.handle.result;
+  assert.equal(launches.length, minted);
+  assert.ok(declined.launched.argv.includes('--strict-mcp-config'));
+  assert.ok(declined.launched.argv.includes('{"mcpServers":{}}'));
+  assert.ok(!declined.launched.argv.some((arg) => arg.includes('mcp__crewkite__')));
   // Each turn launched with its own token.
   const tokens = launches.map((args) => args[args.indexOf('--token') + 1]);
   assert.equal(tokens.length, 2);

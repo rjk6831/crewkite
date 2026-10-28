@@ -506,24 +506,20 @@ test('a message sent during a turn waits and starts when the turn ends', {
   ];
   const users = (read: ChatThreadRead) => read.messages.filter((m) => m.author.kind === 'user');
   for (const row of cases) {
+    const scripted = createScriptedChatAdapter({
+      family: 'openai',
+      turns: [
+        [
+          { kind: 'permission', requestId: 'edit-1', question: 'Edit net.mjs?' },
+          { kind: 'text', itemId: 'reply', chunks: ['Done.'] },
+        ],
+        [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
+      ],
+    });
     const thread = standalone(t, {
       // The thread tools socket failed to open: every cloud turn says so and runs without them.
       threadToolsDown: () => true,
-      adapters: new Map([
-        [
-          'openai',
-          createScriptedChatAdapter({
-            family: 'openai',
-            turns: [
-              [
-                { kind: 'permission', requestId: 'edit-1', question: 'Edit net.mjs?' },
-                { kind: 'text', itemId: 'reply', chunks: ['Done.'] },
-              ],
-              [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
-            ],
-          }),
-        ],
-      ]),
+      adapters: new Map([['openai', scripted]]),
     });
     const { store, service, taskId } = thread;
     const parked = turnReaches(thread, 'waiting-permission');
@@ -606,6 +602,23 @@ test('a message sent during a turn waits and starts when the turn ends', {
       ran,
       row.name,
     );
+
+    // A side question carries the thread packet. With no thread tools, the packet does not name
+    // them, and the turn carries the same answer for the client's config.
+    const asking = settles(thread);
+    const effects2: (() => void)[] = [];
+    store.transaction(() =>
+      service.ask(
+        { taskId, family: 'openai', model: selection.model, question: 'Which file?' },
+        effects2,
+      ),
+    );
+    for (const effect of effects2) effect();
+    await asking;
+    const side = (scripted.requests as unknown as ChatTurnRequest[]).at(-1);
+    assert.match(side?.prompt ?? '', /^This is a side question to OpenAI/, row.name);
+    assert.doesNotMatch(side?.prompt ?? '', /Thread tools are available/, row.name);
+    assert.equal(side?.threadTools, false, row.name);
   }
 
   // One running turn per family: a second thread's message on the same family waits in its own
@@ -979,6 +992,8 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${thread.turns[2].id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];
   assert.match(request.prompt, /moved from OpenAI to Google\. Reason: usage limit reached\./);
+  // This controller has its thread tools, so the packet names them.
+  assert.match(request.prompt, /^Thread tools are available: thread_turns,/m);
   assert.match(request.prompt, /New message from the person:\nFix the rounding\./);
   assert.match(request.prompt, /^net\.mjs \+1 -0$/m);
   assert.match(request.prompt, /^\+\/\/ half done$/m);
