@@ -630,11 +630,13 @@ test('a thread read returns messages in cursor order and the live events of the 
     thread.turns.map((turn) => turn.state),
     ['done', 'running'],
   );
+  assert.equal(thread.more, false);
   const earlier = await read({ beforeCursor: thread.messages[2].cursor, limit: 1 });
   assert.deepEqual(
     earlier.messages.map((message) => message.text),
     ['First reply.'],
   );
+  assert.equal(earlier.more, true);
 
   // A turn's stored events read back whole, oldest first, a page at a time under the cap.
   const [done, running] = thread.turns;
@@ -713,7 +715,12 @@ test('a thread read returns messages in cursor order and the live events of the 
 // A limit stop needs a second connected family, so these tests bring a catalog of their own.
 function limitThread(
   t: TestContext,
-  options: { autoHandoff: boolean; resetsAt: string | null; handoffMode?: ChatHandoffMode },
+  options: {
+    autoHandoff: boolean;
+    resetsAt: string | null;
+    handoffMode?: ChatHandoffMode;
+    google?: ChatScriptStep[][];
+  },
 ) {
   const limit = chatFailure({
     stage: 'stream',
@@ -747,7 +754,13 @@ function limitThread(
   const adapters = new Map([
     ['openai', stopped],
     ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: reply('Not chosen.') })],
-    ['google', createScriptedChatAdapter({ family: 'google', turns: reply('Carrying on.') })],
+    [
+      'google',
+      createScriptedChatAdapter({
+        family: 'google',
+        turns: options.google ?? reply('Carrying on.'),
+      }),
+    ],
     ['local', createScriptedChatAdapter({ family: 'local', turns: reply('Not chosen.') })],
   ] as const);
   // The test clock starts at the same fixed time in every service it builds.
@@ -937,8 +950,8 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     'Person:\nKeep going.',
     'Person:\nThen the tests.',
   ]);
-  assert.match(back.prompt, /^Local \(local-model\) answered:\nNot chosen\.$/m);
-  assert.match(back.prompt, /^Anthropic \(anthropic-model\) answered:\nNot chosen\.$/m);
+  assert.match(back.prompt, /^Local, builder \(local-model\):\nNot chosen\.$/m);
+  assert.match(back.prompt, /^Anthropic, builder \(anthropic-model\):\nNot chosen\.$/m);
   assert.match(back.prompt, /^No files changed in the scratch copy since then\.$/m);
   assert.doesNotMatch(back.prompt, /Go on\.|Fix the rounding\./);
   assert.match(back.prompt, /New message from the person:\nBack to you\.$/);
@@ -977,6 +990,44 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(
     changed.messages.at(-2)?.text,
     'Continued on Google (google-model-2) from Google (google-model). Reason: model changed in the composer.',
+  );
+
+  // The cap decision clears the saved session before the turn runs. When that turn fails, the
+  // next one starts fresh with the full packet and the thread says so only once.
+  const broke = chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' });
+  const capped = limitThread(t, {
+    autoHandoff: false,
+    resetsAt: null,
+    google: [
+      [{ kind: 'text', itemId: 'reply', chunks: ['Carrying on.'] }],
+      [{ kind: 'fail', stopReason: 'error', failure: broke }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Back.'] }],
+    ],
+  });
+  const step = (text: string, choice: ChatModelSelection, state: ChatTurn['state'] = 'done') => {
+    const ended = turnReaches(capped, state);
+    capped.send(text, choice);
+    return ended;
+  };
+  await step('Start here.', pick('google'));
+  for (let index = 0; index < 5; index++) await step(`${index} ${long}`, pick('anthropic'));
+  await step('Still there?', pick('google'), 'failed');
+  assert.deepEqual(
+    capped.read().thread.sessions.map((value) => value.family),
+    ['anthropic'],
+  );
+  await step('Try again.', pick('google'));
+  const retried = capped.adapters.get('google')?.requests[2];
+  assert.equal(retried?.session, null);
+  assert.match(
+    retried?.prompt ?? '',
+    /^This thread continues on Google in a new session\. Reason: the thread moved past what the old session could carry\.$/m,
+  );
+  assert.equal(
+    capped
+      .read()
+      .messages.filter((message) => message.text.startsWith('Started a new Google session')).length,
+    1,
   );
 });
 
@@ -1222,6 +1273,10 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const pinned = () => repo('rev-parse', threadBaseRef(task.id));
   const started = await read();
   assert.deepEqual(started.thread.skipped, [{ path: 'vendor/lib', reason: 'submodule' }]);
+  assert.equal(started.thread.skippedTotal, 1);
+  const skippedLine =
+    'The scratch copy skipped 1 entry it cannot hold, such as submodules and links that lead outside. Changes lists them.';
+  assert.equal(started.messages.filter((message) => message.text === skippedLine).length, 1);
   assert.equal(pinned(), started.thread.base);
   const scratch = adapter.requests[0].scratch.directory;
   // The edit goes through the link. The file under the skipped submodule is never accepted.
@@ -1704,6 +1759,15 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     assert.match(fix?.prompt ?? '', /Fix each one in the scratch copy/);
     // The fixer is the builder again: it resumes the builder's session.
     assert.equal(fix?.session?.sessionId, `session-${read.turns[0].id}`);
+    // The builder's next message hears the reviews and the challenge, each named by family
+    // and role.
+    store.transaction(() => service.configure({ taskId, flightMode: 'manual' }));
+    const after = turnReaches(thread, 'done');
+    thread.send('Ship it.', pick('openai'));
+    await after;
+    const delta = adapters.get('openai')?.requests[2]?.prompt ?? '';
+    assert.match(delta, /^Anthropic, reviewer \(anthropic-model\):\nClean\.\nFindings: 0$/m);
+    assert.match(delta, /^Google, challenger \(google-model\):\nIt holds\.$/m);
   }
 });
 
@@ -2317,6 +2381,12 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   const ref = `refs/crewkite/threads/${taskId}`;
   git(root, ['update-ref', ref, scripted.requests[0].scratch.base]);
   assert.equal(store.transaction(() => service.deleteThread({ taskId }, [])).outcome, 'applied');
+  assert.deepEqual(
+    store
+      .eventsAfter('0')
+      .flatMap((event) => (event.type === 'task.removed' ? [[event.taskId, event.payload]] : [])),
+    [[null, { taskId }]],
+  );
   assert.ok(existsSync(join(folder, 'files')));
   const restarted = start();
   restarted.recover();
