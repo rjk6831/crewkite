@@ -1485,7 +1485,7 @@ export class Controller {
       case 'ReadExtensions':
         return { outcome: 'applied', data: { kind: 'extensions', ...this.extensions().read() } };
       case 'ConfigureExtension':
-        return this.extensions().configure(command.payload);
+        return this.extensions().configure(command.payload, effects);
       case 'RunExtensionCommand':
         return this.extensions().run(command.payload);
       case 'AcceptChatChanges':

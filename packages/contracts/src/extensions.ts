@@ -99,6 +99,7 @@ export const ExtensionRefusalSchema = z.enum([
   'contract-too-new',
   'folder-mismatch',
   'entry-missing',
+  'folder-unsupported',
 ]);
 export type ExtensionRefusal = z.infer<typeof ExtensionRefusalSchema>;
 
@@ -114,7 +115,10 @@ export const ExtensionListingSchema = z.strictObject({
   refusal: ExtensionRefusalSchema.nullable(),
   line: z.string().max(500).nullable(),
   manifest: ExtensionManifestSchema.nullable(),
-  /** The canonical hash of the manifest. Turning an extension on names the hash the person saw. */
+  /**
+   * The canonical hash of the manifest and of every regular file in the folder, by sorted relative
+   * path, size and bytes. Turning an extension on names the hash the person saw.
+   */
   manifestHash: z
     .string()
     .regex(/^[a-f0-9]{64}$/)
@@ -124,8 +128,9 @@ export type ExtensionListing = z.infer<typeof ExtensionListingSchema>;
 
 const slotFields = { extensionId: id, id, title, command: id };
 /**
- * A place in the desktop and the CLI where an extension that is on shows up. A slot carries data
- * only. Clients render its title and the text its command returns, and run no extension code.
+ * A place in the desktop where an extension that is on shows up. The CLI reads the same slots
+ * once its interactive client lands. A slot carries data only. Clients render its title and the
+ * text its command returns, and run no extension code.
  */
 export const ExtensionSlotSchema = z.discriminatedUnion('slot', [
   z.strictObject({ slot: z.literal('settings-card'), ...slotFields }),

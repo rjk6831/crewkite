@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { cpSync, mkdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import type {
@@ -76,6 +76,7 @@ test('a manifest is refused for a bad version, an unknown authority or another c
 
 // The probe tries every way out of its context that the test can name.
 const probeModule = `
+let kept;
 export const commands = {
   look: (context) => ({ text: JSON.stringify({
     context: Object.keys(context).sort(),
@@ -90,6 +91,13 @@ export const commands = {
   },
   probed: (context) => { context.emit('probed', { text: 'seen' }); return { text: 'emitted' }; },
   later: async () => ({ text: 'late' }),
+  thenable: () => ({ get then() { throw new Error('then getter'); } }),
+  keep: (context) => { kept = context; return { text: 'kept' }; },
+  reuse: () => {
+    try { kept.thread.read(); return { text: 'leaked read' }; } catch {}
+    try { kept.emit('probed', { text: 'late' }); return { text: 'leaked emit' }; } catch {}
+    return { text: 'expired' };
+  },
 };
 `;
 const blindModule = `
@@ -119,7 +127,18 @@ test('an extension command passes the built-in checks and reaches only its own t
       'local-owner',
     )
   ).entity as Task;
-  const commandIds = ['look', 'other', 'retitle', 'raise', 'builtin', 'probed', 'later'];
+  const commandIds = [
+    'look',
+    'other',
+    'retitle',
+    'raise',
+    'builtin',
+    'probed',
+    'later',
+    'thenable',
+    'keep',
+    'reuse',
+  ];
   install(
     home,
     'probe',
@@ -245,6 +264,23 @@ test('an extension command passes the built-in checks and reaches only its own t
       { extensionId: 'probe', commandId: 'later', taskId: mine.id },
       { outcome: 'blocked', reason: 'extension-async-unsupported' },
     ],
+    [
+      'a then getter that throws is an extension failure',
+      { extensionId: 'probe', commandId: 'thenable', taskId: mine.id },
+      { outcome: 'blocked', reason: 'extension-failed' },
+    ],
+    [
+      'a command can keep its context',
+      { extensionId: 'probe', commandId: 'keep', taskId: mine.id },
+      { outcome: 'applied' },
+      'kept',
+    ],
+    [
+      'a kept context reads and emits nothing once its command returned',
+      { extensionId: 'probe', commandId: 'reuse', taskId: other.id },
+      { outcome: 'applied' },
+      'expired',
+    ],
   ];
   for (const [claim, payload, expected, text] of rows) {
     const result = await run(
@@ -305,6 +341,28 @@ test('an extension command passes the built-in checks and reaches only its own t
     'stale-revision',
     'a command without a thread needs revision zero',
   );
+
+  // The choice is written after the commit, so a failed commit leaves the extension as it was.
+  const save = controller.store.saveReceipt;
+  controller.store.saveReceipt = () => {
+    throw Error('receipt write failed');
+  };
+  await assert.rejects(
+    controller.execute(
+      command(
+        'ConfigureExtension',
+        { extensionId: 'blind', enabled: false, manifestHash: await hashOf('blind') },
+        0,
+      ),
+      'local-owner',
+    ),
+  );
+  controller.store.saveReceipt = save;
+  assert.equal(
+    (await read()).extensions.find((item) => item.folder === 'blind')?.state,
+    'on',
+    'a configure whose commit failed changes no choice',
+  );
 });
 
 test('the sample thread action loads only while the sample extension is on and its contract matches', async (t) => {
@@ -322,12 +380,31 @@ test('the sample thread action loads only while the sample extension is on and i
         {
           extensionId: sampleExtensionId,
           enabled,
-          manifestHash: (await read()).extensions[0]?.manifestHash ?? 'f'.repeat(64),
+          manifestHash:
+            (await read()).extensions.find((item) => item.folder === sampleExtensionId)
+              ?.manifestHash ?? 'f'.repeat(64),
         },
         0,
       ),
       'local-owner',
     );
+  const turnOn = async (id: string) =>
+    controller.execute(
+      command(
+        'ConfigureExtension',
+        {
+          extensionId: id,
+          enabled: true,
+          manifestHash:
+            (await read()).extensions.find((item) => item.folder === id)?.manifestHash ??
+            'f'.repeat(64),
+        },
+        0,
+      ),
+      'local-owner',
+    );
+  const stateOf = async (id: string) =>
+    (await read()).extensions.find((item) => item.folder === id);
   const count = () =>
     controller.execute(
       command(
@@ -360,12 +437,80 @@ test('the sample thread action loads only while the sample extension is on and i
   assert.equal((await count()).reason, 'extension-off', 'and stops the command');
 
   assert.equal((await configure(true)).outcome, 'applied');
+  // Consent covers every file in the folder: a sibling module or a package.json turns it off.
+  for (const [name, body] of [
+    ['helper.mjs', 'export const extra = 1;\n'],
+    ['package.json', '{ "type": "commonjs" }\n'],
+  ] as const) {
+    writeFileSync(join(folder, name), body);
+    assert.equal(
+      (await stateOf(sampleExtensionId))?.state,
+      'changed',
+      `a new ${name} turns it off`,
+    );
+    assert.equal((await count()).reason, 'extension-off', `and stops the command after ${name}`);
+    rmSync(join(folder, name));
+    assert.equal((await stateOf(sampleExtensionId))?.state, 'on', `removing ${name} restores it`);
+  }
+  symlinkSync(join(folder, 'index.mjs'), join(folder, 'linked.mjs'));
+  assert.equal(
+    (await stateOf(sampleExtensionId))?.refusal,
+    'folder-unsupported',
+    'a link in the folder is refused',
+  );
+  rmSync(join(folder, 'linked.mjs'));
+  const crowded = join(home, 'extensions', 'crowded');
+  cpSync(folder, crowded, { recursive: true });
+  const crowdedManifest = join(crowded, 'manifest.json');
+  writeFileSync(
+    crowdedManifest,
+    JSON.stringify({ ...JSON.parse(readFileSync(crowdedManifest, 'utf8')), id: 'crowded' }),
+  );
+  for (let index = 0; index < 256; index += 1) writeFileSync(join(crowded, `f${index}.txt`), '');
+  assert.equal(
+    (await stateOf('crowded'))?.refusal,
+    'folder-unsupported',
+    'a folder over the bound is refused',
+  );
+  rmSync(crowded, { recursive: true });
+
+  // A file that changes while the module loads refuses the load, and the run needs a restart.
+  install(
+    home,
+    'shifty',
+    {},
+    `import { writeFileSync } from 'node:fs';
+writeFileSync(new URL('./late.txt', import.meta.url), 'changed');
+export const commands = { look: () => ({ text: 'shifty' }) };
+`,
+  );
+  assert.equal(
+    (await turnOn('shifty')).reason,
+    'extension-changed-while-loading',
+    'a folder that changed during the load stays off',
+  );
+  assert.equal((await stateOf('shifty'))?.state, 'off');
+  assert.equal((await turnOn('shifty')).reason, 'extension-restart-needed');
+
+  // A load failure is recorded, so a fixed module asks for a restart.
+  install(home, 'broken', {}, `throw new Error('broken at load');\n`);
+  assert.equal((await turnOn('broken')).reason, 'extension-load-failed');
+  writeFileSync(
+    join(home, 'extensions', 'broken', 'index.mjs'),
+    `export const commands = { look: () => ({ text: 'fixed' }) };\n`,
+  );
+  assert.equal(
+    (await turnOn('broken')).reason,
+    'extension-restart-needed',
+    'a module fixed after a failed load needs a restart',
+  );
+
   const path = join(folder, 'manifest.json');
   writeFileSync(
     path,
     JSON.stringify({ ...JSON.parse(readFileSync(path, 'utf8')), contract: '2.0.0' }),
   );
-  const bumped = (await read()).extensions[0];
+  const bumped = await stateOf(sampleExtensionId);
   assert.equal(bumped?.state, 'refused', 'a contract major bump turns the extension off');
   assert.equal(bumped?.refusal, 'contract-major-mismatch');
   assert.match(bumped?.line ?? '', /^Built for extension contract 2\.x\./);
