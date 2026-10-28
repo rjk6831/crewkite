@@ -382,12 +382,25 @@ export class Controller {
       projectPath: (projectId) => this.projectPath(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
       catalog: () => this.chatCatalog(),
+      localContext: () => this.localContext(),
       // A settled turn spent allowance, so the gauge reads again.
       onTurnSettled: (family) => {
         if (family === 'anthropic') void this.anthropicUsage().refreshWhenDue(this.id('cmd'));
       },
     });
     return this.chatRuntime;
+  }
+
+  /** The context of the Local model a turn would run on, when Local is connected. */
+  private localContext(): number | null {
+    const setup = this.localSetup();
+    if (setup.connected !== true || setup.observationStale) return null;
+    const loaded = (setup.observation?.models ?? []).filter(
+      (choice) => choice.state === 'loaded-eligible',
+    );
+    const chosen =
+      loaded.find((choice) => choice.selectionId === setup.selection?.selectionId) ?? loaded[0];
+    return chosen?.contextLength ?? null;
   }
 
   // What the Google and Local clients last reported about the files they take. Memory only: the
@@ -1173,6 +1186,8 @@ export class Controller {
         'DiscardChatChange',
         'RenameChatThread',
         'DeleteChatThread',
+        'RunChatPlan',
+        'CancelChatPlan',
       ].includes(command.command)
     ) {
       // A thread streams events many times a second. Its commands serialize on the active turn,
@@ -1335,6 +1350,10 @@ export class Controller {
         return this.chat().renameThread(command.payload);
       case 'DeleteChatThread':
         return this.chat().deleteThread(command.payload, effects);
+      case 'RunChatPlan':
+        return this.chat().runPlan(command.payload, effects);
+      case 'CancelChatPlan':
+        return this.chat().cancelPlan(command.payload, effects);
       case 'ReadChatTurnEvents':
         return this.chat().readTurnEvents(command.payload);
       case 'AcceptChatChanges':

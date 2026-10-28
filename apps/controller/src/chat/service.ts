@@ -98,6 +98,8 @@ import {
   readChatBranchStatus,
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
+import { localRoomFits, type PlanInputs } from './plan.ts';
+import { PlanRunner } from './plan-runner.ts';
 import {
   adviceContext,
   challengeContext,
@@ -110,6 +112,7 @@ import {
   type HandoffReason,
   handoffPacket,
   handoffReason,
+  orchestratorContext,
   presentInstructions,
   reviewContext,
   systemContext,
@@ -149,6 +152,10 @@ export type ChatServiceDeps = {
   schedule?: Schedule;
   /** When the machine last booted. The default subtracts `os.uptime()` from the clock. */
   bootedAt?: () => string;
+  /** The context length of the loaded Local model, or null. A plan sends easy slices by it. */
+  localContext?: () => number | null;
+  /** Whether a slice's files fit a Local prompt. The default applies the A5 room rule. */
+  localSliceFits?: PlanInputs['localSliceFits'];
 };
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
@@ -325,6 +332,8 @@ const stoppedResult: ChatTurnResult = {
 export class ChatService {
   private readonly deps: ChatServiceDeps;
   private readonly live = new Map<string, LiveTurn>();
+  /** Orchestrator plans: proposal, assignment and the slice chain (ADR 0045). */
+  private readonly plans: PlanRunner;
   private closed = false;
   /** The copy `importing` made, for the import command it commits next. */
   private staged:
@@ -333,6 +342,7 @@ export class ChatService {
 
   constructor(deps: ChatServiceDeps) {
     this.deps = deps;
+    this.plans = new PlanRunner(this.planHost());
   }
 
   /**
@@ -358,7 +368,8 @@ export class ChatService {
     const message = { ...payload, files };
     const { thread, left } = this.checkedThread(task);
     const free = !thread.activeTurnId && !left.length;
-    if (free && !thread.queued.length) return this.begin(task, thread, message, effects);
+    if (free && !thread.queued.length)
+      return this.begin(task, thread, this.plans.route(thread, message), effects);
     if (free) {
       // The oldest queued message goes first. One that cannot start any more, say on a family
       // that is gone, blocks the queue until it is removed, so the person hears about that one.
@@ -943,6 +954,54 @@ export class ChatService {
     };
   }
 
+  /** Run a proposed plan, or one slice of it once its dependencies are done. */
+  runPlan(payload: Payload<'RunChatPlan'>, effects: Effects): CommandResult {
+    return this.plans.run(payload, effects);
+  }
+
+  /** Cancel a proposed plan, or stop a running one. Unfinished slices show not run. */
+  cancelPlan(payload: Payload<'CancelChatPlan'>, effects: Effects): CommandResult {
+    return this.plans.cancel(payload, effects);
+  }
+
+  /** The service's own reads and writes, lent to the plan runner. */
+  private planHost(): ConstructorParameters<typeof PlanRunner>[0] {
+    const text = (taskId: string, id: string | null) =>
+      id ? this.findEntry(taskId, id)?.text : undefined;
+    return {
+      transaction: (work) => this.deps.store.transaction(work),
+      call: (work) => this.call(work),
+      catalog: (taskId) => this.deps.catalog(taskId),
+      now: () => this.deps.now(),
+      task: (taskId) => this.task(taskId),
+      thread: (taskId) => this.thread(taskId),
+      putThread: (task, thread) => this.putThread(task, thread),
+      line: (task, value) =>
+        this.appendEntry(task, {
+          kind: 'chat-system',
+          author: { kind: 'system', turnId: null },
+          text: fitText(value, 16_384),
+        }),
+      turn: (turnId) => this.turn(turnId),
+      turns: (taskId) => this.turns(taskId),
+      reply: (turn) => text(turn.taskId, turn.assistantMessageId),
+      message: (turn) => text(turn.taskId, turn.userMessageId),
+      begin: (task, thread, input, effects) => this.begin(task, thread, input, effects),
+      crewStep: (task, thread, chain, effects) => this.crewStep(task, thread, chain, effects),
+      stopActive: (taskId, effects) => {
+        const id = this.thread(taskId).activeTurnId;
+        const live = id ? this.activeLive(taskId, id) : undefined;
+        if (!live) return;
+        live.stopRequested = true;
+        effects.push(() => this.call(() => live.handle?.stop()));
+      },
+      free: (task) => !this.checkedThread(task).left.length,
+      scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      localContext: () => this.deps.localContext?.() ?? null,
+      localSliceFits: this.deps.localSliceFits ?? localRoomFits,
+    };
+  }
+
   readThread(payload: Payload<'ReadChatThread'>): ChatThreadRead {
     // Reads run synchronously on the one connection, so nothing lands between this and the rows.
     const cursor = this.deps.store.cursor();
@@ -1010,7 +1069,11 @@ export class ChatService {
         "SELECT task_id FROM chat_threads WHERE json_extract(body,'$.crewChain.step') IN ('review','fix','challenge')",
       )
       .all() as { task_id: string }[];
-    if (!rows.length && !flagged.length && !waiting.length && !chains.length) return;
+    const plans = this.deps.store.db
+      .prepare("SELECT task_id FROM chat_threads WHERE json_extract(body,'$.plan.phase')='running'")
+      .all() as { task_id: string }[];
+    if (!rows.length && !flagged.length && !waiting.length && !chains.length && !plans.length)
+      return;
     this.deps.store.transaction(() => {
       for (const row of rows) {
         const turn = this.turn(row.id);
@@ -1043,6 +1106,7 @@ export class ChatService {
         if (task && thread.crewChain && !(open && OPEN_STATES.has(open.state)))
           this.stopCrew(task, thread, thread.crewChain, 'CrewKite restarted');
       }
+      this.plans.recoverThreads(plans.map((row) => row.task_id));
     });
     for (const row of waiting) this.continueQueue(row.task_id);
   }
@@ -1520,6 +1584,7 @@ export class ChatService {
     if (result.stopReason === 'limit' && !live.stopRequested && !this.closed)
       this.continueOnLimit(turnId);
     if (turn && !this.closed) this.advanceCrew(turnId);
+    if (turn && !this.closed) this.plans.settled(turnId);
     // A handoff above opens the rerun first. The queue waits for that turn to settle.
     if (turn && !this.closed) this.continueQueue(turn.taskId);
   }
@@ -1758,6 +1823,8 @@ export class ChatService {
     review?: string,
   ) {
     const step = chain.step as CrewStep;
+    // A plan with slices left runs the next one, and the challenger waits for the last.
+    if (step === 'challenge' && this.plans.beforeChallenge(task, thread, chain, effects)) return;
     const members = thread.crew?.members ?? [];
     const member = (role: string) => members.find((entry) => entry.role === role)?.selection;
     const selection =
@@ -1780,6 +1847,8 @@ export class ChatService {
 
   private finishCrew(task: Task, thread: ChatThread, chain: ChatCrewChain) {
     this.putThread(task, { ...thread, crewChain: { ...chain, step: 'finished', reason: null } });
+    // After the last slice of a plan the plan's own line closes the crew.
+    if (this.plans.finished(task)) return;
     const rounds = `${chain.reviewRounds} review ${chain.reviewRounds === 1 ? 'round' : 'rounds'}`;
     const fixes = `${chain.fixes} ${chain.fixes === 1 ? 'fix' : 'fixes'}`;
     this.appendEntry(task, {
@@ -1798,6 +1867,8 @@ export class ChatService {
   ) {
     const reason = `${cause[0].toUpperCase()}${cause.slice(1)}.`;
     this.putThread(task, { ...thread, crewChain: { ...chain, step: 'stopped', reason } });
+    // A slice's chain that stops stops its plan. The slices left show not run.
+    this.plans.halt(task, cause);
     this.appendEntry(task, {
       kind: 'chat-system',
       author: { kind: 'system', turnId: null },
@@ -1928,7 +1999,13 @@ export class ChatService {
     const thread = this.thread(task.id);
     const [first, ...rest] = thread.queued;
     if (!first) return { outcome: 'applied' };
-    return this.begin(task, { ...thread, queued: rest }, first, effects, first.id);
+    return this.begin(
+      task,
+      { ...thread, queued: rest },
+      this.plans.route(thread, first),
+      effects,
+      first.id,
+    );
   }
 
   /**
@@ -2131,6 +2208,7 @@ export class ChatService {
         : history.findLast((entry) => entry.role === 'assistant')?.text) ?? null;
     if (role === 'advisor') return adviceContext(name, directory, answer);
     if (role === 'challenger') return challengeContext(name, directory, answer);
+    if (role === 'orchestrator') return orchestratorContext(name, directory);
     if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';
     let files: ChatChangesRead['files'] | null = null;

@@ -1556,6 +1556,22 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
   const limit = chatFailure({ stage: 'stream', kind: 'usage-limit', message: 'Limit.' });
   const limited: ChatScriptStep[] = [{ kind: 'fail', stopReason: 'limit', failure: limit }];
   const twoFindings = 'Rounding drops a cent in net.mjs.\nTotals skip tax.\nFindings: 2';
+  const slice = (id: number, difficulty: string, depends: number[]) => ({
+    id,
+    title: `Part ${id}`,
+    brief: `Do part ${id}.`,
+    files: ['src/net.mjs'],
+    depends,
+    difficulty,
+    readOnly: false,
+  });
+  const twoSlices = {
+    planId: 'p1',
+    goal: 'Fix the rounding.',
+    slices: [slice(1, 'medium', []), slice(2, 'hard', [1])],
+  };
+  const planReply = (plan: object) =>
+    reply(`Two parts.\n\n\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``);
   const cases = [
     {
       name: 'findings 2 then 0',
@@ -1628,15 +1644,95 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         reason: 'Anthropic reached its usage limit.',
       },
     },
+    {
+      name: 'a plan runs each slice with its review, then one challenge',
+      plan: [planReply(twoSlices)],
+      builds: [reply('Built part 1.'), reply('Built part 2.')],
+      reviews: [reply('Clean.\nFindings: 0'), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['assistant', 'openai'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 2 slices, 2 reviews, 0 fixes.',
+      // The challenge follows the last slice's own review chain.
+      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      builderAt: 3,
+      card: ['finished', 'done', 'done'],
+    },
+    {
+      name: 'balanced waits for Run plan, and an override moves a slice to a ranked family',
+      plan: [planReply({ ...twoSlices, slices: [twoSlices.slices[0]] })],
+      // OpenAI would build the slice without the override.
+      builds: [reply('Unused.')],
+      reviews: [reply('Built on Anthropic.'), reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      balanced: true,
+      builtOn: 'anthropic',
+      picked: 'Slice 1 (medium) assigned to Anthropic: picked on the plan card.',
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'anthropic'],
+        ['reviewer', 'anthropic'],
+        ['challenger', 'google'],
+      ],
+      line: 'Crew finished: 1 slice, 1 review, 0 fixes.',
+      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      builderAt: 1,
+      card: ['finished', 'done'],
+    },
+    {
+      name: 'a failed slice stops the plan and the rest do not run',
+      plan: [planReply(twoSlices)],
+      builds: [
+        [
+          {
+            kind: 'fail',
+            stopReason: 'error',
+            failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
+          },
+        ],
+      ],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['orchestrator', 'openai'],
+        ['assistant', 'openai'],
+      ],
+      line: 'Plan stopped: slice 1 failed. Run it again from the plan card.',
+      chain: null,
+      card: ['stopped', 'failed', 'not-run'],
+    },
+    {
+      name: 'a plan that fails validation goes back once, then stops',
+      plan: [reply('Here is my plan in prose.'), reply('Still prose.')],
+      builds: [reply('Unused.')],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [
+        ['orchestrator', 'openai'],
+        ['orchestrator', 'openai'],
+      ],
+      line: 'Plan stopped: the plan did not pass validation. The reply has no fenced json block tagged plan.',
+      chain: null,
+      card: null,
+    },
   ] as const;
   for (const row of cases) {
     const now = createTestClock().now();
+    const planned = 'plan' in row;
     const adapters = new Map([
       [
         'openai',
         createScriptedChatAdapter({
           family: 'openai',
-          turns: [reply('Built it.'), reply('Fixed both.')],
+          turns: planned
+            ? [...row.plan, ...row.builds]
+            : [reply('Built it.'), reply('Fixed both.')],
         }),
       ],
       ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: row.reviews })],
@@ -1660,20 +1756,57 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         { role: 'builder', selection: pick('openai') },
         { role: 'reviewer', selection: pick('anthropic') },
         { role: 'challenger', selection: pick('google') },
+        ...(planned ? [{ role: 'orchestrator', selection: pick('openai') } as const] : []),
       ],
     };
-    store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+    const balanced = 'balanced' in row;
+    store.transaction(() =>
+      service.configure({ taskId, crew, flightMode: balanced ? 'balanced' : 'glide' }),
+    );
     // Entering glide turns automatic handoff on. The person may turn it off again.
-    assert.equal(thread.read().thread.autoHandoff, true, row.name);
+    assert.equal(thread.read().thread.autoHandoff, !balanced, row.name);
     if (row.autoHandoff === false)
       store.transaction(() => service.configure({ taskId, autoHandoff: false }));
     const ended = next(
       thread,
       (event) =>
         event.type === 'conversation.entry' &&
-        (event.payload as { text: string }).text.startsWith('Crew '),
+        /^(Crew|Plan) (finished|stopped)/.test((event.payload as { text: string }).text),
     );
-    thread.send('Fix the rounding.', pick('openai'));
+    if (balanced) {
+      const proposed = next(
+        thread,
+        (event) =>
+          event.type === 'chat.thread' && (event.payload as ChatThread).plan?.phase === 'proposed',
+      );
+      thread.send('Fix the rounding.', pick('openai'));
+      const shown = (await proposed).payload as ChatThread;
+      const card = shown.plan;
+      // Balanced runs nothing until Run plan: the card arrives on a free thread.
+      assert.equal(shown.activeTurnId, null, row.name);
+      assert.equal(thread.read().turns.length, 1, row.name);
+      const run = (overrides: { sliceId: number; family: ChatFamily; model: string }[]) => {
+        const effects: (() => void)[] = [];
+        const result = store.transaction(() =>
+          service.runPlan({ taskId, planId: 'p1', overrides }, effects),
+        );
+        for (const effect of effects) effect();
+        return result;
+      };
+      // Only a ranked candidate on the card can take a slice.
+      assert.equal(
+        run([{ sliceId: 1, family: 'google', model: 'google-unranked' }]).reason,
+        'override-not-ranked',
+        row.name,
+      );
+      const other = card?.slices[0].candidates.find((value) => value.family === 'anthropic');
+      assert.ok(other, row.name);
+      assert.equal(
+        run([{ sliceId: 1, family: other.family, model: other.model }]).outcome,
+        'applied',
+        row.name,
+      );
+    } else thread.send('Fix the rounding.', pick('openai'));
     await ended;
 
     const read = thread.read();
@@ -1683,9 +1816,44 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       row.name,
     );
     assert.equal(read.messages.at(-1)?.text, row.line, row.name);
-    const { builderTurnId, ...chain } = read.thread.crewChain ?? {};
-    assert.equal(builderTurnId, read.turns[0].id, row.name);
-    assert.deepEqual(chain, row.chain, row.name);
+    if (row.chain === null) assert.equal(read.thread.crewChain, null, row.name);
+    else {
+      const { builderTurnId, ...chain } = read.thread.crewChain ?? {};
+      assert.equal(builderTurnId, read.turns['builderAt' in row ? row.builderAt : 0].id, row.name);
+      assert.deepEqual(chain, row.chain, row.name);
+    }
+    if (planned) {
+      const card = read.thread.plan;
+      assert.deepEqual(
+        card ? [card.phase, ...card.slices.map((value) => value.status)] : null,
+        row.card,
+        row.name,
+      );
+      const asked = adapters.get('openai')?.requests ?? [];
+      assert.equal(asked[0]?.role, 'orchestrator', row.name);
+      assert.match(asked[0]?.systemContext ?? '', /```json plan/, row.name);
+      if (row.card === null) {
+        assert.match(asked[1]?.prompt ?? '', /^The plan did not pass validation\. /, row.name);
+        assert.match(asked[1]?.prompt ?? '', /^> Fix the rounding\.$/m, row.name);
+        continue;
+      }
+      const lines = read.messages.map((message) => message.text);
+      assert.ok(
+        lines.includes(
+          'Slice 1 (medium) assigned to OpenAI: the crew builder, ranked 2 of 3 by Most allowance left.',
+        ),
+        row.name,
+      );
+      // An override keeps the controller's line and adds the person's pick after it.
+      if ('picked' in row) assert.ok(lines.includes(row.picked), row.name);
+      const builtOn = 'builtOn' in row ? row.builtOn : 'openai';
+      assert.equal(card?.slices[0].assignment?.family, builtOn, row.name);
+      const brief = (builtOn === 'openai' ? asked[1] : adapters.get(builtOn)?.requests[0])?.prompt;
+      const of = `Slice 1 of ${row.card.length - 1} in plan p1: Part 1`;
+      assert.match(brief ?? '', new RegExp(`^${of}$`, 'm'), row.name);
+      assert.match(brief ?? '', /^Do part 1\.$/m, row.name);
+      continue;
+    }
     // The person's pick stays on the builder whatever the crew borrowed.
     assert.equal(read.thread.selection?.family, 'openai', row.name);
     const reviewed = adapters.get('anthropic')?.requests[0];
