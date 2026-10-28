@@ -466,7 +466,7 @@ export class Controller {
     return runtime.broker.mint({
       taskId: request.taskId,
       turnId: request.turnId,
-      reader: this.chat().threadReads(request.taskId),
+      reader: this.chat().threadReads(request.taskId, request.scratch.directory),
     });
   }
 
@@ -878,7 +878,7 @@ export class Controller {
         return { ...connection, connectedWithoutToken: secret === null };
       },
       // Local runs the same five reads as functions in this process. No socket or token.
-      threadReader: (request) => this.chat().threadReads(request.taskId),
+      threadReader: (request) => this.chat().threadReads(request.taskId, request.scratch.directory),
     });
     return new Map<ChatFamily, ChatAdapter>([
       ['openai', openai],

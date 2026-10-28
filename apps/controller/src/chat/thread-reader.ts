@@ -47,6 +47,8 @@ export type ThreadReaderSource = Readonly<{
   store: Store;
   /** The controller home. The thread's scratch copy is under it. */
   home: string;
+  /** The copy `thread_diff` reads when it is not the thread's own, as for a plan slice. */
+  scratch?: string;
   projectPath: (projectId: string) => string | undefined;
   /** Milliseconds, for the elapsed time of a running turn. */
   now: () => number;
@@ -265,7 +267,8 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
             );
       let all: ReturnType<typeof scratchChanges>;
       try {
-        all = scratchChanges(root, join(source.home, 'chat', taskId, 'scratch'), base);
+        const scratch = source.scratch ?? join(source.home, 'chat', taskId, 'scratch');
+        all = scratchChanges(root, scratch, base);
       } catch (error) {
         if (!(error instanceof ScratchTooLarge)) throw error;
         return ThreadDiffResultSchema.parse({ diff: `${error.message}\n`, more: null });

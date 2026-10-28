@@ -1973,8 +1973,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         ['ask', 'google'],
       ],
       line: 'Crew finished: 2 slices, 2 reviews, 0 fixes.',
-      // The challenge follows the last slice's own review chain.
-      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      // Each slice reviews in its own lane. The thread's chain holds the challenge alone.
+      chain: { step: 'finished', reviewRounds: 0, fixes: 0, reason: null },
       builderAt: 3,
       card: ['finished', 'done', 'done'],
     },
@@ -2020,7 +2020,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         ['challenger', 'google'],
       ],
       line: 'Crew finished: 1 slice, 1 review, 0 fixes.',
-      chain: { step: 'finished', reviewRounds: 1, fixes: 0, reason: null },
+      chain: { step: 'finished', reviewRounds: 0, fixes: 0, reason: null },
       builderAt: 1,
       card: ['finished', 'done'],
     },
@@ -2349,6 +2349,339 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     assert.match(delta, /^Anthropic, reviewer \(anthropic-model\):\nClean\.\nFindings: 0$/m);
     assert.match(delta, /^Google, challenger \(google-model\):\nIt holds\.$/m);
   }
+});
+
+// A plan's slices run side by side, each in its own scratch copy, and merge in plan order.
+// OpenAI takes the medium slices and Local the easy ones, so two families answer at once.
+test('plan slices run side by side in their own copies, merge in plan order and stop together', {
+  timeout: 60000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep => ({ kind: 'text', itemId: 'r', chunks: [text] });
+  const write = (path: string, content: string): ChatScriptStep => ({
+    kind: 'tool',
+    callId: `w-${path}`,
+    toolKind: 'edit',
+    title: `Write ${path}`,
+    write: { path, content },
+  });
+  const park: ChatScriptStep = { kind: 'permission', requestId: 'park', question: 'Go on?' };
+  const failed: ChatScriptStep = {
+    kind: 'fail',
+    stopReason: 'error',
+    failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
+  };
+  const slice = (id: number, difficulty: 'easy' | 'medium', depends: number[] = []) => ({
+    id,
+    title: `Part ${id}`,
+    brief: `Do part ${id}.`,
+    files: [],
+    depends,
+    difficulty,
+    readOnly: false,
+  });
+  const planned = (slices: object[]): ChatScriptStep[] => [
+    reply(
+      `\`\`\`json plan\n${JSON.stringify({ planId: 'p1', goal: 'Split it.', slices })}\n\`\`\``,
+    ),
+  ];
+  const rows = [
+    {
+      name: 'two families at once, a shared family waits, a dependency starts from merged work',
+      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'medium'), slice(4, 'easy', [1])],
+      openai: [[park, write('a.txt', 'one\n'), reply('Built 1.')], [write('c.txt', 'three\n')]],
+      local: [[write('b.txt', 'two\n')], [write('d.txt', 'four\n')]],
+      line: 'Crew finished: 4 slices, 0 reviews, 0 fixes.',
+      card: ['finished', 'done', 'done', 'done', 'done'],
+      files: { 'a.txt': 'one\n', 'b.txt': 'two\n', 'c.txt': 'three\n', 'd.txt': 'four\n' },
+    },
+    {
+      name: 'a conflict blocks the slice and the orchestrator merges it in one turn',
+      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      openai: [[write('net.mjs', 'one\n')], [write('net.mjs', 'one\ntwo\n'), reply('Merged.')]],
+      local: [[write('net.mjs', 'two\n')]],
+      line: 'Crew finished: 2 slices, 0 reviews, 1 fix.',
+      card: ['finished', 'done', 'done'],
+      files: { 'net.mjs': 'one\ntwo\n' },
+      conflict: true,
+    },
+    {
+      name: 'a conflict the orchestrator cannot resolve stops the plan with the slice blocked',
+      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      openai: [[write('net.mjs', 'one\n')], [failed]],
+      local: [[write('net.mjs', 'two\n')]],
+      line: 'Plan stopped: the orchestrator could not resolve slice 2.',
+      card: ['stopped', 'done', 'blocked'],
+      files: { 'net.mjs': 'one\n' },
+      conflict: true,
+    },
+    {
+      name: 'stop ends every running slice and keeps the finished one',
+      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'easy', [2])],
+      openai: [[write('a.txt', 'one\n')]],
+      local: [[{ kind: 'wait' } as const]],
+      line: 'Plan stopped: you cancelled it.',
+      card: ['stopped', 'done', 'not-run', 'not-run'],
+      files: { 'a.txt': 'one\n' },
+      stop: true,
+    },
+  ];
+  for (const row of rows) {
+    const now = createTestClock().now();
+    const scripted = (family: ChatFamily, turns: ChatScriptStep[][]) =>
+      createScriptedChatAdapter({ family, turns });
+    const openai = scripted('openai', [planned(row.slices), ...row.openai]);
+    const local = scripted('local', row.local);
+    // What each slice's copy held when its turn started.
+    const held: Record<string, boolean> = {};
+    const watch = (adapter: typeof openai) => ({
+      ...adapter,
+      startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+        held[request.turnId] = existsSync(join(request.scratch.directory, 'a.txt'));
+        return adapter.startTurn(request, emit);
+      },
+    });
+    const families = [familyEntry('openai', 10, null, now), familyEntry('local', 90, null, now)];
+    const thread = standalone(t, {
+      adapters: new Map([
+        ['openai', watch(openai)],
+        ['local', watch(local)],
+      ]),
+      catalog: () => ({ families }),
+      localContext: () => 32_768,
+      localSliceFits: () => true,
+    });
+    const { store, service, taskId } = thread;
+    const crew: ChatCrew = {
+      name: 'Plan crew',
+      members: [
+        { role: 'builder', selection: pick('openai') },
+        { role: 'orchestrator', selection: pick('openai') },
+      ],
+    };
+    store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+    const cards: ChatThread[] = [];
+    store.subscribe((event) => {
+      if (event.type === 'chat.thread' && (event.payload as ChatThread).plan)
+        cards.push(event.payload as ChatThread);
+    });
+    const ended = next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        /^(Crew finished|Plan stopped)/.test((event.payload as { text: string }).text),
+    );
+    const parked = next(
+      thread,
+      (event) => event.type === 'agent.event' && event.payload.type === 'permission.requested',
+    );
+    const merging = next(
+      thread,
+      (event) =>
+        event.type === 'chat.thread' &&
+        (event.payload as ChatThread).plan?.slices[1]?.lane?.step === 'merge',
+    );
+    const first = next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        (event.payload as { text: string }).text.startsWith('Slice 1 finished'),
+    );
+    thread.send('Split the work.', pick('openai'));
+    if (row.name.startsWith('two families')) {
+      await parked;
+      // Slice 2 ran and finished while slice 1 still waits on its question. It merges after slice
+      // 1, in plan order. Slice 3 waits for OpenAI, and slice 4 for slice 1.
+      const shown = ((await merging).payload as ChatThread).plan;
+      assert.deepEqual(
+        shown?.slices.map((value) => [value.status, value.lane?.step ?? null]),
+        [
+          ['running', 'build'],
+          ['running', 'merge'],
+          ['queued', null],
+          ['queued', null],
+        ],
+        row.name,
+      );
+      const open = thread.read().turns.find((turn) => turn.slice === 1);
+      assert.equal(
+        act(store, (effects) =>
+          service.resolvePermission(
+            { taskId, turnId: open?.id as string, requestId: 'park', choice: 'allow-once' },
+            effects,
+          ),
+        ).outcome,
+        'applied',
+        row.name,
+      );
+    }
+    if ('stop' in row) {
+      await first;
+      assert.equal(
+        act(store, (effects) => service.cancelPlan({ taskId, planId: 'p1' }, effects)).outcome,
+        'applied',
+        row.name,
+      );
+    }
+    await ended;
+    if ('stop' in row) await settles(thread);
+    const read = thread.read();
+    const lines = read.messages.map((message) => message.text);
+    assert.equal(lines.at(-1), row.line, row.name);
+    const card = read.thread.plan;
+    assert.deepEqual(
+      card ? [card.phase, ...card.slices.map((value) => value.status)] : null,
+      row.card,
+      row.name,
+    );
+    const scratch = join(dirname(thread.root), 'chat', taskId, 'scratch');
+    for (const [path, content] of Object.entries(row.files))
+      assert.equal(readFileSync(join(scratch, path), 'utf8'), content, `${row.name}: ${path}`);
+    // Every slice turn worked in its own copy, never in the thread's or another slice's.
+    const requests = [...openai.requests, ...local.requests];
+    const copies = requests.flatMap((request) => {
+      const turn = read.turns.find((value) => value.id === request.turnId);
+      return turn?.slice !== undefined && turn.role === 'assistant'
+        ? [[turn.slice, request.scratch.directory] as const]
+        : [];
+    });
+    assert.equal(new Set(copies.map(([, directory]) => directory)).size, copies.length, row.name);
+    for (const [id, directory] of copies) {
+      assert.notEqual(directory, scratch, row.name);
+      assert.ok(directory.endsWith(join('slices', String(id), 'copy')), row.name);
+    }
+    if (row.name.startsWith('two families')) {
+      // Slices start in one turn per family. Slice 4 started from slice 1's merged work.
+      assert.deepEqual(
+        read.turns.map((turn) => [turn.selection.family, turn.slice ?? null]),
+        [
+          ['openai', null],
+          ['openai', 1],
+          ['local', 2],
+          ['openai', 3],
+          ['local', 4],
+        ],
+        row.name,
+      );
+      const fourth = read.turns.find((turn) => turn.slice === 4);
+      assert.equal(held[fourth?.id ?? ''], true, row.name);
+      const finished = lines.filter((line) => /^Slice \d finished/.test(line));
+      assert.deepEqual(
+        finished,
+        [1, 2, 3, 4].map((id) => `Slice ${id} finished: 1 file merged.`),
+        row.name,
+      );
+      assert.ok(lines.includes('Slice 2 started on Local (local-model).'), row.name);
+    }
+    if ('conflict' in row) {
+      const blocked = cards.find((value) => value.plan?.slices[1]?.status === 'blocked')?.plan;
+      assert.deepEqual(blocked?.slices[1]?.conflicts, ['net.mjs'], row.name);
+      assert.ok(
+        lines.includes(
+          'Slice 2 blocked: 1 file conflicts with the thread copy: net.mjs. The orchestrator gets one turn to resolve it.',
+        ),
+        row.name,
+      );
+      // The orchestrator's model resolves in the thread copy, with the slice's version quoted.
+      const resolve = openai.requests.at(-1);
+      assert.equal(resolve?.role, 'fixer', row.name);
+      assert.equal(resolve?.scratch.directory, scratch, row.name);
+      assert.match(resolve?.prompt ?? '', /^net\.mjs, as the slice left it:\n\n```\ntwo\n```$/m);
+    }
+    if ('stop' in row) {
+      const stopped = read.turns.find((turn) => turn.slice === 2);
+      assert.equal(stopped?.state, 'stopped', row.name);
+    }
+  }
+});
+
+// Startup recovery stops a plan whose slice was mid-review with one plain line.
+test('a restart during a plan shows the plan stopped with a line', {
+  timeout: 30000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const plan = {
+    planId: 'p1',
+    goal: 'One part.',
+    slices: [
+      {
+        id: 1,
+        title: 'Part 1',
+        brief: 'Do it.',
+        files: [],
+        depends: [],
+        difficulty: 'medium',
+        readOnly: false,
+      },
+    ],
+  };
+  const now = createTestClock().now();
+  const families = [familyEntry('openai', 10, null, now), familyEntry('anthropic', 50, null, now)];
+  const { store, service, taskId, start, send, read } = standalone(t, {
+    adapters: new Map([
+      [
+        'openai',
+        createScriptedChatAdapter({
+          family: 'openai',
+          turns: [
+            [
+              {
+                kind: 'text',
+                itemId: 'r',
+                chunks: [`\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``],
+              },
+            ],
+            [{ kind: 'text', itemId: 'r', chunks: ['Built.'] }],
+          ],
+        }),
+      ],
+      [
+        'anthropic',
+        createScriptedChatAdapter({ family: 'anthropic', turns: [[{ kind: 'wait' }]] }),
+      ],
+    ]),
+    catalog: () => ({ families }),
+  });
+  const crew: ChatCrew = {
+    name: 'Plan crew',
+    members: [
+      { role: 'builder', selection: pick('openai') },
+      { role: 'reviewer', selection: pick('anthropic') },
+      { role: 'orchestrator', selection: pick('openai') },
+    ],
+  };
+  store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+  const reviewing = next(
+    { store },
+    (event) =>
+      event.type === 'chat.turn' &&
+      (event.payload as ChatTurn).role === 'reviewer' &&
+      (event.payload as ChatTurn).state === 'running',
+  );
+  send('Do the part.', pick('openai'));
+  await reviewing;
+  t.after(() => service.close());
+
+  const restarted = start();
+  restarted.recover();
+  const after = read(restarted);
+  assert.equal(after.messages.at(-1)?.text, 'Plan stopped: restarted.');
+  assert.deepEqual(
+    after.thread.plan && [
+      after.thread.plan.phase,
+      ...after.thread.plan.slices.map((s) => s.status),
+    ],
+    ['stopped', 'not-run'],
+  );
+  assert.equal(after.turns.at(-1)?.state, 'failed');
 });
 
 // Each row parks a turn on one ask. Balanced answers safe asks at ask time. A policy changed
