@@ -28,6 +28,7 @@ import {
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
@@ -61,6 +62,8 @@ export type OpenAiChatDeps = Readonly<{
   spawn?: Spawn;
   /** Tests run the wait after Stop by hand. */
   schedule?: Schedule;
+  /** The thread tools server for this turn, with its own token. Null runs the turn without. */
+  threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }>;
 
 export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
@@ -209,7 +212,6 @@ const QUIET = new Set([
   'item/commandExecution/terminalInteraction',
   'account/updated',
   'remoteControl/status/changed',
-  'mcpServer/startupStatus/updated',
   'skills/changed',
 ]);
 const LIMIT_TEXT = /\busage limit/i;
@@ -298,6 +300,17 @@ const changeItem = z.object({
   ),
 });
 const mcpItem = z.object({ server: maybe(z.string()), tool: maybe(z.string()) });
+// config/read flattens unknown keys into the config object, mcp_servers among them. The override
+// parser splits keys on dots, so a name it cannot hold safely is not read.
+const mcpNames = z.object({
+  config: z.object({
+    mcp_servers: z
+      .record(z.string().regex(/^[A-Za-z0-9_-]{1,200}$/), z.unknown())
+      .optional()
+      .refine((servers) => Object.keys(servers ?? {}).length <= 128),
+  }),
+});
+const mcpStatus = z.object({ name: z.string(), status: z.string() });
 const searchItem = z.object({ query: maybe(z.string()) });
 const toolEnd = z.object({
   status: maybe(z.string()),
@@ -374,6 +387,9 @@ class OpenAiChatTurn {
   private nextId = 1;
   private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
   private threadId: string | null = null;
+  private readonly threadTools: ThreadToolsServer | null;
+  // Thread config for the tools: our one server, and every other configured server off.
+  private mcpConfig: Record<string, unknown> | null = null;
   private threadEffort: z.output<typeof threadReply>['reasoningEffort'];
   private turnId: string | null = null;
   // A terminal error notice. The failure is built when the turn ends, so a rate-limit update
@@ -419,6 +435,7 @@ class OpenAiChatTurn {
     this.emit = emit;
     this.schedule = deps.schedule ?? defaultSchedule;
     this.reportUsage = openAiUsageReporter(deps.onUsage);
+    this.threadTools = deps.threadTools?.(request) ?? null;
     this.trace = frameTrace(request.now ?? Date.now, TRACE_LIMITS);
     let finish: (result: ChatTurnResult) => void = () => {};
     const result = new Promise<ChatTurnResult>((resolve) => {
@@ -572,13 +589,50 @@ class OpenAiChatTurn {
                     }),
                   );
               }
-              if (this.media.length) this.listModels(null, 1);
-              else this.openThread();
+              this.readMcpServers();
             },
           );
         });
       },
     );
+  }
+
+  /**
+   * The thread tools go on the thread's config. That config merges into the person's own, so a
+   * server they configured would still load. config/read names every configured server for the
+   * scratch copy, and each one goes off for this thread. A client that does not answer runs the
+   * turn without the tools and with its servers as they were.
+   */
+  private readMcpServers() {
+    const next = () => (this.media.length ? this.listModels(null, 1) : this.openThread());
+    const tools = this.threadTools;
+    if (!tools) return next();
+    const params = { includeLayers: false, cwd: this.request.scratch.directory };
+    this.call('config/read', params, (reply) => {
+      const read = 'result' in reply ? mcpNames.safeParse(reply.result) : null;
+      if (!read?.success) {
+        this.notice(
+          'warning',
+          'Codex did not list its MCP servers, so this turn runs without the thread tools.',
+          true,
+        );
+        return next();
+      }
+      const others = Object.keys(read.data.config.mcp_servers ?? {}).filter(
+        (name) => name !== tools.name,
+      );
+      this.mcpConfig = {
+        ...Object.fromEntries(others.map((name) => [`mcp_servers.${name}.enabled`, false])),
+        [`mcp_servers.${tools.name}`]: {
+          command: tools.command,
+          args: tools.args,
+          enabled: true,
+          // The tools only read, so a call never needs the person.
+          default_tools_approval_mode: 'approve',
+        },
+      };
+      next();
+    });
   }
 
   /**
@@ -652,6 +706,7 @@ class OpenAiChatTurn {
       approvalsReviewer: 'user',
       sandbox: sandboxMode(this.request),
       serviceTier: 'default',
+      ...(this.mcpConfig ? { config: this.mcpConfig } : {}),
     };
     const start = (history: boolean) =>
       this.call('thread/start', { ...settings, ephemeral: false }, (reply) => {
@@ -976,6 +1031,12 @@ class OpenAiChatTurn {
             this.providerFailure('stream', null, this.terminal ?? turn?.error ?? null),
           );
         return this.end({ stopReason: 'done', failure: null });
+      }
+      case 'mcpServer/startupStatus/updated': {
+        const value = mcpStatus.safeParse(params).data;
+        if (value?.name === this.threadTools?.name && value?.status === 'failed')
+          this.notice('warning', 'The thread tools did not start for this turn.', true);
+        return;
       }
       default:
         if (!QUIET.has(method)) this.unknown(method);

@@ -18,6 +18,7 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import type { Schedule } from '../../host/worker.ts';
 import {
@@ -579,6 +580,8 @@ export function googleChatAdapter(deps: {
   launch: (request: ChatTurnRequest) => GoogleChatLaunch;
   /** Called with what each initialize declared, so the catalog can say which files go native. */
   onPromptCapabilities?: (capabilities: GooglePromptCapabilities) => void;
+  /** The thread tools server for this turn, with its own token. Null runs the turn without. */
+  threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }): ChatAdapter {
   return {
     family: 'google',
@@ -1139,6 +1142,12 @@ export function googleChatAdapter(deps: {
             deps.onPromptCapabilities?.(capabilities);
           } catch {}
           stage = 'session';
+          // ACP takes the session's servers on session/new and session/load. The thread tools are
+          // the only one, and the agent starts it in the session's own process.
+          const tools = deps.threadTools?.(request) ?? null;
+          const mcpServers = tools
+            ? [{ name: tools.name, command: tools.command, args: [...tools.args], env: [] }]
+            : [];
           let resumed = false;
           if (prior && handshake.agentCapabilities?.loadSession && !cancelled) {
             phase = 'replay';
@@ -1148,7 +1157,7 @@ export function googleChatAdapter(deps: {
               await live.request('session/load', {
                 sessionId: prior.sessionId,
                 cwd: scratch,
-                mcpServers: [],
+                mcpServers,
               });
               resumed = true;
             } catch (error) {
@@ -1161,7 +1170,7 @@ export function googleChatAdapter(deps: {
           if (!resumed && !cancelled) {
             phase = 'setup';
             sessionId = newSession.parse(
-              await live.request('session/new', { cwd: scratch, mcpServers: [] }),
+              await live.request('session/new', { cwd: scratch, mcpServers }),
             ).sessionId;
           }
           const id = sessionId;

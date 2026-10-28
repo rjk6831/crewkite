@@ -3,8 +3,9 @@
 // CrewKite writes, one JSON-RPC line each:
 //   initialize                 {protocolVersion:1, clientCapabilities:{fs:{readTextFile:false,
 //                              writeTextFile:false}, terminal:false}, clientInfo:{name, version}}
-//   session/new                {cwd:<scratch>, mcpServers:[]}
-//   session/load               {sessionId, cwd:<scratch>, mcpServers:[]}
+//   session/new                {cwd:<scratch>, mcpServers:[]}, or with the thread tools
+//                              [{name:"crewkite", command:<node>, args:[...], env:[]}]
+//   session/load               {sessionId, cwd:<scratch>, mcpServers:<the same>}
 //   session/set_config_option  {sessionId, configId, value}, once for the model, once for the mode
 //   session/prompt             {sessionId, prompt:[{type:'text', text}, ...one block per file]},
 //                              each file as {type:'image'|'audio', data, mimeType},
@@ -40,6 +41,8 @@ import { type AgentEvent, AgentEventSchema } from '@crewkite/contracts';
 import type { AcpChatPeerCase } from '../../../../../packages/testkit/src/providers/acp-peer.ts';
 import type { ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
 import { byteSize } from '../../chat/prompt.ts';
+import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
+import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import type { AcpLifecycle, AcpSpawn } from './acp/client.ts';
@@ -140,6 +143,7 @@ async function run(
   f: Rig,
   req: ChatTurnRequest,
   react: (event: AgentEvent, handle: ChatTurnHandle) => void = () => {},
+  threadTools?: Parameters<typeof googleChatAdapter>[0]['threadTools'],
 ) {
   const events: AgentEvent[] = [];
   const frames: Frame[] = [];
@@ -155,6 +159,7 @@ async function run(
   };
   const capabilities: GooglePromptCapabilities[] = [];
   const adapter = googleChatAdapter({
+    threadTools,
     onPromptCapabilities: (value) => capabilities.push(value),
     launch: () => ({
       client: f.client,
@@ -363,6 +368,31 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       'You are working in a scratch copy of demo.\n\nEarlier in this conversation:\n\nUser: earlier question\n\nAssistant: earlier answer\n\nWhat does this project do?',
     );
     assert.equal(lost.result.stopReason, 'done');
+
+    // With the thread tools, session/new and session/load each carry the one server, read-only
+    // turns included, and each turn has its own token.
+    const broker = new ThreadToolsBroker({ home: f.home });
+    const threadTools = (turn: ChatTurnRequest) =>
+      broker.mint({ ...turn, reader: fixtureReader() });
+    const rows = [
+      { method: 'session/new', patch: {} },
+      { method: 'session/load', patch: { session: first.result.session, readOnly: true } },
+    ];
+    const tokens = [];
+    for (const row of rows) {
+      const turn = await run(f, request(f, row.patch), () => {}, threadTools);
+      const [opened] = withMethod(turn.frames, row.method);
+      const servers = opened.params?.mcpServers as Array<{ name: string; args: string[] }>;
+      assert.equal(servers.length, 1);
+      assert.deepEqual(servers[0], {
+        name: 'crewkite',
+        command: process.execPath,
+        args: servers[0].args,
+        env: [],
+      });
+      tokens.push(servers[0].args[servers[0].args.indexOf('--token') + 1]);
+    }
+    assert.equal(new Set(tokens).size, rows.length);
   } finally {
     f.dispose();
     g.dispose();
