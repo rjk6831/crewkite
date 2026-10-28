@@ -196,3 +196,14 @@ Six claims cover the interactive CLI and its scripting path. Each runs a real co
 - The interactive app preselects the project from `INIT_CWD`, offers the saved policy and keeps ask when the person declines, keeps a digit as text until Tab gives the request focus, answers it with a digit, asks before Ctrl+C leaves a running reply, stops it with Escape and leaves on the next Ctrl+C.
 
 These tests establish the CLI's own wiring. The controller's permission, acceptance and push rules keep their existing claims, and the CLI test adds none of its own.
+
+## Parallel plan slices
+
+Three test functions cover the parallel rules of the ADR 0045 amendment. Each runs at the lowest layer that can see it, with scripted adapters, a synthetic repository and real SQLite.
+
+- The ready table in the plan tests is pure. It checks that independent slices on two families start together, that two ready slices on one family start one at a time in plan order, that a family busy in another thread holds its slice back, that a slice waits until every dependency is done and that nothing starts while a slice is blocked.
+- The lane rows in the service tests run a real plan in Glide on two scripted families. In the first row, slice 1 parks on a question while slice 2 runs and finishes on the other family, which proves two slice turns were open at once. Slice 2 then waits to merge until slice 1 has, slice 3 waits for its family, and slice 4 starts from a copy that already holds slice 1's merged file. Every slice turn worked in its own copy, never the thread's, and the thread copy ends with all four files. The conflict rows have two slices change one file. The second one is blocked with the path on the card and a line, and the orchestrator's model gets one turn in the thread copy with the slice's version quoted. When that turn writes the merge, the plan finishes. When it fails, the plan stops with the slice blocked. The stop row cancels the plan while one slice runs: that slice's turn ends stopped, the merged slice keeps its file and the rest show not run.
+- The restart test stops the controller while a slice's review runs. A second service on the same store fails the open turn and writes "Plan stopped: restarted." with the slice not run.
+
+The renderer's plan card table adds a blocked row that can run again and a row that lists what it waits on and its conflicts. None of this covers a live provider, a real merge of two models' edits, or the time a real copy takes on a large repository.
+
