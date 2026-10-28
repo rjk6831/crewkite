@@ -12,7 +12,8 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import { runTool, type ThreadReader } from './local-tools.ts';
+import { runTool } from './local-tools.ts';
+import type { ThreadReads } from './thread-reader.ts';
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'local-tools-'));
@@ -138,7 +139,7 @@ test('thread tools read through the reader, are cut to the Local room and fail w
   try {
     const long = 'x'.repeat(5000);
     const seen: unknown[] = [];
-    const threads: ThreadReader = {
+    const threads: ThreadReads = {
       turns: (args) => {
         seen.push(args);
         return {

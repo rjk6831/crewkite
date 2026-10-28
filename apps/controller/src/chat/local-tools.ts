@@ -29,6 +29,7 @@ import {
 } from '@crewkite/contracts';
 import { z } from 'zod';
 import { groupAbsent } from '../host/worker.ts';
+import type { ThreadReads } from './thread-reader.ts';
 
 // The tools CrewKite runs itself for a model that has no agent loop of its own. Every result is
 // bounded so a small context window survives a few calls, and the model is told the bounds.
@@ -49,28 +50,13 @@ const KILL_MS = 1000;
 
 type FileDiff = z.output<typeof ChatFileDiffSchema>;
 
-type Reading<T> = T | Promise<T>;
-/**
- * Read-only access to the current thread, the same five reads the cloud clients get through the
- * controller's MCP server. The controller supplies one per turn, already scoped to that thread
- * and with secrets redacted. Local never reaches the thread store any other way.
- */
-export interface ThreadReader {
-  turns(
-    args: z.output<typeof ThreadTurnsArgsSchema>,
-  ): Reading<z.output<typeof ThreadTurnsResultSchema>>;
-  turn(
-    args: z.output<typeof ThreadTurnArgsSchema>,
-  ): Reading<z.output<typeof ThreadTurnResultSchema>>;
-  diff(
-    args: z.output<typeof ThreadDiffArgsSchema>,
-  ): Reading<z.output<typeof ThreadDiffResultSchema>>;
-  checks(): Reading<z.output<typeof ThreadChecksResultSchema>>;
-  live(): Reading<z.output<typeof ThreadLiveResultSchema>>;
-}
 export type ToolContext = Readonly<{
-  /** Present when this turn can read its thread. The thread tools fail without it. */
-  threads?: ThreadReader;
+  /**
+   * Present when this turn can read its thread. The controller supplies the thread reader per
+   * turn, scoped to that thread and redacted, and Local reaches the thread store no other way.
+   * The thread tools fail without it.
+   */
+  threads?: ThreadReads;
   /** Most bytes a thread tool result may take, sized from the room the Local prompt has left. */
   threadBytes?: number;
   scratch: string;
@@ -664,7 +650,7 @@ const cutToRoom = (text: string, bytes: number) =>
 const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim();
 
 /** One thread read as compact text. Each result is checked against its contract first. */
-async function readThread(name: string, args: Record<string, unknown>, threads: ThreadReader) {
+async function readThread(name: string, args: Record<string, unknown>, threads: ThreadReads) {
   switch (name) {
     case 'thread_turns': {
       const { turns } = ThreadTurnsResultSchema.parse(

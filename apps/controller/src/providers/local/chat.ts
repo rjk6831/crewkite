@@ -51,10 +51,10 @@ import {
   readScratchFile,
   SEARCH_HITS,
   THREAD_TOOLS,
-  type ThreadReader,
 } from '../../chat/local-tools.ts';
 import { attachedLine, attachedSection, byteSize } from '../../chat/prompt.ts';
 import { cachedRepoMap } from '../../chat/repo-map.ts';
+import type { ThreadReads } from '../../chat/thread-reader.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { localPromptRoom } from './budget.ts';
 
@@ -693,7 +693,7 @@ export function localChatAdapter(deps: {
    * The thread reads for one turn, scoped to that turn's thread. The controller supplies it.
    * Without it, or when it answers null, the turn offers no thread tool.
    */
-  threadReader?: (request: ChatTurnRequest) => ThreadReader | null;
+  threadReader?: (request: ChatTurnRequest) => ThreadReads | null;
 }): ChatAdapter {
   return {
     family: 'local',
@@ -706,7 +706,7 @@ function startLocalTurn(
   connect: LocalConnect,
   request: ChatTurnRequest,
   emit: (event: AgentEvent) => void,
-  threads: ThreadReader | null,
+  threads: ThreadReads | null,
 ): ChatTurnHandle {
   const now = request.now ?? Date.now;
   const began = now();
