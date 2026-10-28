@@ -7,6 +7,7 @@ import type { ChatFamily } from '@crewkite/contracts';
 import {
   attachedLine,
   attachedSection,
+  deltaPacket,
   type EarlierFile,
   earlierReach,
   handoffPacket,
@@ -15,6 +16,7 @@ import {
   systemContext,
   THREAD_TOOLS_LINE,
   withAttachments,
+  withoutThreadToolsLine,
 } from './prompt.ts';
 
 const [shared, anthropic, google] = instructionFiles;
@@ -82,6 +84,7 @@ test('a request holds the new message once and lists each file once, in the sect
           files: [],
           prompt: message,
           earlier: files,
+          threadTools: true,
         })
       : message;
     return [text, attachedSection(own)].filter(Boolean).join('\n\n');
@@ -165,9 +168,39 @@ test('a request holds the new message once and lists each file once, in the sect
     files: [],
     prompt: '',
     earlier: [{ attachment: old, came: '', reach: earlierReach('google', '/x') }],
+    threadTools: true,
   });
   assert.match(packet, /^Person:\n\(Files only: fresh\.pdf\)$/m);
   assert.equal(packet.split(`\n${THREAD_TOOLS_LINE}\n`).length, 2);
+  // A turn without thread tools is not told it has them, in either packet, and a late discovery
+  // takes the line out of a packet that carried it.
+  const bare = {
+    from: 'openai',
+    to: 'google',
+    reason: 'manual',
+    history: [],
+    files: [],
+    prompt: '',
+    threadTools: false,
+  } as const;
+  const delta = {
+    from: null,
+    to: 'google',
+    reason: null,
+    turns: [],
+    changes: [],
+    checks: [],
+    earlier: [],
+    prompt: '',
+  } as const;
+  for (const [text, fixed] of [
+    [handoffPacket(bare), handoffPacket({ ...bare, threadTools: true })],
+    [deltaPacket({ ...delta, threadTools: false }), deltaPacket({ ...delta, threadTools: true })],
+  ]) {
+    assert.doesNotMatch(text, /Thread tools are available/);
+    assert.equal(fixed.split(`\n${THREAD_TOOLS_LINE}\n`).length, 2);
+    assert.equal(withoutThreadToolsLine(fixed), text);
+  }
   assert.match(packet, /old\.png, .*came with a message with no text, sent as a file link below$/m);
   assert.match(
     packet,

@@ -42,6 +42,7 @@ import {
   MAX_CHAT_TURN_EVENTS_BYTES,
   type Project,
   rankFamilies,
+  scrubSecrets,
   type Task,
   TaskSchema,
   writesScratch,
@@ -100,6 +101,7 @@ import {
   readChatBranchStatus,
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
+import type { McpRegistry } from './mcp-servers.ts';
 import type { PlanInputs } from './plan.ts';
 import { PlanRunner, sentMessage } from './plan-runner.ts';
 import {
@@ -123,6 +125,7 @@ import {
   withAttachments,
 } from './prompt.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
+import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
 
 export type ChatServiceDeps = {
   store: Store;
@@ -161,8 +164,13 @@ export type ChatServiceDeps = {
    * when settling fails, so what the turn was lent (its thread tools token) ends with it.
    */
   onTurnEnded?: (turnId: string) => void;
-  /** True when the thread tools socket failed to open, so cloud turns run without the tools. */
+  /**
+   * True when the thread tools server cannot be minted, because the socket failed to open or is
+   * not open yet. A cloud turn then runs without the tools, and its packet does not name them.
+   */
   threadToolsDown?: () => boolean;
+  /** The person's own MCP servers, supplied by the desktop. Absent means none. */
+  mcp?: McpRegistry;
   /** Process table access and timers. Tests replace them; the defaults are the real ones. */
   groupAbsent?: (group: number) => boolean;
   signalGroup?: (group: number, signal: NodeJS.Signals) => void;
@@ -227,6 +235,8 @@ type LiveTurn = {
   calls: Map<string, { title: string; input: unknown }>;
   /** The policy the adapter launched with. It answers what that policy covers on its own. */
   policy: ChatPermissionPolicy;
+  /** This turn started the person's MCP servers. A policy change mid-turn never answers their calls. */
+  mcp: boolean;
   /** Send now stopped this turn. Its queued message starts next with the stopped turn's packet. */
   steered: boolean;
   noticed: boolean;
@@ -1275,6 +1285,7 @@ export class ChatService {
       kinds: new Map(),
       calls: new Map(),
       policy: 'ask',
+      mcp: false,
       steered: false,
       noticed: false,
       started: false,
@@ -1352,6 +1363,7 @@ export class ChatService {
     if (this.closed || live.stopRequested) return stoppedResult;
     const request = this.request(turn);
     live.policy = request.permissionPolicy;
+    live.mcp = (request.mcp?.servers.length ?? 0) > 0;
     // The first turn copies the project, which takes time. Stop may have arrived meanwhile.
     if (this.closed || live.stopRequested) return stoppedResult;
     this.record(turn, live, {
@@ -1362,9 +1374,20 @@ export class ChatService {
       effort: turn.selection.effort,
       role: turn.role,
     });
-    if (turn.selection.family !== 'local' && this.deps.threadToolsDown?.())
-      this.toolsDown(turn, live);
-    live.handle = adapter.startTurn(request, (event) => this.record(turn, live, event));
+    if (request.threadTools === false) this.toolsDown(turn, live);
+    for (const message of request.mcp?.notes ?? [])
+      this.record(turn, live, {
+        type: 'provider.notice',
+        turnId: turn.id,
+        level: 'info',
+        message,
+        trace: true,
+      });
+    // A secret of a server this turn started never reaches the thread, the trace or a prompt card.
+    const secrets = request.mcp?.secrets ?? [];
+    live.handle = adapter.startTurn(request, (event) =>
+      this.record(turn, live, scrubSecrets(event, secrets)),
+    );
     try {
       this.deps.store.transaction(() => this.saveGroups(turn.id, live));
     } catch {
@@ -1384,7 +1407,7 @@ export class ChatService {
         this.appendEntry(this.task(turn.taskId) as Task, {
           kind: 'chat-system',
           author: { kind: 'system', turnId: turn.id },
-          text: 'Thread tools are unavailable: the controller could not open its socket. This turn runs without them.',
+          text: 'Thread tools are unavailable: the controller has no socket open for them. This turn runs without them.',
         }),
       );
     } catch {
@@ -1394,8 +1417,7 @@ export class ChatService {
       type: 'provider.notice',
       turnId: turn.id,
       level: 'info',
-      message:
-        'Thread tools absent for this turn: thread_turns, thread_turn, thread_diff, thread_checks and thread_live.',
+      message: THREAD_TOOLS_ABSENT,
       trace: true,
     });
   }
@@ -1437,6 +1459,9 @@ export class ChatService {
     const asked = turn.role === 'ask';
     let carries = !!turn.handoffFrom || rerun || asked;
     const family = turn.selection.family;
+    // One answer per turn. The packet, the client's MCP config and the notice all follow it.
+    // Local reads the thread through functions, and its adapter drops the line when it has no reader.
+    const threadTools = family === 'local' || !this.deps.threadToolsDown?.();
     const pending = turn.handoffFrom ? this.pendingHandoff(task.id) : null;
     let reason: HandoffReason = pending?.reason ?? (asked ? 'ask' : rerun ? 'rerun' : 'manual');
     // A native session holds one model, so another model of the family starts a new session.
@@ -1471,6 +1496,7 @@ export class ChatService {
             thread.base,
             prompt,
             turn.handoffFrom ? reason : null,
+            threadTools,
           )
         : null;
     if (delta === 'over') {
@@ -1502,6 +1528,8 @@ export class ChatService {
     // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
     // the thread allows.
     const balanced = writer && thread.flightMode === 'balanced';
+    const permissionPolicy = writer && !balanced ? thread.permissionPolicy : 'ask';
+    const permissionGrants = writer && !balanced ? (thread.permissionGrants ?? []) : [];
     return {
       turnId: turn.id,
       taskId: task.id,
@@ -1516,9 +1544,11 @@ export class ChatService {
             history,
             prompt,
             files,
+            threadTools,
           })
         : (caught?.prompt ?? prompt),
       files,
+      threadTools,
       systemContext: this.context(turn, project.name, directory, root, thread, history),
       // The packet carries the transcript, so a turn with a packet sends no separate history. With a
       // delta, the history stops where the delta starts, for an adapter that has to start over.
@@ -1526,10 +1556,19 @@ export class ChatService {
       session,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
-      permissionPolicy: writer && !balanced ? thread.permissionPolicy : 'ask',
+      permissionPolicy,
       // A reviewer or advisor reads only, so what the thread allowed does not reach it.
-      permissionGrants: writer && !balanced ? (thread.permissionGrants ?? []) : [],
+      permissionGrants,
       readOnly: !writer,
+      // Decided with the thread tools above: the person's servers a turn starts follow this turn's
+      // family and this policy, and never exceed it.
+      mcp: this.deps.mcp?.compose({
+        family,
+        taskId: task.id,
+        permissionPolicy,
+        permissionGrants,
+        readOnly: !writer,
+      }),
       deadlineMs: TURN_DEADLINE_MS,
       environment: this.deps.resolveEnvironment(turn.selection.family),
       now: () => Date.parse(this.deps.now()),
@@ -1676,6 +1715,9 @@ export class ChatService {
     if (!balanced && policy === live.policy) return null;
     const call = live.calls.get(open.callId ?? '');
     const kind = live.kinds.get(open.callId ?? '');
+    // A call the kinds do not name may be a server's. Its policy was cut at launch and a looser
+    // thread policy set since does not raise it.
+    if (live.mcp && (kind === undefined || kind === 'other')) return null;
     const words = `${open.question}\n${call?.title ?? ''}`;
     if (/\bnetwork\b/i.test(words)) return null;
     const scratch = this.scratchDirectory(live.taskId);
@@ -2451,6 +2493,7 @@ export class ChatService {
       history: readonly ChatHistoryEntry[];
       prompt: string;
       files: NonNullable<ChatTurnRequest['files']>;
+      threadTools: boolean;
     },
   ): string {
     const changes = this.scratchDiff(turn.taskId, input.root, input.base);
@@ -2464,6 +2507,7 @@ export class ChatService {
         history,
         files: [...changeList(changes), ...stopped, ...patches, ...checks],
         prompt: input.prompt,
+        threadTools: input.threadTools,
         instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
         earlier: input.files.flatMap((file) =>
           file.earlier
@@ -2648,6 +2692,7 @@ export class ChatService {
     base: string,
     prompt: string,
     reason: HandoffReason | null,
+    threadTools: boolean,
   ):
     | { prompt: string; files: NonNullable<ChatTurnRequest['files']>; history: ChatHistoryEntry[] }
     | 'over'
@@ -2727,6 +2772,7 @@ export class ChatService {
         earlier,
         prompt,
         clip,
+        threadTools,
       });
     for (const clip of [undefined, PACKET_ENTRY_CHARACTERS]) {
       const room = PACKET_BYTES - Buffer.byteLength(build(clip, []));

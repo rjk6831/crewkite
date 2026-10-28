@@ -61,6 +61,7 @@ import {
 } from './adapter.ts';
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
+import { McpRegistry } from './mcp-servers.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
 
@@ -506,29 +507,45 @@ test('a message sent during a turn waits and starts when the turn ends', {
   ];
   const users = (read: ChatThreadRead) => read.messages.filter((m) => m.author.kind === 'user');
   for (const row of cases) {
+    const scripted = createScriptedChatAdapter({
+      family: 'openai',
+      turns: [
+        [
+          { kind: 'permission', requestId: 'edit-1', question: 'Edit net.mjs?' },
+          { kind: 'text', itemId: 'reply', chunks: ['Done.'] },
+        ],
+        [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
+      ],
+    });
+    const mcp = new McpRegistry();
     const thread = standalone(t, {
       // The thread tools socket failed to open: every cloud turn says so and runs without them.
       threadToolsDown: () => true,
-      adapters: new Map([
-        [
-          'openai',
-          createScriptedChatAdapter({
-            family: 'openai',
-            turns: [
-              [
-                { kind: 'permission', requestId: 'edit-1', question: 'Edit net.mjs?' },
-                { kind: 'text', itemId: 'reply', chunks: ['Done.'] },
-              ],
-              [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
-            ],
-          }),
-        ],
-      ]),
+      mcp,
+      adapters: new Map([['openai', scripted]]),
     });
     const { store, service, taskId } = thread;
+    // The thread turned a server on. OpenAI cannot route its calls through the gate, so the
+    // controller leaves it out of the request and says so in the request's notes.
+    mcp.set({
+      servers: [
+        {
+          name: 'notes',
+          command: 'notes-server',
+          args: [],
+          secretArgs: [],
+          env: {},
+          readTools: [],
+        },
+      ],
+      threads: { [taskId]: { notes: 'all' } },
+    });
     const parked = turnReaches(thread, 'waiting-permission');
     thread.send(first);
     const { id: turnId } = await parked;
+    const sent = (scripted.requests as unknown as ChatTurnRequest[])[0]?.mcp;
+    assert.deepEqual(sent?.servers, []);
+    assert.match(sent?.notes[0] ?? '', /^MCP server notes is off for this turn\./);
     const refused = row.send
       .map((text) => thread.send(text))
       .flatMap((result) => (result.outcome === 'applied' ? [] : [[result.reason, result.next]]));
@@ -606,6 +623,23 @@ test('a message sent during a turn waits and starts when the turn ends', {
       ran,
       row.name,
     );
+
+    // A side question carries the thread packet. With no thread tools, the packet does not name
+    // them, and the turn carries the same answer for the client's config.
+    const asking = settles(thread);
+    const effects2: (() => void)[] = [];
+    store.transaction(() =>
+      service.ask(
+        { taskId, family: 'openai', model: selection.model, question: 'Which file?' },
+        effects2,
+      ),
+    );
+    for (const effect of effects2) effect();
+    await asking;
+    const side = (scripted.requests as unknown as ChatTurnRequest[]).at(-1);
+    assert.match(side?.prompt ?? '', /^This is a side question to OpenAI/, row.name);
+    assert.doesNotMatch(side?.prompt ?? '', /Thread tools are available/, row.name);
+    assert.equal(side?.threadTools, false, row.name);
   }
 
   // One running turn per family: a second thread's message on the same family waits in its own
@@ -979,6 +1013,8 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.equal(thread.thread.sessions[0]?.sessionId, `session-${thread.turns[2].id}`);
   const [request] = on.adapters.get('google')?.requests ?? [];
   assert.match(request.prompt, /moved from OpenAI to Google\. Reason: usage limit reached\./);
+  // This controller has its thread tools, so the packet names them.
+  assert.match(request.prompt, /^Thread tools are available: thread_turns,/m);
   assert.match(request.prompt, /New message from the person:\nFix the rounding\./);
   assert.match(request.prompt, /^net\.mjs \+1 -0$/m);
   assert.match(request.prompt, /^\+\/\/ half done$/m);

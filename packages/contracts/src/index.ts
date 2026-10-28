@@ -41,6 +41,7 @@ import {
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
+import { McpSupplySchema } from './mcp.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -2512,6 +2513,8 @@ export const CommandSchema = z.discriminatedUnion('command', [
   // revision, so no desktop or controller record of a command ever holds the value.
   read('SupplyLocalToken', z.strictObject({ token: LocalTokenSchema })),
   read('ReadLocalToken', empty),
+  // The person's MCP servers travel on this command only, and no receipt holds them.
+  read('SupplyMcpServers', McpSupplySchema),
   read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
   read(
     'GetTaskConversation',
@@ -3815,6 +3818,7 @@ export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export { canonicalJson } from './canonical.ts';
 export * from './chat.ts';
+export * from './mcp.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

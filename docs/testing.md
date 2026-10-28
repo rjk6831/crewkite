@@ -94,3 +94,24 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## Thread tools agreement and the control socket
+
+Two claims from the rc-05 follow-up. Each lives in an existing test.
+
+| Claim | Where |
+|-------|-------|
+| A turn without thread tools gets a packet that does not name them, a request the adapters read as no tools, and one notice | `chat/service.test.ts` queue row, `chat/prompt.test.ts`, the Anthropic config row |
+| A client with another temporary directory finds the socket through the home record, a squatted per-user folder makes the controller bind elsewhere and the client refuse an untrusted folder, a home reached through a link names the same socket, and a removed socket gives a restart message | `packages/client/src/output.test.ts` |
+| A turn whose thread tools source gives none loses the packet line, runs with an empty config and traces the notice | Anthropic config row |
+| A controller on a home 120 characters deep answers a client and a CLI command, and a socket file left by a crashed run does not block the start | `packages/client/src/output.test.ts`, `packages/client/src/client.test.ts`, `apps/cli/src/main.test.ts` |
+
+## The person's MCP servers
+
+Three claims from the thread MCP servers change. Each lives in a test.
+
+| Claim | Where |
+|-------|-------|
+| A server's policy never exceeds the thread's, a listed read runs unasked only under the reads policy, and a server's annotations or an unlisted name never widen it | `chat/mcp-servers.test.ts`, with a scripted stdio server in `chat/mcp-fixture-server.mjs` |
+| Each family gets the servers the thread turned on only where the controller's gate sees their calls: Anthropic in the one strict config, Google only while every call asks, OpenAI, Local and read only turns never | `chat/mcp-servers.test.ts`, the Anthropic config and permission rows, the queue row in `chat/service.test.ts` |
+| A stored secret is sealed on disk, never returned to the window, kept across an edit, refused without a keychain and removed from a turn's events | `apps/desktop/src/main/mcp-vault.test.ts`, `apps/desktop/src/main/grants.test.ts` |

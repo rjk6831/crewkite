@@ -31,8 +31,10 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
+import { anthropicMcpEntries, mcpToolAnswer } from '../../chat/mcp-servers.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
+import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
@@ -523,7 +525,7 @@ function chatArguments(
     // The config option takes several values, so the flag after it closes the list. Strict mode
     // goes on every turn: with no thread tools the config is empty and no other server loads.
     '--mcp-config',
-    JSON.stringify({ mcpServers: server ?? {} }),
+    JSON.stringify({ mcpServers: { ...(server ?? {}), ...anthropicMcpEntries(request.mcp) } }),
     '--strict-mcp-config',
     '--model',
     model,
@@ -544,7 +546,13 @@ export function anthropicChatAdapter(deps: {
   /** The thread tools server for this turn, with its own token. Null runs the turn without. */
   threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }): ChatAdapter {
-  return { family: 'anthropic', startTurn: (request, emit) => startTurn(deps, request, emit) };
+  return {
+    family: 'anthropic',
+    startTurn: (request, emit) => {
+      const turn = turnTools(deps.threadTools, request, emit);
+      return startTurn({ ...deps, threadTools: () => turn.server }, turn.request, emit);
+    },
+  };
 }
 
 function startTurn(
@@ -669,7 +677,7 @@ function startTurn(
       request,
       prior,
       message.folders,
-      deps.threadTools?.(request) ?? null,
+      request.threadTools === false ? null : (deps.threadTools?.(request) ?? null),
     );
     child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,
@@ -1076,15 +1084,25 @@ function startTurn(
       (kind !== 'edit' || inside) &&
       (allowed.has(toolName) ||
         (kind !== 'other' && request.permissionGrants?.includes(kind) === true));
+    // A tool of the person's own MCP server follows the policy the controller cut to the thread's
+    // ceiling. Allow-all and the kind grants say nothing about it, and a tool of any server this
+    // turn did not attach asks.
+    const mcp = mcpToolAnswer(request.mcp, toolName);
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
     // Edits land only in the scratch copy, so allow-all sends an edit outside it to the person.
     const automatic = request.readOnly
       ? 'deny'
-      : request.permissionPolicy === 'allow-all' && (kind !== 'edit' || inside)
-        ? 'allow-once'
-        : granted
-          ? 'allow-thread'
-          : null;
+      : mcp !== null
+        ? mcp === 'allow'
+          ? 'allow-once'
+          : allowed.has(toolName)
+            ? 'allow-thread'
+            : null
+        : request.permissionPolicy === 'allow-all' && (kind !== 'edit' || inside)
+          ? 'allow-once'
+          : granted
+            ? 'allow-thread'
+            : null;
     // The ask is open before the event goes out, so an answer given from inside the
     // controller's event handler still finds it.
     if (!automatic) asks.set(requestId, entry);

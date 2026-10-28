@@ -122,12 +122,13 @@ export async function startController(options: ControllerOptions) {
         const completion = Promise.withResolvers<void>();
         closing = completion.promise;
         try {
-          const stopped = controller.close();
+          // The socket closes first, so the next controller on this home cannot start while this
+          // one still owns the socket path.
           void (async () => {
             try {
               await server.close();
             } finally {
-              await stopped;
+              await controller.close();
             }
           })().then(completion.resolve, completion.reject);
         } catch (error) {

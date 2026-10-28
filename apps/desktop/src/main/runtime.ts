@@ -73,14 +73,7 @@ export function resolveRuntime(
   const appRoot = realpathSync(appPath);
   const home = environment.CREWKITE_HOME;
   const profile = environment.CREWKITE_PROFILE;
-  if (
-    !home ||
-    !profile ||
-    !isAbsolute(home) ||
-    !isAbsolute(profile) ||
-    home === profile ||
-    Buffer.byteLength(join(home, 'control.sock')) > 100
-  )
+  if (!home || !profile || !isAbsolute(home) || !isAbsolute(profile) || home === profile)
     throw new Error('Choose separate absolute controller home and desktop profile paths.');
   let mode: RuntimeManifest['mode'] = 'demo';
   let stateRoots: string[];
@@ -211,6 +204,7 @@ export class DesktopController {
           ...checkEnvironment(),
           PATH: process.env.PATH,
           HOME: process.env.HOME,
+          TMPDIR: process.env.TMPDIR,
           CODEX_HOME: process.env.CODEX_HOME,
           CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
           LANG: 'en_US.UTF-8',
@@ -225,9 +219,7 @@ export class DesktopController {
       this.child = child;
       console.log(`Controller PID: ${child.pid ?? 'starting'}`);
       const readyLine =
-        this.paths.mode === 'demo'
-          ? 'CREWKITE_CONTROLLER_READY'
-          : `Controller ready at ${join(this.paths.home, 'control.sock')}`;
+        this.paths.mode === 'demo' ? 'CREWKITE_CONTROLLER_READY' : 'Controller ready at ';
       let output = '';
       let finished = false;
       const finish = (error?: Error) => {
@@ -246,7 +238,15 @@ export class DesktopController {
         output += bytes.toString('utf8');
         if (output.length > 4096)
           finish(new Error('The controller startup output exceeded its bound.'));
-        else if (output.split('\n').includes(readyLine)) finish();
+        else if (
+          output
+            .split('\n')
+            .some(
+              (line) =>
+                line === readyLine || (readyLine.endsWith(' ') && line.startsWith(readyLine)),
+            )
+        )
+          finish();
       });
       child.stderr?.on('data', () => {});
       child.once('error', () => finish(new Error('The standalone controller could not start.')));

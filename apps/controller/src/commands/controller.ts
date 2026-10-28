@@ -40,6 +40,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
+import { McpRegistry } from '../chat/mcp-servers.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
@@ -368,6 +369,8 @@ export class Controller {
     return this.taskOperationRuntime;
   }
 
+  /** The person's MCP servers as the desktop last supplied them. Memory only. */
+  private readonly mcpServers = new McpRegistry();
   private chatRuntime?: ChatService;
   private chat(): ChatService {
     this.chatRuntime ??= new ChatService({
@@ -391,30 +394,31 @@ export class Controller {
       },
       // The turn's thread tools token dies with the turn.
       onTurnEnded: (turnId) => this.threadToolsRuntime?.broker.end(turnId),
-      threadToolsDown: () => this.threadToolsRuntime?.failed === true,
+      threadToolsDown: () =>
+        this.threadToolsRuntime !== undefined && (!this.threadToolsRuntime.ready || this.closed),
+      mcp: this.mcpServers,
     });
     return this.chatRuntime;
   }
 
   // One broker for the controller's life. Its socket listens once the default adapters exist, and
-  // a turn that starts before it listens, or after listening failed, runs without the tools.
-  // After a failure every cloud turn says so in the thread.
+  // a turn that starts before it listens, or after listening failed, runs without the tools. The
+  // chat service asks once per turn, so the packet, the client's config and the thread notice agree.
   private threadToolsRuntime?: {
     broker: ThreadToolsBroker;
     ready: boolean;
-    failed: boolean;
     started: Promise<void>;
   };
   private threadToolsBroker() {
     if (this.threadToolsRuntime) return this.threadToolsRuntime;
     const broker = new ThreadToolsBroker({ home: this.home });
-    const runtime = { broker, ready: false, failed: false, started: Promise.resolve() };
+    const runtime = { broker, ready: false, started: Promise.resolve() };
     runtime.started = broker.start().then(
       () => {
         runtime.ready = !this.closed;
       },
       () => {
-        runtime.failed = true;
+        // The socket stays closed, and every cloud turn runs without the tools.
       },
     );
     this.threadToolsRuntime = runtime;
@@ -877,6 +881,13 @@ export class Controller {
       ].includes(command.command)
     )
       return this.taskOperations().execute(command as TaskOperationCommand);
+    // Before any receipt path: a server's secrets must not reach a journal row either.
+    if (command.command === 'SupplyMcpServers') {
+      if (command.actor.kind !== 'desktop')
+        return { outcome: 'denied', reason: 'desktop-actor-only' };
+      this.mcpServers.set(command.payload);
+      return { outcome: 'applied' };
+    }
     // Before any receipt path: the token must not reach a journal row.
     if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
       return this.localTokenCommand(command);

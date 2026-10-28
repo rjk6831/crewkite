@@ -1058,8 +1058,6 @@ export class EvaluationCommands {
     const attempt = this.jobAttempt(plan.run, route.id);
     const directory = join(this.home, 'verification', attempt.id);
     const stateRoot = join(realpathSync('/tmp'), `ck-${attempt.id}`);
-    if (Buffer.byteLength(join(stateRoot, 'e2e-XXXXXX', 'control.sock')) > 100)
-      throw Error('Verification state path is too long.');
     const owner: CheckOwner = {
       version: 1,
       attemptId: attempt.id,

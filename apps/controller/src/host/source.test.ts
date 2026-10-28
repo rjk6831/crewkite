@@ -483,9 +483,11 @@ test('source inspection bounds file metadata without running filters or reading 
   copyFileSync(process.execPath, bundledNode);
   chmodSync(bundledNode, 0o700);
   const environment = {
-    CREWKITE_HOME: join(runtimeDirectory, 'home'),
+    // A home 120 characters or deeper still resolves, since the control socket is not inside it.
+    CREWKITE_HOME: join(runtimeDirectory, 'home'.repeat(25)),
     CREWKITE_PROFILE: join(runtimeDirectory, 'profile'),
   };
+  assert.ok(environment.CREWKITE_HOME.length >= 120);
   mkdirSync(environment.CREWKITE_HOME, { mode: 0o700 });
   const retained = new Map([
     ['demo-catalog.json', 'historical catalog'],

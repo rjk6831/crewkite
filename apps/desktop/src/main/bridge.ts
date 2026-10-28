@@ -24,6 +24,8 @@ import {
   type Event,
   EventSchema,
   MAX_FRAME_BYTES,
+  type McpServerInput,
+  type McpState,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
@@ -38,6 +40,7 @@ import {
   RememberedLocalToken,
   type SecretStorage,
 } from './local-token.ts';
+import { McpVault, supplyMcp } from './mcp-vault.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { assertSender, openExternalLink } from './security.ts';
@@ -480,6 +483,38 @@ export async function installBridge(
       );
     },
   );
+  // The person's MCP servers. Main keeps the secrets and the renderer gets the view only. Every
+  // change goes to the controller in memory, so a thread's next turn sees it.
+  const mcp = new McpVault(controller.paths.profile, storage);
+  const handOver = async () => {
+    if (client)
+      await supplyMcp(
+        mcp,
+        (value) => client?.command(value) ?? Promise.resolve(null),
+        desktopActor,
+      );
+  };
+  const mcpCall = (name: string, run: (input: Record<string, unknown>) => McpState) => {
+    ipcMain.handle(`crewkite:mcp-${name}`, async (event, input: unknown) => {
+      assertSender(event, window);
+      const state = run((input ?? {}) as Record<string, unknown>);
+      await handOver().catch(() => {});
+      return state;
+    });
+  };
+  ipcMain.handle('crewkite:mcp-state', (event) => {
+    assertSender(event, window);
+    return mcp.state();
+  });
+  mcpCall('save', (input) => mcp.save(input as McpServerInput));
+  mcpCall('remove', (input) => mcp.remove(String(input.name)));
+  mcpCall('thread', (input) =>
+    mcp.setThread(
+      String(input.taskId),
+      String(input.name),
+      (input.policy as string | null) ?? null,
+    ),
+  );
   ipcMain.handle('crewkite:local-token-status', async (event) => {
     assertSender(event, window);
     return tokens.status();
@@ -569,6 +604,7 @@ export async function installBridge(
     try {
       receipts.load();
       client = await controller.connect();
+      await handOver().catch(() => {});
       client.onConnection((state) => {
         connection = { kind: 'connection', state, reconnectAvailable: state === 'offline' };
         notice(connection);

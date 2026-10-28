@@ -52,7 +52,12 @@ import {
   SEARCH_HITS,
   THREAD_TOOLS,
 } from '../../chat/local-tools.ts';
-import { attachedLine, attachedSection, byteSize } from '../../chat/prompt.ts';
+import {
+  attachedLine,
+  attachedSection,
+  byteSize,
+  withoutThreadToolsLine,
+} from '../../chat/prompt.ts';
 import { cachedRepoMap } from '../../chat/repo-map.ts';
 import type { ThreadReads } from '../../chat/thread-reader.ts';
 import { frameTrace } from '../../chat/trace.ts';
@@ -1162,7 +1167,12 @@ function startLocalTurn(
         return null;
       }
     };
-    const message = [request.prompt, attachedSection(files.texts)].filter(Boolean).join('\n\n');
+    const message = [
+      threads === null ? withoutThreadToolsLine(request.prompt) : request.prompt,
+      attachedSection(files.texts),
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     const build = (summary: Summary | null, trim: boolean) =>
       bounded(
         buildPrompt(

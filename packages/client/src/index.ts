@@ -4,6 +4,7 @@ import type {
   CommandResult,
   DesktopNotice,
   Event,
+  McpBridge,
   ProjectPage,
   ProjectPageRequest,
   Snapshot,
@@ -68,6 +69,8 @@ export interface DesktopSource {
   rememberLocalToken?(): Promise<LocalTokenStatus>;
   /** Delete the kept token and clear the controller's copy. */
   forgetLocalToken?(): Promise<LocalTokenStatus>;
+  /** The person's MCP servers. The page sees names and counts, never a secret. */
+  mcp?: McpBridge;
 }
 export type LocalTokenStatus = { available: boolean; reason?: string; remembered: boolean };
 export type ThreadAttentionInput = {

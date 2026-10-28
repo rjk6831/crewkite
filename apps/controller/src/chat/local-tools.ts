@@ -231,8 +231,6 @@ export const THREAD_TOOLS = [
     },
   },
 ] as const;
-export const THREAD_TOOL_LINE =
-  'Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live.';
 
 // Small models send numbers as strings now and then. Coercion keeps those calls useful.
 const line = z.coerce.number().int().min(1).max(10_000_000);
