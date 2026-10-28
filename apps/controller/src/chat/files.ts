@@ -33,6 +33,10 @@ const HEAD_BYTES = 64 * 1024;
 const MIME = /^[a-z0-9][a-z0-9!#$&^_.+-]*\/[a-z0-9!#$&^_.+-]+$/i;
 
 export type StagedFile = Readonly<{ attachment: ChatAttachment; temporary: string }>;
+/** How far a copy got. `total` is the size the file had when it opened. */
+export type ImportProgress = Readonly<{ name: string; bytes: number; total: number }>;
+// A large file reports every 4 MiB, so a 1 GiB copy sends 256 updates and not 1,024.
+const PROGRESS_BYTES = 4 * 1024 * 1024;
 
 // A partial copy carries the mark of the controller process that writes it. Only one controller
 // runs at a time, so a copy under another mark is one a crash left behind.
@@ -45,18 +49,24 @@ const RUN = randomBytes(6).toString('hex');
  * A path is read in chunks, so a large file never sits whole in memory. Partial copies a crash
  * left go first.
  */
-export async function stageFile(folder: string, source: FileSource): Promise<StagedFile> {
+export async function stageFile(
+  folder: string,
+  source: FileSource,
+  onProgress?: (progress: ImportProgress) => void,
+): Promise<StagedFile> {
   mkdirSync(folder, { recursive: true, mode: 0o700 });
   for (const name of readdirSync(folder))
     if (name.startsWith(PARTIAL) && !name.startsWith(`${PARTIAL}${RUN}-`))
       rmSync(join(folder, name), { force: true });
   const temporary = join(folder, `${PARTIAL}${RUN}-${randomBytes(8).toString('hex')}`);
   try {
+    const name = fileName('path' in source ? basename(source.path) : source.name);
     const read =
       'path' in source
-        ? await copyFrom(source.path, temporary)
+        ? await copyFrom(source.path, temporary, (bytes, total) =>
+            onProgress?.({ name, bytes, total }),
+          )
         : await writeBytes(source.base64, temporary);
-    const name = fileName('path' in source ? basename(source.path) : source.name);
     const attachment = ChatAttachmentSchema.parse({
       id: read.hash,
       name,
@@ -100,7 +110,11 @@ export function storedFile(folder: string, attachment: ChatAttachment): string |
 
 type Read = { hash: string; bytes: number; head: Buffer };
 
-async function copyFrom(path: string, temporary: string): Promise<Read> {
+async function copyFrom(
+  path: string,
+  temporary: string,
+  progress: (bytes: number, total: number) => void,
+): Promise<Read> {
   let input: FileHandle;
   try {
     // A pipe would block an ordinary open until something writes to it.
@@ -126,6 +140,7 @@ async function copyFrom(path: string, temporary: string): Promise<Read> {
       const buffer = Buffer.allocUnsafe(CHUNK_BYTES);
       const head: Buffer[] = [];
       let bytes = 0;
+      let reported = 0;
       for (;;) {
         let count: number;
         try {
@@ -140,7 +155,12 @@ async function copyFrom(path: string, temporary: string): Promise<Read> {
         for (let written = 0; written < count; )
           written += (await output.write(chunk, written, count - written)).bytesWritten;
         bytes += count;
+        if (bytes - reported >= PROGRESS_BYTES) {
+          reported = bytes;
+          progress(bytes, Math.max(stat.size, bytes));
+        }
       }
+      progress(bytes, bytes);
       return { hash: hash.digest('hex'), bytes, head: Buffer.concat(head) };
     } finally {
       await output.close();
