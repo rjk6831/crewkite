@@ -39,7 +39,7 @@ type State = { oid: string; mode: string } | null;
 
 /**
  * The slices that may open their builder turn now, in plan order: queued, every dependency done,
- * and on a family with no open turn. Two ready slices on one family run one after the other, so
+ * and assigned to a family with no open turn. Two ready slices on one family run one after the other, so
  * at most one of them is picked. Nothing starts while a slice is blocked, since its resolve turn
  * edits the thread copy that a new slice would copy.
  */
@@ -55,8 +55,9 @@ export function readySlices(
     const slice = plan.slices.find((value) => value.id === id) as Slice;
     const family = slice.assignment?.family;
     if (slice.status !== 'queued' || !slice.depends.every((dep) => done.has(dep))) continue;
-    if (family && taken.has(family)) continue;
-    if (family) taken.add(family);
+    // A slice with no family has nothing to run on. The runner stops the plan over it.
+    if (!family || taken.has(family)) continue;
+    taken.add(family);
     ready.push(slice);
   }
   return ready;

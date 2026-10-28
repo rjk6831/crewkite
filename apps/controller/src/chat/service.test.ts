@@ -2420,14 +2420,26 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       conflict: true,
     },
     {
+      // Slice 2 finished while slice 1 runs, so it merges before the stop and is not lost.
       name: 'stop ends every running slice and keeps the finished one',
       slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'easy', [2])],
-      openai: [[write('a.txt', 'one\n')]],
-      local: [[{ kind: 'wait' } as const]],
+      openai: [[{ kind: 'wait' } as const]],
+      local: [[write('b.txt', 'two\n')]],
       line: 'Plan stopped: you cancelled it.',
-      card: ['stopped', 'done', 'not-run', 'not-run'],
-      files: { 'a.txt': 'one\n' },
+      card: ['stopped', 'not-run', 'done', 'not-run'],
+      files: { 'b.txt': 'two\n' },
       stop: true,
+    },
+    {
+      // Slice 2 cannot start, and the slice 1 turn opened in the same step never runs.
+      name: 'a slice that cannot start stops the plan before a sibling opened beside it runs',
+      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      openai: [[write('a.txt', 'one\n')]],
+      local: [],
+      line: 'Plan stopped: slice 2 could not start. Connect this provider in Settings or pick another.',
+      card: ['stopped', 'not-run', 'failed'],
+      files: {},
+      unplugged: true,
     },
   ];
   for (const row of rows) {
@@ -2449,7 +2461,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     const thread = standalone(t, {
       adapters: new Map([
         ['openai', watch(openai)],
-        ['local', watch(local)],
+        ...('unplugged' in row ? [] : [['local', watch(local)] as const]),
       ]),
       catalog: () => ({ families }),
       localContext: () => 32_768,
@@ -2485,12 +2497,6 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         event.type === 'chat.thread' &&
         (event.payload as ChatThread).plan?.slices[1]?.lane?.step === 'merge',
     );
-    const first = next(
-      thread,
-      (event) =>
-        event.type === 'conversation.entry' &&
-        (event.payload as { text: string }).text.startsWith('Slice 1 finished'),
-    );
     thread.send('Split the work.', pick('openai'));
     if (row.name.startsWith('two families')) {
       await parked;
@@ -2520,7 +2526,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       );
     }
     if ('stop' in row) {
-      await first;
+      await merging;
       assert.equal(
         act(store, (effects) => service.cancelPlan({ taskId, planId: 'p1' }, effects)).outcome,
         'applied',
@@ -2528,7 +2534,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       );
     }
     await ended;
-    if ('stop' in row) await settles(thread);
+    if ('stop' in row || 'unplugged' in row) await settles(thread);
     const read = thread.read();
     const lines = read.messages.map((message) => message.text);
     assert.equal(lines.at(-1), row.line, row.name);
@@ -2593,8 +2599,14 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       assert.match(resolve?.prompt ?? '', /^net\.mjs, as the slice left it:\n\n```\ntwo\n```$/m);
     }
     if ('stop' in row) {
-      const stopped = read.turns.find((turn) => turn.slice === 2);
+      const stopped = read.turns.find((turn) => turn.slice === 1);
       assert.equal(stopped?.state, 'stopped', row.name);
+      assert.ok(lines.includes('Slice 2 finished: 1 file merged.'), row.name);
+    }
+    if ('unplugged' in row) {
+      assert.equal(read.turns.find((turn) => turn.slice === 1)?.state, 'stopped', row.name);
+      assert.equal(openai.requests.length, 1, row.name);
+      assert.ok(!existsSync(join(scratch, 'a.txt')), row.name);
     }
   }
 });

@@ -385,6 +385,8 @@ const stoppedResult: ChatTurnResult = {
 export class ChatService {
   private readonly deps: ChatServiceDeps;
   private readonly live = new Map<string, LiveTurn>();
+  /** Plan slice turns stopped before their launch ran. Each starts as stopped. */
+  private readonly stoppedEarly = new Set<string>();
   /** Orchestrator plans: proposal, assignment and the slice chain (ADR 0045). */
   private readonly plans: PlanRunner;
   /** Project checks the crew chain runs after a fix and after the last slice. */
@@ -585,16 +587,19 @@ export class ChatService {
     return { outcome: 'applied' };
   }
 
-  /** Answer every open ask of the running turn that the thread now covers. */
+  /** Answer every open ask of the running turns that the thread now covers. */
   private answerCovered(taskId: string) {
     const thread = this.thread(taskId);
-    const live = thread.activeTurnId ? this.activeLive(taskId, thread.activeTurnId) : undefined;
-    if (!live) return;
-    for (const requestId of [...live.permissions.keys()]) {
-      const choice = this.covered(thread, live, requestId);
-      if (!choice) continue;
-      live.permissions.delete(requestId);
-      this.call(() => live.handle?.respondPermission(requestId, choice));
+    // Plan slices run side by side, so every open turn of the thread hears the new policy.
+    for (const [turnId, open] of this.live) {
+      const live = open.taskId === taskId ? this.activeLive(taskId, turnId) : undefined;
+      if (!live) continue;
+      for (const requestId of [...live.permissions.keys()]) {
+        const choice = this.covered(thread, live, requestId);
+        if (!choice) continue;
+        live.permissions.delete(requestId);
+        this.call(() => live.handle?.respondPermission(requestId, choice));
+      }
     }
   }
 
@@ -1214,6 +1219,8 @@ export class ChatService {
           .get(family),
       stopTurn: (taskId, turnId) => {
         const live = this.activeLive(taskId, turnId);
+        // A turn opened in the same transaction has no live turn yet. Its launch reads this.
+        if (!live && !this.live.has(turnId)) this.stoppedEarly.add(turnId);
         if (!live) return;
         live.stopRequested = true;
         queueMicrotask(() => this.call(() => live.handle?.stop()));
@@ -1497,6 +1504,7 @@ export class ChatService {
       gone: new Set(),
       done: Promise.resolve(),
     };
+    if (this.stoppedEarly.delete(turn.id)) live.stopRequested = true;
     this.live.set(turn.id, live);
     live.done = this.run(turn, live);
   }

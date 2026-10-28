@@ -234,7 +234,7 @@ test('assignment is a pure function of connected families, allowances, difficult
 });
 
 test('ready slices start together with every dependency done, one per family, none while one is blocked', () => {
-  type Row = { id: number; family: ChatFamily; depends: number[]; status: string };
+  type Row = { id: number; family: ChatFamily | null; depends: number[]; status: string };
   const card = (rows: Row[]) => ({
     slices: rows.map((row) => ({
       id: row.id,
@@ -243,7 +243,9 @@ test('ready slices start together with every dependency done, one per family, no
       depends: row.depends,
       readOnly: false,
       status: row.status as 'queued',
-      assignment: { family: row.family, model: `${row.family}-model`, reason: 'Ranked.' },
+      assignment: row.family
+        ? { family: row.family, model: `${row.family}-model`, reason: 'Ranked.' }
+        : null,
       candidates: [],
       turnId: null,
     })),
@@ -291,6 +293,15 @@ test('ready slices start together with every dependency done, one per family, no
       ],
       busy: ['local'],
       ready: [4],
+    },
+    {
+      name: 'a slice with no family to run on never starts',
+      slices: [
+        { id: 1, family: null, depends: [], status: 'queued' },
+        { id: 2, family: 'local', depends: [], status: 'queued' },
+      ],
+      busy: [],
+      ready: [2],
     },
     {
       name: 'nothing starts while a slice is blocked',

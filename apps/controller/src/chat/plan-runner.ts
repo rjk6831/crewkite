@@ -214,14 +214,21 @@ export class PlanRunner {
    * written its own.
    */
   halt(task: Task, cause: string, line = false) {
-    const thread = this.host.thread(task.id);
-    const plan = thread.plan;
-    if (plan?.phase !== 'running') return;
-    for (const slice of plan.slices)
+    let thread = this.host.thread(task.id);
+    if (thread.plan?.phase !== 'running') return;
+    for (const slice of thread.plan.slices)
       if (slice.lane && !slice.lane.pending && slice.turnId && this.open(slice.turnId))
         this.host.stopTurn(task.id, slice.turnId);
     if (this.closing.get(task.id) === 'checks') this.host.stopCombinedChecks(task.id);
     this.closing.delete(task.id);
+    // A slice whose chain finished and only waited for its turn to merge keeps its work: it
+    // merges now, in plan order, ahead of the stop.
+    for (const id of order(thread.plan)) {
+      const slice = find(thread.plan as ChatPlanState, id);
+      if (slice?.status === 'running' && slice.lane?.step === 'merge')
+        thread = this.merge(task, thread, slice, true);
+    }
+    const plan = thread.plan as ChatPlanState;
     const slices = plan.slices.map(({ lane: _lane, ...slice }) =>
       slice.status === 'queued' || slice.status === 'running'
         ? { ...slice, status: 'not-run' as const }
@@ -466,6 +473,11 @@ export class PlanRunner {
       if (!lanes().length) this.halt(task, 'you sent a new message', true);
       return;
     }
+    const done = new Set(thread.plan.slices.filter((s) => s.status === 'done').map((s) => s.id));
+    const homeless = thread.plan.slices.find(
+      (s) => s.status === 'queued' && !s.assignment && s.depends.every((dep) => done.has(dep)),
+    );
+    if (homeless) return this.halt(task, `slice ${homeless.id} has no family to run on`, true);
     for (const id of order(thread.plan)) {
       const slice = find(thread.plan, id) as Slice;
       if (slice.status === 'done') continue;
@@ -597,8 +609,11 @@ export class PlanRunner {
     return saved;
   }
 
-  /** Replay a finished slice onto the thread copy. A conflict blocks it for the orchestrator. */
-  private merge(task: Task, thread: ChatThread, slice: Slice): ChatThread {
+  /**
+   * Replay a finished slice onto the thread copy. A conflict blocks it for the orchestrator, or,
+   * while the plan stops, for the card to run again.
+   */
+  private merge(task: Task, thread: ChatThread, slice: Slice, stopping = false): ChatThread {
     const plan = thread.plan as ChatPlanState;
     const lane = slice.lane as Lane;
     const id = slice.id;
@@ -616,8 +631,9 @@ export class PlanRunner {
             folder,
           });
     } catch (error) {
-      this.put(task, thread, plan, { [id]: { status: 'failed', lane: undefined } });
+      const failed = this.put(task, thread, plan, { [id]: { status: 'failed', lane: undefined } });
       const why = error instanceof Error ? ` ${error.message}` : '';
+      if (stopping) return failed;
       this.halt(task, `slice ${id} could not merge.${why}`.replace(/\.$/, ''), true);
       return this.host.thread(task.id);
     }
@@ -638,14 +654,14 @@ export class PlanRunner {
       [id]: {
         status: 'blocked',
         conflicts: listedConflicts(conflicts),
-        lane: { ...lane, step: 'resolve', pending: true },
+        lane: stopping ? undefined : { ...lane, step: 'resolve', pending: true },
       },
     });
     const named = listedConflicts(conflicts).join(', ');
     const more = conflicts.length > listedConflicts(conflicts).length ? ' and more' : '';
     this.host.line(
       task,
-      `Slice ${id} blocked: ${plural(conflicts.length, 'file conflicts', 'files conflict')} with the thread copy: ${named}${more}. The orchestrator gets one turn to resolve it.`,
+      `Slice ${id} blocked: ${plural(conflicts.length, 'file conflicts', 'files conflict')} with the thread copy: ${named}${more}. ${stopping ? 'Run it again from the plan card.' : 'The orchestrator gets one turn to resolve it.'}`,
     );
     return saved;
   }
@@ -661,14 +677,15 @@ export class PlanRunner {
     })?.turnId;
     // Manual runs nothing after a builder turn, so the plan closes without a challenge.
     if (thread.flightMode === 'manual' || !last) return this.finish(task, thread, plan);
-    this.closing.set(task.id, 'checks');
     const directory = this.host.scratchDirectory(task.id);
-    effects.push(() =>
+    // Marked once the transaction commits, so a rollback leaves the plan free to move on.
+    effects.push(() => {
+      this.closing.set(task.id, 'checks');
       this.host.runCombinedChecks(task.id, directory).then(
         (result) => this.checked(task.id, last, result),
         () => this.checked(task.id, last, null),
-      ),
-    );
+      );
+    });
   }
 
   /** The checks on the merged copy ended. A failure goes to the fixer once, then the challenge. */
