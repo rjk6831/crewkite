@@ -38,8 +38,8 @@ test('the picker lists live models first, folds hidden ones, sets known ones apa
     [
       'the selection is an ID the list does not hold',
       family([model('a', { source: 'live' })]),
-      'claude-typed-9',
-      { live: ['a'], hidden: [], known: [], typed: 'claude-typed-9' },
+      'typed-9',
+      { live: ['a'], hidden: [], known: [], typed: 'typed-9' },
     ],
   ] as const) {
     const groups = modelGroups(
@@ -64,8 +64,8 @@ test('the picker lists live models first, folds hidden ones, sets known ones apa
   );
   // The typed ID is passed to the client as an argument, so its shape is checked first.
   for (const [text, ok] of [
-    ['claude-opus-4-1', true],
-    ['gemini-3.8-flash', true],
+    ['family-model-4-1', true],
+    ['model-3.8-flash', true],
     ['-rf', false],
     ['two words', false],
     ['', false],

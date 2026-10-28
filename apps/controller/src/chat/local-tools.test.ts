@@ -148,7 +148,7 @@ test('thread tools read through the reader, are cut to the Local room and fail w
               id: 'trn_01J00000000000000000000001',
               sequence: 1,
               family: 'anthropic',
-              model: 'sonnet',
+              model: 'model-a',
               role: 'assistant',
               status: 'done',
               startedAt: '2026-10-28T00:00:00.000Z',
@@ -174,7 +174,7 @@ test('thread tools read through the reader, are cut to the Local room and fail w
       runTool(name, args, { ...context, threads, threadBytes });
     const turns = await run('thread_turns', { since: '0', limit: 5 });
     assert.equal(turns.status, 'ok', turns.output);
-    assert.match(turns.output, /#1 trn_01J00000000000000000000001 anthropic sonnet assistant/);
+    assert.match(turns.output, /#1 trn_01J00000000000000000000001 anthropic model-a assistant/);
     // Numbers sent as strings reach the reader as numbers, with the schema default applied.
     assert.deepEqual(seen, [{ since: 0, limit: 5 }]);
     const cut = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 1024);
