@@ -8,7 +8,7 @@ This page describes the current design. The reasoning behind each choice is in t
 |-----------|------|--------------|
 | `apps/controller` | State, policy, routing, provider adapters, execution host, artifacts, evidence | Trust in model output as authority |
 | `apps/desktop` | Electron main and preload, React renderer, native pickers, a narrow bridge to the client | Database access, provider launches, arbitrary shell or file APIs |
-| `apps/cli` | Human commands, JSON output, offline diagnostics | A second permission, acceptance or database write path |
+| `apps/cli` | Human commands, interactive terminal mode, JSON output, offline diagnostics | A second permission, acceptance or database write path |
 | `packages/contracts` | Runtime schemas, state and reason vocabularies, fixture contracts | Electron, database or provider code |
 | `packages/client` | Handshake, typed commands, reconnect and replay, bounded reads | Domain transitions, provider protocols |
 | `packages/testkit` | Fake provider executables, synthetic repositories, injected clocks, fault fixtures | Any production inference route |
@@ -53,6 +53,24 @@ A failed turn keeps a failure record: the stage, a kind, one sentence saying wha
 
 `HandoffChatThread` moves a thread to another provider. The controller never asks the stopped model to summarize its own work, in line with [ADR 0007](adr/0007-recover-from-durable-facts.md). The next turn's first prompt is built from stored facts: the last 60 messages of the transcript, with user messages verbatim, the last three assistant answers in full and earlier answers cut to 600 characters, the changed files with their line counts, and the new message. The new provider reads the files itself in the same scratch copy. The earlier provider's session ID stays on the thread, so moving back resumes it when that provider allows.
 
+## Scratch copies
+
+The first turn on a thread fills its scratch copy from the thread's base. When the checkout sits on that base and Git reports no change to a tracked file, a regular file whose size matches the committed copy is cloned from the checkout, on a volume that supports copy-on-write clones. The controller hashes each clone as a Git blob and compares it with the committed object ID, and a mismatch is replaced with the committed bytes. Every other file is read from Git in runs of at most 32 MiB, and a single file larger than a run streams straight into the copy. A copy of more than 100,000 files is refused with its own message.
+
+Changes, Discard and Accept compare by object ID and read only the changed files. A comparison reads at most 64 MiB of changed files for its patches. A changed file past that shows a "Not compared" note, and Accept still takes it.
+
+## Plan slices
+
+A plan from the orchestrator runs as the controller decides ([ADR 0045](adr/0045-the-orchestrator-proposes-and-the-controller-assigns.md) and its parallel amendment). The orchestrator proposes the plan and never picks which slice starts. Slices whose dependencies are done start together, each in its own scratch copy made from the thread's base and brought up to the thread's copy. At most one turn runs per provider family across all threads, so ready slices on one family run in plan order. Each slice runs the review chain with the same caps as a crew.
+
+A finished slice replays onto the thread's copy in plan order. The comparison uses blob IDs and modes. A changed path is a conflict when the thread's copy holds neither what the slice started from nor the slice's own version. The slice then shows as Blocked with those paths, its other paths merge, and the orchestrator's model gets one fixer turn in the thread's copy with the conflicting versions quoted. A failed or stopped step stops the plan, and a slice can then run again from a fresh copy. After the last slice, the enabled project checks run on the thread's copy, and then the challenger runs.
+
+## Project checks
+
+The controller finds check commands in `package.json` scripts, `pyproject.toml` tool tables, Makefile targets and a `Cargo.toml`. Each one starts off. A command the person adds is accepted only as a program that runs in the scratch copy. Shells, wrappers such as `env`, inline code flags and paths outside the copy are refused.
+
+A run needs the thread's permission for commands. The approval covers those commands and the script text behind them, so a changed script asks again. Checks run as local processes with the person's permissions, and nothing contains them. Balanced and Glide run the enabled checks after each fix and after the last slice of a plan. The full output goes to the artifact store, and the thread shows a redacted tail of the last 1,000 characters.
+
 ## Task conversation
 
 The structured planning turn described in this section is retired. It sent the whole history to a read-only session as one prompt with an output schema and kept only a final answer that matched the schema. The [chat thread](#chat-thread) replaces it, and [ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md) records why. The tables it wrote stay in the schema because migrations only append. The rest of this section records how it worked.
@@ -84,7 +102,8 @@ The sealed combined candidate still needs an explicitly prepared full check and 
 
 The controller runs as one headless Node process per user. The desktop app and the CLI connect to it over a private Unix domain socket using length-prefixed JSON frames with a size limit.
 
-- The socket lives in a directory only the user can read. Each connection presents a token from a user-only file during the handshake.
+- The socket lives in a per-user folder under the temporary directory, named for the user's ID. The controller records the socket it bound in `control-socket` in the home, and clients read the path from that record. A folder that is a link, is not private to the user or is someone else's is not used. The controller then binds in a fresh private folder beside it. A path longer than 100 bytes goes under `/tmp`.
+- Each connection presents a token from a user-only file during the handshake.
 - The controller binds the actor to the connection. A caller-supplied actor ID is correlation data only.
 - Provider processes and workers never receive the socket path or token.
 - Clients that speak a different protocol version are rejected.
@@ -102,6 +121,10 @@ A separate repository profile prepares the complete committed source and explici
 A separate candidate evaluation freezes its own scoped consent and reviewer assignment without changing the original run policy. The default recipe runs the trusted synthetic Node collection. An explicit project Node recipe selects up to 32 committed test files and freezes their exact bytes. Both run in an independent candidate copy through the existing local process owner. Passing checks retain evidence and wait for explicit `StartCandidateReview`. That command consumes the supplemental one-use review grant for one fresh native review within the original run's remaining attempt, minute and concurrency caps. The writer's fixed allowance is unchanged. Review input binds the immutable original and candidate bytes, task context, exact successful checks and reviewer profile. Repository review includes every changed text file, with explicit additions and deletions, and binds the whole candidate. Unsupported binary changes and an oversized review input remain retained and cannot pass that review. Review uses the same three-phase ownership journal and retains evidence only after quiescence. Same-family review establishes process independence only.
 
 A native candidate becomes ready only after the exact checks and declared review method pass with proven ownership. Local acceptance revalidates the retained proof and current source through the existing publication path. Completed check evidence can survive a moved runtime when its saved definition digest is valid and the reporter bytes, evaluator, test collection, criteria and all other arguments are unchanged. The saved reporter path is never executed during publication validation. Pending checks and review starts keep exact current definitions. Expired inference consent or an unavailable provider account does not erase completed evidence. Creating a branch still requires its own current destination-specific acceptance grant or approval. The evaluation preview reports whether that local action can be requested; it grants no publication authority.
+
+## Command-line client
+
+`apps/cli` is a second client of the controller. It connects over the same socket and reads the same home record as the desktop, so a thread started in one shows in the other. With no subcommand on a terminal it opens an interactive mode, drawn with Ink on React. Otherwise it runs one command and can print JSON lines for scripts. It adds no permission, acceptance or write path. A permission answer must name an open request and an option it offered, Accept creates one new local branch, and Push needs confirmation. [The CLI guide](../apps/cli/README.md) lists its keys and commands.
 
 ## Commands and events
 
@@ -152,6 +175,9 @@ The command set for the first release:
 | `AcceptChatChanges` | Commit the scratch copy on the thread's base as one new local branch; the checkout stays untouched |
 | `DiscardChatChange` | Restore one path of the scratch copy to the thread's base; Accept then carries only what is left |
 | `ReadChatThread`, `ReadChatChanges`, `ReadChatCatalog` | Bounded reads of the thread, of the scratch diff against its base, and of the providers and models the composer can offer |
+| `ReadChatInstructions`, `ReadChatPrompts`, `SaveChatPrompt`, `DeleteChatPrompt` | Read the instruction files at the copy root and the saved prompts that the desktop and the CLI share, and save or delete one prompt |
+| `SupplyMcpServers` | Give the controller the person's MCP server set from the desktop. It is a read with no receipt, and the controller keeps the set in memory |
+| `ReadExtensions`, `ConfigureExtension`, `RunExtensionCommand` | List extension folders and their slots, turn one on or off after its hash check, and run one declared command with an idempotency receipt |
 | `RefreshChatModels` | Read the OpenAI model list through the client with no thread and no model turn. One read runs at a time, and a process group it leaves behind blocks the next one |
 | `ConfigureLocal`, `BeginLocalConnectionInput`, `RefreshLocalModels`, `SelectLocalModel`, `DisconnectLocal` | Explicit loopback setup, private credential input and observed model selection under the persisted Local revision |
 | `PrepareCombinedRun` | Freeze a parent and two scoped children, shared dispatch allowances, checks and reviewer without starting work |
@@ -270,6 +296,24 @@ One authenticated socket client in main serves the renderer. Main supplies comma
 Project registration uses a parented native directory picker. Generic renderer commands cannot supply a registration path. Export remains a controller effect: main reads the returned immutable artifact, verifies its length and checksum, then offers a parented save dialog. A saved patch uses an unused destination and durable file and directory writes. Cancellation keeps the artifact available. The CLI receives the artifact result independently of desktop saving.
 
 The packaged desktop defaults to the normal controller entrypoint. A fresh workspace has no synthetic project or scripted route catalog. The manifest selects one fixed workspace or demo entrypoint; page content and environment variables cannot change that mode. Initialized homes keep their retained state. The explicit demo has a separate bootstrap with a persisted fake catalog and a private home and profile. Main verifies the standalone Node version, platform, architecture and checksum before launch. The staged runtime resolves fixed entries inside its package. A connected source journey does not establish installed recovery.
+
+## The person's MCP servers
+
+The person's own MCP servers join a turn only when the controller writes them into that turn's config ([ADR 0046](adr/0046-the-persons-servers-join-a-thread-only-by-the-controllers-config.md)). Each server is off for every thread and gets one of three policies per thread: ask each time, allow reads or allow all. A policy never goes past the thread's permission policy. Under allow reads, only the listed read tools run without asking, and a server's own annotations can only narrow that list.
+
+Each family has its own route. Anthropic gets the servers in one strict config and sends every call that is not on its allow list to the controller. Google takes them only while the thread asks for everything, so every call asks. OpenAI and Local run none. Review and advice turns are read-only and get none either. A turn that leaves a server out writes one line to its trace that says why.
+
+Secret arguments and environment values are sealed with `safeStorage`, refused on a device with no keychain and never returned to the window. The controller removes each secret value from the turn's events and failure text. Only the desktop app supplies the servers.
+
+The thread tools server is the one MCP source a turn gets without the person's choice. A turn without thread tools does not name them in its packet, and its adapter reads the request as no tools.
+
+## Extensions
+
+An extension is a folder under the CrewKite home with a manifest and an entry module ([ADR 0047](adr/0047-extensions-attach-through-one-versioned-seam.md)). It is off until the person turns it on, and turning it on names the hash of the folder the person was shown. The hash covers every regular file, so a later change turns the extension off again. The manifest's authority list is closed. Contract 1.0.0 offers `thread.read` and `thread.event`, and nothing else.
+
+An extension command runs only through `RunExtensionCommand`, which passes the same owner, schema, receipt and task checks as a built-in command. The command gets a frozen context. Its reader and emitter work only on the thread the command ran on, and only while the command runs. Its output is text and label rows, validated before any event is emitted. Slots are data. Clients show their titles and the returned text and run no extension code. Crew roles are listed without being scheduled into the chain.
+
+Contract 1.0.0 runs the module inside the controller process, so an enabled extension has the person's permissions. The seam limits what CrewKite hands it. It does not contain the code. [Extensions](extensions.md) is the reference for manifests and slots.
 
 ## Repository layout
 
