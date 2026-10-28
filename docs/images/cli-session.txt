@@ -1,0 +1,77 @@
+A terminal session with the interactive CLI, 96 columns wide, with NO_COLOR=1 and --no-animation.
+The controller ran the scripted chat adapter, so no provider client was involved and the model ID
+is the fixture's. Lines in brackets say which keys were pressed between two screens.
+
+$ crewkite
+                                                    ◢ ◣
+                                                   ◢█ █◣
+                                                  ◢██ ██◣
+
+ ████                     █   █  █   █            ◥██ ██◤
+██    █ ██   ███  █     █ █  █      ████  ███      ██ ██
+██    ██    █▄▄▄█ █  █  █ ███   ██   █   █▄▄▄█     ◥█ █◤
+██    █     █     █ █ █ █ █  █   █   █   █          ◥ ◤
+ ████ █      ████  █   █  █   █ ███   ██  ████       ╰
+
+╭──────────────────────────────────────────────────────────────────────────────────────────────╮
+│  Ask about this project or describe a change                                                 │
+╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+A fixture-model default  project shop  Ctrl+K keys
+O connect   A ██░░░░░░ 30% left   L set up
+
+[Typed: Clamp the discount at the subtotal, then Enter]
+
+› Clamp the discount at the subtotal
+
+A fixture-model ◆   Waiting for you
+  ✓ Read 2 files, searched once
+  Plan
+
+  The discount can push the total below zero. I will clamp it:
+
+  • keep subtotalMinor as is
+  • clamp discountMinor at the subtotal
+
+  ╭────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ js                                                                                         │
+  │ return subtotal - Math.min(discount, subtotal);                                            │
+  ╰────────────────────────────────────────────────────────────────────────────────────────────╯
+  ╭────────────────────────────────────────────────────────────────────────────────────────────╮
+  │ Edit net.mjs?                                                                              │
+  │ [1] Allow once   [2] Deny                                                                  │
+  │ Thread policy: Ask each time. Press 1 or 2 to answer.                                      │
+  ╰────────────────────────────────────────────────────────────────────────────────────────────╯
+╭──────────────────────────────────────────────────────────────────────────────────────────────╮
+│  Message, /command or @file                                                                  │
+╰──────────────────────────────────────────────────────────────────────────────────────────────╯
+A fixture-model default  manual · Ask each time  Ctrl+K keys
+O connect   A ██░░░░░░ 30% left   L set up
+
+[Pressed 1 to allow the edit once, then Ctrl+G to open Changes]
+
+Changes (1 file)
+    +2 -2    net.mjs
+╭────────────────────────────────────────────────────────────────────────────────────────────╮
+│ --- a/net.mjs                                                                              │
+│ +++ b/net.mjs                                                                              │
+│ @@ -1,3 +1,3 @@                                                                            │
+│ -export function netMinor() {                                                              │
+│ -  throw new Error('netMinor is not implemented.');                                        │
+│ +export function netMinor(s, d) {                                                          │
+│ +  return s - Math.min(d, s);                                                              │
+│  }                                                                                         │
+│                                                                                            │
+╰────────────────────────────────────────────────────────────────────────────────────────────╯
+Up and Down pick a file. A Accept to branch  D Discard file  P Push  O Open pull request  Esc
+back
+O connect   A ██░░░░░░ 30% left   L set up
+
+[Pressed A, then Enter to accept on the suggested branch name]
+
+Changes (0 files)
+The scratch copy matches the base.
+Accepted on crewkite/clamp-the-discount-at-the-subtotal at e4e3232
+Up and Down pick a file. A Accept to branch  D Discard file  P Push  O Open pull request  Esc
+back
+Accepted on crewkite/clamp-the-discount-at-the-subtotal.
+O connect   A ██░░░░░░ 30% left   L set up

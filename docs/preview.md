@@ -71,3 +71,17 @@ On Windows and Linux the window shortcuts use Control in place of Command. The w
 ## Send a short record
 
 Keep a short record of what you asked, which provider answered, any refusal or error line, what Changes showed, and whether the next action was clear. A few sentences is enough. The [roadmap](roadmap.md) lists the open evidence gates.
+
+## Try the CLI
+
+The CLI talks to the same controller as the desktop, so keep the desktop open while you try it. From a source checkout, run `pnpm crewkite` in a terminal inside a project you added. The [CLI guide](../apps/cli/README.md) lists every key and command, and [a recorded session](images/cli-session.txt) shows the screens.
+
+1. Start it. The kite wordmark draws at the top, the message box below it and one gauge per provider under that.
+2. Send a message. Type a change you want and press Enter. The reply streams in, reads fold into one line, and the kite spinner turns while it runs. Press Escape to stop it.
+3. Answer a permission. When the reply asks to edit, press 1 to allow once, 2 to allow for this thread or the number for Deny.
+4. Open Changes with Ctrl+G. Press A to accept on a new branch, then P to push it once you agree to the question, and O to open a pull request.
+5. Try the slash commands: `/model`, `/provider`, `/crew`, `/ask` and `/help`. Type `@` and part of a file name to mention a file.
+6. Leave with Ctrl+C. While a reply runs, it asks first, and the reply keeps running in the controller. The desktop shows the same thread.
+7. Script it. `pnpm crewkite -p "What does netMinor return for 3000 and 4000?"` prints one reply and exits with the turn's status, and `pnpm crewkite thread list --json` prints the threads as JSON lines.
+
+Set `NO_COLOR=1` to check the screens without colour, and pass `--no-animation` to keep the spinner still. Note anything the CLI showed differently from the desktop in your record.

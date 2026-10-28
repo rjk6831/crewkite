@@ -94,3 +94,16 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## CLI
+
+Six claims cover the interactive CLI and its scripting path. Each runs a real controller on a private socket with the scripted chat adapter, or a pure module, and no provider client.
+
+- Print mode streams the reply to stdout and exits with the status of its turn: 0 when done, 1 when it failed on a usage limit and 3 when another command stopped it. It finds the project of the current checkout through registration.
+- The thread commands with `--json` write only lines `CliJsonLineSchema` accepts, through a new thread, a watched permission answered by `thread permit`, Accept, `list` and `show`. Push without `--confirm` sends nothing and says what it would push.
+- Each interactive view draws a scripted thread: the wordmark at both sizes, the folded reads, Markdown, the open permission with its options and the thread policy, the answered thread, Changes with the diff and the accepted branch, the crew, the plan card in Balanced and after a stop, Settings with provider cards and a dotted stale gauge, the thread list and help. Under `NO_COLOR` every view keeps its text and draws no colour. The kite panels and gauges take the desktop's colours, yellow at 40 percent and red at empty, and the spinner moves only with full animation.
+- Slash commands parse only from the shared list, and the message box keeps multi-line editing, history on Up and Down, slash and mention completion, and absolute paths after `@` as attachments.
+- `cli.json` is checked with the schemas the desktop saves its defaults with, falls back to defaults with a named field, is written private to its owner, and backs the renderer's preference functions. Key bindings match their modifiers exactly.
+- The interactive app sends a typed message, answers a permission with a digit, asks before Ctrl+C leaves a running reply, stops it with Escape and leaves on the next Ctrl+C.
+
+These tests establish the CLI's own wiring. The controller's permission, acceptance and push rules keep their existing claims, and the CLI test adds none of its own.
