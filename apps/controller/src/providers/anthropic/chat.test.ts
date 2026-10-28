@@ -45,6 +45,7 @@
 // - The last assistant frame's usage is the context in use; modelUsage gives the window.
 // - Only a result's subtype must keep its shape. errors, usage and modelUsage may change.
 // - SIGINT to the group ends a running turn. A failed resume exits non-zero without a result.
+
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
@@ -70,6 +71,7 @@ import {
   type ChatToolKind,
 } from '@crewkite/contracts';
 import type { ChatTurnRequest } from '../../chat/adapter.ts';
+import { THREAD_TOOLS_LINE } from '../../chat/prompt.ts';
 import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
@@ -175,6 +177,8 @@ function run(
   message = prompt,
   extra: Pick<Parameters<typeof anthropicChatAdapter>[0], 'threadTools'> & {
     readOnly?: boolean;
+    /** The controller's answer for this turn. False wins over a thread tools source. */
+    turnTools?: boolean;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
@@ -217,6 +221,7 @@ function run(
     now: () => Date.parse('2026-10-23T00:00:00.000Z'),
     files,
     readOnly: extra.readOnly,
+    threadTools: extra.turnTools,
   };
   const handle = anthropicChatAdapter({
     launch: () => ({ executable: fixture, sha256 }),
@@ -800,6 +805,45 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     // The copies go when the turn ends.
     assert.equal(existsSync(join(turn.work, 'files')), false);
   }
+  // The controller decided this turn has no tools: nothing is minted, the config is empty and
+  // strict, and the tools are not allowed, even though a source is wired.
+  const minted = launches.length;
+  const declined = run(streamed(), null, [], 'ask', undefined, [], undefined, {
+    threadTools,
+    turnTools: false,
+  });
+  t.after(declined.cleanup);
+  await declined.handle.result;
+  assert.equal(launches.length, minted);
+  assert.ok(declined.launched.argv.includes('--strict-mcp-config'));
+  assert.ok(declined.launched.argv.includes('{"mcpServers":{}}'));
+  assert.ok(!declined.launched.argv.some((arg) => arg.includes('mcp__crewkite__')));
+  // The source gives none although the controller expected tools: the packet loses its line, the
+  // config is empty and the trace says so.
+  const lost = run(
+    streamed(),
+    null,
+    [],
+    'ask',
+    undefined,
+    [],
+    `${prompt}\n\n${THREAD_TOOLS_LINE}`,
+    {
+      threadTools: () => null,
+    },
+  );
+  t.after(lost.cleanup);
+  await lost.handle.result;
+  assert.doesNotMatch(lost.launched.input.join(''), /Thread tools are available/);
+  assert.ok(lost.launched.argv.includes('{"mcpServers":{}}'));
+  assert.ok(
+    lost.events.some(
+      (event) =>
+        event.type === 'provider.notice' &&
+        event.trace === true &&
+        /thread_live/.test(event.message),
+    ),
+  );
   // Each turn launched with its own token.
   const tokens = launches.map((args) => args[args.indexOf('--token') + 1]);
   assert.equal(tokens.length, 2);

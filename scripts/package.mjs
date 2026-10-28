@@ -272,8 +272,6 @@ export async function packageDesktop() {
 
   const stage = join(primary, 'internal/packages/d0', values.id);
   const build = join(primary, 'internal/package-build', values.id);
-  if (Buffer.byteLength(join(stage, 'state/home/control.sock')) > 100)
-    throw new Error('Choose a shorter build name for the packaged controller socket.');
   if (existsSync(stage) || existsSync(build))
     throw new Error('Build or package directory already exists. Choose an unused --id.');
   if (git('status', '--porcelain', '--untracked-files=no'))

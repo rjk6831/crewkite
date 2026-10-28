@@ -391,30 +391,30 @@ export class Controller {
       },
       // The turn's thread tools token dies with the turn.
       onTurnEnded: (turnId) => this.threadToolsRuntime?.broker.end(turnId),
-      threadToolsDown: () => this.threadToolsRuntime?.failed === true,
+      threadToolsDown: () =>
+        this.threadToolsRuntime !== undefined && (!this.threadToolsRuntime.ready || this.closed),
     });
     return this.chatRuntime;
   }
 
   // One broker for the controller's life. Its socket listens once the default adapters exist, and
-  // a turn that starts before it listens, or after listening failed, runs without the tools.
-  // After a failure every cloud turn says so in the thread.
+  // a turn that starts before it listens, or after listening failed, runs without the tools. The
+  // chat service asks once per turn, so the packet, the client's config and the thread notice agree.
   private threadToolsRuntime?: {
     broker: ThreadToolsBroker;
     ready: boolean;
-    failed: boolean;
     started: Promise<void>;
   };
   private threadToolsBroker() {
     if (this.threadToolsRuntime) return this.threadToolsRuntime;
     const broker = new ThreadToolsBroker({ home: this.home });
-    const runtime = { broker, ready: false, failed: false, started: Promise.resolve() };
+    const runtime = { broker, ready: false, started: Promise.resolve() };
     runtime.started = broker.start().then(
       () => {
         runtime.ready = !this.closed;
       },
       () => {
-        runtime.failed = true;
+        // The socket stays closed, and every cloud turn runs without the tools.
       },
     );
     this.threadToolsRuntime = runtime;

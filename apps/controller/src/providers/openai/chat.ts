@@ -27,8 +27,9 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
-import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import { attachedLine, attachedSection, withoutThreadToolsLine } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
+import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
@@ -69,7 +70,11 @@ export type OpenAiChatDeps = Readonly<{
 export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
   return {
     family: 'openai',
-    startTurn: (request, emit) => new OpenAiChatTurn(deps, request, emit).handle,
+    startTurn: (request, emit) => {
+      const turn = turnTools(deps.threadTools, request, emit);
+      return new OpenAiChatTurn({ ...deps, threadTools: () => turn.server }, turn.request, emit)
+        .handle;
+    },
   };
 }
 
@@ -435,7 +440,7 @@ class OpenAiChatTurn {
     this.emit = emit;
     this.schedule = deps.schedule ?? defaultSchedule;
     this.reportUsage = openAiUsageReporter(deps.onUsage);
-    this.threadTools = deps.threadTools?.(request) ?? null;
+    this.threadTools = request.threadTools === false ? null : (deps.threadTools?.(request) ?? null);
     this.trace = frameTrace(request.now ?? Date.now, TRACE_LIMITS);
     let finish: (result: ChatTurnResult) => void = () => {};
     const result = new Promise<ChatTurnResult>((resolve) => {
@@ -765,7 +770,12 @@ class OpenAiChatTurn {
   }
 
   private startTurn(fresh: boolean, history: boolean) {
-    const { systemContext, prompt, selection } = this.request;
+    const { systemContext, selection } = this.request;
+    // A client that did not list its servers runs this turn without the tools, so the packet
+    // must not name them.
+    const prompt = this.mcpConfig
+      ? this.request.prompt
+      : withoutThreadToolsLine(this.request.prompt);
     const transcript = history
       ? this.request.history
           .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.text}`)

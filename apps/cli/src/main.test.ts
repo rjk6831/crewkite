@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { encodeFrame, FrameDecoder } from '@crewkite/client';
+import {
+  controllerSocketPath,
+  ownSocketDirectory,
+  publishControllerSocket,
+} from '@crewkite/client/node';
 import {
   type Command,
   type CommandResult,
@@ -15,7 +20,11 @@ import {
 import { runCli } from './main.ts';
 
 test('CLI lists traverse empty pages and preserve incomplete output', async (context) => {
-  const home = mkdtempSync('/tmp/crewkite-cli-');
+  // A home 120 characters deep still serves the CLI, since the control socket is not inside it.
+  const base = mkdtempSync('/tmp/crewkite-cli-');
+  const home = join(base, 'deep'.repeat(25));
+  assert.ok(home.length >= 120);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
   writeFileSync(join(home, 'token'), 'a'.repeat(64), { mode: 0o600 });
   const stamp = { epoch: 'a'.repeat(32), revision: '1' };
   const header: WorkspaceState = {
@@ -110,10 +119,12 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
   context.after(async () => {
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((done) => server.close(() => done()));
-    rmSync(home, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true });
   });
-  server.listen(join(home, 'control.sock'));
+  ownSocketDirectory(dirname(controllerSocketPath(home)));
+  server.listen(controllerSocketPath(home));
   await once(server, 'listening');
+  publishControllerSocket(home, controllerSocketPath(home));
   const execute = async (args: string[]) => {
     let out = '',
       err = '';
@@ -296,8 +307,10 @@ test('CLI operation actions keep exact review bindings and bounded continuation'
     await new Promise<void>((done) => server.close(() => done()));
     rmSync(home, { recursive: true, force: true });
   });
-  server.listen(join(home, 'control.sock'));
+  ownSocketDirectory(dirname(controllerSocketPath(home)));
+  server.listen(controllerSocketPath(home));
   await once(server, 'listening');
+  publishControllerSocket(home, controllerSocketPath(home));
   const execute = async (args: string[]) => {
     let out = '',
       err = '';

@@ -45,6 +45,11 @@ export type ChatTurnRequest = Readonly<{
   history: readonly ChatHistoryEntry[];
   /** Native session to resume when the provider supports it. Null on the first turn. */
   session: ChatSession | null;
+  /**
+   * False when the controller decided this turn runs without the thread tools. The packet does not
+   * name them, and the adapter starts no thread tools server and sends an empty MCP config.
+   */
+  threadTools?: boolean;
   /** The scratch copy where edits land. Never the person's checkout. */
   scratch: Readonly<{ directory: string; base: string; projectName: string }>;
   /** Private per-turn working directory under the controller home, for logs and sockets. */

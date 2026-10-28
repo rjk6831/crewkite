@@ -14,8 +14,6 @@ const internal = existsSync(join(root, 'internal/tools'))
 if (!existsSync(internal)) prepareStateDirectory(root, internal);
 const home = resolve(process.env.CREWKITE_HOME ?? join(internal, 'demo-home'));
 const profile = resolve(process.env.CREWKITE_PROFILE ?? join(internal, 'desktop-profile'));
-if (Buffer.byteLength(join(home, 'control.sock')) > 100)
-  throw new Error('Choose a shorter demo home under the repository internal directory.');
 for (const directory of [home, profile]) {
   if (!directory.startsWith(`${internal}/`) && !directory.startsWith(`${root}/internal/`))
     throw new Error('Demo state and profile must stay under this checkout internal directory.');

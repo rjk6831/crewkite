@@ -94,3 +94,14 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## Thread tools agreement and the control socket
+
+Two claims from the rc-05 follow-up. Each lives in an existing test.
+
+| Claim | Where |
+|-------|-------|
+| A turn without thread tools gets a packet that does not name them, a request the adapters read as no tools, and one notice | `chat/service.test.ts` queue row, `chat/prompt.test.ts`, the Anthropic config row |
+| A client with another temporary directory finds the socket through the home record, a squatted per-user folder makes the controller bind elsewhere and the client refuse an untrusted folder, a home reached through a link names the same socket, and a removed socket gives a restart message | `packages/client/src/output.test.ts` |
+| A turn whose thread tools source gives none loses the packet line, runs with an empty config and traces the notice | Anthropic config row |
+| A controller on a home 120 characters deep answers a client and a CLI command, and a socket file left by a crashed run does not block the start | `packages/client/src/output.test.ts`, `packages/client/src/client.test.ts`, `apps/cli/src/main.test.ts` |

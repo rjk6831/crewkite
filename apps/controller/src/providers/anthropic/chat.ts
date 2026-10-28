@@ -33,6 +33,7 @@ import {
 import { scratchPath } from '../../chat/local-tools.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
+import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
@@ -544,7 +545,13 @@ export function anthropicChatAdapter(deps: {
   /** The thread tools server for this turn, with its own token. Null runs the turn without. */
   threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }): ChatAdapter {
-  return { family: 'anthropic', startTurn: (request, emit) => startTurn(deps, request, emit) };
+  return {
+    family: 'anthropic',
+    startTurn: (request, emit) => {
+      const turn = turnTools(deps.threadTools, request, emit);
+      return startTurn({ ...deps, threadTools: () => turn.server }, turn.request, emit);
+    },
+  };
 }
 
 function startTurn(
@@ -669,7 +676,7 @@ function startTurn(
       request,
       prior,
       message.folders,
-      deps.threadTools?.(request) ?? null,
+      request.threadTools === false ? null : (deps.threadTools?.(request) ?? null),
     );
     child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,

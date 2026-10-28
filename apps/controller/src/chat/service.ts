@@ -123,6 +123,7 @@ import {
   withAttachments,
 } from './prompt.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
+import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
 
 export type ChatServiceDeps = {
   store: Store;
@@ -161,7 +162,10 @@ export type ChatServiceDeps = {
    * when settling fails, so what the turn was lent (its thread tools token) ends with it.
    */
   onTurnEnded?: (turnId: string) => void;
-  /** True when the thread tools socket failed to open, so cloud turns run without the tools. */
+  /**
+   * True when the thread tools server cannot be minted, because the socket failed to open or is
+   * not open yet. A cloud turn then runs without the tools, and its packet does not name them.
+   */
   threadToolsDown?: () => boolean;
   /** Process table access and timers. Tests replace them; the defaults are the real ones. */
   groupAbsent?: (group: number) => boolean;
@@ -1362,8 +1366,7 @@ export class ChatService {
       effort: turn.selection.effort,
       role: turn.role,
     });
-    if (turn.selection.family !== 'local' && this.deps.threadToolsDown?.())
-      this.toolsDown(turn, live);
+    if (request.threadTools === false) this.toolsDown(turn, live);
     live.handle = adapter.startTurn(request, (event) => this.record(turn, live, event));
     try {
       this.deps.store.transaction(() => this.saveGroups(turn.id, live));
@@ -1384,7 +1387,7 @@ export class ChatService {
         this.appendEntry(this.task(turn.taskId) as Task, {
           kind: 'chat-system',
           author: { kind: 'system', turnId: turn.id },
-          text: 'Thread tools are unavailable: the controller could not open its socket. This turn runs without them.',
+          text: 'Thread tools are unavailable: the controller has no socket open for them. This turn runs without them.',
         }),
       );
     } catch {
@@ -1394,8 +1397,7 @@ export class ChatService {
       type: 'provider.notice',
       turnId: turn.id,
       level: 'info',
-      message:
-        'Thread tools absent for this turn: thread_turns, thread_turn, thread_diff, thread_checks and thread_live.',
+      message: THREAD_TOOLS_ABSENT,
       trace: true,
     });
   }
@@ -1437,6 +1439,9 @@ export class ChatService {
     const asked = turn.role === 'ask';
     let carries = !!turn.handoffFrom || rerun || asked;
     const family = turn.selection.family;
+    // One answer per turn. The packet, the client's MCP config and the notice all follow it.
+    // Local reads the thread through functions, and its adapter drops the line when it has no reader.
+    const threadTools = family === 'local' || !this.deps.threadToolsDown?.();
     const pending = turn.handoffFrom ? this.pendingHandoff(task.id) : null;
     let reason: HandoffReason = pending?.reason ?? (asked ? 'ask' : rerun ? 'rerun' : 'manual');
     // A native session holds one model, so another model of the family starts a new session.
@@ -1471,6 +1476,7 @@ export class ChatService {
             thread.base,
             prompt,
             turn.handoffFrom ? reason : null,
+            threadTools,
           )
         : null;
     if (delta === 'over') {
@@ -1516,9 +1522,11 @@ export class ChatService {
             history,
             prompt,
             files,
+            threadTools,
           })
         : (caught?.prompt ?? prompt),
       files,
+      threadTools,
       systemContext: this.context(turn, project.name, directory, root, thread, history),
       // The packet carries the transcript, so a turn with a packet sends no separate history. With a
       // delta, the history stops where the delta starts, for an adapter that has to start over.
@@ -2451,6 +2459,7 @@ export class ChatService {
       history: readonly ChatHistoryEntry[];
       prompt: string;
       files: NonNullable<ChatTurnRequest['files']>;
+      threadTools: boolean;
     },
   ): string {
     const changes = this.scratchDiff(turn.taskId, input.root, input.base);
@@ -2464,6 +2473,7 @@ export class ChatService {
         history,
         files: [...changeList(changes), ...stopped, ...patches, ...checks],
         prompt: input.prompt,
+        threadTools: input.threadTools,
         instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
         earlier: input.files.flatMap((file) =>
           file.earlier
@@ -2648,6 +2658,7 @@ export class ChatService {
     base: string,
     prompt: string,
     reason: HandoffReason | null,
+    threadTools: boolean,
   ):
     | { prompt: string; files: NonNullable<ChatTurnRequest['files']>; history: ChatHistoryEntry[] }
     | 'over'
@@ -2727,6 +2738,7 @@ export class ChatService {
         earlier,
         prompt,
         clip,
+        threadTools,
       });
     for (const clip of [undefined, PACKET_ENTRY_CHARACTERS]) {
       const room = PACKET_BYTES - Buffer.byteLength(build(clip, []));
