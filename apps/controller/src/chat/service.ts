@@ -56,14 +56,15 @@ import {
   refValue,
 } from '../host/publication.ts';
 import {
-  committedFiles,
-  type FileContent,
+  type CandidateHash,
   git,
-  type KeptEntry,
+  hashCandidateFiles,
   type PlannedFile,
-  readCandidateFiles,
   readPlannedBlobs,
+  type ScratchPlan,
+  ScratchTooLarge,
   scratchPlan,
+  treeFromScratch,
 } from '../host/source.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../host/worker.ts';
 import { localSliceFits } from '../providers/local/budget.ts';
@@ -77,6 +78,7 @@ import {
   chatFailure,
 } from './adapter.ts';
 import {
+  changedPaths,
   type DiscardOutcome,
   deleteThreadBaseRef,
   discardScratchPath,
@@ -578,19 +580,17 @@ export class ChatService {
       return blocked('git-identity-missing', 'Configure a Git name and email before acceptance.');
     const scratch = this.scratchDirectory(task.id);
     let fileCount: number;
-    let files: FileContent[];
-    let kept: KeptEntry[];
+    let plan: ScratchPlan;
+    let candidates: CandidateHash[];
     try {
-      const source = committedFiles(root, base, { scratch: true });
-      kept = source.kept;
+      plan = scratchPlan(root, base);
+      candidates = hashCandidateFiles(scratch, root, plan);
       // The Changes tab count, so the system line matches what the person reviewed. A base link
-      // the copy changed is listed there and comes from the base, so it is not counted.
-      const links = new Set(source.links.map((link) => link.path));
-      fileCount = scratchChanges(root, scratch, base, false).filter(
-        (file) => !links.has(file.path),
-      ).length;
-      files = readCandidateFiles(scratch, root, base, source);
-    } catch {
+      // the copy changed is listed there and comes from the base, so it is not counted. Changes
+      // lists at most 2000 files.
+      fileCount = Math.min(changedPaths(plan, candidates).length, 2000);
+    } catch (error) {
+      if (error instanceof ScratchTooLarge) return blocked('scratch-unreadable', error.message);
       return blocked(
         'scratch-unreadable',
         'Remove new links and special files from the scratch copy.',
@@ -605,8 +605,13 @@ export class ChatService {
         source: root,
         repository: work,
         base,
-        files,
-        kept,
+        tree: treeFromScratch({
+          repository: work,
+          source: root,
+          scratch,
+          plan,
+          candidates,
+        }),
         identity,
         at,
         message: payload.message?.trim()
@@ -1119,11 +1124,28 @@ export class ChatService {
     const root = task && this.deps.projectPath(task.projectId);
     if (!thread.scratchReady || !thread.base || !root)
       return { taskId: payload.taskId, base: thread.base, files: [] };
-    return {
-      taskId: payload.taskId,
-      base: thread.base,
-      files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
-    };
+    try {
+      return {
+        taskId: payload.taskId,
+        base: thread.base,
+        files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
+      };
+    } catch (error) {
+      if (!(error instanceof ScratchTooLarge)) throw error;
+      // The read has no field for a cause, so one entry says why the list is empty.
+      return {
+        taskId: payload.taskId,
+        base: thread.base,
+        files: [
+          {
+            path: 'Changes could not be listed',
+            additions: 0,
+            deletions: 0,
+            patch: `${error.message}\n`,
+          },
+        ],
+      };
+    }
   }
 
   readCatalog(payload: Payload<'ReadChatCatalog'>): ChatCatalogRead {
@@ -2421,13 +2443,9 @@ export class ChatService {
     if (role === 'orchestrator') return orchestratorContext(name, directory);
     if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
     const base = thread.base ?? '';
-    let files: ChatChangesRead['files'] | null = null;
-    try {
-      files = scratchChanges(root, directory, base);
-    } catch {
-      // The brief says the changes could not be read, and the model works from the files.
-    }
-    return reviewContext(name, directory, base, files, crew);
+    // The brief says why the changes could not be read, and the model works from the files.
+    const files = this.scratchDiff(turn.taskId, root, base);
+    return reviewContext(name, directory, base, files, crew, this.unreadable.get(turn.taskId));
   }
 
   /** The newest reply from a turn that wrote to the scratch copy. */
@@ -2442,11 +2460,18 @@ export class ChatService {
 
   private scratchDiff(taskId: string, root: string, base: string): FileDiff[] | null {
     try {
-      return scratchChanges(root, this.scratchDirectory(taskId), base);
-    } catch {
+      const files = scratchChanges(root, this.scratchDirectory(taskId), base);
+      this.unreadable.delete(taskId);
+      return files;
+    } catch (error) {
+      if (error instanceof ScratchTooLarge) this.unreadable.set(taskId, error.message);
+      else this.unreadable.delete(taskId);
       return null;
     }
   }
+
+  // Why the last Changes read of a thread failed when the cause was size, for the prompts.
+  private unreadable = new Map<string, string>();
 
   /**
    * The next provider starts cold, so the packet states what the scratch copy holds and where
@@ -2476,7 +2501,12 @@ export class ChatService {
         to: turn.selection.family,
         reason: input.reason,
         history,
-        files: [...changeList(changes), ...stopped, ...patches, ...checks],
+        files: [
+          ...changeList(changes, this.unreadable.get(turn.taskId)),
+          ...stopped,
+          ...patches,
+          ...checks,
+        ],
         prompt: input.prompt,
         instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
         earlier: input.files.flatMap((file) =>
@@ -2769,7 +2799,11 @@ export class ChatService {
     base: string,
   ): { lines: string[]; changed: FileDiff[] } {
     const now = this.scratchDiff(taskId, root, base);
-    if (now === null) return { lines: ['The scratch changes could not be read.'], changed: [] };
+    if (now === null)
+      return {
+        lines: [this.unreadable.get(taskId) ?? 'The scratch changes could not be read.'],
+        changed: [],
+      };
     const record = this.readSeen(taskId, family);
     if (record?.sequence !== seen)
       return {
@@ -3334,8 +3368,8 @@ const clip = (text: string, characters: number) =>
 /** Two records of a changed file match when their counts and patch match. */
 const fileDigest = (file: FileDiff) => hashCanonical([file.additions, file.deletions, file.patch]);
 
-function changeList(files: readonly FileDiff[] | null): string[] {
-  if (files === null) return ['The scratch changes could not be read.'];
+function changeList(files: readonly FileDiff[] | null, why?: string): string[] {
+  if (files === null) return [why ?? 'The scratch changes could not be read.'];
   if (files.length === 0) return ['No files changed yet.'];
   return [
     ...files

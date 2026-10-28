@@ -10,6 +10,7 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
+  readSync,
   realpathSync,
   renameSync,
   rmdirSync,
@@ -20,12 +21,16 @@ import {
 import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { ChatChangesRead } from '@crewkite/contracts';
 import {
-  committedFiles,
+  type CandidateHash,
   type FileContent,
   git,
+  hashCandidateFiles,
   type LinkEntry,
-  readCandidateFiles,
+  type PlannedFile,
+  readPlannedBlobs,
   restoreLink,
+  type ScratchPlan,
+  scratchPlan,
 } from '../host/source.ts';
 
 type FileDiff = ChatChangesRead['files'][number];
@@ -38,6 +43,23 @@ const MAXIMUM_LINES = 50_000;
 const MAXIMUM_EDITS = 2_000;
 const CONTEXT = 3;
 
+// The most file bytes one comparison reads for patches. A larger change set still lists every
+// path, and the files past this limit say so in place of a patch.
+const DIFF_READ_BYTES = 64 * 1024 * 1024;
+
+/** The paths whose bytes or mode differ from the base, sorted. Links the copy changed are apart. */
+export function changedPaths(
+  plan: ScratchPlan,
+  candidates: readonly CandidateHash[],
+): { path: string; old?: PlannedFile; next?: CandidateHash }[] {
+  const before = new Map(plan.files.map((file) => [file.path, file]));
+  const after = new Map(candidates.map((file) => [file.path, file]));
+  return [...new Set([...before.keys(), ...after.keys()])]
+    .sort()
+    .map((path) => ({ path, old: before.get(path), next: after.get(path) }))
+    .filter(({ old, next }) => !(old && next && old.oid === next.oid && old.mode === next.mode));
+}
+
 /** Compare the scratch copy with the committed base. One entry per changed path, sorted. */
 export function scratchChanges(
   repository: string,
@@ -45,35 +67,82 @@ export function scratchChanges(
   base: string,
   patches = true,
 ): FileDiff[] {
-  const source = committedFiles(repository, base, { scratch: true });
-  const before = byPath(source.files);
+  const plan = scratchPlan(repository, base);
   // Committed ignore rules keep generated files such as installed packages out of the diff.
   // Skipped entries always come from the base, so they never show as changes.
-  const after = byPath(readCandidateFiles(scratch, repository, base, source));
+  const changed = new Map(
+    changedPaths(plan, hashCandidateFiles(scratch, repository, plan)).map((entry) => [
+      entry.path,
+      entry,
+    ]),
+  );
   // Accept takes held links from the base too. One the copy changed shows, so the person sees
   // that the copy's version stays out.
   const links = new Map<string, { link: LinkEntry; change: LinkChange }>();
-  for (const link of source.links) {
+  for (const link of plan.links) {
     const change = linkChange(scratch, link);
     if (change) links.set(link.path, { link, change });
   }
-  const paths = [...new Set([...before.keys(), ...after.keys(), ...links.keys()])].sort();
+  const paths = [...new Set([...changed.keys(), ...links.keys()])].sort();
   const files: FileDiff[] = [];
   let budget = patches ? TOTAL_PATCH_BYTES : 0;
+  let read = 0;
   for (const path of paths) {
-    const old = before.get(path);
-    const next = after.get(path);
     const held = links.get(path);
-    if (!held && old && next && old.hash === next.hash && old.mode === next.mode) continue;
+    const entry = changed.get(path);
     // shortcut: the read shape holds 2000 files. Upgrade: page changes when a thread needs more.
     if (files.length === 2000) break;
-    const diff = held ? linkDiff(held.link, held.change) : fileDiff(path, old, next);
+    let diff: FileDiff;
+    let notice = false;
+    if (held) diff = linkDiff(held.link, held.change);
+    else if (!patches) diff = { path, additions: 0, deletions: 0, patch: null };
+    else {
+      const size = (entry?.old?.bytes ?? 0) + (entry?.next?.bytes ?? 0);
+      if (read + size > DIFF_READ_BYTES) {
+        diff = { path, additions: 0, deletions: 0, patch: notCompared(size, read) };
+        notice = true;
+      } else {
+        read += size;
+        const old = entry?.old
+          ? { ...entry.old, content: readPlannedBlobs(repository, [entry.old])[0] }
+          : undefined;
+        const next = entry?.next ? readScratchFile(scratch, entry.next.path) : undefined;
+        diff = fileDiff(path, old, next);
+      }
+    }
     const bytes = diff.patch === null ? 0 : Buffer.byteLength(diff.patch);
     const keep = diff.patch !== null && diff.patch.length <= PATCH_CHARACTERS && bytes <= budget;
     if (keep) budget -= bytes;
-    files.push({ ...diff, patch: keep ? diff.patch : null });
+    // A not-compared note is a short explanation of a cause, so it stays whatever the budget.
+    files.push({ ...diff, patch: keep || notice ? diff.patch : null });
   }
   return files;
+}
+
+const mebibytes = (bytes: number) => (bytes / (1024 * 1024)).toFixed(1);
+
+function notCompared(size: number, read: number): string {
+  return `Not compared\nThis change reads ${mebibytes(size)} MiB of files, and this comparison already read ${mebibytes(read)} MiB of the ${mebibytes(DIFF_READ_BYTES)} MiB it reads at most. Accept still takes the change. Open the file in your editor to review it.\n`;
+}
+
+function readScratchFile(scratch: string, path: string): FileContent {
+  const fd = openSync(
+    join(scratch, path),
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const state = fstatSync(fd);
+    const content = readFileSync(fd);
+    return {
+      path,
+      mode: state.mode & 0o111 ? '100755' : '100644',
+      hash: '',
+      bytes: content.length,
+      content,
+    };
+  } finally {
+    closeSync(fd);
+  }
 }
 
 type DiscardDone = 'restored' | 'removed' | 'recovered' | 'relinked';
@@ -129,7 +198,7 @@ export function discardScratchPath(
   path: string,
   writing?: (done: DiscardDone) => void,
 ): DiscardOutcome {
-  const source = committedFiles(repository, base, { scratch: true });
+  const source = scratchPlan(repository, base);
   // A case-insensitive volume reaches a held entry under any spelling.
   const wanted = pathKey(path);
   const covers = (held: string) =>
@@ -182,7 +251,7 @@ export function discardScratchPath(
   const temporary = join(dirname(target), `.${basename(target)}.${randomBytes(6).toString('hex')}`);
   const mode = original.mode === '100755' ? 0o755 : 0o644;
   try {
-    writeFileSync(temporary, original.content, { flag: 'wx', mode });
+    writeFileSync(temporary, readPlannedBlobs(repository, [original])[0], { flag: 'wx', mode });
     chmodSync(temporary, mode);
     renameSync(temporary, target);
   } catch (error) {
@@ -220,15 +289,21 @@ export function readDiscardMark(file: string): DiscardMark | null {
   }
 }
 
-function sameFile(file: string, original: FileContent) {
+function sameFile(file: string, original: PlannedFile) {
   const fd = openSync(file, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const state = fstatSync(fd);
-    const bytes = readFileSync(fd);
-    return (
-      (state.mode & 0o111 ? '100755' : '100644') === original.mode &&
-      createHash('sha256').update(bytes).digest('hex') === original.hash
+    if ((state.mode & 0o111 ? '100755' : '100644') !== original.mode) return false;
+    if (state.size !== original.bytes) return false;
+    const hash = createHash(original.oid.length === 64 ? 'sha256' : 'sha1').update(
+      `blob ${state.size}\0`,
     );
+    const chunk = Buffer.allocUnsafe(1024 * 1024);
+    for (let count = 1; count > 0; ) {
+      count = readSync(fd, chunk, 0, chunk.length, null);
+      hash.update(chunk.subarray(0, count));
+    }
+    return hash.digest('hex') === original.oid;
   } finally {
     closeSync(fd);
   }
@@ -276,10 +351,6 @@ export function deleteThreadBaseRef(repository: string, taskId: string) {
   const current = refCommit(repository, ref);
   if (current === null) return;
   git(repository, ['update-ref', '--no-deref', '-d', ref, current]);
-}
-
-function byPath(files: FileContent[]) {
-  return new Map(files.map((file) => [file.path, file]));
 }
 
 function fileDiff(path: string, old?: FileContent, next?: FileContent): FileDiff {

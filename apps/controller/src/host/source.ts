@@ -13,6 +13,7 @@ import {
   openSync,
   readdirSync,
   readFileSync,
+  readSync,
   realpathSync,
   rmSync,
   symlinkSync,
@@ -61,6 +62,9 @@ const MAX_SCRATCH_FILES = 100_000;
 const MAX_LINK_EXPANSIONS = 40;
 // BOM handling off, so a name that starts with U+FEFF keeps it.
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+
+/** A scratch copy holds more files than CrewKite compares. The message names that cause. */
+export class ScratchTooLarge extends Error {}
 
 export function git(
   directory: string,
@@ -653,7 +657,7 @@ function resolvesInside(link: LinkEntry, live: ReadonlyMap<string, LinkEntry>): 
 /** Base paths the copy reads from the base, by folded name. */
 type ScratchScope = Map<string, { path: string }>;
 
-function scratchScope(source: CommittedSource): ScratchScope {
+function scratchScope(source: Pick<CommittedSource, 'kept'>): ScratchScope {
   const scope: ScratchScope = new Map();
   for (const entry of source.kept) {
     let path: string;
@@ -678,12 +682,78 @@ export function readCandidateFiles(
   source?: CommittedSource,
 ): FileContent[] {
   const original = source?.files ?? committedFiles(repository, base);
-  const scope = source && scratchScope(source);
-  const rules = original.filter((file) => file.path.split('/').at(-1) === '.gitignore');
-  if (!rules.length) return readScratchFiles(root, undefined, scope);
+  return walkCandidates(
+    root,
+    original.map((file) => file.path),
+    original.filter((file) => file.path.split('/').at(-1) === '.gitignore'),
+    source && scratchScope(source),
+    ({ path, mode, fd, total }) => {
+      const bytes = readFileSync(fd);
+      total(bytes.length);
+      return content(path, mode, bytes);
+    },
+    MAX_SOURCE_BYTES,
+  );
+}
+
+/** A candidate file of a scratch copy: its path, mode, size and the oid git would give it. */
+export type CandidateHash = { path: string; mode: FileEntry['mode']; oid: string; bytes: number };
+
+/**
+ * The candidate files of a scratch copy by blob oid, with the rules `readCandidateFiles` applies
+ * to links, special files, ignored paths and collisions. Each file streams through the hash, so no
+ * byte limit applies and memory holds one chunk.
+ */
+export function hashCandidateFiles(
+  root: string,
+  repository: string,
+  plan: ScratchPlan,
+): CandidateHash[] {
+  const rules = plan.files.filter((file) => file.path.split('/').at(-1) === '.gitignore');
+  const blobs = readPlannedBlobs(repository, rules);
+  const algorithm = (plan.files[0]?.oid.length ?? 40) === 64 ? 'sha256' : 'sha1';
+  const chunk = Buffer.allocUnsafe(1024 * 1024);
+  return walkCandidates(
+    root,
+    plan.files.map((file) => file.path),
+    rules.map((file, index) => ({ path: file.path, content: blobs[index] })),
+    scratchScope(plan),
+    ({ path, mode, fd, size }) => {
+      const hash = createHash(algorithm).update(`blob ${size}\0`);
+      let read = 0;
+      for (let count = 1; count > 0; ) {
+        count = readSync(fd, chunk, 0, chunk.length, null);
+        hash.update(chunk.subarray(0, count));
+        read += count;
+      }
+      if (read !== size) throw new Error('A scratch file changed while it was read.');
+      return { path, mode, oid: hash.digest('hex'), bytes: size };
+    },
+    null,
+  );
+}
+
+type Taken = {
+  path: string;
+  mode: FileEntry['mode'];
+  fd: number;
+  size: number;
+  /** Counts bytes a taker read against the walk's byte limit. */
+  total: (bytes: number) => void;
+};
+
+function walkCandidates<T>(
+  root: string,
+  originalPaths: readonly string[],
+  rules: readonly { path: string; content: Buffer }[],
+  scope: ScratchScope | undefined,
+  take: (file: Taken) => T,
+  byteLimit: number | null,
+): T[] {
+  if (!rules.length) return walkScratch(root, undefined, scope, take, byteLimit);
   const tracked = new Set<string>();
   for (const path of [
-    ...original.map((file) => file.path),
+    ...originalPaths,
     ...[...(scope?.values() ?? [])].map((entry) => entry.path),
   ]) {
     const parts = path.split('/');
@@ -697,7 +767,7 @@ export function readCandidateFiles(
       writeFileSync(join(context, rule.path), rule.content);
     }
     // Frozen rules exclude generated files without letting new ignore rules conceal edits.
-    return readScratchFiles(
+    return walkScratch(
       root,
       (paths) => {
         const requested = new Map<string, string>();
@@ -728,6 +798,8 @@ export function readCandidateFiles(
         return new Set(ignored.map((path) => requested.get(path) as string));
       },
       scope,
+      take,
+      byteLimit,
     );
   } finally {
     rmSync(context, { recursive: true, force: true });
@@ -735,18 +807,30 @@ export function readCandidateFiles(
 }
 
 export function readFiles(root: string): FileContent[] {
-  return readScratchFiles(root);
+  return walkScratch(
+    root,
+    undefined,
+    undefined,
+    ({ path, mode, fd, total }) => {
+      const bytes = readFileSync(fd);
+      total(bytes.length);
+      return content(path, mode, bytes);
+    },
+    MAX_SOURCE_BYTES,
+  );
 }
 
-function readScratchFiles(
+function walkScratch<T>(
   root: string,
-  ignored?: (paths: string[]) => Set<string>,
-  scope?: ScratchScope,
-): FileContent[] {
+  ignored: ((paths: string[]) => Set<string>) | undefined,
+  scope: ScratchScope | undefined,
+  take: (file: Taken) => T,
+  byteLimit: number | null,
+): T[] {
   const rootState = lstatSync(root);
   if (!rootState.isDirectory() || rootState.isSymbolicLink())
     throw new Error('Scratch root is not an independent directory.');
-  const files: FileContent[] = [];
+  const files: T[] = [];
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
   const limit = scope ? MAX_SCRATCH_FILES : MAX_SOURCE_FILES;
@@ -781,13 +865,26 @@ function readScratchFiles(
         const opened = fstatSync(fd);
         if (!opened.isFile() || opened.nlink !== 1 || opened.mode & 0o6000)
           throw new Error('Scratch contains an unsupported file mode.');
-        if (opened.size + total > MAX_SOURCE_BYTES || files.length >= limit)
+        if (files.length >= limit)
+          throw new ScratchTooLarge(
+            `The scratch copy holds more than ${limit.toLocaleString('en-US')} files, the most CrewKite compares.`,
+          );
+        if (byteLimit !== null && opened.size + total > byteLimit)
           throw new Error('Scratch exceeds the source limit.');
         safePath(path, seen, prefixes);
-        const bytes = readFileSync(fd);
-        total += bytes.length;
-        if (total > MAX_SOURCE_BYTES) throw new Error('Scratch exceeds the source byte limit.');
-        files.push(content(path, opened.mode & 0o111 ? '100755' : '100644', bytes));
+        files.push(
+          take({
+            path,
+            mode: opened.mode & 0o111 ? '100755' : '100644',
+            fd,
+            size: opened.size,
+            total: (bytes) => {
+              total += bytes;
+              if (byteLimit !== null && total > byteLimit)
+                throw new Error('Scratch exceeds the source byte limit.');
+            },
+          }),
+        );
       } finally {
         closeSync(fd);
       }
@@ -1048,4 +1145,85 @@ export function treeFromFiles(
   ];
   git(repository, ['update-index', '-z', '--index-info'], Buffer.concat(entries));
   return git(repository, ['write-tree']).toString().trim();
+}
+
+/**
+ * The tree a chat acceptance commits, built without reading unchanged files. The new repository
+ * borrows the project's objects, so a candidate that matches the base by oid and mode points at the
+ * base's blob and only a changed file is written. Kept entries go in as the base has them. The
+ * same path, mode and count rules as `treeFromFiles` apply.
+ */
+export function treeFromScratch(input: {
+  repository: string;
+  source: string;
+  scratch: string;
+  plan: ScratchPlan;
+  candidates: readonly CandidateHash[];
+}): string {
+  const { plan, candidates } = input;
+  if (candidates.length + plan.kept.length > MAX_SCRATCH_FILES)
+    throw new ScratchTooLarge(
+      `The scratch copy holds more than ${MAX_SCRATCH_FILES.toLocaleString('en-US')} files, the most CrewKite compares.`,
+    );
+  const seen = new Set<string>();
+  const prefixes = new Map<string, string>();
+  for (const entry of plan.kept) {
+    if (
+      !['100644', '100755', '120000', '160000'].includes(entry.mode) ||
+      !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(entry.oid) ||
+      (entry.mode === '160000') !== (entry.content === null) ||
+      entry.path.includes(0) ||
+      !entry.path.length
+    )
+      throw Error('Source contains an unsupported kept entry.');
+    let name: string | null;
+    try {
+      name = utf8.decode(entry.path);
+    } catch {
+      name = null;
+    }
+    if (name !== null) safePath(name, seen, prefixes);
+  }
+  for (const file of candidates) {
+    safePath(file.path, seen, prefixes);
+    if (!['100644', '100755'].includes(file.mode))
+      throw Error('Source contains an unsupported file.');
+  }
+  const objects = git(input.source, [
+    'rev-parse',
+    '--path-format=absolute',
+    '--git-path',
+    'objects',
+  ])
+    .toString('utf8')
+    .trim();
+  mkdirSync(input.repository, { recursive: true, mode: 0o700 });
+  git(input.repository, ['init', '--quiet']);
+  mkdirSync(join(input.repository, '.git', 'objects', 'info'), { recursive: true });
+  writeFileSync(join(input.repository, '.git', 'objects', 'info', 'alternates'), `${objects}\n`);
+  git(input.repository, ['read-tree', '--empty']);
+  const held = new Map(plan.files.map((file) => [file.path, file]));
+  const entries: Buffer[] = [];
+  for (const file of candidates) {
+    const base = held.get(file.path);
+    if (!(base && base.oid === file.oid && base.mode === file.mode)) {
+      const written = git(input.repository, [
+        'hash-object',
+        '-w',
+        '--no-filters',
+        '--',
+        join(input.scratch, file.path),
+      ])
+        .toString('utf8')
+        .trim();
+      if (written !== file.oid) throw Error('A scratch file changed while it was read.');
+    }
+    entries.push(Buffer.from(`${file.mode} ${file.oid}\t${file.path}\0`));
+  }
+  for (const entry of plan.kept)
+    entries.push(
+      Buffer.concat([Buffer.from(`${entry.mode} ${entry.oid}\t`), entry.path, Buffer.from([0])]),
+    );
+  git(input.repository, ['update-index', '-z', '--index-info'], Buffer.concat(entries));
+  return git(input.repository, ['write-tree']).toString().trim();
 }

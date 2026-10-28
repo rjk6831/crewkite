@@ -42,7 +42,9 @@ export function preparePublication(input: {
   source: string;
   repository: string;
   base: string;
-  files: FileContent[];
+  files?: FileContent[];
+  /** A tree already built in `repository`, such as `treeFromScratch` makes. */
+  tree?: string;
   /** Base entries a chat scratch copy left out. They go into the tree unchanged. */
   kept?: readonly KeptEntry[];
   identity: GitIdentity;
@@ -54,7 +56,7 @@ export function preparePublication(input: {
     throw new Error('Publication from this Git object format is unsupported in D0.');
   const identity = validateIdentity(input.identity);
   const at = TimestampSchema.parse(input.at);
-  const treeOid = treeFromFiles(input.repository, input.files, input.kept);
+  const treeOid = input.tree ?? treeFromFiles(input.repository, input.files ?? [], input.kept);
   const parent = git(input.source, ['cat-file', 'commit', input.base]);
   const copied = git(input.repository, ['hash-object', '-t', 'commit', '-w', '--stdin'], parent)
     .toString()
@@ -69,7 +71,16 @@ export function preparePublication(input: {
   )
     .toString()
     .trim();
-  // A submodule entry names a commit in another repository, so the pack leaves it out.
+  // A submodule entry names a commit in another repository, so the pack leaves it out. A tree
+  // built on the project's objects also leaves out what the base already holds.
+  const held = input.tree
+    ? new Set(
+        git(input.source, ['ls-tree', '-r', '-t', '--format=%(objectname)', input.base])
+          .toString()
+          .trim()
+          .split('\n'),
+      )
+    : new Set<string>();
   const objects = git(input.repository, [
     'ls-tree',
     '-r',
@@ -81,7 +92,8 @@ export function preparePublication(input: {
     .trim()
     .split('\n')
     .filter((line) => line && !line.startsWith('commit '))
-    .map((line) => line.slice(line.indexOf(' ') + 1));
+    .map((line) => line.slice(line.indexOf(' ') + 1))
+    .filter((oid) => !held.has(oid));
   const pack = git(
     input.repository,
     ['pack-objects', '--stdout'],

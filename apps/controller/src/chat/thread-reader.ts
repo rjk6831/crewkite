@@ -21,6 +21,7 @@ import {
   ThreadTurnsResultSchema,
 } from '@crewkite/contracts';
 import type { z } from 'zod';
+import { ScratchTooLarge } from '../host/source.ts';
 import type { Store } from '../store/index.ts';
 import { scratchChanges } from './changes.ts';
 
@@ -236,7 +237,14 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
                 .filter((turn) => turn.sequence > (args.since ?? 0))
                 .flatMap((turn) => changed(events(turn.id))),
             );
-      const files = scratchChanges(root, join(source.home, 'chat', taskId, 'scratch'), base)
+      let all: ReturnType<typeof scratchChanges>;
+      try {
+        all = scratchChanges(root, join(source.home, 'chat', taskId, 'scratch'), base);
+      } catch (error) {
+        if (!(error instanceof ScratchTooLarge)) throw error;
+        return ThreadDiffResultSchema.parse({ diff: `${error.message}\n`, more: null });
+      }
+      const files = all
         .filter((file) => (args.path ? file.path === args.path : true))
         .filter((file) => !touched || touched.has(file.path));
       const text = redact(
