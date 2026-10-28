@@ -25,9 +25,9 @@ I added a list of my own MCP servers in Settings. A server joins a turn only whe
   - Local runs no MCP servers.
   - Review and advice turns read only, so no server joins them.
 - A server left out of a turn writes one line to the turn trace that says why. The Settings card states the same per-family rules.
-- A policy change in the middle of a turn does not answer a call the kinds do not name, so loosening a thread cannot raise a running server's policy.
+- A policy change in the middle of a turn answers no call of a Google turn that carries my servers, and no call the kinds do not name on other turns, so loosening a thread cannot raise a running server's policy.
 - Secrets are stored the way the Local token is ([ADR 0043](0043-remember-the-local-token-on-this-device.md)): sealed by `safeStorage`, refused when the device has no real keychain, and never returned to the renderer. The window sees the plain arguments, the count of secret arguments and the variable names. Main supplies the resolved set to the controller with a read command that takes no receipt, and the controller keeps it in memory.
-- The controller removes every secret value of the servers a turn started from the turn's events before they reach the thread or the trace. Values shorter than four characters are not matched, since they would match ordinary text.
+- The controller removes every secret value of the servers a turn started from the turn's events and from its failure text before they reach the thread or the trace. Values shorter than four characters are not matched, since they would match ordinary text.
 
 ## Why
 
@@ -42,7 +42,7 @@ I put the secrets in the same store as the Local token because the reasoning in 
 ## Consequences
 
 - Only a desktop session supplies servers. A controller started without the desktop has none, and the CLI sees none.
-- A secret in an argument is visible to other processes of mine in the process list while a turn runs. The environment is the better field for a key, and the card says so.
+- For Anthropic no secret reaches the client's argument list. The config goes in a file with mode 0600 in the turn's private work folder, the client is given its path, and the file is deleted when the turn settles. The server process still receives its own arguments and variables, which another process of mine can read from the process list while it runs. The environment is the better field for a key. Google receives the entries over its protocol, not on a command line.
 - The scrub removes a secret value as written. A secret that a server transforms before printing it is not matched.
 - Google turns on a thread that allows anything do not get my servers, and OpenAI turns never do. The card and the trace say so. Using them there needs a client that sends the approval to the controller, and a new record.
 - A call that I approve with allow for this thread names the one tool for the rest of that turn, as for every other tool.

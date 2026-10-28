@@ -54,6 +54,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -205,10 +206,22 @@ function run(
   const steps = typeof script === 'function' ? script(join(root, 'scratch')) : script;
   const events: AgentEvent[] = [];
   const waiting = new Map<string, (event: AgentEvent) => void>();
-  const launched = { argv: [] as string[], input: [] as string[] };
+  const launched = {
+    argv: [] as string[],
+    input: [] as string[],
+    config: null as { path: string; mode: number; text: string } | null,
+  };
   const usage: unknown[] = [];
   const spawn: Spawn = (executable, argv, options) => {
     launched.argv = argv;
+    // The config file when the client was given a path: what it held and its mode at launch.
+    const path = argv[argv.indexOf('--mcp-config') + 1] ?? '';
+    if (path.endsWith('mcp.json'))
+      launched.config = {
+        path,
+        mode: statSync(path).mode & 0o777,
+        text: readFileSync(path, 'utf8'),
+      };
     const child = spawnCheckChild(
       process.execPath,
       [executable, JSON.stringify(steps), ...argv],
@@ -884,7 +897,14 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
   });
   t.after(joined.cleanup);
   await joined.handle.result;
-  const config = joined.launched.argv.find((arg) => arg.startsWith('{"mcpServers"')) ?? '{}';
+  // The person's servers carry secrets, so the config is a file only this user reads, argv holds
+  // its path and no secret value, and the file is gone when the turn settles.
+  const written = joined.launched.config;
+  assert.ok(written);
+  assert.equal(written.mode, 0o600);
+  assert.ok(!joined.launched.argv.some((arg) => arg.includes('value-one')));
+  assert.equal(existsSync(written.path), false);
+  const config = written.text;
   assert.deepEqual(Object.keys(JSON.parse(config).mcpServers), ['crewkite', 'notes']);
   assert.deepEqual(JSON.parse(config).mcpServers.notes, {
     type: 'stdio',

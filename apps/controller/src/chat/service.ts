@@ -252,6 +252,10 @@ type LiveTurn = {
   policy: ChatPermissionPolicy;
   /** This turn started the person's MCP servers. A policy change mid-turn never answers their calls. */
   mcp: boolean;
+  /** The secret values of the person's servers this turn started, scrubbed from its result. */
+  secrets: readonly string[];
+  /** A Google turn that carries the person's servers: no policy change answers any of its asks. */
+  google: boolean;
   /** Send now stopped this turn. Its queued message starts next with the stopped turn's packet. */
   steered: boolean;
   noticed: boolean;
@@ -1438,6 +1442,8 @@ export class ChatService {
       calls: new Map(),
       policy: 'ask',
       mcp: false,
+      secrets: [],
+      google: false,
       steered: false,
       noticed: false,
       started: false,
@@ -1516,6 +1522,8 @@ export class ChatService {
     const request = this.request(turn);
     live.policy = request.permissionPolicy;
     live.mcp = (request.mcp?.servers.length ?? 0) > 0;
+    live.secrets = request.mcp?.secrets ?? [];
+    live.google = live.mcp && turn.selection.family === 'google';
     // The first turn copies the project, which takes time. Stop may have arrived meanwhile.
     if (this.closed || live.stopRequested) return stoppedResult;
     this.record(turn, live, {
@@ -1881,7 +1889,7 @@ export class ChatService {
     const kind = live.kinds.get(open.callId ?? '');
     // A call the kinds do not name may be a server's. Its policy was cut at launch and a looser
     // thread policy set since does not raise it.
-    if (live.mcp && (kind === undefined || kind === 'other')) return null;
+    if (live.google || (live.mcp && (kind === undefined || kind === 'other'))) return null;
     const words = `${open.question}\n${call?.title ?? ''}`;
     if (/\bnetwork\b/i.test(words)) return null;
     const scratch = this.scratchDirectory(live.taskId);
@@ -1896,7 +1904,9 @@ export class ChatService {
     return policy === 'allow-all' ? allow.id : null;
   }
 
-  private finish(turnId: string, live: LiveTurn, result: ChatTurnResult, left: number[]) {
+  private finish(turnId: string, live: LiveTurn, raw: ChatTurnResult, left: number[]) {
+    // The failure text can echo a server's argument or variable.
+    const result = scrubSecrets(raw, live.secrets);
     const turn = this.turn(turnId);
     if (turn)
       this.record(
