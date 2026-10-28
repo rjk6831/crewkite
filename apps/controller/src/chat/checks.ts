@@ -529,6 +529,7 @@ export class ThreadChecks {
     return {
       items: [...detected, ...custom].slice(0, MAX_ITEMS),
       ask: before?.ask ?? null,
+      approved: before?.approved ?? null,
       runs: before?.runs ?? [],
       detectedAt: this.host.now(),
     };
@@ -601,16 +602,27 @@ export class ThreadChecks {
     task: Task,
     thread: ChatThread,
     directory?: string,
-  ): { commands: { label: string; resolved: string }[]; changed: string[] } {
+  ): { commands: { label: string; resolved: string }[]; changed: string[]; set: string } {
     const where = directory ?? this.directory(task);
+    const home = this.directory(task);
     const commands: { label: string; resolved: string }[] = [];
     const changed: string[] = [];
+    const set = createHash('sha256');
     for (const item of enabledChecks(thread)) {
       const now = describe(item, where);
       commands.push({ label: item.label.slice(0, 80), resolved: now.resolved });
       if (item.pin !== now.digest) changed.push(item.label.slice(0, 80));
+      // The set an approval covers is read from the thread's own copy, whatever copy runs.
+      set.update(`${item.id}\0${item.command}\0${sourceDigest(item, home)}\0`);
     }
-    return { commands, changed };
+    return { commands, changed, set: set.digest('hex') };
+  }
+
+  /** The person allowed this command set for the thread. */
+  approve(taskId: string, set: string) {
+    this.host.update(taskId, (thread) =>
+      thread.checks ? { ...thread, checks: { ...thread.checks, approved: set } } : thread,
+    );
   }
 
   /** The person allowed the changed commands: pin what they run now. */
@@ -640,7 +652,13 @@ export class ThreadChecks {
   private save(taskId: string, run: ChatCheckRun) {
     try {
       this.host.update(taskId, (thread) => {
-        const current = thread.checks ?? { items: [], ask: null, runs: [], detectedAt: null };
+        const current = thread.checks ?? {
+          items: [],
+          ask: null,
+          approved: null,
+          runs: [],
+          detectedAt: null,
+        };
         const runs = current.runs.some((value) => value.id === run.id)
           ? current.runs.map((value) => (value.id === run.id ? run : value))
           : [...current.runs, run];

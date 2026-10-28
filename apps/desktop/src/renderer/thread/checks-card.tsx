@@ -30,7 +30,7 @@ export function ChecksCard({
 }: {
   checks: ChatChecksState;
   onStop: () => Promise<void>;
-  onAnswer: (requestId: string, choice: 'allow' | 'deny') => Promise<void>;
+  onAnswer: (requestId: string, choice: 'allow' | 'allow-thread' | 'deny') => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -87,9 +87,17 @@ export function ChecksCard({
               type="button"
               className="th-pill th-outline"
               disabled={busy}
+              onClick={() => act(onAnswer(ask.requestId, 'allow-thread'))}
+            >
+              Allow for this thread
+            </button>
+            <button
+              type="button"
+              className="th-pill th-outline"
+              disabled={busy}
               onClick={() => act(onAnswer(ask.requestId, 'deny'))}
             >
-              Skip the checks
+              Deny
             </button>
           </div>
         </fieldset>
@@ -230,8 +238,9 @@ export function ChecksSettings({
       </form>
       <p className="th-muted">
         Balanced and Glide run the checks that are on after each fix and after the last slice. A
-        failing check goes to the next fix. Balanced asks before every run. Glide runs them when
-        this thread allows commands, and asks again when a command or script changed.{' '}
+        failing check goes to the next fix. Balanced asks until you allow the commands for this
+        thread. Glide runs them when this thread allows commands. A changed command or script asks
+        again in every mode.{' '}
         {allowed ? 'This thread allows commands.' : 'This thread does not allow commands yet.'}
       </p>
       {error && (

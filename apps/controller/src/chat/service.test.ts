@@ -3313,7 +3313,7 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
     'checks-invalid',
   );
 
-  const answer = (choice: 'allow' | 'deny') => {
+  const answer = (choice: 'allow' | 'allow-thread' | 'deny') => {
     const ask = thread.read().thread.checks?.ask;
     assert.ok(ask, 'a question is waiting');
     const result = act(store, (effects) =>
@@ -3335,17 +3335,8 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
   assert.equal((await refused).outcome, 'denied');
   assert.equal(thread.read().thread.checks?.runs.length, 0);
   assert.equal(thread.read().thread.checks?.ask, null);
-  const pending = service.runCombinedChecks(taskId, first);
-  answer('allow');
-  const failed = await pending;
-  assert.equal(failed.outcome, 'failed');
-  assert.match(failed.brief ?? '', /broken total/);
-  assert.deepEqual(
-    failed.runs.map((run) => [run.status, run.trigger]),
-    [['failed', 'combined']],
-  );
 
-  // Glide with Allow all runs without a question until the script changes.
+  // Glide with Allow all runs without a question.
   configure({
     crew: { name: 'Solo', members: [{ role: 'builder', selection }] },
     flightMode: 'glide',
@@ -3353,6 +3344,23 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
   const quiet = service.runCombinedChecks(taskId, merged('second', true));
   assert.equal(thread.read().thread.checks?.ask, null);
   assert.equal((await quiet).outcome, 'passed');
+
+  // Balanced asks again. Allow for this thread covers the same command set afterwards.
+  configure({ flightMode: 'balanced' });
+  const pending = service.runCombinedChecks(taskId, first);
+  answer('allow-thread');
+  const failed = await pending;
+  assert.equal(failed.outcome, 'failed');
+  assert.match(failed.brief ?? '', /broken total/);
+  assert.deepEqual(
+    failed.runs.map((run) => [run.status, run.trigger]),
+    [['failed', 'combined']],
+  );
+  const covered = service.runCombinedChecks(taskId, merged('fourth', true));
+  assert.equal(thread.read().thread.checks?.ask, null);
+  assert.equal((await covered).outcome, 'passed');
+
+  // A changed script asks in every mode, even for an allowed command set.
   const edited = service.runCombinedChecks(taskId, merged('third', true, `${gate}// edited\n`));
   assert.deepEqual(answer('deny').changed, ['node gate.mjs']);
   assert.equal((await edited).outcome, 'denied');

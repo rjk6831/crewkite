@@ -186,6 +186,7 @@ export type ChatServiceDeps = {
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
 type Effects = (() => void)[];
+type CheckAnswer = 'allow' | 'allow-thread' | 'deny' | 'stop';
 type EntryDraft = ConversationEntry extends infer Entry
   ? Entry extends ConversationEntry
     ? Omit<Entry, 'id' | 'taskId' | 'revision' | 'cursor' | 'at'>
@@ -365,7 +366,7 @@ export class ChatService {
   /** The question each thread waits on before its checks run, with what to do with the answer. */
   private readonly checkAsk = new Map<
     string,
-    { requestId: string; settle: (answer: 'allow' | 'deny' | 'stop', effects: Effects) => void }
+    { requestId: string; settle: (answer: CheckAnswer, effects: Effects) => void }
   >();
   private closed = false;
   /** The copy `importing` made, for the import command it commits next. */
@@ -451,10 +452,13 @@ export class ChatService {
   resolvePermission(payload: Payload<'ResolveChatPermission'>, effects: Effects): CommandResult {
     const asked = this.checkAsk.get(payload.taskId);
     if (asked?.requestId === payload.requestId) {
-      if (payload.choice !== 'allow' && payload.choice !== 'deny')
-        return blocked('permission-not-pending', 'Choose allow or deny.');
+      if (!['allow', 'allow-thread', 'deny'].includes(payload.choice))
+        return blocked(
+          'permission-not-pending',
+          'Choose allow once, allow for this thread or deny.',
+        );
       this.dropCheckAsk(payload.taskId);
-      asked.settle(payload.choice, effects);
+      asked.settle(payload.choice as CheckAnswer, effects);
       return { outcome: 'applied' };
     }
     const live = this.activeLive(payload.taskId, payload.turnId);
@@ -2130,12 +2134,18 @@ export class ChatService {
   }
 
   /**
-   * Whether the person must answer before these checks run. Balanced always asks, as it does for
-   * a command outside the read-only set. Glide runs them when the thread's policy covers commands.
-   * A check whose command or script changed since it was turned on asks in every mode.
+   * Whether the person must answer before these checks run. A check whose command or script
+   * changed since it was turned on asks in every mode. Otherwise a command set the person
+   * allowed for the thread runs. Failing that, Balanced asks as it does for a command outside the
+   * read-only set, and Glide runs them when the thread's policy covers commands.
    */
-  private checksNeedAsk(thread: ChatThread, changed: readonly string[]): boolean {
-    return thread.flightMode !== 'glide' || changed.length > 0 || !commandsAllowed(thread);
+  private checksNeedAsk(
+    thread: ChatThread,
+    assessed: Pick<ReturnType<ThreadChecks['assess']>, 'changed' | 'set'>,
+  ): boolean {
+    if (assessed.changed.length > 0) return true;
+    if (thread.checks?.approved === assessed.set) return false;
+    return thread.flightMode !== 'glide' || !commandsAllowed(thread);
   }
 
   /** Put the question on the thread. The answer arrives as ResolveChatPermission. */
@@ -2144,7 +2154,7 @@ export class ChatService {
     thread: ChatThread,
     trigger: 'fix' | 'plan' | 'combined',
     assessed: ReturnType<ThreadChecks['assess']>,
-    settle: (answer: 'allow' | 'deny' | 'stop', effects: Effects) => void,
+    settle: (answer: CheckAnswer, effects: Effects) => void,
   ) {
     const requestId = `chkask_${randomBytes(16).toString('hex')}`;
     this.checkAsk.set(task.id, { requestId, settle });
@@ -2152,7 +2162,15 @@ export class ChatService {
     if (!current) return;
     this.putThread(task, {
       ...thread,
-      checks: { ...current, ask: { requestId, trigger, ...assessed } },
+      checks: {
+        ...current,
+        ask: {
+          requestId,
+          trigger,
+          commands: assessed.commands,
+          changed: assessed.changed,
+        },
+      },
     });
   }
 
@@ -2174,21 +2192,23 @@ export class ChatService {
     const assessed = this.checks.assess(task, thread);
     // The run starts right after this transaction commits, in the same tick, so a rollback leaves
     // no reservation behind.
-    const go = (fx: Effects, repin: boolean) =>
+    const go = (fx: Effects, repin: boolean, approve: boolean) =>
       fx.push(() => {
         if (repin) this.checks.repin(task);
+        if (approve) this.checks.approve(task.id, assessed.set);
         const entry = this.checks.reserve(task.id);
         this.checks.run(task.id, trigger, undefined, entry).then(
           (result) => this.checksDone(task.id, before, next, result),
           () => this.checksDone(task.id, before, next, null),
         );
       });
-    if (!this.checksNeedAsk(thread, assessed.changed)) {
-      go(effects, false);
+    if (!this.checksNeedAsk(thread, assessed)) {
+      go(effects, false, false);
       return true;
     }
     this.raiseCheckAsk(task, thread, trigger, assessed, (answer, fx) => {
-      if (answer === 'allow') go(fx, assessed.changed.length > 0);
+      if (answer === 'allow' || answer === 'allow-thread')
+        go(fx, assessed.changed.length > 0, answer === 'allow-thread');
       else
         fx.push(() =>
           this.checksDone(task.id, before, next, {
@@ -2213,14 +2233,15 @@ export class ChatService {
     const none = { outcome: 'none', runs: [], brief: null } as const;
     if (!enabledChecks(thread).length) return none;
     const assessed = this.checks.assess(task, thread, directory);
-    if (this.checksNeedAsk(thread, assessed.changed)) {
+    if (this.checksNeedAsk(thread, assessed)) {
       if (this.checkAsk.has(taskId)) return { outcome: 'denied', runs: [], brief: null };
-      const answer = await new Promise<'allow' | 'deny' | 'stop'>((resolve) =>
+      const answer = await new Promise<CheckAnswer>((resolve) =>
         this.deps.store.transaction(() =>
           this.raiseCheckAsk(task, this.thread(taskId), 'combined', assessed, resolve),
         ),
       );
-      if (answer !== 'allow')
+      if (answer === 'allow-thread') this.checks.approve(taskId, assessed.set);
+      if (answer !== 'allow' && answer !== 'allow-thread')
         return { outcome: answer === 'stop' ? 'stopped' : 'denied', runs: [], brief: null };
     }
     return this.checks.run(taskId, 'combined', directory);

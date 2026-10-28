@@ -79,6 +79,8 @@ export type ChatChecksAsk = z.infer<typeof ChatChecksAskSchema>;
 export const ChatChecksStateSchema = z.strictObject({
   items: z.array(ChatCheckSchema).max(16),
   ask: ChatChecksAskSchema.nullable().default(null),
+  /** The command set the person allowed for this thread, as a digest. A change asks again. */
+  approved: hash.nullable().default(null),
   /** The newest runs, oldest first. */
   runs: z.array(ChatCheckRunSchema).max(CHECK_RUNS_KEPT),
   detectedAt: timestamp.nullable(),
