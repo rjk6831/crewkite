@@ -1860,6 +1860,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       builds: [reply('Built part 1.'), reply('Built part 2.')],
       reviews: [reply('Clean.\nFindings: 0'), reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
+      // An Ask sent while the orchestrator reads stops neither the plan nor a chain. It runs last.
+      ask: 'Why two parts?',
       turns: [
         ['orchestrator', 'openai'],
         ['assistant', 'openai'],
@@ -1867,6 +1869,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         ['assistant', 'openai'],
         ['reviewer', 'anthropic'],
         ['challenger', 'google'],
+        ['ask', 'google'],
       ],
       line: 'Crew finished: 2 slices, 2 reviews, 0 fixes.',
       // The challenge follows the last slice's own review chain.
@@ -1946,7 +1949,13 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         }),
       ],
       ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: row.reviews })],
-      ['google', createScriptedChatAdapter({ family: 'google', turns: [reply('It holds.')] })],
+      [
+        'google',
+        createScriptedChatAdapter({
+          family: 'google',
+          turns: [reply('It holds.'), reply('One part waits on the other.')],
+        }),
+      ],
       [
         'local',
         createScriptedChatAdapter({ family: 'local', turns: [reply('Clean.\nFindings: 0')] }),
@@ -2017,7 +2026,26 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         row.name,
       );
     } else thread.send('Fix the rounding.', pick('openai'));
+    const answered =
+      'ask' in row &&
+      next(
+        thread,
+        (event) =>
+          event.type === 'chat.turn' &&
+          (event.payload as ChatTurn).role === 'ask' &&
+          (event.payload as ChatTurn).state === 'done',
+      );
+    if ('ask' in row) {
+      const asked = act(store, (effects) =>
+        service.ask(
+          { taskId, family: 'google', model: 'google-model', question: row.ask },
+          effects,
+        ),
+      );
+      assert.equal(asked.outcome, 'applied', row.name);
+    }
     await ended;
+    await answered;
 
     const read = thread.read();
     assert.deepEqual(
@@ -2025,7 +2053,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       row.turns,
       row.name,
     );
-    assert.equal(read.messages.at(-1)?.text, row.line, row.name);
+    // The Ask's question and answer follow the closing line.
+    assert.equal(read.messages.at('ask' in row ? -3 : -1)?.text, row.line, row.name);
     if (row.chain === null) assert.equal(read.thread.crewChain, null, row.name);
     else {
       const { builderTurnId, ...chain } = read.thread.crewChain ?? {};

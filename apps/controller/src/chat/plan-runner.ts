@@ -24,6 +24,14 @@ type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachme
 type Slice = ChatPlanState['slices'][number];
 
 /** What the runner needs from the chat service. Every call runs inside the caller's transaction. */
+/**
+ * True when the person sent a message that waits in the thread. A queued Ask is a read-only side
+ * question, so it leaves a crew chain or a plan running and starts once they end.
+ */
+export function sentMessage(thread: ChatThread): boolean {
+  return thread.queued.some((message) => message.role !== 'ask');
+}
+
 export type PlanHost = {
   transaction: <T>(work: () => T) => T;
   call: (work: () => void) => void;
@@ -109,7 +117,7 @@ export class PlanRunner {
         this.put(task, thread, plan, { [slice.id]: { status: stopped ? 'not-run' : 'failed' } });
         this.halt(
           task,
-          thread.queued.length
+          sentMessage(thread)
             ? 'you sent a new message'
             : stopped
               ? 'you stopped the reply'
@@ -259,7 +267,7 @@ export class PlanRunner {
     const parsed = parsePlan(this.host.reply(turn) ?? '');
     if ('error' in parsed) {
       const retried = this.host.message(turn)?.startsWith(PLAN_RETRY);
-      if (!retried && !thread.queued.length && !thread.activeTurnId) {
+      if (!retried && !sentMessage(thread) && !thread.activeTurnId) {
         const again = this.host.begin(
           task,
           thread,
@@ -308,7 +316,7 @@ export class PlanRunner {
   private advance(task: Task, thread: ChatThread, effects: Effects) {
     const plan = thread.plan;
     if (plan?.phase !== 'running' || thread.activeTurnId) return;
-    if (thread.queued.length) return this.halt(task, 'you sent a new message', true);
+    if (sentMessage(thread)) return this.halt(task, 'you sent a new message', true);
     const done = new Set(plan.slices.filter((s) => s.status === 'done').map((s) => s.id));
     const order = planOrder(plan.slices) ?? plan.slices.map((slice) => slice.id);
     const next = order

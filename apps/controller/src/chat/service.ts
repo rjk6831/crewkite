@@ -101,7 +101,7 @@ import {
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
 import type { PlanInputs } from './plan.ts';
-import { PlanRunner } from './plan-runner.ts';
+import { PlanRunner, sentMessage } from './plan-runner.ts';
 import {
   adviceContext,
   askContext,
@@ -1896,7 +1896,8 @@ export class ChatService {
 
   /**
    * Move the crew chain on after a turn settles. A done builder turn in balanced or glide starts
-   * it when the crew has a reviewer. A done step starts the next one. A message from the person,
+   * it when the crew has a reviewer. A done step starts the next one. A queued Ask waits for the
+   * chain to end. A message from the person,
    * a stop, a failure or a limit nobody moved on ends it with one line that says why. A rerun on
    * another family is already open when a limit moved the step, and the chain waits for it.
    */
@@ -1922,13 +1923,13 @@ export class ChatService {
             fixes: 0,
             reason: null,
           } as const;
-          if (thread.queued.length)
+          if (sentMessage(thread))
             return this.stopCrew(task, thread, fresh, 'you sent a new message');
           return this.crewStep(task, thread, fresh, effects);
         }
         // A limit already opened the rerun on another family. Its own settle moves the chain on.
         if (thread.activeTurnId) return;
-        if (thread.queued.length)
+        if (sentMessage(thread))
           return this.stopCrew(task, thread, chain, 'you sent a new message');
         if (turn.state === 'stopped')
           return this.stopCrew(task, thread, chain, 'you stopped the reply');
