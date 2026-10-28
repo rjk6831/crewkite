@@ -40,6 +40,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
+import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
@@ -366,6 +367,27 @@ export class Controller {
         ),
     });
     return this.taskOperationRuntime;
+  }
+
+  private savedPrompts(
+    command: Extract<
+      Command,
+      { command: 'ReadChatPrompts' | 'SaveChatPrompt' | 'DeleteChatPrompt' }
+    >,
+  ): CommandResult {
+    try {
+      const prompts =
+        command.command === 'SaveChatPrompt'
+          ? savePrompt(this.home, command.payload)
+          : command.command === 'DeleteChatPrompt'
+            ? deletePrompt(this.home, command.payload.name)
+            : readPrompts(this.home);
+      return { outcome: 'applied', data: { kind: 'chat-prompts', ...prompts } };
+    } catch (failure) {
+      if (failure instanceof PromptsRefused)
+        return { outcome: 'blocked', reason: failure.reason, next: failure.next };
+      throw failure;
+    }
   }
 
   private chatRuntime?: ChatService;
@@ -922,6 +944,10 @@ export class Controller {
         return this.chat().openPullRequest(command.payload);
       return this.chat().branchStatus(command.payload);
     }
+    // Saved prompts are text in the controller home. They change no task, so they skip the task
+    // journal, and saving the same prompt twice leaves the same file.
+    if (command.command === 'SaveChatPrompt' || command.command === 'DeleteChatPrompt')
+      return this.savedPrompts(command);
     // The file copies before the command's transaction opens. A replay answers from its receipt.
     if (command.command === 'ImportChatAttachment' && !this.store.receipt(command.key))
       return this.chat().importing(command.payload, () => this.commitCommand(command, principal));
@@ -1486,6 +1512,19 @@ export class Controller {
               ? { kind: 'chat-thread', ...this.chat().readThread(command.payload) }
               : { kind: 'chat-changes', ...this.chat().readChanges(command.payload) },
         };
+      case 'CompleteChatMention':
+      case 'ReadChatInstructions':
+        if (!this.store.get<Task>('task', command.payload.taskId))
+          return { outcome: 'blocked', reason: 'task-not-found' };
+        return {
+          outcome: 'applied',
+          data:
+            command.command === 'CompleteChatMention'
+              ? { kind: 'chat-mentions', ...this.chat().completeMention(command.payload) }
+              : { kind: 'chat-instructions', ...this.chat().readInstructions(command.payload) },
+        };
+      case 'ReadChatPrompts':
+        return this.savedPrompts(command);
       case 'ReadChatCatalog':
         this.refreshStaleChatModels();
         return {

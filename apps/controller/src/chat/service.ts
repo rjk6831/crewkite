@@ -14,6 +14,8 @@ import {
   ChatFailureSchema,
   type ChatFamily,
   ChatFamilySchema,
+  type ChatInstructionsRead,
+  type ChatMentionsRead,
   type ChatMessage,
   type ChatModelSelection,
   type ChatOutputLimit,
@@ -100,6 +102,7 @@ import {
   readChatBranchStatus,
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
+import { createMentionIndex, readInstructions as readInstructionFiles } from './mentions.ts';
 import type { PlanInputs } from './plan.ts';
 import { PlanRunner, sentMessage } from './plan-runner.ts';
 import {
@@ -1121,6 +1124,30 @@ export class ChatService {
       base: thread.base,
       files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
     };
+  }
+
+  private readonly mentionIndex = createMentionIndex(() => Date.now());
+
+  /** Ranked files and folders of the scratch copy for the text typed after an at sign. */
+  completeMention(payload: Payload<'CompleteChatMention'>): ChatMentionsRead {
+    const thread = this.thread(payload.taskId);
+    const mentions = thread.scratchReady
+      ? this.mentionIndex.complete(
+          this.scratchDirectory(payload.taskId),
+          this.deps.resolveEnvironment('local'),
+          payload.query,
+          payload.limit,
+        )
+      : [];
+    return { taskId: payload.taskId, mentions };
+  }
+
+  /** The instruction files at the copy root, and the text of one the person opens. */
+  readInstructions(payload: Payload<'ReadChatInstructions'>): ChatInstructionsRead {
+    const thread = this.thread(payload.taskId);
+    return thread.scratchReady
+      ? readInstructionFiles(payload.taskId, this.scratchDirectory(payload.taskId), payload.name)
+      : { taskId: payload.taskId, files: [], name: null, text: null, truncated: false };
   }
 
   readCatalog(payload: Payload<'ReadChatCatalog'>): ChatCatalogRead {

@@ -94,3 +94,15 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## Composer parity
+
+Three claims cover the composer additions, and each runs at the lowest layer that can see it.
+
+The mention ranking table runs in the client package on a synthetic file list. It checks that exact and prefix name matches outrank looser ones, that case is ignored, that a subsequence still finds a file, that an empty query lists the shallowest entries, that every answer stays within the limit and that the order does not depend on the input order. The same table checks that an at sign inside an email address starts no mention and that insertion writes the path the provider's tools open: relative to the copy root, a trailing slash on a folder and backticks around a path with white space.
+
+The controller table builds a scratch copy with ignored folders, a link to a file outside and instruction files, then asks for completions. Nothing under `node_modules` or `.git`, no link and no path outside the copy comes back, and the limit bounds the answer. The same table checks the instruction chip source: plain instruction files at the copy root are listed, a link to an outside file is not, only a listed name can be read, and a copy with none lists none.
+
+The saved prompt table covers the controller home. Prompts persist, a repeated name replaces its body, the export is the versioned JSON file in name order, and a damaged file is refused and left as it is. The same table parses `/prompt name key=value` and checks that insertion fills the values given and names the placeholders still open. Slash commands that a path would match, such as `/usr/bin`, stay messages.
+
+These tables use synthetic files and no network. They do not exercise the composer's keyboard handling or the Settings card, which a manual desktop check covers.
