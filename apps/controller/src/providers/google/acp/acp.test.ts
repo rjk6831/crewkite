@@ -15,7 +15,7 @@ import { userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { type ApprovalBinding, CommandSchema } from '@crewkite/contracts';
+import { type ApprovalBinding, CommandSchema, GOOGLE_TERMS_VERSION } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { createTestClock, createTestIds } from '../../../../../../packages/testkit/src/fixtures.ts';
 import type { AcpPeerCase } from '../../../../../../packages/testkit/src/providers/acp-peer.ts';
@@ -2291,6 +2291,21 @@ test('a controller that registers the Google client sets it up at launch and lea
     let setup = controller.store.googleAcpSetup();
     assert.equal(setup.state, 'authentication-required');
     assert.deepEqual(steps(controller), ['acp-initialize quiescent']);
+
+    // Signing in is the person's choice, made after they acknowledge Google's terms.
+    const acknowledged = await controller.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: id('cmd'),
+        actor: { id: 'terminal', kind: 'cli' },
+        command: 'AcknowledgeGoogleTerms',
+        expectedRevision: setup.revision,
+        payload: { textVersion: GOOGLE_TERMS_VERSION },
+      }),
+      'local-owner',
+    );
+    assert.equal(acknowledged.outcome, 'applied');
+    setup = controller.store.googleAcpSetup();
 
     const signIn = await controller.execute(
       CommandSchema.parse({
