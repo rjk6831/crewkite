@@ -7,11 +7,10 @@ import {
   ChatPlanSchema,
   type ChatPlanSlice,
   type ChatPlanState,
-  LOCAL_REPLY_MARGIN,
-  localReplyFloor,
   planOrder,
   rankFamilies,
 } from '@crewkite/contracts';
+import { localPromptRoom } from '../providers/local/budget.ts';
 import { familyName } from './prompt.ts';
 
 // The orchestrator proposes a plan and the controller assigns it (ADR 0045). Everything here is a
@@ -57,7 +56,10 @@ export type PlanInputs = {
   builder: ChatModelSelection;
   /** The loaded Local model's context length, or null when Local has none to offer. */
   localContext: number | null;
-  /** Whether files of these sizes fit a Local prompt of this context (the A5 budget rule). */
+  /**
+   * Whether files of these sizes fit a Local prompt of this context. The controller passes the
+   * Local budget rule, which leaves the outline and the summary their share of the room.
+   */
   localSliceFits: (
     files: readonly { path: string; bytes: number }[],
     contextLength: number,
@@ -78,19 +80,6 @@ const modeName: Record<ChatHandoffMode, string> = {
 
 const MAX_CANDIDATES = 4;
 const count = (value: number) => value.toLocaleString('en-US');
-
-/** Tokens a Local prompt may take: the context less the reply margin and the smallest reply. */
-export const localRoom = (contextLength: number) =>
-  Math.max(0, contextLength - LOCAL_REPLY_MARGIN - localReplyFloor(contextLength));
-
-// Text and code run three to five bytes a token. Three never undercounts.
-const BYTES_PER_TOKEN = 3;
-
-/** The room rule alone: no image, and the named files within the Local prompt room. */
-export const localRoomFits: PlanInputs['localSliceFits'] = (files, contextLength, hasImage) =>
-  !hasImage &&
-  files.reduce((sum, file) => sum + Math.ceil(file.bytes / BYTES_PER_TOKEN), 0) <=
-    localRoom(contextLength);
 
 /**
  * The card rows for a plan: each slice in plan order, queued, with its assignment and up to four
@@ -168,7 +157,7 @@ function assignSlice(
       assignment = {
         family: 'local',
         model: modelOf(local, builder) as string,
-        reason: `${head} Local: ${count(localRoom(context))} token room, Local first.`,
+        reason: `${head} Local: ${count(localPromptRoom(context))} token room, Local first.`,
       };
     else {
       const why = !local
@@ -177,7 +166,7 @@ function assignSlice(
           ? 'Local reports no context length'
           : image
             ? 'Local takes no image file'
-            : `the files do not fit Local's ${count(localRoom(context))} token room`;
+            : `the files do not fit Local's ${count(localPromptRoom(context))} token room`;
       assignment = top(choices, why);
     }
   } else {

@@ -64,6 +64,7 @@ import {
   readCandidateFiles,
 } from '../host/source.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../host/worker.ts';
+import { localSliceFits } from '../providers/local/budget.ts';
 import type { Store } from '../store/index.ts';
 import {
   type ChatAdapter,
@@ -99,7 +100,7 @@ import {
   readChatBranchStatus,
 } from './git.ts';
 import { scratchPath } from './local-tools.ts';
-import { localRoomFits, type PlanInputs } from './plan.ts';
+import type { PlanInputs } from './plan.ts';
 import { PlanRunner } from './plan-runner.ts';
 import {
   adviceContext,
@@ -173,7 +174,7 @@ export type ChatServiceDeps = {
   onImportProgress?: (taskId: string, progress: ImportProgress) => void;
   /** The context length of the loaded Local model, or null. A plan sends easy slices by it. */
   localContext?: () => number | null;
-  /** Whether a slice's files fit a Local prompt. The default applies the A5 room rule. */
+  /** Whether a slice's files fit a Local prompt. The default is the Local budget rule. */
   localSliceFits?: PlanInputs['localSliceFits'];
 };
 
@@ -1084,7 +1085,7 @@ export class ChatService {
       free: (task) => !this.checkedThread(task).left.length,
       scratchDirectory: (taskId) => this.scratchDirectory(taskId),
       localContext: () => this.deps.localContext?.() ?? null,
-      localSliceFits: this.deps.localSliceFits ?? localRoomFits,
+      localSliceFits: this.deps.localSliceFits ?? localSliceFits,
     };
   }
 
