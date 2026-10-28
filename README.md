@@ -11,6 +11,8 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 ![The thread view: a streamed reply, a thinking card, tool cards with a diff and an inline permission prompt.](docs/images/thread.png)
 
+A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan, assigns each slice by allowance and difficulty, and runs it. Builders on any family run the slices, and any model can read what another did through read-only thread tools. Local takes the slices that fit its context. <!-- L9: confirm the crew paragraph once the orchestrator and thread tools are integrated -->
+
 ## Install
 
 1. Install Node 24.22.0 and pnpm 12.11.2.
@@ -21,7 +23,7 @@ To try a published build without the source, follow the [preview guide](docs/pre
 
 ## Principles
 
-- Qualify official clients on their supported subscription path. Cloud-provider authentication stays with those clients. CrewKite never falls back to paid API billing on its own.
+- Qualify official clients on their supported subscription path. Cloud-provider authentication stays with those clients, and CrewKite never reads or stores a provider credential. The one secret it can keep is the token of a model runtime on this device, only when I turn on Remember the Local token, and Forget removes it. CrewKite never falls back to paid API billing on its own.
 - Report usage as observed. A gauge needs a real denominator, a source and a timestamp. Unknown is a valid state.
 - Keep authority in code. Prompts and model output cannot grant permissions, raise limits or accept results.
 - Preserve your source. Writers work in scratch copies. Results land as new local branches only.
