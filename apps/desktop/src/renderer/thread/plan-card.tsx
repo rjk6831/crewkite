@@ -88,6 +88,7 @@ function SliceRow({
       )}
       {reason && <p className="th-plan-reason">{reason}</p>}
       {view.waitsOn && <p className="th-plan-reason">{view.waitsOn}.</p>}
+      {view.conflicts && <p className="th-plan-conflicts">{view.conflicts}.</p>}
     </li>
   );
 }

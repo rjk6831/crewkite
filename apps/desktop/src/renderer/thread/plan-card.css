@@ -83,7 +83,8 @@
 .th-plan-status.is-done {
   color: var(--green);
 }
-.th-plan-status.is-failed {
+.th-plan-status.is-failed,
+.th-plan-status.is-blocked {
   color: var(--red);
 }
 .th-plan-where {
@@ -95,6 +96,11 @@
 }
 .th-plan-reason {
   color: var(--text-dim);
+  font-size: 11.5px;
+  overflow-wrap: anywhere;
+}
+.th-plan-conflicts {
+  color: var(--red);
   font-size: 11.5px;
   overflow-wrap: anywhere;
 }
