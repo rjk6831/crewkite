@@ -276,7 +276,8 @@ export const LocalModelChoiceSchema = z
           ? choice.instanceReference !== null &&
             choice.contextLength !== null &&
             ['gguf', 'safetensors'].includes(choice.identity.format) &&
-            choice.reasons.length === 0
+            // A busy instance still qualifies. The turn waits for it, and the card says Busy.
+            choice.reasons.every((reason) => reason === 'busy')
           : choice.reasons.length > 0,
     'Local model state needs its observed instance and finite compatibility reasons.',
   );

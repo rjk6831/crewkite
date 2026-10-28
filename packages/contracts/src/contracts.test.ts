@@ -1868,6 +1868,20 @@ test('process boundaries reject unknown fields and invalid command identity', ()
       LocalModelObservationSchema.safeParse({ ...observation, ...change }).success,
       false,
     );
+  // A busy loaded instance still qualifies. Any other reason on a loaded choice does not.
+  assert(
+    LocalModelObservationSchema.safeParse({
+      ...observation,
+      models: [{ ...observedChoice, reasons: ['busy'] }],
+    }).success,
+  );
+  assert.equal(
+    LocalModelObservationSchema.safeParse({
+      ...observation,
+      models: [{ ...observedChoice, reasons: ['busy', 'draft'] }],
+    }).success,
+    false,
+  );
   const selectedSetup = {
     ...localSetup,
     setupHash: 'a'.repeat(64),

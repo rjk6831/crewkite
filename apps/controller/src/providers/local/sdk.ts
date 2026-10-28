@@ -397,7 +397,9 @@ export async function discoverLocalModels(
           confirmed.contextLength !== info.contextLength
         )
           throw new Error();
-        choice.state = choice.reasons.length ? 'incompatible' : 'loaded-eligible';
+        choice.state = choice.reasons.some((reason) => reason !== 'busy')
+          ? 'incompatible'
+          : 'loaded-eligible';
       }
       reason = 'transport';
       const currentModels = await client.llm.listLoaded();
