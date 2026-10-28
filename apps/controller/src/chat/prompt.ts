@@ -245,6 +245,76 @@ export function challengeContext(
   return [...lines, `The last answer:\n\n${text}`].join('\n');
 }
 
+/** The example in the orchestrator brief. A test parses it with the plan schema. */
+export const PLAN_EXAMPLE =
+  '{"planId": "p1", "goal": "Add tax to the order total.", "slices": [{"id": 1, "title": "Add the tax rate", "brief": "Add TAX_RATE to src/config.ts and export it.", "files": ["src/config.ts"], "depends": [], "difficulty": "easy", "readOnly": false}, {"id": 2, "title": "Apply tax in totals", "brief": "Use TAX_RATE in orderTotal in src/totals.ts and round to the cent.", "files": ["src/totals.ts", "src/config.ts"], "depends": [1], "difficulty": "medium", "readOnly": false, "hint": {"family": "openai"}}]}';
+
+/**
+ * Brief for an orchestrator turn. It reads, then answers with one plan block the controller
+ * validates. The controller picks the model for each slice, so the brief asks for difficulty and
+ * leaves the choice of family out.
+ */
+export function orchestratorContext(projectName: string, directory: string): string {
+  return [
+    `You are the orchestrator in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    'Do not edit, create or delete files, and do not run commands. You may read and search files to plan the work.',
+    'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan, picks the model for each slice and runs the slices one at a time in dependency order, with a review after each.',
+    'Reply with a short summary, then exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
+    PLAN_EXAMPLE,
+    'Rules:',
+    '- planId: letters, digits, dot, underscore or hyphen, at most 64 characters.',
+    '- goal: at most 2,000 characters.',
+    '- slices: 1 to 8. Each id is a number from 1 to 8, used once.',
+    '- title: at most 120 characters. brief: at most 4,000 characters, written so a model can do the slice without reading this reply.',
+    '- files: at most 40 paths the slice reads or changes, relative to the root of the scratch copy, with forward slashes, no leading slash and no `..`. Name a file the slice creates by the path it will have.',
+    '- depends: ids of the slices that must finish first. No cycles.',
+    '- difficulty: easy for a small change a small local model can make from the named files alone; medium for a change across a few files that needs judgment; hard for design work or a change that needs much of the codebase in view.',
+    '- readOnly: true when the slice only reads, such as an investigation, and changes no file.',
+    '- hint is optional. hint.family (openai, anthropic, google or local) only breaks a tie between families CrewKite already ranks.',
+  ].join('\n');
+}
+
+/** The message that sends a plan that failed validation back to the orchestrator, once. */
+export const PLAN_RETRY = 'The plan did not pass validation.';
+/**
+ * The retry runs in a fresh session on clients that read no history, so it carries the request.
+ */
+export const planRetryText = (error: string, request: string) =>
+  [
+    `${PLAN_RETRY} ${error}`,
+    'Reply again with one corrected plan block for this request:',
+    request
+      .trim()
+      .split('\n')
+      .map((line) => `> ${line}`)
+      .join('\n'),
+  ].join('\n\n');
+
+/**
+ * The message a slice's builder turn answers. It may resume the builder's native session, which
+ * skips the system context, so the slice travels in the message with its assignment line.
+ */
+export function sliceBrief(
+  plan: { planId: string; goal: string; slices: readonly unknown[] },
+  slice: { id: number; title: string; brief: string; files: readonly string[]; readOnly: boolean },
+  assignment: string,
+): string {
+  return [
+    `Slice ${slice.id} of ${plan.slices.length} in plan ${plan.planId}: ${slice.title}`,
+    `The plan's goal: ${plan.goal}`,
+    assignment,
+    slice.brief,
+    slice.files.length
+      ? `Files for this slice, relative to the scratch copy:\n${slice.files.join('\n')}`
+      : '',
+    slice.readOnly
+      ? 'This slice only reads. Do not edit, create or delete files. Report what you found.'
+      : 'Do only this slice. Later slices cover the rest of the plan. Say which files you changed and why.',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
 const FIXER_REVIEW_CHARACTERS = 16_000;
 
 /**
