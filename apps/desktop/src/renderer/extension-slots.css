@@ -1,0 +1,27 @@
+/* Extension slots sit beside the built-in controls and borrow their look. */
+.th-extension-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+.th-extension-output {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 420px;
+  font-size: 12px;
+}
+.th-extension-output p {
+  margin: 0;
+}
+.st-extension-manifest dl {
+  display: grid;
+  grid-template-columns: max-content 1fr;
+  gap: 2px 12px;
+  margin: 6px 0 0;
+  font-size: 12px;
+}
+.st-extension-manifest dd {
+  margin: 0;
+}

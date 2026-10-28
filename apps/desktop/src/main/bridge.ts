@@ -274,6 +274,7 @@ export async function installBridge(
         'ReadChatTurnEvents',
         'ReadChatChanges',
         'ReadChatCatalog',
+        'ReadExtensions',
         'RefreshChatModels',
         'ReadChatBranchStatus',
         'PushChatBranch',

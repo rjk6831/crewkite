@@ -2,6 +2,7 @@ import type { ChatCatalogRead, ChatModelSelection, WorkspaceState } from '@crewk
 import { GitBranch, PanelRight } from 'lucide-react';
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { ExtensionThreadActions } from '../extension-slots.tsx';
 import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
 import {
   cancelPlan,
@@ -365,6 +366,7 @@ export function ThreadView({
           )}
           <ThreadTitle source={source} task={task} />
           <span className="th-project">{projectName}</span>
+          <ExtensionThreadActions source={source} taskId={task.id} />
           <span className="th-badge" title={thread?.base ?? 'No base commit yet'}>
             <GitBranch size={11} aria-hidden="true" />
             {badge}
