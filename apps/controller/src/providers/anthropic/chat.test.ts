@@ -3,7 +3,9 @@
 //
 // argv: --print --output-format stream-json --input-format stream-json --verbose
 //   --include-partial-messages --permission-prompt-tool stdio --setting-sources ''
-//   --settings {"disableAllHooks":true} --permission-mode default|acceptEdits --model M
+//   --settings {"disableAllHooks":true} --permission-mode default|acceptEdits
+//   [--allowedTools Read,Grep,Glob,mcp__crewkite__*] [--mcp-config {"mcpServers":{"crewkite":
+//   {"type":"stdio","command":NODE,"args":[...]}}} --strict-mcp-config] --model M
 //   [--effort E] [--resume S] [--add-dir F]. With no setting sources neither the scratch copy's own .claude
 //   settings nor the user file load, so no allow rule answers an ask before CrewKite sees it.
 //
@@ -66,6 +68,8 @@ import {
   type ChatToolKind,
 } from '@crewkite/contracts';
 import type { ChatTurnRequest } from '../../chat/adapter.ts';
+import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
+import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
 import { anthropicChatAdapter } from './chat.ts';
@@ -166,6 +170,9 @@ function run(
   effort: ChatEffort = 'default',
   files: File[] = [],
   message = prompt,
+  extra: Pick<Parameters<typeof anthropicChatAdapter>[0], 'threadTools'> & {
+    readOnly?: boolean;
+  } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
   mkdirSync(join(root, 'scratch'));
@@ -206,9 +213,11 @@ function run(
     environment: { HOME: root, PATH: '/usr/bin:/bin' },
     now: () => Date.parse('2026-10-23T00:00:00.000Z'),
     files,
+    readOnly: extra.readOnly,
   };
   const handle = anthropicChatAdapter({
     launch: () => ({ executable: fixture, sha256 }),
+    threadTools: extra.threadTools,
     spawn,
     onUsage: (reading) => usage.push(reading),
   }).startTurn(request, (event) => {
@@ -580,6 +589,32 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
   const copy = (work: string, { attachment }: File) =>
     join(work, 'files', attachment.id, attachment.name);
   const framed = `${systemContext}\n\n${prompt}`;
+  // A real broker mints each turn's server line. It never needs to listen for the launch.
+  const broker = new ThreadToolsBroker({ home: stored });
+  const launches: Array<readonly string[]> = [];
+  const threadTools = (request: ChatTurnRequest) => {
+    const server = broker.mint({
+      taskId: request.taskId,
+      turnId: request.turnId,
+      reader: fixtureReader(),
+    });
+    launches.push(server.args);
+    return server;
+  };
+  const withTools = (argv: string[], allowed: string[]) => (_work: string) => {
+    const args = launches.at(-1) ?? [];
+    const config = { mcpServers: { crewkite: { type: 'stdio', command: process.execPath, args } } };
+    const at = argv.indexOf('--model');
+    return [
+      ...argv.slice(0, at),
+      '--allowedTools',
+      allowed.join(','),
+      '--mcp-config',
+      JSON.stringify(config),
+      '--strict-mcp-config',
+      ...argv.slice(at),
+    ];
+  };
   const large = file('large.pdf', 'application/pdf', Buffer.alloc(25 * 1024 * 1024, 0x20));
   const rows: Array<{
     session: ChatSession | null;
@@ -592,6 +627,8 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     files?: File[];
     message?: string;
     content?: unknown[] | ((work: string) => unknown[]);
+    tools?: boolean;
+    readOnly?: boolean;
   }> = [
     { session: null, argv: base, text: `${systemContext}\n\n${prompt}`, id: fresh },
     {
@@ -617,6 +654,23 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
       id: fresh,
       effort: 'minimal' as const,
       reported: null,
+    },
+    {
+      // The thread tools are the only MCP server, allowed without an ask, on writing and
+      // read-only turns alike.
+      session: null,
+      argv: withTools(base, ['mcp__crewkite__*']),
+      text: framed,
+      id: fresh,
+      tools: true,
+    },
+    {
+      session: null,
+      argv: withTools(base, ['Read', 'Grep', 'Glob', 'mcp__crewkite__*']),
+      text: framed,
+      id: fresh,
+      tools: true,
+      readOnly: true,
     },
     {
       // Images, PDFs and UTF-8 text go as blocks in file order before the text. A spreadsheet
@@ -677,11 +731,16 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
       row.effort,
       row.files,
       row.message,
+      { readOnly: row.readOnly, ...(row.tools ? { threadTools } : {}) },
     );
     t.after(turn.cleanup);
     const result = await turn.handle.result;
     const resolved = (value: unknown) => (typeof value === 'function' ? value(turn.work) : value);
     assert.deepEqual(turn.launched.argv, resolved(row.argv));
+    // Exactly one server per launch, and nothing else names MCP.
+    const configs = turn.launched.argv.filter((arg) => arg.startsWith('{"mcpServers"'));
+    assert.equal(configs.length, row.tools ? 1 : 0);
+    if (row.tools) assert.deepEqual(Object.keys(JSON.parse(configs[0]).mcpServers), ['crewkite']);
     const started = turn.events.find((event) => event.type === 'turn.started');
     assert.equal(started?.effort, row.badge ?? 'default', JSON.stringify(row));
     assert.deepEqual(JSON.parse(turn.launched.input[0] ?? ''), {
@@ -695,6 +754,10 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
     // The copies go when the turn ends.
     assert.equal(existsSync(join(turn.work, 'files')), false);
   }
+  // Each turn launched with its own token.
+  const tokens = launches.map((args) => args[args.indexOf('--token') + 1]);
+  assert.equal(tokens.length, 2);
+  assert.equal(new Set(tokens).size, tokens.length);
 });
 
 test('an unknown event goes to the turn trace and never the thread, routine system events go nowhere, and neither ends the turn', async (t) => {

@@ -32,6 +32,7 @@ import {
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
@@ -476,8 +477,22 @@ function userMessage(text: string, files: readonly TurnFile[], staging: string) 
   };
 }
 
-function chatArguments(request: ChatTurnRequest, resume: string | null, folders: string[]) {
+function chatArguments(
+  request: ChatTurnRequest,
+  resume: string | null,
+  folders: string[],
+  tools: ThreadToolsServer | null,
+) {
   const { effort, model } = request.selection;
+  // The thread tools are the one MCP server a turn gets. Strict mode keeps the person's own
+  // servers, project files and plugins out, and the allow rule answers the tools without an ask.
+  const allowed = [
+    ...(request.readOnly ? ['Read', 'Grep', 'Glob'] : []),
+    ...(tools ? [`mcp__${tools.name}__*`] : []),
+  ];
+  const server = tools && {
+    [tools.name]: { type: 'stdio', command: tools.command, args: tools.args },
+  };
   return [
     '--print',
     '--output-format',
@@ -497,8 +512,12 @@ function chatArguments(request: ChatTurnRequest, resume: string | null, folders:
     '{"disableAllHooks":true}',
     '--permission-mode',
     request.permissionPolicy === 'ask' ? 'default' : 'acceptEdits',
-    // Review and advice turns read only.
-    ...(request.readOnly ? ['--allowedTools', 'Read,Grep,Glob'] : []),
+    // Review and advice turns read only. The thread tools only read, on every turn.
+    ...(allowed.length ? ['--allowedTools', allowed.join(',')] : []),
+    // The config option takes several values, so the flag after it closes the list.
+    ...(server
+      ? ['--mcp-config', JSON.stringify({ mcpServers: server }), '--strict-mcp-config']
+      : []),
     '--model',
     model,
     // The client documents low, medium, high, xhigh and max. It has no minimal level.
@@ -515,6 +534,8 @@ export function anthropicChatAdapter(deps: {
   schedule?: Schedule;
   /** Each rate limit frame that reports a window. The last one in a turn is the newest. */
   onUsage?: (reading: UsageReading) => void;
+  /** The thread tools server for this turn, with its own token. Null runs the turn without. */
+  threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }): ChatAdapter {
   return { family: 'anthropic', startTurn: (request, emit) => startTurn(deps, request, emit) };
 }
@@ -637,7 +658,12 @@ function startTurn(
   }
   let child: ChildProcessWithoutNullStreams;
   try {
-    const args = chatArguments(request, prior, message.folders);
+    const args = chatArguments(
+      request,
+      prior,
+      message.folders,
+      deps.threadTools?.(request) ?? null,
+    );
     child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
       cwd: scratch,
       env: environment,
