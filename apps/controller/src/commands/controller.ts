@@ -1391,6 +1391,8 @@ export class Controller {
         return this.chat().renameThread(command.payload);
       case 'DeleteChatThread':
         return this.chat().deleteThread(command.payload, effects);
+      case 'AskChatFamily':
+        return this.chat().ask(command.payload, effects);
       case 'RunChatPlan':
       case 'CancelChatPlan':
         return this.chat().planCommand(command.payload);

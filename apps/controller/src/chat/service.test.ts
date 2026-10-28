@@ -593,7 +593,11 @@ test('a message sent during a turn waits and starts when the turn ends', {
   // queue and starts when the first thread's turn ends. Another family starts at once.
   const shared = createScriptedChatAdapter({
     family: 'openai',
-    turns: [[{ kind: 'wait' }], [{ kind: 'text', itemId: 'reply', chunks: ['Second.'] }]],
+    turns: [
+      [{ kind: 'wait' }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Second.'] }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Answered.'] }],
+    ],
   });
   const other = createScriptedChatAdapter({
     family: 'google',
@@ -638,6 +642,31 @@ test('a message sent during a turn waits and starts when the turn ends', {
   assert.equal(sendTo(third.id, 'On Google.', google).next, undefined);
   await elsewhere;
   assert.equal(other.requests.length, 1);
+  // An ask on a busy family waits like a message, behind the thread that waited first.
+  const asked = act(one.store, (effects) =>
+    one.service.ask(
+      { taskId: third.id, family: 'openai', model: 'fixture-model', question: 'Why?' },
+      effects,
+    ),
+  );
+  assert.equal(
+    asked.next,
+    'OpenAI is answering in another thread. This message starts when that reply ends.',
+  );
+  assert.deepEqual(
+    one.service
+      .readThread({ taskId: third.id, limit: 100 })
+      .thread.queued.map((message) => [message.role, message.text]),
+    [['ask', 'Why?']],
+  );
+  const answered = next(
+    one,
+    (event) =>
+      event.type === 'chat.turn' &&
+      event.taskId === third.id &&
+      (event.payload as ChatTurn).role === 'ask' &&
+      (event.payload as ChatTurn).state === 'done',
+  );
   const freed = next(
     one,
     (event) =>
@@ -649,9 +678,14 @@ test('a message sent during a turn waits and starts when the turn ends', {
     one.service.stopTurn({ taskId: one.taskId, turnId: held.id }, effects),
   );
   await freed;
+  await answered;
   assert.deepEqual(
-    shared.requests.map((request) => request.prompt),
-    ['First thread.', 'Second thread.'],
+    shared.requests.map((request) => [request.role, request.prompt.split('\n').at(-1)]),
+    [
+      ['assistant', 'First thread.'],
+      ['assistant', 'Second thread.'],
+      ['ask', 'Why?'],
+    ],
   );
 });
 
@@ -1171,6 +1205,7 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   const { controller, adapter, task, run, send, read } = await chat(t, [
     [{ kind: 'text', itemId: 'answer', chunks: ['Changed net.mjs.'] }],
     [{ kind: 'text', itemId: 'review', chunks: ['One finding.'] }],
+    [{ kind: 'text', itemId: 'ask', chunks: ['It rounds half up.'] }],
   ]);
   const configure = { permissionPolicy: 'allow-all' };
   assert.equal((await run('ConfigureChatThread', configure, task.revision)).outcome, 'applied');
@@ -1200,6 +1235,34 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   assert.equal(thread.thread.permissionPolicy, 'allow-all');
   assert.equal(thread.thread.sessions.length, 1);
   assert.equal(thread.turns.at(-1)?.role, 'reviewer');
+
+  // Ask: a read-only side question with the thread packet, posted as a turn with the ask role.
+  // The thread keeps its own pick and its builder session.
+  const asked = turnReaches(controller, 'done');
+  const question = { family: 'openai', model: 'fixture-model', question: 'How does it round?' };
+  assert.equal((await run('AskChatFamily', question, task.revision)).outcome, 'applied');
+  await asked;
+  const side = requests[2];
+  assert.equal(side.role, 'ask');
+  assert.equal(side.readOnly, true);
+  assert.equal(side.permissionPolicy, 'ask');
+  assert.equal(side.session, null);
+  assert.match(side.systemContext, /answering a side question/);
+  assert.match(side.prompt, /^This is a side question to OpenAI about the thread below\./);
+  assert.match(side.prompt, /^Person:\nChange net\.mjs\.$/m);
+  assert.match(side.prompt, /New message from the person:\nHow does it round\?$/);
+  const after = await read();
+  assert.equal(after.turns.at(-1)?.role, 'ask');
+  assert.deepEqual(after.messages.at(-1)?.author, {
+    kind: 'assistant',
+    turnId: after.turns.at(-1)?.id,
+    family: 'openai',
+    model: 'fixture-model',
+    role: 'ask',
+    effort: 'default',
+  });
+  assert.deepEqual(after.thread.selection, selection);
+  assert.deepEqual(after.thread.sessions, thread.thread.sessions);
 });
 
 // The scripted adapter has no allow-thread option and no tool event, so this one plays what a real
