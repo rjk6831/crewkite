@@ -42,6 +42,8 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0043](0043-remember-the-local-token-on-this-device.md) | Remember the Local token on this device | Accepted |
 | [0044](0044-thread-tools-over-one-controller-owned-mcp-server.md) | Thread tools over one controller-owned MCP server | Proposed |
 | [0045](0045-the-orchestrator-proposes-and-the-controller-assigns.md) | The orchestrator proposes and the controller assigns | Proposed |
+| [0046](0046-the-persons-servers-join-a-thread-only-by-the-controllers-config.md) | The person's servers join a thread only by the controller's config | Proposed |
+| [0047](0047-extensions-attach-through-one-versioned-seam.md) | Extensions attach through one versioned seam and receive no authority by default | Proposed |
 
 ## Writing a new record
 
