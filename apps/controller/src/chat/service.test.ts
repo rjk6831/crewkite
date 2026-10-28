@@ -2082,6 +2082,40 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
     assert.equal((await importing({ path })).reason, 'file-refused', path);
   assert.deepEqual(partials(), []);
 
+  // A large copy reports progress every 4 MiB and holds no transaction while it runs, so another
+  // command commits mid-copy. The command answers with the stored file as its receipt.
+  const big = join(outside, 'big.log');
+  writeFileSync(big, Buffer.alloc(9 * 1024 * 1024, 97));
+  const seen: [string, number, number][] = [];
+  const slow = standalone(t, {
+    onImportProgress: (id, progress) => {
+      seen.push([progress.name, progress.bytes, progress.total]);
+      if (seen.length === 1)
+        assert.equal(
+          slow.store.transaction(() => slow.service.renameThread({ taskId: id, title: 'Mid copy' }))
+            .outcome,
+          'applied',
+        );
+    },
+  });
+  const large = { taskId: slow.taskId, source: { path: big } };
+  const receipt = await slow.service.importing(large, () =>
+    slow.store.transaction(() => slow.service.importAttachment(large)),
+  );
+  const MiB = 1024 * 1024;
+  assert.deepEqual(seen, [
+    ['big.log', 4 * MiB, 9 * MiB],
+    ['big.log', 8 * MiB, 9 * MiB],
+    ['big.log', 9 * MiB, 9 * MiB],
+  ]);
+  assert.equal(slow.store.get<Task>('task', slow.taskId)?.title, 'Mid copy');
+  assert.equal((receipt.data as ChatAttachment).bytes, 9 * MiB);
+  assert.equal(
+    slow.store.receipt(`chat-file:${slow.taskId}:${(receipt.data as ChatAttachment).id}:big.log`)
+      ?.result.outcome,
+    'applied',
+  );
+
   const { kind: _, ...file } = first.data as ChatAttachment & { kind: 'chat-attachment' };
   const ask = (files: ChatAttachment[]) =>
     act(store, (effects) =>

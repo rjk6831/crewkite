@@ -86,6 +86,7 @@ import {
   dropStaged,
   FileRefused,
   filesFolder,
+  type ImportProgress,
   placeFile,
   type StagedFile,
   stageFile,
@@ -155,6 +156,11 @@ export type ChatServiceDeps = {
   schedule?: Schedule;
   /** When the machine last booted. The default subtracts `os.uptime()` from the clock. */
   bootedAt?: () => string;
+  /**
+   * How far the copy of an import got, outside any transaction. The controller turns it into
+   * the event the attachment chip reads.
+   */
+  onImportProgress?: (taskId: string, progress: ImportProgress) => void;
 };
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
@@ -654,7 +660,13 @@ export class ChatService {
     if (!this.task(payload.taskId)) return commit();
     let staged: StagedFile | CommandResult;
     try {
-      staged = await stageFile(this.filesFolder(payload.taskId), payload.source);
+      staged = await stageFile(this.filesFolder(payload.taskId), payload.source, (progress) => {
+        try {
+          this.deps.onImportProgress?.(payload.taskId, progress);
+        } catch {
+          // A progress update that fails to send changes nothing about the copy.
+        }
+      });
     } catch (error) {
       staged =
         error instanceof FileRefused
