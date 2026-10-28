@@ -1,8 +1,19 @@
-import type { DesktopAttachInput, DesktopFile } from '@crewkite/client';
+import {
+  completeSlash,
+  type DesktopAttachInput,
+  type DesktopFile,
+  expandPrompt,
+  findMentionTrigger,
+  insertMention,
+  parsePromptArgument,
+  parseSlash,
+  type SlashCommand,
+} from '@crewkite/client';
 import type {
   ChatAttachment,
   ChatCatalogRead,
   ChatFamily,
+  ChatMention,
   ChatModelSelection,
   ChatThread,
   LocalSetup,
@@ -26,11 +37,21 @@ import { ContextGauge } from '../context-gauge.tsx';
 import { lastSeen, observeOpenConnection } from '../local-setup-flow.ts';
 import { flightModes, preferredSelection } from '../settings/preferences.ts';
 import { type ChipFile, chipOf, FileChips, keepThumbnail } from './attach.tsx';
-import { configureThread, importAttachment, readCatalog, type ThreadSource } from './commands.ts';
+import {
+  completeMention,
+  configureThread,
+  importAttachment,
+  readCatalog,
+  readPrompts,
+  type ThreadSource,
+} from './commands.ts';
+import { CompleteMenu, type MenuItem } from './composer-menu.tsx';
 import { canSend, isMacPlatform, shortcutFor } from './composer-rules.ts';
 import { deliveryNote, deliveryOf } from './file-fit.ts';
+import { InstructionChip } from './instruction-chip.tsx';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
+import { slashEffect } from './slash-actions.ts';
 
 /**
  * A file in the composer. In a saved thread the controller stores it as soon as it is added, so
@@ -88,6 +109,9 @@ export function Composer({
   onCatalog,
   localState,
   lastMessage = null,
+  onNewThread,
+  onOpenSettings,
+  onOpenChanges,
 }: {
   ref?: Ref<ComposerHandle>;
   source: ThreadSource;
@@ -110,6 +134,11 @@ export function Composer({
   localState?: { setup: LocalSetup | null | undefined; refresh: () => Promise<WorkspaceState> };
   /** The newest message the person sent. Up in an empty box loads it back for editing. */
   lastMessage?: { text: string; files: readonly ChatAttachment[] } | null;
+  /** The slash commands that move around the app. A view that cannot do one leaves it out. */
+  onNewThread?: () => void;
+  onOpenSettings?: () => void;
+  /** Opens the inspector on the Changes tab. A new thread has no changes and leaves it out. */
+  onOpenChanges?: () => void;
 }) {
   const draftKey = taskId ?? 'new';
   const [text, setText] = useState(() => drafts.get(draftKey) ?? '');
@@ -119,6 +148,14 @@ export function Composer({
   const [selection, setSelection] = useState<ChatModelSelection | null>(thread?.selection ?? null);
   const [note, setNote] = useState<string | null>(null);
   const field = useRef<HTMLTextAreaElement>(null);
+  const bar = useRef<HTMLDivElement>(null);
+  const [caret, setCaret] = useState(0);
+  const [found, setFound] = useState<{ query: string; items: ChatMention[] }>({
+    query: '',
+    items: [],
+  });
+  const [active, setActive] = useState(0);
+  const [dismissed, setDismissed] = useState<string | null>(null);
   useImperativeHandle(ref, () => {
     const fill = (value: string) => {
       setText(value);
@@ -164,6 +201,45 @@ export function Composer({
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
   const chosen = selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
+  // An unfinished @ mention at the caret, or a slash command name at the start of the box.
+  const trigger = taskId ? findMentionTrigger(text, caret) : null;
+  const triggerQuery = trigger?.query;
+  useEffect(() => {
+    if (!taskId || triggerQuery === undefined) {
+      setFound({ query: '', items: [] });
+      return;
+    }
+    let live = true;
+    completeMention(source, taskId, triggerQuery).then(
+      (read) => {
+        if (!live) return;
+        setFound({ query: triggerQuery, items: read.mentions });
+        setActive(0);
+      },
+      () => live && setFound({ query: triggerQuery, items: [] }),
+    );
+    return () => {
+      live = false;
+    };
+  }, [source, taskId, triggerQuery]);
+  // Results for an earlier query stay out of the list, so Enter never inserts a stale match.
+  const mentions = trigger && found.query === trigger.query ? found.items : [];
+  const slashMatches: SlashCommand[] = trigger ? [] : completeSlash(text);
+  const menuItems: MenuItem[] =
+    dismissed === text
+      ? []
+      : trigger
+        ? mentions.map((item) => ({
+            key: `${item.kind}:${item.path}`,
+            label: item.kind === 'folder' ? `${item.path}/` : item.path,
+            detail: item.kind === 'folder' ? 'folder' : null,
+          }))
+        : slashMatches.map((item) => ({
+            key: item.name,
+            label: `/${item.name}`,
+            detail: item.summary,
+          }));
+  const menuOpen = menuItems.length > 0;
   const flight = flightModes.find(({ id }) => id === thread?.flightMode) ?? flightModes[0];
   const roles = useRoleRun({
     source,
@@ -218,6 +294,11 @@ export function Composer({
     event?.preventDefault();
     // A message sent while a turn runs waits in the thread and starts when the turn ends.
     const body = text.trim();
+    const slash = files.length === 0 ? parseSlash(body) : null;
+    if (slash) {
+      void runSlash(slash.name, slash.argument);
+      return;
+    }
     if (!canSend({ text: body, files: files.length, blocked, adding })) return;
     const sent = { text: body, files };
     setText('');
@@ -232,6 +313,90 @@ export function Composer({
       setFiles((current) => (current.length > 0 ? current : sent.files));
       setNote(failureText(failure, 'The message was not sent.'));
     }
+  }
+  function clearBox() {
+    setText('');
+    setCaret(0);
+    drafts.delete(draftKey);
+  }
+  function fillBox(value: string) {
+    setText(value);
+    setCaret(value.length);
+    drafts.set(draftKey, value);
+    requestAnimationFrame(() => {
+      field.current?.focus();
+      field.current?.setSelectionRange(value.length, value.length);
+    });
+  }
+  // A slash command moves around the app or fills the box. It never sends a message, and accept,
+  // push and pull request stay behind their own confirmation in Changes.
+  async function runSlash(name: Parameters<typeof slashEffect>[0], argument: string) {
+    const { action, note: said } = slashEffect(name, {
+      thread: taskId !== null,
+      newThread: !!onNewThread,
+      settings: !!onOpenSettings,
+      crew: !!onOpenCrew,
+      changes: !!onOpenChanges,
+    });
+    setNote(said);
+    if (action === 'prompt') {
+      try {
+        const { prompts } = await readPrompts(source);
+        const { name: wanted, values } = parsePromptArgument(argument);
+        const found = prompts.find((prompt) => prompt.name === wanted);
+        if (!found) {
+          const names = prompts.map((prompt) => prompt.name).join(', ');
+          setNote(
+            prompts.length === 0
+              ? 'No prompts are saved yet. Add one in Settings, Prompts.'
+              : `${wanted ? `No saved prompt is named ${wanted}. ` : ''}Saved prompts: ${names}.`,
+          );
+          return;
+        }
+        const filled = expandPrompt(found.body, values);
+        fillBox(filled.text);
+        setNote(filled.missing.length > 0 ? `Fill in ${filled.missing.join(', ')}.` : null);
+      } catch (failure) {
+        setNote(failureText(failure, 'The saved prompts could not be read.'));
+      }
+      return;
+    }
+    if (action === 'ask') {
+      clearBox();
+      if (argument) fillBox(argument);
+      const why = roles.why('ask');
+      if (why) setNote(why);
+      else if (roles.role !== 'ask') roles.toggle('ask');
+      return;
+    }
+    // A command the view cannot run, and /help, leave the box as it is.
+    if (action === 'none') return;
+    clearBox();
+    if (action === 'new-thread') onNewThread?.();
+    else if (action === 'open-settings') onOpenSettings?.();
+    else if (action === 'open-crew') onOpenCrew?.();
+    else if (action === 'open-changes') onOpenChanges?.();
+    else if (action === 'pick-model')
+      bar.current?.querySelector<HTMLButtonElement>('.th-picker > button')?.click();
+  }
+  function pick(index: number) {
+    if (trigger) {
+      const chosenMention = mentions[index];
+      if (!chosenMention) return;
+      const next = insertMention(text, trigger, chosenMention);
+      setText(next.text);
+      drafts.set(draftKey, next.text);
+      setCaret(next.caret);
+      requestAnimationFrame(() => {
+        field.current?.focus();
+        field.current?.setSelectionRange(next.caret, next.caret);
+      });
+      return;
+    }
+    const command = slashMatches[index];
+    if (!command) return;
+    if (command.argument) fillBox(`/${command.name} `);
+    else void runSlash(command.name, '');
   }
   // A saved thread stores each file right away, one at a time, since the desktop sends one
   // command at a time. The controller reads the type from the bytes, and the chip shows it.
@@ -304,6 +469,24 @@ export function Composer({
   }
   function onKeyDown(event: KeyboardEvent<HTMLTextAreaElement>) {
     const field = event.currentTarget;
+    if (menuOpen && !event.nativeEvent.isComposing) {
+      if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+        event.preventDefault();
+        const step = event.key === 'ArrowDown' ? 1 : -1;
+        setActive((active + step + menuItems.length) % menuItems.length);
+        return;
+      }
+      if ((event.key === 'Enter' && !event.shiftKey) || event.key === 'Tab') {
+        event.preventDefault();
+        pick(Math.min(active, menuItems.length - 1));
+        return;
+      }
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        setDismissed(text);
+        return;
+      }
+    }
     const action = shortcutFor(event.nativeEvent, {
       mac: isMacPlatform(),
       composerFocused: true,
@@ -360,16 +543,36 @@ export function Composer({
             field.current?.focus();
           }}
         />
+        {taskId && <InstructionChip source={source} taskId={taskId} refreshKey={running} />}
+        {menuOpen && (
+          <CompleteMenu
+            id="th-complete"
+            label={trigger ? 'Files and folders' : 'Slash commands'}
+            items={menuItems}
+            active={Math.min(active, menuItems.length - 1)}
+            onPick={pick}
+          />
+        )}
+        {/* biome-ignore lint/a11y/useAriaPropsSupportedByRole: the box is a combobox only while its list is open */}
         <textarea
           ref={field}
+          role={menuOpen ? 'combobox' : undefined}
+          aria-expanded={menuOpen ? true : undefined}
+          aria-controls={menuOpen ? 'th-complete' : undefined}
+          aria-activedescendant={
+            menuOpen ? `th-complete-${Math.min(active, menuItems.length - 1)}` : undefined
+          }
           rows={1}
           value={text}
           placeholder="Ask about this project or describe a change"
           aria-label="Message"
           onChange={(event) => {
             setText(event.target.value);
+            setCaret(event.target.selectionStart);
+            setActive(0);
             drafts.set(draftKey, event.target.value);
           }}
+          onSelect={(event) => setCaret(event.currentTarget.selectionStart)}
           onKeyDown={onKeyDown}
           onPaste={onPaste}
         />
@@ -409,7 +612,7 @@ export function Composer({
           </div>
         )}
         {roles.row}
-        <div className="th-composer-bar">
+        <div className="th-composer-bar" ref={bar}>
           <button
             type="button"
             className="th-icon"
@@ -485,7 +688,7 @@ export function Composer({
         </div>
       </form>
       {(blocked ?? notice ?? note) && (
-        <p className="th-note" role="status">
+        <p className="th-note th-note-lines" role="status">
           {blocked ?? notice ?? note}
         </p>
       )}

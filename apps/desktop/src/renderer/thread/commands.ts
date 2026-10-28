@@ -8,12 +8,18 @@ import {
   ChatCatalogReadSchema,
   type ChatChangesRead,
   ChatChangesReadSchema,
+  type ChatInstructionsRead,
+  ChatInstructionsReadSchema,
+  type ChatMentionsRead,
+  ChatMentionsReadSchema,
   type ChatThreadRead,
   ChatThreadReadSchema,
   type ChatTurnEventsRead,
   ChatTurnEventsReadSchema,
   type CommandResult,
+  CompleteChatMentionPayloadSchema,
   ConfigureChatThreadPayloadSchema,
+  DeleteChatPromptPayloadSchema,
   DeleteChatThreadPayloadSchema,
   DiscardChatChangePayloadSchema,
   HandoffChatThreadPayloadSchema,
@@ -23,12 +29,17 @@ import {
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
+  ReadChatInstructionsPayloadSchema,
+  ReadChatPromptsPayloadSchema,
   ReadChatThreadPayloadSchema,
   ReadChatTurnEventsPayloadSchema,
   RefreshChatModelsPayloadSchema,
   RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   RetryChatTurnPayloadSchema,
+  SaveChatPromptPayloadSchema,
+  type SavedPrompts,
+  SavedPromptsSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -49,7 +60,9 @@ const dispatch = (source: ThreadSource, command: string, payload: unknown) =>
   source.command({
     command,
     payload,
-    ...(command.startsWith('Read') ? {} : { expectedRevision: CHAT_REVISION }),
+    ...(command.startsWith('Read') || command === 'CompleteChatMention'
+      ? {}
+      : { expectedRevision: CHAT_REVISION }),
   } as unknown as DesktopCommand);
 
 async function run(
@@ -118,6 +131,46 @@ export const readCatalog = (source: ThreadSource, taskId?: string): Promise<Chat
 // A read can take 20 seconds and its refusal names the next step, so the result comes back as is.
 export const refreshModels = (source: ThreadSource) =>
   dispatch(source, 'RefreshChatModels', RefreshChatModelsPayloadSchema.parse({ family: 'openai' }));
+
+/** Ranked files and folders of the thread's scratch copy for the text after an at sign. */
+export const completeMention = (
+  source: ThreadSource,
+  taskId: string,
+  query: string,
+  limit = 8,
+): Promise<ChatMentionsRead> =>
+  read(
+    source,
+    'CompleteChatMention',
+    CompleteChatMentionPayloadSchema.parse({ taskId, query, limit }),
+    ChatMentionsReadSchema,
+  );
+/** The instruction files at the copy root, and the text of `name` when it is given. */
+export const readInstructions = (
+  source: ThreadSource,
+  taskId: string,
+  name?: string,
+): Promise<ChatInstructionsRead> =>
+  read(
+    source,
+    'ReadChatInstructions',
+    ReadChatInstructionsPayloadSchema.parse({ taskId, name }),
+    ChatInstructionsReadSchema,
+  );
+export const readPrompts = (source: ThreadSource): Promise<SavedPrompts> =>
+  read(source, 'ReadChatPrompts', ReadChatPromptsPayloadSchema.parse({}), SavedPromptsSchema);
+export const savePrompt = (
+  source: ThreadSource,
+  input: { name: string; body: string },
+): Promise<SavedPrompts> =>
+  promptList(source, 'SaveChatPrompt', SaveChatPromptPayloadSchema.parse(input));
+export const deletePrompt = (source: ThreadSource, name: string): Promise<SavedPrompts> =>
+  promptList(source, 'DeleteChatPrompt', DeleteChatPromptPayloadSchema.parse({ name }));
+async function promptList(source: ThreadSource, command: string, payload: unknown) {
+  const { data } = await run(source, command, payload);
+  const { kind: _kind, ...rest } = (data ?? {}) as Record<string, unknown>;
+  return SavedPromptsSchema.parse(rest);
+}
 
 export const sendMessage = (
   source: ThreadSource,

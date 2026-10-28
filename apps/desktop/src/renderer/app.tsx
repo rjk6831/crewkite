@@ -1012,6 +1012,8 @@ export function App() {
             preview={preview}
             connection={connection}
             refresh={workspace.refresh}
+            onNewThread={() => startThread()}
+            onOpenSettings={() => setPage('settings')}
           />
         ) : (
           <WorkspaceEmpty

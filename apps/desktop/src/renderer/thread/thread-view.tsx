@@ -80,6 +80,8 @@ export function ThreadView({
   preview,
   connection,
   refresh,
+  onNewThread,
+  onOpenSettings,
 }: {
   source: ThreadSource;
   task: ThreadTask;
@@ -88,6 +90,8 @@ export function ThreadView({
   preview: boolean;
   connection: string;
   refresh?: () => Promise<WorkspaceState>;
+  onNewThread?: () => void;
+  onOpenSettings?: () => void;
 }) {
   const {
     state,
@@ -451,6 +455,9 @@ export function ThreadView({
           onCatalog={setCatalog}
           localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
           lastMessage={lastMessage}
+          onNewThread={onNewThread}
+          onOpenSettings={onOpenSettings}
+          onOpenChanges={() => setInspector({ open: true, tab: 'changes', focus: null })}
         />
         {/* A zero-width mark on alternate lines lets the same sentence be read twice in a row. */}
         <p className="th-sr" role="status" aria-live="polite" aria-atomic="true">

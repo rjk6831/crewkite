@@ -8,6 +8,7 @@ import { GeneralCard } from './general-card.tsx';
 import { GoogleCard } from './google-card.tsx';
 import { LocalCard } from './local-card.tsx';
 import { OpenAiCard } from './openai-card.tsx';
+import { PromptsCard } from './prompts-card.tsx';
 import { useProviderActions } from './provider-actions.ts';
 import { useCatalog, useClock } from './use-catalog.ts';
 import './settings.css';
@@ -64,6 +65,7 @@ export function SettingsPage({
         <GoogleCard {...card} entry={entry('google')} />
         <LocalCard {...card} entry={entry('local')} />
         <ExtensionsCard source={workspace.source} />
+        {workspace.source && <PromptsCard source={workspace.source} />}
       </div>
     </main>
   );

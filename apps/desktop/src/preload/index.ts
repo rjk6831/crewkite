@@ -150,6 +150,14 @@ const bridge: DesktopSource = {
       throw plain(failure);
     }
   },
+  savePrompts: async () => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-prompts');
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
     await ipcRenderer.invoke('crewkite:reconnect');
