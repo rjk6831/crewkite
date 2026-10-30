@@ -61,6 +61,7 @@ import {
   RunExtensionCommandPayloadSchema,
 } from './extensions.ts';
 import { AcknowledgeGoogleTermsPayloadSchema, GoogleTermsSchema } from './google-terms.ts';
+import { ChatSearchResultSchema, SearchChatHistoryPayloadSchema } from './history-search.ts';
 import { McpSupplySchema } from './mcp.ts';
 
 export const PROTOCOL_VERSION = 1;
@@ -2513,6 +2514,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatInstructions', ReadChatInstructionsPayloadSchema),
   read('ReadChatPrompts', ReadChatPromptsPayloadSchema),
   read('ReadDiagnostics', ReadDiagnosticsPayloadSchema),
+  read('SearchChatHistory', SearchChatHistoryPayloadSchema),
   mutate('SaveChatPrompt', SaveChatPromptPayloadSchema),
   mutate('DeleteChatPrompt', DeleteChatPromptPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
@@ -3588,6 +3590,8 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatInstructionsReadSchema.extend({ kind: z.literal('chat-instructions') }),
   SavedPromptsSchema.extend({ kind: z.literal('chat-prompts') }),
   DiagnosticsReadSchema.safeExtend({ kind: z.literal('diagnostic-files') }),
+  // The byte check on the page stays with the kind tag.
+  ChatSearchResultSchema.safeExtend({ kind: z.literal('chat-search') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
@@ -3864,6 +3868,7 @@ export * from './composer.ts';
 export * from './diagnostics.ts';
 export * from './extensions.ts';
 export * from './google-terms.ts';
+export * from './history-search.ts';
 export * from './mcp.ts';
 export * from './plan-lanes.ts';
 
