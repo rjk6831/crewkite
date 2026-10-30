@@ -63,6 +63,13 @@ import {
 import { AcknowledgeGoogleTermsPayloadSchema, GoogleTermsSchema } from './google-terms.ts';
 import { ChatSearchResultSchema, SearchChatHistoryPayloadSchema } from './history-search.ts';
 import { McpSupplySchema } from './mcp.ts';
+import {
+  AddProjectNotePayloadSchema,
+  EditProjectNotePayloadSchema,
+  ProjectNotesReadSchema,
+  ReadProjectNotesPayloadSchema,
+  RemoveProjectNotePayloadSchema,
+} from './notes.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -2517,6 +2524,10 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('SearchChatHistory', SearchChatHistoryPayloadSchema),
   mutate('SaveChatPrompt', SaveChatPromptPayloadSchema),
   mutate('DeleteChatPrompt', DeleteChatPromptPayloadSchema),
+  read('ReadProjectNotes', ReadProjectNotesPayloadSchema),
+  mutate('AddProjectNote', AddProjectNotePayloadSchema),
+  mutate('EditProjectNote', EditProjectNotePayloadSchema),
+  mutate('RemoveProjectNote', RemoveProjectNotePayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
   mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
@@ -3592,6 +3603,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   DiagnosticsReadSchema.safeExtend({ kind: z.literal('diagnostic-files') }),
   // The byte check on the page stays with the kind tag.
   ChatSearchResultSchema.safeExtend({ kind: z.literal('chat-search') }),
+  ProjectNotesReadSchema.extend({ kind: z.literal('project-notes') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
@@ -3870,6 +3882,7 @@ export * from './extensions.ts';
 export * from './google-terms.ts';
 export * from './history-search.ts';
 export * from './mcp.ts';
+export * from './notes.ts';
 export * from './plan-lanes.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
