@@ -1,0 +1,25 @@
+{
+  "id": "saved-prompts-store",
+  "title": "Keep saved prompts in the controller home",
+  "repository": "self",
+  "base": "cc1711b19ed938aef48ffbf7924012a01e0745bb",
+  "solution": "7eaaff1869b073f6d8a40914de45d7eb98d1dd8e",
+  "text": "The composer needs named prompts with {{placeholders}} that every client reads from one list. Add apps/controller/src/chat/saved-prompts.ts. It keeps the list in a file named prompts.json in the controller home, using the SavedPrompts, SavedPrompt and MAX_SAVED_PROMPTS shapes from the contracts. Export a PromptsRefused error that carries a reason of prompts-unreadable, prompts-full or prompt-not-found and a next sentence that is also its message. readPrompts(home) answers an empty list when the file does not exist. When the file cannot be read, or its content is not valid JSON of the SavedPrompts shape, it throws PromptsRefused with prompts-unreadable and leaves the file untouched on disk, so a person can fix it. savePrompt(home, prompt) replaces the body of a prompt that has the same name, refuses with prompts-full when a new name would pass the maximum, writes the list sorted by name to a temporary file in the home and renames it over prompts.json with mode 0600 (creating the home with mode 0700 if needed), and returns the list as read back. deletePrompt(home, name) refuses with prompt-not-found for an unknown name and otherwise writes the list without it and returns the list. A damaged prompts.json must make a save throw and stay byte for byte as it was. Register the commands ReadChatPrompts, SaveChatPrompt and DeleteChatPrompt in the controller so they answer with a chat-prompts result, change no task and skip the task journal.",
+  "hidden": ["apps/controller/src/chat/saved-prompts.test.ts"],
+  "checks": [
+    {
+      "name": "saved-prompts",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/chat/saved-prompts.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["controller", "chat", "prompts", "persistence"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:33.559Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["saved-prompts"],
+    "passedOnSolution": ["saved-prompts"]
+  }
+}

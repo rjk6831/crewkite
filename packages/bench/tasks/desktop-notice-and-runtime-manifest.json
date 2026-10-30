@@ -1,0 +1,29 @@
+{
+  "id": "desktop-notice-and-runtime-manifest",
+  "title": "Validate desktop notices and the demo runtime manifest",
+  "repository": "self",
+  "base": "be3741b16615851e32d30ebc057874022bc0cb3e",
+  "solution": "6776da3f546429d39e31553f8cdf135be38636c1",
+  "text": "Add two strict schemas to the contracts package, both exported with inferred types. DesktopNoticeSchema is a union discriminated by kind. A connection notice has a state of connecting, connected or offline and a boolean reconnectAvailable. A history-gap notice has an after cursor (CursorSchema). A retry notice has a boolean available. An export notice has an artifactId (ArtifactIdSchema) and an outcome of saved, cancelled or failed. Unknown fields, such as a path on an export notice, and wrong types are refused. RuntimeManifestSchema describes the pinned demo runtime without accepting executable paths: version is the literal 1, mode is the literal demo, and node holds the literal version 24.22.0, a platform of darwin or linux, an arch of arm64 or x64 and a sha256 hash. Any extra field on the manifest or on node, such as an entry or a path, is refused, as are other versions, modes, platforms, architectures and malformed hashes.",
+  "hidden": ["packages/contracts/src/contracts.test.ts"],
+  "checks": [
+    {
+      "name": "contracts",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=process boundaries reject unknown fields and invalid command identity",
+        "packages/contracts/src/contracts.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["contracts", "validation", "desktop"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:57:57.881Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["contracts"],
+    "passedOnSolution": ["contracts"]
+  }
+}

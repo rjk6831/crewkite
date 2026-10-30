@@ -1,0 +1,29 @@
+{
+  "id": "google-launch-waits-for-terms",
+  "title": "Hold the Google launch steps until the terms are acknowledged",
+  "repository": "self",
+  "base": "3197a8de906eeaad817c089551c57ecb81b238b4",
+  "solution": "17e541151f28f7971fdea82379765691dbe0f0a4",
+  "text": "A controller that registers the Google client prepares it at launch: it initializes the client and goes on to discover once a sign-in is recorded. That preparation calls the setup path directly, so it skips the command gate and starts the client before the person has acknowledged the current Google terms text. Fix it. Until the current terms text is acknowledged, the preparation step must return nothing: the client is not started at all, the setup state stays uninitialized and no setup operation is recorded. Once an AcknowledgeGoogleTerms command is applied, the controller must run the preparation right away, with no restart, so that waiting on its googleAcpPreparation promise ends with a fresh client in the authentication-required state after one acp-initialize step. Signing in stays the person's own choice afterwards.",
+  "hidden": ["apps/controller/src/providers/google/acp/acp.test.ts"],
+  "checks": [
+    {
+      "name": "acp",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=a controller that registers the Google client sets it up at launch",
+        "apps/controller/src/providers/google/acp/acp.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["google", "gate", "controller"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:07.981Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["acp"],
+    "passedOnSolution": ["acp"]
+  }
+}

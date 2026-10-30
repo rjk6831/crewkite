@@ -1,0 +1,30 @@
+{
+  "id": "check-allow-for-thread",
+  "title": "Let a person allow a check command set for the whole thread",
+  "repository": "self",
+  "base": "e72104eec43bc2a9ba9ef9b2f36c903420b955c0",
+  "solution": "d4bddeea5ef2ec9a933da6aa2d8f7c85845ec956",
+  "text": "The question before project checks run offers allow and deny. Make it offer the three answers every other permission has: allow once (allow), allow for this thread (allow-thread) and deny. ResolveChatPermission for a check question accepts those three and refuses any other choice with reason permission-not-pending and the next step \"Choose allow once, allow for this thread or deny.\" Allowing for the thread records the approved command set on the thread's check state, in a new nullable field called approved in the contracts: a hash over each enabled check's id, its command and a digest of the script behind it, read from the thread's own copy whichever copy runs. Later runs of the same command set start without a question in every flight mode. A check whose command or script changed since it was turned on still asks, even for an approved set. Without an approval the old rule holds: Balanced asks, and Glide asks only when the thread's permission policy does not cover commands.",
+  "hidden": ["apps/controller/src/chat/service.test.ts"],
+  "checks": [
+    {
+      "name": "service",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=checks refuse shell lines, ask before running and run on a merged copy",
+        "apps/controller/src/chat/service.test.ts"
+      ],
+      "timeoutMs": 600000
+    }
+  ],
+  "difficulty": "hard",
+  "tags": ["checks", "chat", "permissions", "contracts"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:56:33.946Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["service"],
+    "passedOnSolution": ["service"]
+  }
+}

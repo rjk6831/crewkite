@@ -1,0 +1,25 @@
+{
+  "id": "anthropic-mcp-config-refuses-planted-path",
+  "title": "Refuse to write the MCP config through a planted file or link",
+  "repository": "self",
+  "base": "b3da0d11a82231104d9bc3cb0376d16df63eac32",
+  "solution": "3b1522ac3f6d6b372e95ab538b74a03554988ced",
+  "text": "The Anthropic adapter writes the per-turn MCP config, which holds server secrets, to mcp.json in the tmp folder of the turn's work directory. It opens that file in a way that follows a link and overwrites a file another process placed there. Make the adapter refuse to write through a path it did not create. When a file or a link already sits at that path, the client must not start. The turn ends with stop reason error and a failure at stage launch whose message reads \"CrewKite did not start this turn because a file or link already sits where it writes the settings for your MCP servers.\" and whose next action reads \"Remove mcp.json from the turn work folder, then send again.\" No turn.started event is emitted, nothing is written through the link or over the file, and what was placed there stays in place. After a normal turn the adapter removes mcp.json only when this turn created it.",
+  "hidden": ["apps/controller/src/providers/anthropic/chat.test.ts"],
+  "checks": [
+    {
+      "name": "anthropic-chat",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/providers/anthropic/chat.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["anthropic", "security", "files"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:55:21.268Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["anthropic-chat"],
+    "passedOnSolution": ["anthropic-chat"]
+  }
+}

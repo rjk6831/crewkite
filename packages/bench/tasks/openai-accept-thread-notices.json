@@ -1,0 +1,29 @@
+{
+  "id": "openai-accept-thread-notices",
+  "title": "Accept thread-scoped notifications that arrive before the turn reply",
+  "repository": "self",
+  "base": "02dd86357d5aba3d27263e21ca96be5150a2535f",
+  "solution": "898566585919d68159d3d55a7f81f37898b3d01b",
+  "text": "ReplacementTranscript in apps/controller/src/providers/openai/replacement.ts stops an attempt when a thread-scoped notification arrives before the reply to turn start, because such a notification carries no turn identity and is treated as turn output. Accept four documented thread notifications at that point and validate them before any turn identity check: thread/settings/updated, thread/name/updated, thread/readState/changed and thread/queue/changed. Each must name the attempt's own thread, and a notice for another thread is refused. thread/settings/updated carries threadSettings that must match the plan: the plan's model, modelProvider openai, the plan's effort (a missing effort is refused), service tier default, the plan's directory as cwd, approval policy on-request, approvals reviewer user and a read-only sandbox policy whose network access is absent or false. thread/name/updated may carry a threadName that is a string of at most 4096 characters, or null or absent. thread/readState/changed carries a readState with a revision string and a firstUnread that is absent, null, {type: threadStart} or {type: turn, turnId}, and a missing readState is refused. None of these notices completes the transcript, which stays incomplete until the turn finishes. Any other method outside the known list still stops the attempt, and its diagnostic cause is now unsupported where it used to read correlation. A refusal records the offending method in the diagnostic.",
+  "hidden": ["apps/controller/src/providers/openai/replacement.test.ts"],
+  "checks": [
+    {
+      "name": "replacement",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=a replacement requires one matching completed turn",
+        "apps/controller/src/providers/openai/replacement.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "hard",
+  "tags": ["openai", "protocol", "transcript"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:25.509Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["replacement"],
+    "passedOnSolution": ["replacement"]
+  }
+}

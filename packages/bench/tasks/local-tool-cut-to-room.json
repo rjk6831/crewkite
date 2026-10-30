@@ -1,0 +1,29 @@
+{
+  "id": "local-tool-cut-to-room",
+  "title": "Honor a zero or tiny room when a Local thread tool result is cut",
+  "repository": "self",
+  "base": "17e541151f28f7971fdea82379765691dbe0f0a4",
+  "solution": "b3da0d11a82231104d9bc3cb0376d16df63eac32",
+  "text": "Local thread tools cut each result to the room the prompt has left, and add the notice \"[cut to fit the Local context; ask for less]\" on a new line after the cut text. Two cases are wrong. When the room is smaller than the notice, the result should be the text alone, cut to exactly that many bytes, with no notice. When no room is left at all (0 bytes), a thread read should still succeed and return an empty output. A thread read also must not force a 512 byte minimum on the room it is given, so a room of 0 or 20 bytes is honored as given. When the room is large enough for the notice, the result keeps the notice and the whole result still fits the room.",
+  "hidden": ["apps/controller/src/chat/local-tools.test.ts"],
+  "checks": [
+    {
+      "name": "local-tools",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=thread tools read through the reader",
+        "apps/controller/src/chat/local-tools.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["local", "thread-tools", "bytes"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:18.525Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["local-tools"],
+    "passedOnSolution": ["local-tools"]
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "id": "plan-ready-slices-need-a-family",
+  "title": "Never offer a plan slice with no family as ready",
+  "repository": "self",
+  "base": "6cfa2f5a7436bae6728f88371c53e14dcb952d83",
+  "solution": "6b12eca9f7d98cc3460fb1bd99abb51611e29787",
+  "text": "readySlices in apps/controller/src/chat/plan-lanes.ts lists the plan slices that may open their builder turn now: queued, every dependency done, assigned to a family with no open turn, at most one slice per family, and none while a slice is blocked. A queued slice that has no assignment at all (its assignment is null) has nothing to run on, yet it is offered as ready today. It must never be offered, while the other ready slices of the same plan are still offered. Nothing else about the selection changes.",
+  "hidden": ["apps/controller/src/chat/plan.test.ts"],
+  "checks": [
+    {
+      "name": "plan",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=ready slices start together",
+        "apps/controller/src/chat/plan.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["plan", "pure-function"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:32.021Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["plan"],
+    "passedOnSolution": ["plan"]
+  }
+}

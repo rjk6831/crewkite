@@ -1,0 +1,29 @@
+{
+  "id": "cli-task-argument-exit-status",
+  "title": "Keep task command argument checks at exit status 1",
+  "repository": "self",
+  "base": "f1a8c9f5d9afee31e265ae590ba36130b41e34e6",
+  "solution": "73ce87982d075c56d0af1f2376eaa036178946e3",
+  "text": "The CLI uses one exit table: 0 applied, 1 failed while running, 2 nothing was done, 3 a followed turn was stopped. The task commands decide between 1 and 2 with a flag set partway through their own validation, so the same kind of mistake exits 1 or 2 by accident, depending on whether the check runs before or after that point. Make it follow one rule. In the task commands, only arguments that the option parser rejects exit 2. A value a task command rejects after reading its arguments, such as an unsupported --usage-scope value for usage refresh, or --pages given together with --json for task show, exits 1 and sends no command to the controller. The thread commands and print mode keep status 2 for their own checks and refusals. Update the README exit table to say so.",
+  "hidden": ["apps/cli/src/main.test.ts"],
+  "checks": [
+    {
+      "name": "cli-main",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=CLI lists traverse empty pages and preserve incomplete output",
+        "apps/cli/src/main.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["cli", "exit-status"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:56:46.666Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["cli-main"],
+    "passedOnSolution": ["cli-main"]
+  }
+}

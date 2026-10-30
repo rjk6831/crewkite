@@ -1,0 +1,30 @@
+{
+  "id": "chat-refuses-google-until-terms",
+  "title": "Refuse Google chat turns until the terms are acknowledged",
+  "repository": "self",
+  "base": "58fb21c29e071a93e59fa182e26d25bfd0272986",
+  "solution": "de54df23eea870d4e036686aaf877bdeabb0f4ea",
+  "text": "A Google setup that was ready before the terms gate existed keeps answering chat turns without an acknowledgement. Give ChatService a new dependency, googleTermsAcknowledged: () => boolean, which is true when the person acknowledged the current Google terms text. The controller supplies it from the stored acknowledgement (googleTermsCurrent of the googleTerms record in the Google setup). While it answers false the service refuses a Google selection on send, on handoff and on ask with a blocked result whose reason is google-terms-not-acknowledged and whose next step is \"Acknowledge the Google terms in Settings > Google before using Google.\" It also skips Google when it picks the next provider after a limit, and a queued Google turn that reaches its start fails with that same sentence. Other families are not affected.",
+  "hidden": ["apps/controller/src/chat/service.test.ts"],
+  "checks": [
+    {
+      "name": "service",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=a message sent during a turn waits and starts when the turn ends",
+        "apps/controller/src/chat/service.test.ts"
+      ],
+      "timeoutMs": 600000
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["google", "gate", "chat"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:56:03.317Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["service"],
+    "passedOnSolution": ["service"]
+  }
+}

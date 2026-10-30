@@ -1,0 +1,29 @@
+{
+  "id": "package-seal-staged-runtime",
+  "title": "Seal the staged desktop runtime and refuse a failed seal",
+  "repository": "self",
+  "base": "546769908528d587063e997d8ed44dbd5a8e83c9",
+  "solution": "e454bc40cb7abe6b109bedff3e2964c1542e1d79",
+  "text": "Packaging should seal the staged Electron.app before its files are inventoried, so macOS can check the copied runtime. In scripts/package.mjs add and export sealElectronBundle(bundle, execute), where execute defaults to spawnSync and is called as execute(path, args, options). It runs /usr/bin/codesign twice, in this order: first with --force --deep --sign - --preserve-metadata=identifier,entitlements and the bundle path, then with --verify --deep --strict --verbose=2 and the bundle path. The options are an environment of LANG=C and PATH=/usr/bin:/bin, utf8 encoding, a 30000 millisecond timeout, a 65536 byte buffer limit and stdio ignore, pipe, pipe. If a step reports an error, a non-zero status or a signal, throw an Error whose message is \"The staged Electron resource seal did not finish successfully.\" and run no later step. When both steps succeed, return { kind: 'ad-hoc', verified: 'deep-strict', developerID: false, notarized: false }. packageDesktop calls it on the staged Electron.app before the inventory and records the result as the signature next to the Electron version in the manifest.",
+  "hidden": ["scripts/package-seal.test.mjs"],
+  "checks": [
+    {
+      "name": "package-seal",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=staging refuses a failed or unfinished seal or verification",
+        "scripts/package-seal.test.mjs"
+      ]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["packaging", "scripts", "pure-function"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:27.544Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["package-seal"],
+    "passedOnSolution": ["package-seal"]
+  }
+}

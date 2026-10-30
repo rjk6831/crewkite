@@ -1,0 +1,25 @@
+{
+  "id": "mention-completion-stays-inside-copy",
+  "title": "Keep mention completion inside the scratch copy when a folder is a link",
+  "repository": "self",
+  "base": "0adc0c59c0c0e08a119059a606ac26574120aefe",
+  "solution": "7a08c18f53b1480387d02672626c3ce6e9874b4b",
+  "text": "Mention completion lists the files of a thread's scratch copy, and its listing checks only the last segment of each path. If a folder in the copy is replaced by a link to somewhere outside it, the files of that old folder are still listed and offered. Make completion keep only paths whose every parent folder resolves inside the copy. A path whose parent is missing or resolves outside the copy is dropped, and files under ordinary folders are offered as before.",
+  "hidden": ["apps/controller/src/chat/mentions.test.ts"],
+  "checks": [
+    {
+      "name": "mentions",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/chat/mentions.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["composer", "controller", "security", "files"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:21.797Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["mentions"],
+    "passedOnSolution": ["mentions"]
+  }
+}

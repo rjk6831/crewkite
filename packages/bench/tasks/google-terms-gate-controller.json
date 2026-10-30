@@ -1,0 +1,25 @@
+{
+  "id": "google-terms-gate-controller",
+  "title": "Refuse Google connection steps until the terms are acknowledged",
+  "repository": "self",
+  "base": "69e1cfbafb5621a17c4ff54898339b7bdb25b46d",
+  "solution": "fde5a568618e76e8b105e24550b9dc65153a432f",
+  "text": "The controller must refuse every Google connection step until the person has acknowledged the current terms text, so a button, a prompt or a flag in a client cannot stand in for it. Add apps/controller/src/commands/google-terms.ts. googleTermsGate(store, command) answers undefined for any command other than InstallGoogleAcp, InitializeGoogleAcp, AuthenticateGoogleAcp and DiscoverGoogleAcp, and also when googleTermsCurrent accepts the googleTerms record of the Google setup. Otherwise it answers a blocked result with the reason google-terms-not-acknowledged and a next sentence that sends the person to the Google terms summary in Settings. acknowledgeGoogleTerms(store, textVersion, at) stores the acknowledgement in the Google setup record as googleTerms with the version and the time, and answers applied. When textVersion is not GOOGLE_TERMS_VERSION it stores nothing and answers blocked with the reason google-terms-version-changed. In the contracts, add packages/contracts/src/google-terms.ts and export it from the index. It holds GOOGLE_TERMS_VERSION (a date string that changes whenever the wording changes), GOOGLE_TERMS_SUMMARY (a list of short lines that say what Google states about third-party access through its sign-in, that CrewKite has no exception, and that using the route is the person's own choice and risk), GOOGLE_TERMS_CHECKBOX (one sentence the person ticks), GoogleTermsSchema (a strict object with a version string of 1 to 40 characters and an ISO datetime at), AcknowledgeGoogleTermsPayloadSchema (a strict object with a textVersion string of 1 to 40 characters) and googleTermsCurrent(terms), which is true only when the stored version equals GOOGLE_TERMS_VERSION. Give the Google setup schema a googleTerms field that is nullable with a default of null. Add the command AcknowledgeGoogleTerms with that payload as a mutation, and handle it in the controller inside a store transaction, using the controller's clock for the time. Run the gate in the controller before the Google steps execute. The Google setup record gets a googleTerms field that is null until acknowledged, so a text change in a later build asks again. In the desktop, show the terms summary lines and a checkbox on the Google card, keep Connect off until the box is ticked or the terms are already acknowledged (then show the time), and send AcknowledgeGoogleTerms from the setup flow before the first connection stage.",
+  "hidden": ["apps/controller/src/commands/google-terms.test.ts"],
+  "checks": [
+    {
+      "name": "google-terms",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/commands/google-terms.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["controller", "google", "gate", "commands"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:13.657Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["google-terms"],
+    "passedOnSolution": ["google-terms"]
+  }
+}

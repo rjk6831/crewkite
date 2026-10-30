@@ -1,0 +1,29 @@
+{
+  "id": "plan-card-blocked-slices",
+  "title": "Show blocked plan slices and what each slice waits on",
+  "repository": "self",
+  "base": "02c3f74d0f2e1ae4dfcfe927c33f56eb08653946",
+  "solution": "c0d301ed822d1ab6dbec9bb01d5c3f153b8acaf4",
+  "text": "Plan slices now run side by side, so a slice can end up blocked when the merge into the thread copy finds that a path was changed on both sides. Add the status blocked to the plan slice statuses in the contracts, and an optional conflicts field on a plan slice: a list of at most 16 non-empty paths. Add an optional lane to a slice as well: its step (build, review, fix, merge or resolve), whether it is pending, the review rounds (0 to 3), the fix count (0 to 2) and the build turn id or null, and an optional slice number on a turn that names the plan slice whose lane opened it. In the plan card view model (apps/desktop/src/renderer/thread/plan-card.ts) give a blocked slice the label Blocked and let it be run again like a failed one. Every row that depends on other slices says what it waits on: \"Runs after slice 1\" for the unmet ones, and the same text followed by \", done\" when all of them are done. A blocked row also carries conflicts as \"Conflicts in the thread copy: \" followed by the paths joined with a comma and a space. The card counts as running whenever the plan phase is running, not only while a slice has status running.",
+  "hidden": ["apps/desktop/src/renderer/thread/thread-state.test.ts"],
+  "checks": [
+    {
+      "name": "thread-state",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=the plan card offers what the flight mode allows",
+        "apps/desktop/src/renderer/thread/thread-state.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "hard",
+  "tags": ["plan", "desktop", "contracts"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:58:30.249Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["thread-state"],
+    "passedOnSolution": ["thread-state"]
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "id": "cli-google-terms-gate",
+  "title": "Gate Google use in the interactive CLI on the terms acknowledgement",
+  "repository": "self",
+  "base": "58fb21c29e071a93e59fa182e26d25bfd0272986",
+  "solution": "de54df23eea870d4e036686aaf877bdeabb0f4ea",
+  "text": "The interactive CLI calls beforeGoogleConnection in apps/cli/src/interactive/google-gate.ts before any Google connection or usage read it starts, but the function is a placeholder that always answers true. Make it the real gate. It takes an object with three members: read, which resolves the workspace state of which only the Google setup record is used, send, which takes a command name and a payload and resolves the controller's command result, and ask, which shows a question and answers true only on an explicit yes. Export a type GoogleGateDeps for that object. When the setup's googleTerms record is current (googleTermsCurrent from the contracts) it answers true at once. Otherwise it asks one question made of the terms summary lines joined by spaces, the checkbox text and \" (y/n)\". On a no it answers false and sends nothing. On a yes it sends AcknowledgeGoogleTerms with the current terms version and answers true when the controller applied it or had already applied it. In the app, give the confirm line an optional no callback that runs on n, Escape or Ctrl+C, and run the gate before a message goes out on a Google selection, refusing with \"Google stays off until you acknowledge its terms. Answer y when asked, or use Settings > Google in the desktop app.\" when it answers false.",
+  "hidden": ["apps/cli/src/interactive/app.test.ts"],
+  "checks": [
+    {
+      "name": "interactive-app",
+      "command": "node",
+      "args": ["--test", "apps/cli/src/interactive/app.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["cli", "google", "gate"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
+    "verifiedAt": "2026-10-30T18:56:43.582Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["interactive-app"],
+    "passedOnSolution": ["interactive-app"]
+  }
+}
