@@ -116,7 +116,8 @@ jobs:
       - name: Lint, types, policy and tests
         timeout-minutes: 12
         shell: bash
-        run: pnpm lint && pnpm types && pnpm policy && pnpm test 2>&1 | tee "$RUNNER_TEMP/linux-output.log"
+        run: |
+          { pnpm lint && pnpm types && pnpm policy && pnpm test; } 2>&1 | tee "$RUNNER_TEMP/linux-output.log"
         env:
           PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
       - name: Keep the output
