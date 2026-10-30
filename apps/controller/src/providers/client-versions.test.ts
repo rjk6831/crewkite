@@ -6,6 +6,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -196,7 +197,8 @@ test('the chat path still refuses a client file its group or other users can wri
 });
 
 function scratch() {
-  const root = mkdtempSync(join(tmpdir(), 'crewkite-client-versions-'));
+  // The real path, because the finder reports resolved paths and macOS links /var to /private/var.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-client-versions-')));
   const bin = join(root, 'bin');
   const store = join(root, 'store');
   mkdirSync(bin);
@@ -425,7 +427,11 @@ test('the version read is bounded, kills its whole process group and passes a mi
     } finally {
       delete process.env.CREWKITE_FIXTURE_SECRET;
     }
-    assert.deepEqual(JSON.parse(readFileSync(seen, 'utf8')), ['HOME', 'LANG', 'NO_COLOR', 'PATH']);
+    // macOS adds __CF_USER_TEXT_ENCODING to every process it starts; CrewKite does not pass it.
+    const passed = (JSON.parse(readFileSync(seen, 'utf8')) as string[]).filter(
+      (name) => !name.startsWith('__CF_'),
+    );
+    assert.deepEqual(passed, ['HOME', 'LANG', 'NO_COLOR', 'PATH']);
 
     // A file that changes while its version runs keeps no version.
     link(client('codex-changing', `echo '# touched' >> "$0"\necho '0.170.2'`));

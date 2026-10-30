@@ -4,6 +4,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -169,7 +170,8 @@ test('the Codex native build sits beside the npm script for each supported compu
 });
 
 test('a Linux npm layout resolves to the native build through the shared trust checks', () => {
-  const root = mkdtempSync(join(tmpdir(), 'crewkite-linux-client-'));
+  // The real path, because the finder reports resolved paths and macOS links /var to /private/var.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-linux-client-')));
   try {
     const bin = join(root, 'bin');
     const lib = join(root, 'lib/node_modules/@openai/codex');

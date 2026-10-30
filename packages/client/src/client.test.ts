@@ -122,9 +122,14 @@ async function serve(
   };
 }
 
-// The CLI exits 2 when its arguments do not parse and 1 for other refused input.
+// The CLI exits 2 when its arguments do not parse or name a malformed ID, and 1 for other refused
+// input.
 const parseFailure = (errors: string) =>
-  /^(?:Unknown option|Option '|Unexpected argument)/m.test(errors) ? 2 : 1;
+  /^(?:Unknown option|Option '|Unexpected argument|That is not a (?:thread|project) ID)/m.test(
+    errors,
+  )
+    ? 2
+    : 1;
 
 test('framing preserves fragmented messages and rejects oversized or incomplete input', () => {
   const message: TransportMessage = { type: 'welcome', protocol: 1, cursor: '7' };

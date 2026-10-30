@@ -4453,6 +4453,7 @@ test('an appointed native proposal is retained and applied once after every phas
   await nativeWait('Local formatted writer', formattedLocal.terminal);
   await t.test(
     'a formatted Local candidate still traces to its completed replacement',
+    { skip: macosToolchainOnly },
     async () => {
       const formattedCandidate = formattedLocal.controller
         .snapshot()
