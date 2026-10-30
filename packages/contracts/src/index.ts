@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { ChatAnalyticsReadSchema, ReadChatAnalyticsPayloadSchema } from './analytics.ts';
 import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
@@ -2518,6 +2519,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatThread', ReadChatThreadPayloadSchema),
   read('ReadChatChanges', ReadChatChangesPayloadSchema),
   read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
+  read('ReadChatAnalytics', ReadChatAnalyticsPayloadSchema),
   read('CompleteChatMention', CompleteChatMentionPayloadSchema),
   read('ReadChatInstructions', ReadChatInstructionsPayloadSchema),
   read('ReadChatPrompts', ReadChatPromptsPayloadSchema),
@@ -3598,6 +3600,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
   ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
   ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
+  ChatAnalyticsReadSchema.extend({ kind: z.literal('chat-analytics') }),
   ChatMentionsReadSchema.extend({ kind: z.literal('chat-mentions') }),
   ChatInstructionsReadSchema.extend({ kind: z.literal('chat-instructions') }),
   SavedPromptsSchema.extend({ kind: z.literal('chat-prompts') }),
@@ -3874,6 +3877,7 @@ export type SealedHandoffPacket = z.infer<typeof SealedHandoffPacketSchema>;
 export type Event = z.infer<typeof EventSchema>;
 export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
+export * from './analytics.ts';
 export { canonicalJson } from './canonical.ts';
 export * from './chat.ts';
 export * from './checks.ts';
