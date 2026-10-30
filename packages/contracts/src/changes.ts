@@ -9,7 +9,13 @@ const id = (prefix: string) =>
   z.string().regex(new RegExp(`^${prefix}_[0-7][0-9A-HJKMNP-TV-Z]{25}$`));
 const hex64 = z.string().regex(/^[a-f0-9]{64}$/);
 const line = z.number().int().nonnegative();
+// A page cursor names whatever path the copy holds. A hunk command names a file a comment may
+// quote, so control characters there would let the message carry line breaks nobody typed.
 const changePath = z.string().min(1).max(4096);
+const hunkPath = changePath.refine(
+  (path) => path.isWellFormed() && !/\p{Cc}/u.test(path),
+  'A hunk path needs no control characters.',
+);
 
 /** The most entries one Changes page holds. */
 export const MAX_CHANGES_PAGE = 2000;
@@ -71,7 +77,7 @@ export const ChatChangesReadSchema = z.strictObject({
 });
 export type ChatChangesRead = z.infer<typeof ChatChangesReadSchema>;
 
-const hunkRef = { taskId: id('tsk'), path: changePath, hunk: hex64 };
+const hunkRef = { taskId: id('tsk'), path: hunkPath, hunk: hex64 };
 
 /** Mark one hunk accepted, or take the mark back. Accept then takes only accepted hunks. */
 export const DecideChatHunkPayloadSchema = z.strictObject({
