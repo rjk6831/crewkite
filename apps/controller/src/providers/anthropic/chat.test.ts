@@ -50,6 +50,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -198,6 +199,8 @@ function run(
     turnTools?: boolean;
     /** The person's servers the controller composed for this turn. */
     mcp?: ThreadMcp;
+    /** Runs before the turn starts with the path the per-turn MCP config will be written to. */
+    plant?: (path: string) => void;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
@@ -255,6 +258,10 @@ function run(
     threadTools: extra.turnTools,
     mcp: extra.mcp,
   };
+  if (extra.plant) {
+    mkdirSync(join(root, 'work', 'tmp'), { recursive: true, mode: 0o700 });
+    extra.plant(join(root, 'work', 'tmp', 'mcp.json'));
+  }
   const handle = anthropicChatAdapter({
     launch: () => ({ executable: fixture, sha256 }),
     threadTools: extra.threadTools,
@@ -914,6 +921,35 @@ test('a new session gets the framing, a saved one is resumed with the prompt alo
   });
   assert.ok(joined.launched.argv.includes('--strict-mcp-config'));
   assert.ok(!joined.launched.argv.some((arg) => arg.includes('mcp__notes')));
+  // A link or a file already at the config path refuses the turn with one plain line. The client
+  // never starts, nothing is written through the link or over the file, and what was placed stays.
+  for (const kind of ['link', 'file'] as const) {
+    let target = '';
+    const planted = run(streamed(), null, [], 'ask', undefined, [], undefined, {
+      mcp: notesServer('reads'),
+      plant: (path) => {
+        target = join(dirname(path), 'victim.txt');
+        writeFileSync(target, 'untouched');
+        if (kind === 'link') symlinkSync(target, path);
+        else writeFileSync(path, 'untouched');
+      },
+    });
+    t.after(planted.cleanup);
+    const refused = await planted.handle.result;
+    const path = join(planted.work, 'tmp', 'mcp.json');
+    assert.equal(refused.stopReason, 'error', kind);
+    assert.equal(refused.failure?.stage, 'launch', kind);
+    assert.match(
+      refused.failure?.message ?? '',
+      /did not start this turn because a file or link already sits where it writes/,
+      kind,
+    );
+    assert.deepEqual(planted.launched.argv, [], kind);
+    assert.equal(readFileSync(target, 'utf8'), 'untouched', kind);
+    assert.equal(readFileSync(path, 'utf8'), 'untouched', kind);
+    assert.equal(lstatSync(path).isSymbolicLink(), kind === 'link', kind);
+    assert.ok(!planted.events.some((event) => event.type === 'turn.started'), kind);
+  }
   assert.ok(!declined.launched.argv.some((arg) => arg.includes('mcp__crewkite__')));
   // The source gives none although the controller expected tools: the packet loses its line, the
   // config is empty and the trace says so.

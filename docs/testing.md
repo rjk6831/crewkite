@@ -221,3 +221,9 @@ One table in `apps/controller/src/providers/local/budget.test.ts` covers the roo
 
 - A thread read gets the prompt room that the built prompt leaves, at three bytes a token, within the 64 KiB bound every tool result has. A small prompt leaves most of the room, large attachments leave less, a prompt that fills or passes the room leaves nothing, and a context too small for any prompt leaves nothing. A second test sweeps six context sizes and checks that the read never passes the room and never grows as the prompt grows.
 - The tool test in `apps/controller/src/chat/local-tools.test.ts` checks that no room gives an empty result and that a room smaller than the cut notice gets the text alone.
+
+## Per-turn MCP config file
+
+One row in the Anthropic chat table in `apps/controller/src/providers/anthropic/chat.test.ts` covers the file that holds the person's MCP servers for a turn.
+
+- The adapter creates `mcp.json` with mode 0600 and with O_EXCL and O_NOFOLLOW, so a link or a file already at that path refuses the turn with one plain line at the launch stage. The client never starts. Nothing is written through the link or over the file, the placed link or file stays where it was, and the turn removes only a file it created itself.

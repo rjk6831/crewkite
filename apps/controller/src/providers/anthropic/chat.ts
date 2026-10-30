@@ -578,11 +578,14 @@ function startTurn(
   // The person's servers can carry secret arguments and variables, so their config goes in a file
   // only this user can read, and the client's argv names the file. It goes with the turn.
   const mcpFile = join(request.work.directory, 'tmp', 'mcp.json');
+  // Only a file this turn created is removed. Anything already at the path stays where it is.
+  let mcpWritten = false;
+  let mcpRefused = false;
   const unstage = () => {
     if (!isAbsolute(staging)) return;
     try {
       rmSync(staging, { recursive: true, force: true });
-      rmSync(mcpFile, { force: true });
+      if (mcpWritten) rmSync(mcpFile, { force: true });
     } catch {}
   };
   const refuse = (failure: ChatFailure): ChatTurnHandle => ({
@@ -688,11 +691,20 @@ function startTurn(
       (servers) => {
         const text = JSON.stringify({ mcpServers: servers });
         if (!request.mcp?.servers.length) return text;
-        const handle = openSync(
-          mcpFile,
-          constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC,
-          0o600,
-        );
+        // O_EXCL refuses a file already at the path and O_NOFOLLOW refuses a link there, so the
+        // secrets are never written through a path another process placed.
+        let handle: number;
+        try {
+          handle = openSync(
+            mcpFile,
+            constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+            0o600,
+          );
+        } catch (error) {
+          mcpRefused = true;
+          throw error;
+        }
+        mcpWritten = true;
         try {
           writeSync(handle, text);
         } finally {
@@ -708,6 +720,16 @@ function startTurn(
       stdio: ['pipe', 'pipe', 'pipe'],
     });
   } catch {
+    if (mcpRefused)
+      return refuse(
+        chatFailure({
+          stage: 'launch',
+          kind: 'internal',
+          message:
+            'CrewKite did not start this turn because a file or link already sits where it writes the settings for your MCP servers.',
+          nextAction: 'Remove mcp.json from the turn work folder, then send again.',
+        }),
+      );
     return refuse(
       chatFailure({
         stage: 'launch',
