@@ -1240,31 +1240,59 @@ export function treeFromScratch(input: {
   writeFileSync(join(input.repository, '.git', 'objects', 'info', 'alternates'), `${objects}\n`);
   git(input.repository, ['read-tree', '--empty']);
   const held = new Map(plan.files.map((file) => [file.path, file]));
-  const entries: Buffer[] = [];
-  for (const file of candidates) {
+  // One git process for every lookup and one for every scratch file, so the cost stays with the
+  // bytes and not with a process per file.
+  const changed = candidates.filter((file) => {
     const base = held.get(file.path);
+    return !(base && base.oid === file.oid && base.mode === file.mode);
+  });
+  const present = presentObjects(
+    input.repository,
+    changed.map((file) => file.oid),
+  );
+  const missing = changed.filter((file) => !present.has(file.oid));
+  const written = (oid: string, expected: string) => {
+    if (oid !== expected) throw Error('A scratch file changed while it was read.');
+  };
+  const streamed: CandidateHash[] = [];
+  for (const file of missing) {
     const replaced = input.contents?.get(file.path);
-    if (
-      !(base && base.oid === file.oid && base.mode === file.mode) &&
-      !hasObject(input.repository, file.oid)
-    ) {
-      const written = (
-        replaced
-          ? git(input.repository, ['hash-object', '-w', '--no-filters', '--stdin'], replaced)
-          : git(input.repository, [
-              'hash-object',
-              '-w',
-              '--no-filters',
-              '--',
-              join(input.scratch, file.path),
-            ])
-      )
-        .toString('utf8')
-        .trim();
-      if (written !== file.oid) throw Error('A scratch file changed while it was read.');
-    }
-    entries.push(Buffer.from(`${file.mode} ${file.oid}\t${file.path}\0`));
+    const path = join(input.scratch, file.path);
+    // hash-object reads one path per line and strips a final carriage return, so such a name
+    // goes on its own.
+    if (replaced)
+      written(
+        git(input.repository, ['hash-object', '-w', '--no-filters', '--stdin'], replaced)
+          .toString('utf8')
+          .trim(),
+        file.oid,
+      );
+    else if (/[\r\n]/.test(path))
+      written(
+        git(input.repository, ['hash-object', '-w', '--no-filters', '--', path])
+          .toString('utf8')
+          .trim(),
+        file.oid,
+      );
+    else streamed.push(file);
   }
+  if (streamed.length) {
+    const oids = git(
+      input.repository,
+      ['hash-object', '-w', '--no-filters', '--stdin-paths'],
+      `${streamed.map((file) => join(input.scratch, file.path)).join('\n')}\n`,
+    )
+      .toString('utf8')
+      .split('\n')
+      .filter(Boolean);
+    if (oids.length !== streamed.length) throw Error('A scratch file changed while it was read.');
+    streamed.forEach((file, index) => {
+      written(oids[index], file.oid);
+    });
+  }
+  const entries: Buffer[] = candidates.map((file) =>
+    Buffer.from(`${file.mode} ${file.oid}\t${file.path}\0`),
+  );
   for (const entry of plan.kept)
     entries.push(
       Buffer.concat([Buffer.from(`${entry.mode} ${entry.oid}\t`), entry.path, Buffer.from([0])]),
@@ -1273,11 +1301,20 @@ export function treeFromScratch(input: {
   return git(input.repository, ['write-tree']).toString().trim();
 }
 
-function hasObject(repository: string, oid: string): boolean {
-  try {
-    git(repository, ['cat-file', '-e', oid]);
-    return true;
-  } catch {
-    return false;
-  }
+/** The oids the repository or its alternates already hold, from one batch lookup. */
+function presentObjects(repository: string, oids: readonly string[]): Set<string> {
+  const wanted = [...new Set(oids)];
+  if (!wanted.length) return new Set();
+  const lines = git(repository, ['cat-file', '--batch-check'], `${wanted.join('\n')}\n`)
+    .toString('utf8')
+    .split('\n')
+    .filter(Boolean);
+  if (lines.length !== wanted.length) throw Error('Invalid object lookup.');
+  const present = new Set<string>();
+  wanted.forEach((oid, index) => {
+    const [named, kind] = lines[index].split(' ');
+    if (named !== oid) throw Error('Invalid object lookup.');
+    if (kind === 'blob') present.add(oid);
+  });
+  return present;
 }
