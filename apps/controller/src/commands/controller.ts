@@ -40,6 +40,7 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
+import { readAnalytics } from '../chat/analytics.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
 import { McpRegistry } from '../chat/mcp-servers.ts';
 import { ProjectNotes } from '../chat/project-notes.ts';
@@ -1605,6 +1606,15 @@ export class Controller {
       case 'EditProjectNote':
       case 'RemoveProjectNote':
         return notesCommand(this.projectNotes(), command);
+      case 'ReadChatAnalytics': {
+        const analytics = readAnalytics(this.store, command.payload, this.now());
+        return analytics
+          ? { outcome: 'applied', data: { kind: 'chat-analytics', ...analytics } }
+          : {
+              outcome: 'blocked',
+              reason: command.payload.scope === 'thread' ? 'task-not-found' : 'project-not-found',
+            };
+      }
       case 'ReadChatCatalog':
         this.refreshStaleChatModels();
         return {
