@@ -3853,6 +3853,27 @@ test('startup recovery lets a queued message start, and any other failed turn st
       turns: [[{ kind: 'fail' as const, stopReason: 'error' as const, failure: failed }]],
       started: false,
     },
+    {
+      name: 'the client output repeats the restart text',
+      crash: false,
+      turns: [
+        [
+          {
+            kind: 'fail' as const,
+            stopReason: 'error' as const,
+            failure: {
+              ...chatFailure({
+                stage: 'stream',
+                kind: 'internal',
+                message: 'The turn did not finish before the controller restarted.',
+              }),
+              detail: 'The client wrote this to its error output.',
+            },
+          },
+        ],
+      ],
+      started: false,
+    },
   ];
   for (const row of rows) {
     const thread = standalone(t, {

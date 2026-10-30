@@ -140,6 +140,7 @@ import {
   withAttachments,
   withNotes,
 } from './prompt.ts';
+import { failedByRestart, restartFailure } from './restart-failure.ts';
 import { copyScratch } from './scratch-copy.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
 import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
@@ -1406,16 +1407,7 @@ export class ChatService {
         const left = this.stillPresent(turn);
         this.settle(turn.id, {
           state: 'failed',
-          failure: {
-            ...(left.length
-              ? processFailure(left)
-              : chatFailure({
-                  stage: 'stream',
-                  kind: 'internal',
-                  message: 'The turn did not finish before the controller restarted.',
-                })),
-            detail: RESTART_DETAIL,
-          },
+          failure: restartFailure(left.length, groupNames(left)),
           text: streamedText(this.agentEvents(turn.taskId, turn.id)),
           session: null,
           stopReason: 'error',
@@ -2762,7 +2754,7 @@ export class ChatService {
         if (
           newest &&
           (newest.state === 'failed' || endedOnLimit(newest)) &&
-          !endedByRestart(newest) &&
+          !failedByRestart(newest.failure) &&
           !sentAfter
         )
           return;
@@ -3888,13 +3880,6 @@ function readOnlyCommand(input: unknown, scratch: string): boolean {
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */
-// Startup recovery writes this as the failure detail, so a turn it failed stays recognizable.
-const RESTART_DETAIL = 'The controller restarted while this turn was open.';
-
-function endedByRestart(turn: ChatTurn): boolean {
-  return turn.state === 'failed' && turn.failure?.detail === RESTART_DETAIL;
-}
-
 function endedOnLimit(turn: ChatTurn): boolean {
   return turn.stopReason
     ? turn.stopReason === 'limit'
