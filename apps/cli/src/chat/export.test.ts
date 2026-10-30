@@ -58,20 +58,38 @@ test('export writes a Markdown file and a share page to new files and replaces n
   assert.ok(html.includes('Ask [redacted].'));
   assert.ok(!html.includes('<script'));
 
-  // A second run never replaces a file, and a missing flag or thread writes nothing.
-  const again = await run(['export', taskId, '--markdown', notes, '--home', home]);
+  // A second run never replaces a file, and the file it names keeps its bytes. A taken path stops
+  // the run before another file is made.
+  const before = readFileSync(notes, 'utf8');
+  const fresh = join(directory, 'fresh.md');
+  const again = await run(['export', taskId, '--markdown', fresh, '--html', page, '--home', home]);
   assert.equal(again.code, 2);
   assert.match(again.io.err, /already exists/);
+  assert.equal(readFileSync(page, 'utf8'), html);
+  assert.ok(!existsSync(fresh));
+  const taken = await run(['export', taskId, '--markdown', notes, '--home', home]);
+  assert.equal(taken.code, 2);
+  assert.equal(readFileSync(notes, 'utf8'), before);
+
+  // A missing or malformed thread ID is a usage error that names the problem and prints no help.
+  // Help is only for --help. Nothing is written for an unknown thread, and no file is left.
+  const nameless = await run(['export', '--markdown', fresh, '--home', home]);
+  assert.equal(nameless.code, 2);
+  assert.match(nameless.io.err, /Give the thread ID/);
+  assert.ok(!nameless.io.out.includes('Usage:'));
+  const malformed = await run(['export', 'not-an-id', '--markdown', fresh, '--home', home]);
+  assert.equal(malformed.code, 2);
+  assert.match(malformed.io.err, /not a thread ID/);
   assert.equal((await run(['export', taskId, '--home', home])).code, 2);
-  const missing = join(directory, 'missing.md');
+  assert.match((await run(['export', '--help'])).io.out, /^Usage: crewkite export/);
   const none = await run([
     'export',
     'tsk_0000000000000000000000000A',
     '--markdown',
-    missing,
+    fresh,
     '--home',
     home,
   ]);
   assert.equal(none.code, 2);
-  assert.ok(!existsSync(missing));
+  assert.ok(!existsSync(fresh));
 });
