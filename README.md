@@ -23,7 +23,7 @@ To try a published build without the source, follow the [preview guide](docs/pre
 
 ## Google and your account
 
-Google's third-party access FAQ says that third-party access through its coding client login violates its terms. Its headless FAQ also excludes consumer CLI wrappers. The dated links are in [Google and your account](docs/providers.md#google-and-your-account). Google does not name CrewKite, and CrewKite has no exception from Google. Using the Google route is your own choice and your own risk. Roots No Limits LLC accepts no liability for action Google takes against your account. Settings shows this summary and keeps Connect Google off until you tick a box that says you have read Google's terms and accept the risk. The controller refuses Google use without that acknowledgement, and it asks again when this text changes.
+Google's third-party access FAQ says that third-party access through its coding client login violates its terms. Its headless FAQ also excludes consumer CLI wrappers. The dated links are in [Google and your account](docs/providers.md#google-and-your-account). Google does not name CrewKite, and CrewKite has no exception from Google. Using the Google route is your own choice and your own risk. Settings shows this summary and keeps Connect Google off until you tick a box that says you have read Google's terms, accept the risk, and that Roots No Limits LLC is not liable for Google's actions against your account. The controller refuses Google use without that acknowledgement, and it asks again when this text changes.
 
 ## Principles
 
