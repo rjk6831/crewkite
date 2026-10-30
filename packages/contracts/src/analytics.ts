@@ -11,9 +11,14 @@ const timestamp = z.iso.datetime();
 const count = z.number().int().nonnegative();
 const known = count.nullable();
 
-/** The most threads a project read lists and the most turns a thread read lists. */
+/**
+ * The most threads a project read lists and the most turns a thread read lists. A turn row with
+ * eight measured windows is under 1.5 KB, so 500 of them stay well under the 1 MiB frame limit.
+ */
 export const ANALYTICS_MAX_THREADS = 500;
-export const ANALYTICS_MAX_TURNS = 1000;
+export const ANALYTICS_MAX_TURNS = 500;
+/** The most gauge windows one family reports. Windows read most recently come first. */
+export const ANALYTICS_MAX_WINDOWS = 8;
 
 export const ReadChatAnalyticsPayloadSchema = z.discriminatedUnion('scope', [
   z.strictObject({ scope: z.literal('thread'), taskId }),
@@ -45,9 +50,13 @@ export const AnalyticsFamilySchema = z.strictObject({
   wallMs: count,
   tokensIn: known,
   tokensOut: known,
-  /** Turns whose client reported tokens in or out. The sums above cover these turns only. */
-  tokenTurns: count,
-  allowance: z.array(AnalyticsAllowanceSchema).max(16),
+  /** Turns whose client reported tokens in. `tokensIn` covers these turns only. */
+  tokensInTurns: count,
+  /** Turns whose client reported tokens out. `tokensOut` covers these turns only. */
+  tokensOutTurns: count,
+  allowance: z.array(AnalyticsAllowanceSchema).max(ANALYTICS_MAX_WINDOWS),
+  /** Gauge windows of the family left out because more than the cap reported readings. */
+  windowsOmitted: count,
 });
 export type AnalyticsFamily = z.infer<typeof AnalyticsFamilySchema>;
 
@@ -68,11 +77,17 @@ const rowShape = {
   wallMs: count,
   tokensIn: known,
   tokensOut: known,
-  tokenTurns: count,
+  tokensInTurns: count,
+  tokensOutTurns: count,
+  /**
+   * Check runs that reached a result, passed or failed. A run still running and a run that was
+   * stopped have no result and are not counted.
+   */
   checksRun: count,
   checksPassed: count,
   checksFailed: count,
-  branchesAccepted: count,
+  /** Branch acceptances: each time the thread's changes went to a branch. */
+  acceptances: count,
   /** The plan of the thread now. Null when the thread has no plan. */
   slices: AnalyticsPlanSlicesSchema.nullable(),
 };
@@ -106,7 +121,7 @@ export const AnalyticsTurnRowSchema = z.strictObject({
         consumed: z.number().finite().nonnegative(),
       }),
     )
-    .max(16),
+    .max(ANALYTICS_MAX_WINDOWS),
 });
 export type AnalyticsTurnRow = z.infer<typeof AnalyticsTurnRowSchema>;
 
@@ -123,6 +138,12 @@ export const ChatAnalyticsReadSchema = z.strictObject({
   threadCount: count,
   /** Thread reads list their turns in order. A thread past the cap lists the newest turns. */
   turnRows: z.array(AnalyticsTurnRowSchema).max(ANALYTICS_MAX_TURNS),
-  turnRowsTruncated: z.boolean(),
+  /** Turns of the thread that `turnRows` leaves out. Zero when it lists every turn. */
+  turnRowsOmitted: count,
+  /**
+   * The read stopped at its cap on gauge readings, so allowance for the earliest turns may be
+   * unmeasured. Everything else is complete.
+   */
+  gaugeTruncated: z.boolean(),
 });
 export type ChatAnalyticsRead = z.infer<typeof ChatAnalyticsReadSchema>;
