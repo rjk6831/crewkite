@@ -9,6 +9,8 @@ import {
   ChatCatalogReadSchema,
   type ChatChangesRead,
   ChatChangesReadSchema,
+  type ChatExport,
+  ChatExportSchema,
   type ChatMessage,
   ChatMessageSchema,
   type ChatModelSelection,
@@ -27,6 +29,7 @@ import {
   type Event,
   type ProjectNotesRead,
   ProjectNotesReadSchema,
+  type ExportFormat,
   type ProjectPage,
   type ProjectPageRequest,
   type SavedPrompts,
@@ -61,7 +64,12 @@ export type ChatTransport = {
 };
 
 // Reads carry no revision. Their names start with Read, apart from these.
-const readCommands = new Set(['CompleteChatMention', 'InspectSource', 'SearchChatHistory']);
+const readCommands = new Set([
+  'CompleteChatMention',
+  'ExportChatThread',
+  'InspectSource',
+  'SearchChatHistory',
+]);
 // Chat mutations carry revision zero, as the desktop's do. The controller does not race chat
 // commands on the task revision.
 const CHAT_REVISION = 0;
@@ -142,6 +150,8 @@ export function chatClient(
         },
         ChatSearchResultSchema,
       ),
+    exportThread: (taskId: string, format: ExportFormat): Promise<ChatExport> =>
+      read('ExportChatThread', { taskId, format }, ChatExportSchema),
     readPrompts: (): Promise<SavedPrompts> => read('ReadChatPrompts', {}, SavedPromptsSchema),
     readNotes: (projectId: string): Promise<ProjectNotesRead> =>
       read('ReadProjectNotes', { projectId }, ProjectNotesReadSchema),

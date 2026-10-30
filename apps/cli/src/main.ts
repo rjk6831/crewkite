@@ -54,6 +54,7 @@ import {
 import { runUsageAnalytics } from './chat/analytics.ts';
 import { connectChat } from './chat/connect.ts';
 import { runNotesCommand } from './chat/notes.ts';
+import { runExportCommand } from './chat/export.ts';
 import { type Connect, notDone, runPrint, runThreadCommand } from './chat/scripting.ts';
 import { runSearchCommand } from './chat/search.ts';
 import { runDiagnosticsCommand } from './diagnostics.ts';
@@ -67,6 +68,7 @@ const help = `Usage: crewkite                     interactive mode in a terminal
        crewkite diagnostics export <folder> [--thread task-id] [--home path]
        crewkite search <text> [--limit 1..50] [--per-thread 1..5] [--json] [--home path]
        crewkite notes <list|add|remove> <project-id> [text|note-id] [--json] (crewkite notes --help)
+       crewkite export <task-id> [--markdown path] [--html path] [--home path]
        crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
@@ -149,6 +151,7 @@ export async function runCli(
   if (args[0] === 'notes') return runNotesCommand(args.slice(1), output, connect);
   if (args[0] === 'usage' && (args[1] === 'thread' || args[1] === 'project'))
     return runUsageAnalytics(args.slice(1), output, connect);
+  if (args[0] === 'export') return runExportCommand(args.slice(1), output, connect);
   if (printRequested(args)) return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
   const streamWrite = async (text: string) => {
