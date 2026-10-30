@@ -277,9 +277,11 @@ test('the google quota read maps zero-turn account buckets to window observation
         resolveGoogleUsageClient({ HOME: environment.HOME }, [bin]).reason,
         'client-unavailable',
       );
+      // The reader accepts a range of builds, so a file with no readable version is refused as
+      // unreadable, and it still never sees an account file.
       writeFileSync(join(bin, 'agy'), 'private-canary', { mode: 0o700 });
       const mismatch = resolveGoogleUsageClient({ HOME: environment.HOME }, [bin]);
-      assert.equal(mismatch.reason, 'client-build-mismatch');
+      assert.equal(mismatch.reason, 'client-version-unreadable');
       assert(!JSON.stringify(mismatch).includes('private'));
     }
   } finally {

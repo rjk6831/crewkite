@@ -2,7 +2,14 @@ import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
-import { NativeProfileSchema } from '@crewkite/contracts';
+import { type ClientVersionStatus, NativeProfileSchema } from '@crewkite/contracts';
+import {
+  clientDirectories,
+  clientHostGate,
+  clientVersionStatus,
+  findClient,
+  openAiNativeSibling,
+} from '../client-versions.ts';
 import { nativeDiscoveryEnvironment } from './native-discovery.ts';
 
 const descriptor = {
@@ -97,10 +104,13 @@ export function resolveRepositoryProfile(environment = process.env): NativeProfi
 
 function repositoryResolution(resolved: NativeProfileResolution): NativeProfileResolution {
   const { maximumFileBytes: _fileLimit, ...common } = descriptor;
+  const clientVersion =
+    'clientVersion' in resolved.facts ? resolved.facts.clientVersion : descriptor.clientVersion;
   return {
     ...resolved,
     facts: NativeProfileSchema.parse({
       ...common,
+      clientVersion,
       id: 'openai-repository-v1',
       displayName: 'OpenAI repository work',
       qualifiedAt: null,
@@ -112,4 +122,79 @@ function repositoryResolution(resolved: NativeProfileResolution): NativeProfileR
       reason: resolved.facts.available ? 'qualification-pending' : resolved.facts.reason,
     }),
   };
+}
+
+/** What the chat path found: the client's state and, when it is accepted, a launchable profile. */
+export type ChatClientResolution = {
+  status: ClientVersionStatus;
+  profile?: NativeProfileResolution;
+  /** Why nothing was searched for, when the computer or its settings rule the client out. */
+  reason?: string;
+};
+
+/** The quota reader's profile: the accepted chat client, or an unavailable one that says why. */
+export function resolveOpenAiUsageClient(environment = process.env): NativeProfileResolution {
+  const chat = resolveOpenAiChatClient(environment, { id: 'openai-file-v1' });
+  if (chat.profile) return chat.profile;
+  const reason =
+    chat.status.state === 'missing'
+      ? 'client-unavailable'
+      : chat.reason === 'unsupported-platform' ||
+          chat.reason === 'native-home-unavailable' ||
+          chat.reason === 'configuration-location-unsupported'
+        ? chat.reason
+        : 'client-build-mismatch';
+  return unavailableNativeProfile(reason);
+}
+
+/**
+ * The chat path and the quota reader take any accepted build (ADR 0009, amendment of
+ * 2026-10-31). The search, real path, owner and mode checks match the profiles; only the digest
+ * pin is gone. The facts keep the profile's shape with the found version, so a stored model list
+ * or quota read from another build no longer matches.
+ */
+export function resolveOpenAiChatClient(
+  environment = process.env,
+  options: { id?: 'openai-file-v1' | 'openai-repository-v1'; directories?: string[] } = {},
+): ChatClientResolution {
+  const gate =
+    clientHostGate('openai', environment) ??
+    (environment.CODEX_HOME !== undefined
+      ? {
+          reason: 'configuration-location-unsupported',
+          detail:
+            'Codex reads CODEX_HOME, which CrewKite does not support yet. Unset it, then restart CrewKite.',
+        }
+      : null);
+  if (gate)
+    return {
+      status: clientVersionStatus('openai', { state: 'unavailable', detail: gate.detail }),
+      reason: gate.reason,
+    };
+  const found = findClient('openai', {
+    directories: options.directories ?? clientDirectories('openai', environment),
+    home: environment.HOME as string,
+    path: environment.PATH,
+    siblings: openAiNativeSibling,
+  });
+  if (!found.client) return { status: found.status };
+  const located = {
+    client: found.client,
+    environment: nativeDiscoveryEnvironment(environment),
+    locationHash: createHash('sha256')
+      .update(JSON.stringify({ home: environment.HOME, configurationHome: null }))
+      .digest('hex'),
+  };
+  const facts = { ...descriptor, clientVersion: found.client.version };
+  const profile: NativeProfileResolution =
+    options.id === 'openai-file-v1'
+      ? {
+          ...located,
+          facts: NativeProfileSchema.parse({ ...facts, available: true, reason: 'available' }),
+        }
+      : repositoryResolution({
+          ...located,
+          facts: NativeProfileSchema.parse({ ...facts, available: true, reason: 'available' }),
+        });
+  return { status: found.status, profile };
 }

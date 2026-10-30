@@ -31,6 +31,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { ChatClientRefused } from '../../chat/clients.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import { anthropicMcpEntries, mcpToolAnswer } from '../../chat/mcp-servers.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
@@ -676,12 +677,15 @@ function startTurn(
   try {
     const client = deps.launch(request);
     executable = verifiedExecutable(client.executable, client.sha256);
-  } catch {
+  } catch (error) {
     return refuse(
       chatFailure({
         stage: 'launch',
         kind: 'client-missing',
-        message: 'The Anthropic client is missing or does not match the verified build.',
+        message:
+          error instanceof ChatClientRefused
+            ? error.message
+            : 'The Anthropic client is missing or changed since Settings checked it.',
       }),
     );
   }

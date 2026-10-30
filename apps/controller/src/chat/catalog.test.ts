@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LocalSetupSchema } from '@crewkite/contracts';
+import { AnthropicNativeProfileSchema, LocalSetupSchema } from '@crewkite/contracts';
+import { resolveAnthropicNativeProfile } from '../providers/anthropic/profile.ts';
 import { LOCAL_TEXT_TYPES } from '../providers/local/chat.ts';
 import { buildChatCatalog, type ChatCatalogInput } from './catalog.ts';
 
@@ -169,5 +170,59 @@ test('the catalog reports the file types each client said it takes, and null bef
     const entry = catalog.families.find((value) => value.family === family);
     const got = !entry?.accepts ? null : matches(entry.accepts, type) ? 'native' : entry.unlisted;
     assert.equal(got, want, label);
+  }
+});
+
+test('a writer profile build mismatch no longer disconnects chat when the chat client accepts the build', () => {
+  const writer = AnthropicNativeProfileSchema.parse(resolveAnthropicNativeProfile({}).facts);
+  const mismatch = AnthropicNativeProfileSchema.parse({
+    ...writer,
+    available: false,
+    reason: 'client-build-mismatch',
+  });
+  const status = (state: 'newer' | 'older', accepted: boolean) => ({
+    state,
+    accepted,
+    version: state === 'newer' ? '9.9.9' : '0.0.1',
+    tested: '1.0.0',
+    minimum: '0.5.0',
+    message: `fixture ${state}`,
+  });
+  const newer = {
+    status: status('newer', true),
+    profile: {
+      facts: AnthropicNativeProfileSchema.parse({
+        ...writer,
+        clientVersion: '9.9.9',
+        available: true,
+        reason: 'qualification-pending',
+      }),
+      client: { executable: '/usr/local/bin/fixture', sha256: 'a'.repeat(64), version: '9.9.9' },
+    },
+  };
+  const read = (clients: ChatCatalogInput['clients']) =>
+    buildChatCatalog({
+      profiles: [mismatch],
+      clients,
+      openAiModels: null,
+      local: localSetup(false),
+      windows: [],
+      nowMs: Date.parse('2026-10-31T12:00:00.000Z'),
+    }).families.find((entry) => entry.family === 'anthropic');
+  for (const [label, clients, connected, reason, message] of [
+    ['newer build', { anthropic: newer }, true, null, 'fixture newer'],
+    [
+      'older build',
+      { anthropic: { status: status('older', false) } },
+      false,
+      'client-version-unsupported',
+      'fixture older',
+    ],
+    ['no chat resolver', undefined, false, 'client-build-mismatch', undefined],
+  ] satisfies [string, ChatCatalogInput['clients'], boolean, string | null, string | undefined][]) {
+    const entry = read(clients);
+    assert.equal(entry?.connected, connected, label);
+    assert.equal(entry?.reason, reason, label);
+    assert.equal(entry?.client?.message, message, label);
   }
 });

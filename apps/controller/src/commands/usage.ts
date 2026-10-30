@@ -31,7 +31,10 @@ import {
 } from '../providers/google/profile.ts';
 import { OpenAiDiscovery } from '../providers/openai/discovery.ts';
 import { startNativeSession } from '../providers/openai/native-discovery.ts';
-import { unavailableNativeProfile } from '../providers/openai/profile.ts';
+import {
+  type NativeProfileResolution,
+  unavailableNativeProfile,
+} from '../providers/openai/profile.ts';
 import { deriveWindow } from '../usage/index.ts';
 import type { Controller } from './controller.ts';
 import { googleTermsAcknowledged } from './google-terms.ts';
@@ -50,7 +53,7 @@ export class UsageCommands {
       home: this.home,
       now: this.now,
       artifactId: () => this.id('art'),
-      resolve: () => this.profileFor('anthropic-file-v1'),
+      resolve: () => this.anthropicChatProfile(),
       blocked: () => {
         const connection = this.nativeConnections().status();
         if (connection.state === 'unknown') return 'anthropic-connection-ownership-unknown';
@@ -75,14 +78,26 @@ export class UsageCommands {
     return this.anthropicUsageRuntime;
   }
 
+  /**
+   * The Anthropic client the quota reader and the sign-in check run: the chat client found by
+   * version range, or the pinned profile when the controller has no chat resolver.
+   */
+  anthropicChatProfile(this: Controller): NativeProfileResolution {
+    const found = this.options.chatClients?.anthropic
+      ? this.chatClientFor('anthropic').profile
+      : undefined;
+    return found ?? this.profileFor('anthropic-file-v1');
+  }
+
   googleUsageReader(this: Controller) {
     const reader = this.store.googleUsageReader();
     return UsageReaderSchema.parse({
       id: googleUsageDescriptor.id,
       family: 'google',
-      clientVersion: googleUsageDescriptor.clientVersion,
+      clientVersion: this.usageResolution.status?.version ?? googleUsageDescriptor.clientVersion,
       available: this.usageResolution.available,
       reason: this.usageResolution.reason,
+      ...(this.usageResolution.status ? { client: this.usageResolution.status } : {}),
       lastObservedAt: reader.last_observed_at,
       lastAttemptAt: reader.last_attempt_at,
     });
@@ -100,6 +115,7 @@ export class UsageCommands {
       clientVersion: facts.clientVersion,
       available: profile.facts.available,
       reason: profile.facts.available ? 'available' : profile.facts.reason,
+      ...(this.options.chatClients?.openai ? { client: this.chatClientFor('openai').status } : {}),
       readState: state?.state ?? 'idle',
       readReason: state?.reason ?? null,
       lastRequest: state?.lastRequest ?? null,

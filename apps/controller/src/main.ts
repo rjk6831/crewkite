@@ -17,12 +17,18 @@ import { installCrashCapture } from './diagnostics/crash.ts';
 import { appendControllerLog } from './diagnostics/log.ts';
 import { configuredIdentity } from './host/publication.ts';
 import {
+  resolveAnthropicChatClient,
   resolveAnthropicCompactNativeProfile,
   resolveAnthropicNativeProfile,
 } from './providers/anthropic/profile.ts';
 import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
 import { refreshAvailableMemory, startGpuProbe } from './providers/local/hardware.ts';
-import { resolveNativeProfile, resolveRepositoryProfile } from './providers/openai/profile.ts';
+import {
+  resolveNativeProfile,
+  resolveOpenAiChatClient,
+  resolveOpenAiUsageClient,
+  resolveRepositoryProfile,
+} from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
 
 function runtimeBytes(path: string, maximum: number) {
@@ -96,7 +102,17 @@ export function resolvePackagedLocalInput(root: string) {
 export async function startController(options: ControllerOptions) {
   const configuration = {
     openAiUsageClient:
-      !options.nativeProfile && !options.nativeProfiles ? resolveNativeProfile : undefined,
+      !options.nativeProfile && !options.nativeProfiles
+        ? () => resolveOpenAiUsageClient()
+        : undefined,
+    // Chat finds each client by version range. The writer profiles below keep their exact pins.
+    chatClients:
+      !options.nativeProfile && !options.nativeProfiles
+        ? {
+            openai: () => resolveOpenAiChatClient(),
+            anthropic: () => resolveAnthropicChatClient(),
+          }
+        : undefined,
     registerGoogleAcp: !options.nativeProfile && !options.nativeProfiles,
     nativeProfiles: options.nativeProfile
       ? undefined

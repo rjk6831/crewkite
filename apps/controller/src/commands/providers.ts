@@ -657,7 +657,7 @@ export class ProviderCommands {
       {
         key: command.key,
         requestHash: hash,
-        profile: this.profileFor('anthropic-file-v1'),
+        profile: this.anthropicChatProfile(),
         directory,
         repositoryRoot: this.home,
       },

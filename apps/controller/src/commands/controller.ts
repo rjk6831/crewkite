@@ -44,6 +44,7 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { readAnalytics } from '../chat/analytics.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
+import { ChatClientRefused, type ChatClientResolvers, chatClient } from '../chat/clients.ts';
 import { exportThread } from '../chat/export.ts';
 import { McpRegistry } from '../chat/mcp-servers.ts';
 import { ProjectNotes } from '../chat/project-notes.ts';
@@ -185,6 +186,8 @@ export type ControllerOptions = {
   gitState?: () => GitState;
   /** Chat adapters by family. A family without one refuses new chat turns. */
   chatAdapters?: ReadonlyMap<ChatFamily, ChatAdapter>;
+  /** The chat client per family, found by version range. Without one, the profiles stand in. */
+  chatClients?: ChatClientResolvers;
 };
 
 export class Controller {
@@ -521,11 +524,7 @@ export class Controller {
   /** Starts a picker read when the last one is old. A catalog read never waits for it. */
   private refreshAnthropicModels(profiles: NativeProfileResolution[]) {
     const read = this.anthropicModelRead;
-    const client = profiles.find(
-      (value) =>
-        ['anthropic-file-v1', 'anthropic-file-compact-v1'].includes(value.facts.id) &&
-        value.facts.available,
-    )?.client;
+    const client = this.chatClientFor('anthropic', profiles).profile?.client;
     const now = Date.parse(this.now());
     // Ten minutes after a read, one minute after a miss.
     if (
@@ -562,6 +561,12 @@ export class Controller {
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
+      // A controller built with fixed profiles and no chat resolver lets those profiles decide.
+      clients: Object.fromEntries(
+        (['openai', 'anthropic'] as const)
+          .filter((family) => this.options.chatClients?.[family])
+          .map((family) => [family, this.chatClientFor(family, profiles)]),
+      ),
       anthropicModel: this.anthropicUsage().clientModel(),
       anthropicModels: this.anthropicModelRows,
       googlePrompt: this.googlePrompt,
@@ -597,7 +602,10 @@ export class Controller {
           key === CHAT_MODEL_CATALOG
             ? OpenAiModelCatalogObservationSchema.parse(value)
             : ModelCatalogObservationSchema.parse(value);
-        const profile = profiles.find((value) => value.facts.id === catalog.profileId);
+        // The chat client first, so a list read with the build found by range still counts.
+        const profile = [this.chatOpenAiProfile(profiles), ...profiles].find(
+          (value) => value?.facts.id === catalog.profileId,
+        );
         if (
           !profile?.facts.available ||
           hashCanonical(profile.client) !== hashCanonical(catalog.client) ||
@@ -634,13 +642,16 @@ export class Controller {
     }
   }
 
-  /** The OpenAI profile a chat turn launches with, in the adapter's order of preference. */
-  private chatOpenAiProfile(profiles = this.resolveProfiles()) {
-    for (const id of ['openai-repository-v1', 'openai-file-v1']) {
-      const profile = profiles.find((value) => value.facts.id === id);
-      if (profile?.facts.available && profile.client && profile.environment && profile.locationHash)
-        return profile;
-    }
+  /** The client a chat turn, model read or quota read launches, found by version range. */
+  chatClientFor(family: 'openai' | 'anthropic', profiles?: NativeProfileResolution[]) {
+    return chatClient(family, this.options.chatClients, () => profiles ?? this.resolveProfiles());
+  }
+
+  /** The OpenAI profile a chat turn launches with. */
+  private chatOpenAiProfile(profiles?: NativeProfileResolution[]) {
+    const profile = this.chatClientFor('openai', profiles).profile;
+    if (profile?.facts.available && profile.client && profile.environment && profile.locationHash)
+      return profile;
   }
 
   private chatModelReadRecord() {
@@ -806,7 +817,12 @@ export class Controller {
       google: ['google-acp-v1'],
       local: [],
     };
-    const profiles = this.resolveProfiles();
+    const profiles = [
+      ...(family === 'openai' || family === 'anthropic'
+        ? [this.chatClientFor(family).profile ?? []].flat()
+        : []),
+      ...this.resolveProfiles(),
+    ];
     // Writer profiles trim PATH to the system directories. A chat turn runs the person's own
     // commands through the client, so it keeps the PATH the controller was started with.
     const path = process.env.PATH ? { PATH: process.env.PATH } : {};
@@ -820,20 +836,18 @@ export class Controller {
     );
   }
 
-  /** One adapter per family, each resolving its client from the profiles at launch time. */
+  /** One adapter per family, each resolving its client by version range at launch time. */
   private defaultChatAdapters(): Map<ChatFamily, ChatAdapter> {
     this.threadToolsBroker();
     const threadTools = (request: ChatTurnRequest) => this.threadTools(request);
-    const client = (ids: string[], family: string) => {
-      const profile = this.resolveProfiles().find(
-        (value) => ids.includes(value.facts.id) && value.facts.available && value.client,
-      );
-      if (!profile?.client) throw Error(`The ${family} client is not connected.`);
-      return profile.client;
+    const client = (family: 'openai' | 'anthropic') => {
+      const found = this.chatClientFor(family);
+      if (!found.profile?.client) throw new ChatClientRefused(found.status.message);
+      return found.profile.client;
     };
     const openai = openAiChatAdapter({
       launch: (request: ChatTurnRequest) => ({
-        ...client(['openai-repository-v1', 'openai-file-v1'], 'OpenAI'),
+        ...client('openai'),
         directory: request.work.directory,
         repositoryRoot: this.home,
         environment: request.environment,
@@ -842,7 +856,7 @@ export class Controller {
       threadTools,
     });
     const anthropic = anthropicChatAdapter({
-      launch: () => client(['anthropic-file-v1', 'anthropic-file-compact-v1'], 'Anthropic'),
+      launch: () => client('anthropic'),
       spawn: this.options.nativeSpawn as Parameters<typeof anthropicChatAdapter>[0]['spawn'],
       schedule: this.options.schedule,
       onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),

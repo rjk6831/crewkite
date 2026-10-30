@@ -4,7 +4,13 @@ import { userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
 import { z } from 'zod';
-import type { NativeProfileResolution } from '../openai/profile.ts';
+import {
+  clientDirectories,
+  clientHostGate,
+  clientVersionStatus,
+  findClient,
+} from '../client-versions.ts';
+import type { ChatClientResolution, NativeProfileResolution } from '../openai/profile.ts';
 import { nativeAuthEnvironment } from './native-discovery.ts';
 
 const descriptor = {
@@ -99,4 +105,51 @@ export function resolveAnthropicCompactNativeProfile(
   environment = process.env,
 ): NativeProfileResolution {
   return resolve(compactDescriptor, environment);
+}
+
+/**
+ * The chat path, the model read, the quota reader and the sign-in check take any accepted build
+ * (ADR 0009, amendment of 2026-10-31). The search, real path, owner and mode checks match the
+ * profile; only the digest pin is gone. The facts carry the found version.
+ */
+export function resolveAnthropicChatClient(
+  environment = process.env,
+  directories?: string[],
+): ChatClientResolution {
+  const gate =
+    clientHostGate('anthropic', environment) ??
+    (environment.CLAUDE_CONFIG_DIR !== undefined
+      ? {
+          reason: 'configuration-location-unsupported',
+          detail:
+            'Claude Code reads CLAUDE_CONFIG_DIR, which CrewKite does not support yet. Unset it, then restart CrewKite.',
+        }
+      : null);
+  if (gate)
+    return {
+      status: clientVersionStatus('anthropic', { state: 'unavailable', detail: gate.detail }),
+      reason: gate.reason,
+    };
+  const found = findClient('anthropic', {
+    directories: directories ?? clientDirectories('anthropic', environment),
+    home: environment.HOME as string,
+    path: environment.PATH,
+  });
+  if (!found.client) return { status: found.status };
+  return {
+    status: found.status,
+    profile: {
+      facts: AnthropicNativeProfileSchema.parse({
+        ...descriptor,
+        clientVersion: found.client.version,
+        available: true,
+        reason: 'qualification-pending',
+      }),
+      client: found.client,
+      environment: nativeAuthEnvironment(environment, '/tmp'),
+      locationHash: createHash('sha256')
+        .update(JSON.stringify({ home: environment.HOME, configurationHome: null }))
+        .digest('hex'),
+    },
+  };
 }

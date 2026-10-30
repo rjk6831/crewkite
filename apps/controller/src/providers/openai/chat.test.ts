@@ -80,6 +80,7 @@ import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { findClient } from '../client-versions.ts';
 import { type OpenAiChatDeps, openAiChatAdapter } from './chat.ts';
 import type { OpenAiUsage } from './discovery.ts';
 
@@ -256,6 +257,8 @@ function turn(
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
     schedule?: Schedule;
+    /** The client the turn launches, when a test resolved its own. */
+    client?: { executable: string; sha256: string };
   } = {},
 ) {
   const home = mkdtempSync(join(root, `${scenario}-`));
@@ -272,7 +275,12 @@ function turn(
   let args: string[] = [];
   let launchEnvironment: NodeJS.ProcessEnv = {};
   const adapter = openAiChatAdapter({
-    launch: () => ({ executable, sha256, directory: work, repositoryRoot: home, environment }),
+    launch: () => ({
+      ...(options.client ?? { executable, sha256 }),
+      directory: work,
+      repositoryRoot: home,
+      environment,
+    }),
     onUsage: (value) => usage.push(value),
     spawn: (path, clientArgs, spawnOptions) => {
       args = clientArgs;
@@ -369,6 +377,35 @@ test('streamed thinking and text reach the thread in the order the client sends 
     usage: { usedTokens: 300, capacityTokens: 400_000 },
     changedPaths: [],
   });
+});
+
+test('a Codex build newer than the tested one, found by version range, launches a chat turn', async () => {
+  // One file answers --version as the client would and plays the app-server peer otherwise.
+  const bin = join(root, 'newer-bin');
+  mkdirSync(bin);
+  const script = join(root, 'codex-newer.cjs');
+  writeFileSync(
+    script,
+    `#!/usr/bin/env node\nif (process.argv[2] === '--version') { console.log('codex-cli 0.170.2'); process.exit(0); }\n${peer}`,
+    { mode: 0o755 },
+  );
+  symlinkSync(script, join(bin, 'codex'));
+  const found = findClient('openai', {
+    directories: [bin],
+    home: root,
+    path: dirname(process.execPath),
+    cache: new Map(),
+  });
+  assert.equal(found.status.state, 'newer');
+  assert.equal(
+    found.status.message,
+    'Codex 0.170.2 found. Tested with 0.163.0; newer builds usually work.',
+  );
+  assert(found.client);
+  const run = turn('reply', { client: found.client });
+  const result = await run.settled();
+  assert.equal(result.stopReason, 'done');
+  assert.equal(result.assistantText, 'Hello.');
 });
 
 test('a command approval holds the turn until respondPermission answers it', async () => {

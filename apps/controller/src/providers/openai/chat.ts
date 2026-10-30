@@ -27,6 +27,7 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { ChatClientRefused } from '../../chat/clients.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import {
   attachedLine,
@@ -541,9 +542,11 @@ class OpenAiChatTurn {
         stage: 'launch',
         kind: 'client-missing',
         message:
-          step === 'client'
-            ? 'Codex is missing or changed since Settings checked it.'
-            : 'Codex could not start.',
+          error instanceof ChatClientRefused
+            ? error.message
+            : step === 'client'
+              ? 'Codex is missing or changed since Settings checked it.'
+              : 'Codex could not start.',
       });
     }
   }

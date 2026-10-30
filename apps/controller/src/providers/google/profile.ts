@@ -1,8 +1,6 @@
-import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { userInfo } from 'node:os';
-import { isAbsolute, join } from 'node:path';
-import { GoogleNativeProfileSchema } from '@crewkite/contracts';
+import { type ClientVersionStatus, GoogleNativeProfileSchema } from '@crewkite/contracts';
+import { CLIENT_VERSIONS, clientDirectories, findClient } from '../client-versions.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
 import type { GoogleClientIdentity } from './native-writer.ts';
 
@@ -35,14 +33,14 @@ export function resolveGoogleNativeProfile(_environment = process.env): NativePr
   };
 }
 
-// The quota reader runs automatically using one zero-turn /usage command
-// on the pinned client and never prepares, starts or submits a task.
+// The quota reader runs automatically using one zero-turn /usage command on the installed CLI
+// and never prepares, starts or submits a task. It accepts any build the version table accepts
+// (ADR 0009, amendment of 2026-10-31); the ACP bundle keeps its exact pin.
 export const googleUsageDescriptor = {
   id: 'google-usage-v1',
   family: 'google',
   displayName: 'Google quota read',
-  clientVersion: '1.4.2',
-  clientSha256: '74935642426b5bb1fcf07a5555f847c478f4517dd002c72b9c98159cb773b932',
+  clientVersion: CLIENT_VERSIONS.google.tested,
   command: '/usage',
   maximumReadMs: 20000,
 } as const;
@@ -53,6 +51,7 @@ export type GoogleUsageClientResolution =
       reason: 'available';
       client: GoogleClientIdentity;
       environment: NodeJS.ProcessEnv;
+      status?: ClientVersionStatus;
     }
   | {
       available: false;
@@ -60,10 +59,14 @@ export type GoogleUsageClientResolution =
         | 'unsupported-platform'
         | 'native-home-unavailable'
         | 'client-unavailable'
-        | 'client-build-mismatch';
+        | 'client-build-mismatch'
+        | 'client-version-unsupported'
+        | 'client-version-unreadable'
+        | 'client-untrusted';
+      status?: ClientVersionStatus;
     };
 
-/** Find the pinned client without executing it or reading authentication files. */
+/** Find an accepted CLI build and read its version. No account file is read. */
 export function resolveGoogleUsageClient(
   environment = process.env,
   searchDirectories?: readonly string[],
@@ -72,35 +75,32 @@ export function resolveGoogleUsageClient(
     return { available: false, reason: 'unsupported-platform' };
   if (!environment.HOME || environment.HOME !== userInfo().homedir)
     return { available: false, reason: 'native-home-unavailable' };
-  let found = false;
-  const directories = searchDirectories ?? [
-    ...(environment.PATH ?? '').split(':').filter(isAbsolute),
-    join(environment.HOME, '.local/bin'),
-    '/opt/homebrew/bin',
-    '/usr/local/bin',
-  ];
-  for (const directory of new Set(directories.filter(isAbsolute))) {
-    try {
-      const executable = realpathSync(join(directory, 'agy'));
-      const stat = lstatSync(executable);
-      if (!stat.isFile() || stat.size > 256 * 1024 * 1024) continue;
-      found = true;
-      if (
-        createHash('sha256').update(readFileSync(executable)).digest('hex') !==
-        googleUsageDescriptor.clientSha256
-      )
-        continue;
-      return {
-        available: true,
-        reason: 'available',
-        client: {
-          executable,
-          version: googleUsageDescriptor.clientVersion,
-          sha256: googleUsageDescriptor.clientSha256,
-        },
-        environment: { HOME: environment.HOME },
-      };
-    } catch {}
-  }
-  return { available: false, reason: found ? 'client-build-mismatch' : 'client-unavailable' };
+  const found = findClient('google', {
+    directories: searchDirectories ?? clientDirectories('google', environment),
+    home: environment.HOME,
+    path: environment.PATH,
+  });
+  const status = found.status;
+  if (!found.client)
+    return {
+      available: false,
+      reason:
+        status.state === 'untrusted'
+          ? 'client-untrusted'
+          : status.state === 'unreadable'
+            ? 'client-version-unreadable'
+            : status.state === 'missing'
+              ? 'client-unavailable'
+              : 'client-version-unsupported',
+      status,
+    };
+  return {
+    available: true,
+    reason: 'available',
+    // The metadata launch takes a plain three-part version. A prerelease keeps its core here and
+    // its full text in the status.
+    client: { ...found.client, version: found.client.version.split('-')[0] },
+    environment: { HOME: environment.HOME },
+    status,
+  };
 }
