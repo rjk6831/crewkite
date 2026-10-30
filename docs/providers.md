@@ -122,7 +122,11 @@ I ran this adapter live against the real client during development. The dated qu
 
 ## Client versions
 
-Chat, the model reads, the quota readers and the Anthropic sign-in check accept a range of client builds, as the [ADR 0009 amendment](adr/0009-native-client-trust-profile.md#amendment-2026-10-31) records. CrewKite finds the client on the same search path as the writer profiles, checks that the file is a regular file owned by me or the system with no write access for other users, and runs its `--version` flag in its own process group for at most five seconds. It reads each build once and again when the file changes.
+Chat, the model reads, the quota readers and the Anthropic sign-in check accept a range of client builds, as the [ADR 0009 amendment](adr/0009-native-client-trust-profile.md#amendment-2026-10-31) records. CrewKite finds the client on the same search path as the writer profiles. It checks that the file is a regular file owned by me or the system, that neither its group nor other users can write it, and that other users cannot write the folder it sits in. It then runs the client's `--version` flag in its own process group for at most five seconds, with only HOME, PATH, LANG, NO_COLOR and the client's own update switches set, and kills the whole group afterwards. A process the client starts in a new session with `setsid` leaves that group and escapes the kill; `--version` has no reason to do that. Lines that announce an update are skipped when CrewKite reads the version. If the file changes while the flag runs, the version is discarded, and every launch hashes the file again, so a later swap is refused at launch.
+
+CrewKite reads each build once and again when the file changes. A version it cannot read is tried again after a minute, then after twice as long each time up to fifteen minutes, so a client that hangs on `--version` costs its five seconds rarely. Check again on the provider card reads at once. No version read runs while the controller holds its database transaction.
+
+A Codex build newer than the tested one that closes before it answers its first request most often refused a setting CrewKite passes under `--strict-config`. The thread then says so in one line that names the found and tested builds, and the client's own words stay in the failure detail.
 
 | Family | Client | Tested build | Minimum | Update command |
 |--------|--------|--------------|---------|----------------|
