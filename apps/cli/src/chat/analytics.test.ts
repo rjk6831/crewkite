@@ -56,11 +56,14 @@ test('usage thread and project read the controller and save a new csv', {
   assert.equal(kind, 'chat-analytics');
   const read = ChatAnalyticsReadSchema.parse(body);
   assert.deepEqual(
-    [read.scope, read.turns, read.openTurns, read.handoffs, read.checksRun, read.branchesAccepted],
+    [read.scope, read.turns, read.openTurns, read.handoffs, read.checksRun, read.acceptances],
     ['thread', 1, 0, 0, 0, 0],
   );
   // The scripted client reports no tokens, so they read as unknown and never as zero.
-  assert.deepEqual([read.tokensIn, read.tokensOut, read.tokenTurns], [null, null, 0]);
+  assert.deepEqual(
+    [read.tokensIn, read.tokensOut, read.tokensInTurns, read.tokensOutTurns],
+    [null, null, 0, 0],
+  );
 
   const text = capture();
   assert.equal(await runCli(['usage', 'project', projectId, '--home', home], text.output), 0);
@@ -75,7 +78,10 @@ test('usage thread and project read the controller and save a new csv', {
     await runCli(['usage', 'thread', taskId, '--csv', file, '--home', home], saved.output),
     0,
   );
-  const lines = readFileSync(file, 'utf8').replace(/^﻿/, '').trimEnd().split('\r\n');
+  const lines = readFileSync(file, 'utf8')
+    .replace(/^\uFEFF/, '')
+    .trimEnd()
+    .split('\r\n');
   assert.equal(lines.length, 2);
   assert.match(lines[1], /^[^,]+,0,assistant,anthropic,fixture-model,done,/);
   const again = capture();

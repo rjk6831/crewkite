@@ -49,8 +49,8 @@ export function analyticsText(read: ChatAnalyticsRead): string {
   const lines = [
     `${read.name} (${read.scope} ${read.id})`,
     `Turns ${read.turns}${read.openTurns ? `, ${read.openTurns} still open` : ''}. Handoffs ${read.handoffs}. Wall time ${wallText(read.wallMs)}.`,
-    `Tokens in ${tokensText(read.tokensIn, read.tokenTurns, read.turns)}, out ${tokensText(read.tokensOut, read.tokenTurns, read.turns)}.`,
-    `Checks run ${read.checksRun}, passed ${read.checksPassed}, failed ${read.checksFailed}. Branches accepted ${read.branchesAccepted}.`,
+    `Tokens in ${tokensText(read.tokensIn, read.tokensInTurns, read.turns)}, out ${tokensText(read.tokensOut, read.tokensOutTurns, read.turns)}.`,
+    `Checks with a result ${read.checksRun}, passed ${read.checksPassed}, failed ${read.checksFailed}. Branch acceptances ${read.acceptances}.`,
   ];
   if (read.slices)
     lines.push(
@@ -65,32 +65,45 @@ export function analyticsText(read: ChatAnalyticsRead): string {
           family.family,
           String(family.turns),
           wallText(family.wallMs),
-          tokensText(family.tokensIn, family.tokenTurns, family.turns),
-          tokensText(family.tokensOut, family.tokenTurns, family.turns),
+          tokensText(family.tokensIn, family.tokensInTurns, family.turns),
+          tokensText(family.tokensOut, family.tokensOutTurns, family.turns),
         ]),
       ]),
     );
-    for (const family of read.families)
+    for (const family of read.families) {
       for (const entry of family.allowance)
         lines.push(`Allowance, ${family.family}  ${allowanceText(entry)}`);
+      if (family.windowsOmitted > 0)
+        lines.push(
+          `${family.windowsOmitted} more ${family.family} windows are not listed. The most recently read come first.`,
+        );
+    }
+    if (read.families.some((family) => family.allowance.length > 0))
+      lines.push(
+        'Allowance counts only turns that gauge readings within 15 minutes bracket with no other chat turn of the project in between. Task runs, other projects and use outside CrewKite are not checked.',
+      );
+    if (read.gaugeTruncated)
+      lines.push('The gauge read stopped at its row cap, so allowance may be missing.');
   }
   if (read.scope === 'project' && read.threads.length > 0)
     lines.push(
       '',
       ...table([
-        ['Thread', 'Turns', 'Wall time', 'Handoffs', 'Checks passed', 'Branches'],
+        ['Thread', 'Turns', 'Wall time', 'Handoffs', 'Checks passed', 'Acceptances'],
         ...read.threads.map((thread) => [
           thread.title,
           String(thread.turns),
           wallText(thread.wallMs),
           String(thread.handoffs),
           `${thread.checksPassed} of ${thread.checksRun}`,
-          String(thread.branchesAccepted),
+          String(thread.acceptances),
         ]),
       ]),
     );
   if (read.scope === 'project' && read.threadCount > read.threads.length)
-    lines.push(`${read.threadCount - read.threads.length} more threads are not listed.`);
+    lines.push(
+      `${read.threadCount - read.threads.length} more threads are in neither the list nor the --csv file.`,
+    );
   if (read.scope === 'thread' && read.turnRows.length > 0) {
     const shown = read.turnRows.slice(-MAX_TURN_LINES);
     lines.push(
@@ -109,7 +122,13 @@ export function analyticsText(read: ChatAnalyticsRead): string {
       ]),
     );
     if (read.turnRows.length > shown.length)
-      lines.push(`${read.turnRows.length - shown.length} earlier turns are in the --csv file.`);
+      lines.push(
+        `${read.turnRows.length - shown.length} earlier turns are not shown here. The --csv file holds all ${read.turnRows.length} listed turns.`,
+      );
+    if (read.turnRowsOmitted > 0)
+      lines.push(
+        `${read.turnRowsOmitted} older turns are in neither the list nor the --csv file. The read keeps the newest ${read.turnRows.length}.`,
+      );
   }
   return lines.join('\n');
 }

@@ -113,10 +113,13 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
     ['Turns', `${read.turns}${read.openTurns ? `, ${read.openTurns} open` : ''}`],
     ['Handoffs', String(read.handoffs)],
     ['Wall time', wallText(read.wallMs)],
-    ['Tokens in', tokensText(read.tokensIn, read.tokenTurns, read.turns)],
-    ['Tokens out', tokensText(read.tokensOut, read.tokenTurns, read.turns)],
-    ['Checks', `${read.checksPassed} passed of ${read.checksRun} run, ${read.checksFailed} failed`],
-    ['Branches accepted', String(read.branchesAccepted)],
+    ['Tokens in', tokensText(read.tokensIn, read.tokensInTurns, read.turns)],
+    ['Tokens out', tokensText(read.tokensOut, read.tokensOutTurns, read.turns)],
+    [
+      'Checks with a result',
+      `${read.checksPassed} passed of ${read.checksRun}, ${read.checksFailed} failed`,
+    ],
+    ['Branch acceptances', String(read.acceptances)],
     ...(read.slices
       ? ([
           [
@@ -155,8 +158,8 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
                 <th scope="row">{family.family}</th>
                 <td>{family.turns}</td>
                 <td>{wallText(family.wallMs)}</td>
-                <td>{tokensText(family.tokensIn, family.tokenTurns, family.turns)}</td>
-                <td>{tokensText(family.tokensOut, family.tokenTurns, family.turns)}</td>
+                <td>{tokensText(family.tokensIn, family.tokensInTurns, family.turns)}</td>
+                <td>{tokensText(family.tokensOut, family.tokensOutTurns, family.turns)}</td>
               </tr>
             ))}
           </tbody>
@@ -174,10 +177,20 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
               )),
             )}
           </ul>
+          {read.families.some((family) => family.windowsOmitted > 0) && (
+            <p className="th-muted">
+              Some windows are not listed. The most recently read come first.
+            </p>
+          )}
+          {read.gaugeTruncated && (
+            <p className="th-muted">
+              The gauge read stopped at its row cap, so allowance may be missing.
+            </p>
+          )}
           <p className="th-muted">
             A turn is charged only when gauge readings within 15 minutes before and after it show
-            the drop and no other turn on that family overlapped. Use outside CrewKite between the
-            readings counts too.
+            the drop and no other chat turn of the project overlapped. Task runs, other projects and
+            use outside CrewKite between the readings are not checked, and they count too.
           </p>
         </>
       )}
@@ -192,7 +205,7 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
                 <th scope="col">Wall time</th>
                 <th scope="col">Handoffs</th>
                 <th scope="col">Checks passed</th>
-                <th scope="col">Branches</th>
+                <th scope="col">Acceptances</th>
               </tr>
             </thead>
             <tbody>
@@ -203,14 +216,15 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
                   <td>{wallText(thread.wallMs)}</td>
                   <td>{thread.handoffs}</td>
                   <td>{`${thread.checksPassed} of ${thread.checksRun}`}</td>
-                  <td>{thread.branchesAccepted}</td>
+                  <td>{thread.acceptances}</td>
                 </tr>
               ))}
             </tbody>
           </table>
           {read.threadCount > read.threads.length && (
             <p className="th-muted">
-              {read.threadCount - read.threads.length} more threads are not listed.
+              {read.threadCount - read.threads.length} more threads are in neither this list nor the
+              CSV file.
             </p>
           )}
         </div>
@@ -244,7 +258,14 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
           </table>
           {read.turnRows.length > turns.length && (
             <p className="th-muted">
-              {read.turnRows.length - turns.length} earlier turns are in the CSV file.
+              {read.turnRows.length - turns.length} earlier turns are not shown here. The CSV file
+              holds all {read.turnRows.length} listed turns.
+            </p>
+          )}
+          {read.turnRowsOmitted > 0 && (
+            <p className="th-muted">
+              {read.turnRowsOmitted} older turns are in neither this list nor the CSV file. The read
+              keeps the newest {read.turnRows.length}.
             </p>
           )}
         </div>
