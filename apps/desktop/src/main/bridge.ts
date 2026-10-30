@@ -29,8 +29,8 @@ import {
   type McpServerInput,
   type McpState,
   projectNotesMarkdown,
-  ReadProjectNotesPayloadSchema,
   ReadChatAnalyticsPayloadSchema,
+  ReadProjectNotesPayloadSchema,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
