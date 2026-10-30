@@ -7,14 +7,18 @@ import { redact as redactSecrets } from '../chat/redact.ts';
 // builds on.
 
 const EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b/g;
-// A key whose name ends like a secret has its string value replaced whatever the value looks like.
-const SECRET_KEY = /(token|secret|password|passwd|key|authorization)$/i;
+// A key whose name ends like a secret loses its whole value, whatever its type or shape.
+const SECRET_KEY =
+  /(token|secret|password|passwd|pwd|key|apikey|authorization|credential|cookie)s?$/i;
 
 function homePattern(home: string): RegExp | null {
   const trimmed = home.replace(/\/+$/, '');
   if (trimmed === '') return null;
   // The folder name must end where the path does, so /Users/ann leaves /Users/annette alone.
-  return new RegExp(`${trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_.-])`, 'g');
+  return new RegExp(
+    `${trimmed.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![A-Za-z0-9_-]|\\.[A-Za-z0-9_-])`,
+    'g',
+  );
 }
 
 export function redactDiagnosticText(text: string, home: string = homedir()): string {
@@ -31,9 +35,7 @@ export function redactDiagnosticValue(value: unknown, home: string = homedir()):
     return Object.fromEntries(
       Object.entries(value).map(([key, item]) => [
         key,
-        typeof item === 'string' && SECRET_KEY.test(key)
-          ? '[redacted]'
-          : redactDiagnosticValue(item, home),
+        item !== null && SECRET_KEY.test(key) ? '[redacted]' : redactDiagnosticValue(item, home),
       ]),
     );
   return value;

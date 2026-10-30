@@ -26,7 +26,7 @@ test('the diagnostics bundle holds exactly the listed parts, redacted, from a fi
   writeFileSync(join(home, 'controller.log'), `${lines.join('\n')}\n`);
   writeFileSync(
     join(home, 'cli.json'),
-    JSON.stringify({ permissionPolicy: 'ask', accessToken: 'settings-secret' }),
+    JSON.stringify({ permissionPolicy: 'ask', theme: 'dark', accessToken: 'settings-secret' }),
   );
   const events = Array.from(
     { length: 250 },
@@ -91,10 +91,14 @@ test('the diagnostics bundle holds exactly the listed parts, redacted, from a fi
   };
   assert.equal(clients.clients[0]?.client.executable, '~/bin/client-a');
   assert.equal(clients.clients[0]?.client.sha256, 'a'.repeat(64));
-  assert.deepEqual(JSON.parse(part('settings.json')), {
-    present: true,
-    settings: { permissionPolicy: 'ask', accessToken: '[redacted]' },
-  });
+  // A field the schema does not know keeps the whole file out. A valid file exports its fields.
+  assert.deepEqual(JSON.parse(part('settings.json')), { present: true, readable: false });
+  writeFileSync(join(home, 'cli.json'), JSON.stringify({ permissionPolicy: 'ask', theme: 'dark' }));
+  const valid = JSON.parse(buildDiagnostics(source, {})[2]?.text ?? '{}') as {
+    settings: { theme: string; permissionPolicy: string };
+  };
+  assert.equal(valid.settings.theme, 'dark');
+  assert.equal(valid.settings.permissionPolicy, 'ask');
   const versions = JSON.parse(part('versions.json')) as Record<string, string | null>;
   assert.equal(versions.crewkite, '0.0.0');
   assert.equal(versions.controller, '1.2.3');

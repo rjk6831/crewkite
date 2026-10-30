@@ -19,6 +19,7 @@ import {
 } from 'node:os';
 import { join } from 'node:path';
 import {
+  CliSettingsSchema,
   DIAGNOSTIC_EVENT_BYTES,
   DIAGNOSTIC_EVENTS,
   DIAGNOSTIC_LOG_BYTES,
@@ -72,7 +73,14 @@ function readSettings(home: string): unknown {
     if (!state.isFile() || state.size > SETTINGS_BYTES) return { present: true, readable: false };
     const buffer = Buffer.alloc(state.size);
     const count = readSync(file, buffer, 0, state.size, 0);
-    return { present: true, settings: JSON.parse(buffer.subarray(0, count).toString('utf8')) };
+    // Only fields the schema knows leave. A file with any other field is reported as unreadable,
+    // which is also how the CLI treats it.
+    const parsed = CliSettingsSchema.safeParse(
+      JSON.parse(buffer.subarray(0, count).toString('utf8')),
+    );
+    return parsed.success
+      ? { present: true, settings: parsed.data }
+      : { present: true, readable: false };
   } catch {
     return { present: true, readable: false };
   } finally {
