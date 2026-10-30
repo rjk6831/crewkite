@@ -57,6 +57,8 @@ export type ChatTransport = {
   ): Promise<() => void>;
   /** Called once the client stops trying to reconnect. Returns the call that removes it. */
   onReconnectExhausted?(listener: () => void): () => void;
+  /** Called with the current state and again at each change. Returns the call that removes it. */
+  onConnection?(listener: (state: 'connecting' | 'connected' | 'offline') => void): () => void;
   workspaceState(): Promise<WorkspaceState>;
   projectPage(input: ProjectPageRequest): Promise<ProjectPage>;
   taskPage(input: TaskPageRequest): Promise<TaskPage>;

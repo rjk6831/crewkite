@@ -51,11 +51,19 @@ import {
   TaskSchema,
   type WorkspaceContinuation,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { runUsageAnalytics } from './chat/analytics.ts';
 import { connectChat } from './chat/connect.ts';
 import { runExportCommand } from './chat/export.ts';
 import { runNotesCommand } from './chat/notes.ts';
-import { type Connect, notDone, runPrint, runThreadCommand } from './chat/scripting.ts';
+import {
+  type Connect,
+  notDone,
+  projectIdArg,
+  runPrint,
+  runThreadCommand,
+  threadIdArg,
+} from './chat/scripting.ts';
 import { runSearchCommand } from './chat/search.ts';
 import { runDiagnosticsCommand } from './diagnostics.ts';
 
@@ -63,8 +71,10 @@ const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
 
 const help = `Usage: crewkite                     interactive mode in a terminal [--no-animation]
-       crewkite -p <message> [--thread task-id | --project project-id] [--model family[/model]] [--json]
-       crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show> ... (crewkite thread --help)
+       crewkite <--version|-v|version>   print the version
+       crewkite <--help|-h|help>         print this text
+       crewkite -p <message> [--thread task-id | --project project-id | --register] [--model family[/model[:effort]]] [--permission-policy ask|allow-edits|allow-all] [--file path ...] [--json]
+       crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show|changes> ... (crewkite thread --help)
        crewkite diagnostics export <folder> [--thread task-id] [--home path]
        crewkite search <text> [--limit 1..50] [--per-thread 1..5] [--json] [--home path]
        crewkite notes <list|add|remove> <project-id> [text|note-id] [--json] (crewkite notes --help)
@@ -174,6 +184,7 @@ export async function runCli(
         limit: { type: 'string' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
+        version: { type: 'boolean', short: 'v' },
         'before-cursor': { type: 'string' },
         title: { type: 'string' },
         outcome: { type: 'string' },
@@ -203,8 +214,24 @@ export async function runCli(
         'confirm-quota-account': { type: 'boolean' },
       },
     });
-    if (values.help || positionals.length === 0) {
+    if (values.version || (positionals.length === 1 && positionals[0] === 'version')) {
+      if (positionals.length > (values.version ? 0 : 1))
+        throw new Error('Use crewkite --version alone. Use --help.');
+      output.out(`${CREWKITE_VERSION}\n`);
+      return 0;
+    }
+    if (values.help || positionals.length === 0 || positionals[0] === 'help') {
       output.out(help);
+      return 0;
+    }
+    // Asking for the usage commands without naming one lists them, as the other command groups do.
+    if (positionals.length === 1 && positionals[0] === 'usage') {
+      output.out(
+        `${help
+          .split('\n')
+          .filter((line) => /^\s+crewkite usage /.test(line))
+          .join('\n')}\n`,
+      );
       return 0;
     }
     const [area, action, id, ...extra] = positionals;
@@ -394,6 +421,9 @@ export async function runCli(
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
+    // Approval commands take an approval ID. Every other task command names a task or a project.
+    if (area === 'task' && id !== undefined && action !== 'approve' && action !== 'deny')
+      (action === 'create' ? projectIdArg : threadIdArg)(id);
     if (area === 'project' && (action !== 'add' || id === undefined))
       throw new Error('Use project add with one repository path.');
     const creatingTask = area === 'task' && action === 'create';
@@ -762,7 +792,7 @@ export async function runCli(
           ...(savedTo ? { savedTo } : {}),
           ...(nextCommand ? { nextCommand } : {}),
         },
-        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}${created?.success ? `\n${command?.command === 'RegisterProject' ? 'Project' : 'Task'} ${created.data.id}` : ''}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
+        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}${!succeeded(result) && command?.command === 'RegisterProject' && result.next ? `\n${result.next}` : ''}${created?.success ? `\n${command?.command === 'RegisterProject' ? 'Project' : 'Task'} ${created.data.id}` : ''}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
       );
     };
     const finishAction = async (result: CommandResult) => {
@@ -1008,7 +1038,9 @@ export async function runCli(
       const result = await request('GetHealth', {});
       print(
         result,
-        result.data?.kind === 'health' ? result.data.status : (result.reason ?? result.outcome),
+        result.data?.kind === 'health'
+          ? [result.data.status, ...result.data.blockers].join('\n')
+          : (result.reason ?? result.outcome),
       );
       return succeeded(result) ? 0 : 2;
     }

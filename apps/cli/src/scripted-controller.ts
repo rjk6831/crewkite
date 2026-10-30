@@ -9,7 +9,7 @@ import {
 } from '../../../packages/testkit/src/chat-adapter.ts';
 import { createDemoFixtures } from '../../../packages/testkit/src/index.ts';
 import { createSyntheticRepository } from '../../../packages/testkit/src/repository.ts';
-import { Controller } from '../../controller/src/commands/controller.ts';
+import { Controller, type ControllerOptions } from '../../controller/src/commands/controller.ts';
 import { unavailableNativeProfile } from '../../controller/src/providers/openai/profile.ts';
 import { serve } from '../../controller/src/server/index.ts';
 
@@ -41,12 +41,14 @@ const scriptedProfile = {
 export async function startScriptedController(
   t: TestContext,
   turns: readonly (readonly ChatScriptStep[])[],
+  options: Pick<ControllerOptions, 'gitState'> = {},
 ) {
   const directory = mkdtempSync(join(tmpdir(), 'crewkite-cli-'));
   const home = join(directory, 'home');
   const repository = createSyntheticRepository(join(directory, 'shop')).directory;
   const fixtures = createDemoFixtures(new Date(0).toISOString());
   const controller = new Controller({
+    ...options,
     home,
     routes: fixtures.snapshot.routes,
     observations: fixtures.snapshot.usage.map((window) => window.observation),

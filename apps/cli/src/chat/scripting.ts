@@ -2,6 +2,7 @@ import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
   type AgentEvent,
+  type ChatAttachment,
   type ChatCatalogRead,
   ChatEffortSchema,
   type ChatFailure,
@@ -16,8 +17,10 @@ import {
   type CliThreadEvent,
   type CommandResult,
   type Event,
+  ProjectIdSchema,
   ProjectSchema,
   rankFamilies,
+  TaskIdSchema,
 } from '@crewkite/contracts';
 import { crewkiteHome, loadSettings } from '../settings.ts';
 import { callerDirectory, checkoutAt, projectsForCheckout } from './checkout.ts';
@@ -41,6 +44,7 @@ export const threadHelp = `Usage: crewkite thread new <project-id> <message> [--
        crewkite thread pr <task-id> [--title text] [--body text] [--json]
        crewkite thread list [--json]
        crewkite thread show <task-id> [--json]
+       crewkite thread changes <task-id> [--json]
        crewkite -p <message> [--thread task-id | --project project-id | --register] [--model ...] [--permission-policy ...] [--file path ...] [--json]
 
 Every command takes --home path. Exit status: 0 done, 1 failed (an error, a lost connection or a
@@ -154,6 +158,26 @@ export function chooseSelection(
 
 export class UsageError extends Error {}
 
+/** A thread ID in the shape the contract takes, or a one line refusal before any command runs. */
+export function threadIdArg(value: string | undefined): string {
+  if (!value) throw new UsageError('Give the thread ID.');
+  if (!TaskIdSchema.safeParse(value).success)
+    throw new UsageError(
+      'That is not a thread ID. Thread IDs start with tsk_. List them with crewkite thread list.',
+    );
+  return value;
+}
+
+/** A project ID in the shape the contract takes, or a one line refusal before any command runs. */
+export function projectIdArg(value: string | undefined): string {
+  if (!value) throw new UsageError('Give the project ID.');
+  if (!ProjectIdSchema.safeParse(value).success)
+    throw new UsageError(
+      'That is not a project ID. Project IDs start with prj_. Add one with crewkite project add <path>.',
+    );
+  return value;
+}
+
 /**
  * A cloud family takes a model ID its list does not hold, as the desktop's typed model does, and
  * the client rejects it on the first turn if it is wrong. A Local model has to be on this computer.
@@ -248,6 +272,15 @@ export function followThread(
       ),
     );
   const stopLost = client.transport.onReconnectExhausted?.(lost);
+  // The client retries for about a minute before it gives up. One line says why nothing prints.
+  let announced = false;
+  const stopOffline = client.transport.onConnection?.((state) => {
+    if (state === 'connected') announced = false;
+    else if (state === 'offline' && !announced) {
+      announced = true;
+      io.err('Lost the controller. Reconnecting for up to 60 seconds.\n');
+    }
+  });
   // After a gap in the stream the thread is read again, so a turn that ended meanwhile settles.
   const resynced = () =>
     void client.readThread(taskId).then((fresh) => {
@@ -316,6 +349,7 @@ export function followThread(
     stop: () => {
       unsubscribe?.();
       stopLost?.();
+      stopOffline?.();
     },
   };
 }
@@ -379,6 +413,32 @@ async function applyPolicy(
   io.err(`Permission policy: ${read.thread.permissionPolicy}\n`);
 }
 
+/**
+ * Removes a thread this command created when its first message was never accepted, so a refusal
+ * leaves no empty thread behind. The controller refuses to delete a thread that has a reply
+ * running, so a thread that did start work stays.
+ */
+async function dropThread(client: ChatClient, taskId: string) {
+  try {
+    await client.send('DeleteChatThread', { taskId });
+  } catch {}
+}
+
+/** Runs a step before the first message and drops the thread this command made when it throws. */
+async function withThreadDropped(
+  client: ChatClient,
+  taskId: string,
+  created: boolean,
+  step: () => Promise<unknown>,
+) {
+  try {
+    await step();
+  } catch (error) {
+    if (created) await dropThread(client, taskId);
+    throw error;
+  }
+}
+
 /** Starts one message and, with `watch`, follows its turn. Returns the exit code. */
 async function sendAndFollow(
   client: ChatClient,
@@ -391,6 +451,8 @@ async function sendAndFollow(
     json: boolean;
     watch: boolean;
     command: string;
+    /** True when this command made the thread, so a first message that is refused removes it. */
+    created: boolean;
   },
 ): Promise<number> {
   const before = await client.readThread(input.taskId);
@@ -398,17 +460,20 @@ async function sendAndFollow(
     ? followThread(client, before, io, { text: input.text, json: input.json })
     : null;
   try {
-    const stored = [];
-    for (const path of input.files)
-      stored.push(await client.importAttachment(input.taskId, resolve(path)));
+    const stored: ChatAttachment[] = [];
+    await withThreadDropped(client, input.taskId, input.created, async () => {
+      for (const path of input.files)
+        stored.push(await client.importAttachment(input.taskId, resolve(path)));
+    });
     const result = await client.send('SendChatMessage', {
       taskId: input.taskId,
       text: input.text,
       selection: input.selection,
       files: stored,
     });
+    if (!applied(result) && input.created) await dropThread(client, input.taskId);
     if (input.json) await io.out(jsonLine(resultLine(input.command, result, input.taskId)));
-    else if (!input.watch) await io.out(`${input.taskId}\n`);
+    else if (!input.watch && (applied(result) || !input.created)) await io.out(`${input.taskId}\n`);
     if (!applied(result)) {
       if (!input.json) io.err(`${result.next ?? result.reason ?? 'The message was not sent.'}\n`);
       return CLI_EXIT.notDone;
@@ -457,6 +522,19 @@ export function openRequests(read: ChatThreadRead) {
   );
 }
 
+const threadActions = new Set([
+  'send',
+  'watch',
+  'permit',
+  'deny',
+  'stop',
+  'accept',
+  'push',
+  'pr',
+  'show',
+  'changes',
+]);
+
 export async function runThreadCommand(args: string[], io: Io, connect: Connect): Promise<number> {
   let client: ChatClient | undefined;
   let json = false;
@@ -492,6 +570,9 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
       if (!value) throw new UsageError(`Give the ${what}.`);
       return value;
     };
+    // A malformed ID is refused here, before the controller is asked anything.
+    if (action === 'new') projectIdArg(first);
+    else if (threadActions.has(action)) threadIdArg(first);
     const home = crewkiteHome(values.home);
     client = await connect(home);
     const settings = loadSettings(home);
@@ -515,12 +596,14 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
           settings.settings.selection,
           Date.now(),
         );
-        const taskId =
-          action === 'new'
-            ? (await client.createThread(need(first, 'project ID'), text)).id
-            : need(first, 'thread ID');
-        if (action === 'new' || values['permission-policy'] !== undefined)
-          await applyPolicy(client, io, taskId, policyFlag(values['permission-policy']));
+        const created = action === 'new';
+        const taskId = created
+          ? (await client.createThread(need(first, 'project ID'), text)).id
+          : need(first, 'thread ID');
+        if (created || values['permission-policy'] !== undefined)
+          await withThreadDropped(client, taskId, created, () =>
+            applyPolicy(client as ChatClient, io, taskId, policyFlag(values['permission-policy'])),
+          );
         return await sendAndFollow(client, io, {
           taskId,
           text,
@@ -529,6 +612,7 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
           json,
           watch: values.watch === true,
           command: 'SendChatMessage',
+          created,
         });
       }
       case 'watch': {
@@ -646,6 +730,38 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
         await io.out(json ? jsonLine({ v: 2, kind: 'thread', read }) : threadSummaryText(read));
         return 0;
       }
+      case 'changes': {
+        const changes = await client.readChanges(need(first, 'thread ID'));
+        if (json)
+          await io.out(
+            jsonLine(
+              resultLine(
+                'ReadChatChanges',
+                {
+                  outcome: 'applied',
+                  data: {
+                    kind: 'chat-changes',
+                    ...changes,
+                    // The list names the files. The patch of an ordinary file stays in the controller.
+                    files: changes.files.map((file) => ({
+                      ...file,
+                      patch: file.additions + file.deletions === 0 ? file.patch : null,
+                    })),
+                  },
+                },
+                changes.taskId,
+              ),
+            ),
+          );
+        else if (changes.files.length === 0) io.err('No changes in this thread.\n');
+        else
+          for (const file of changes.files) {
+            await io.out(`+${file.additions} -${file.deletions} ${terminalText(file.path)}\n`);
+            if (file.additions + file.deletions === 0 && file.patch)
+              io.err(`${terminalText(file.patch)}`);
+          }
+        return 0;
+      }
       default:
         throw new UsageError(`Unknown thread command: ${action}.`);
     }
@@ -702,6 +818,8 @@ export async function runPrint(
       throw new UsageError('Use crewkite -p "message". Quote a message that has spaces.');
     if ([values.thread, values.project, values.register].filter(Boolean).length > 1)
       throw new UsageError('Give one of --thread, --project or --register.');
+    if (values.thread !== undefined) threadIdArg(values.thread);
+    if (values.project !== undefined) projectIdArg(values.project);
     const policy = policyFlag(values['permission-policy']);
     const home = crewkiteHome(values.home);
     client = await connect(home);
@@ -715,6 +833,7 @@ export async function runPrint(
       Date.now(),
     );
     let taskId = values.thread;
+    const created = !taskId;
     if (!taskId) {
       const projectId =
         values.project ??
@@ -722,7 +841,10 @@ export async function runPrint(
       taskId = (await client.createThread(projectId, text)).id;
       if (!json) io.err(`Thread ${taskId}\n`);
     }
-    await applyPolicy(client, io, taskId, policy);
+    const thread = taskId;
+    await withThreadDropped(client, thread, created, () =>
+      applyPolicy(client as ChatClient, io, thread, policy),
+    );
     return await sendAndFollow(client, io, {
       taskId,
       text,
@@ -731,6 +853,7 @@ export async function runPrint(
       json,
       watch: true,
       command: 'SendChatMessage',
+      created,
     });
   } catch (error) {
     return failure(error, io, json);

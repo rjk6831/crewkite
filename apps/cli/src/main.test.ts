@@ -17,6 +17,7 @@ import {
   type TaskPage,
   type WorkspaceState,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { runCli } from './main.ts';
 
 test('CLI lists traverse empty pages and preserve incomplete output', async (context) => {
@@ -139,6 +140,35 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
     });
     return { code, out, err };
   };
+  // These answer from the arguments alone, so the controller sees no command.
+  const helpText = (await execute(['--help'])).out;
+  const matches = (actual: string, expected: string | RegExp) =>
+    expected instanceof RegExp ? expected.test(actual) : actual === expected;
+  const version = `${CREWKITE_VERSION}\n`;
+  const rows: [string[], number, string | RegExp, string | RegExp][] = [
+    [['--version'], 0, version, ''],
+    [['-v'], 0, version, ''],
+    [['version'], 0, version, ''],
+    [['help'], 0, helpText, ''],
+    [['usage'], 0, /^ {7}crewkite usage show[\s\S]*usage stop/, ''],
+    [['task', 'show', 'tsk_nope'], 2, '', /^That is not a thread ID\.[^\n]*\n$/],
+    [['task', 'changes', 'prj_01ARZ3NDEKTSV4RRFFQ69G5FAV'], 2, '', /^That is not a thread ID/],
+    [
+      ['task', 'create', 'prj_nope', '--title', 'a', '--outcome', 'b', '--criterion', 'c'],
+      2,
+      '',
+      /^That is not a project ID\.[^\n]*\n$/,
+    ],
+  ];
+  for (const [args, code, out, err] of rows) {
+    const result = await execute(args);
+    assert.equal(result.code, code, args.join(' '));
+    assert.ok(matches(result.out, out), `${args.join(' ')}: ${result.out}`);
+    assert.ok(matches(result.err, err), `${args.join(' ')}: ${result.err}`);
+    assert.deepEqual(commands, [], args.join(' '));
+  }
+  for (const flag of ['--register', '--permission-policy', '--file', ':effort'])
+    assert.ok(helpText.includes(flag), flag);
   for (const args of [
     ['usage', 'show'],
     ['local', 'status'],

@@ -22,6 +22,15 @@ const failure = {
   nextAction: 'Continue on another provider.',
 };
 
+async function listThreadIds(home: string) {
+  const client = await connectChat(home);
+  try {
+    return (await client.listThreads()).threads.map((thread) => thread.id);
+  } finally {
+    client.transport.close();
+  }
+}
+
 function capture(onOut: (text: string) => void = () => {}) {
   const io = { out: '', err: '' };
   return {
@@ -169,6 +178,10 @@ test('print mode streams the reply, uses only a registered checkout and exits wi
   await stop();
   assert.equal(await losing, 1);
   assert.match(lost.io.out, /connection to the controller ended/);
+  assert.equal(
+    lost.io.err.match(/^Lost the controller\. Reconnecting for up to 60 seconds\.$/gm)?.length,
+    1,
+  );
 });
 
 test('thread commands with --json write only lines the published schema accepts', {
@@ -251,6 +264,62 @@ test('thread commands with --json write only lines the published schema accepts'
   );
   assert.ok(lines.some((line) => line.kind === 'thread' && line.read.thread.taskId === taskId));
 
+  // The Changes list reads through the controller, as text and as one schema line.
+  const changes = capture();
+  assert.equal(
+    await runCli(['thread', 'changes', taskId, '--home', home], changes.output),
+    0,
+    changes.io.err,
+  );
+  assert.match(changes.io.out, /^\+\d+ -\d+ net\.mjs\n$/);
+  assert.equal(
+    await runCli(['thread', 'changes', taskId, '--json', '--home', home], capture(parse).output),
+    0,
+  );
+  const listed = lines.findLast((line) => line.kind === 'result');
+  assert.equal(listed?.kind === 'result' && listed.command, 'ReadChatChanges');
+  const listedFiles = (listed?.kind === 'result' ? listed.data : undefined) as
+    | { kind: string; files: { path: string; patch: string | null }[] }
+    | undefined;
+  assert.equal(listedFiles?.kind, 'chat-changes');
+  assert.deepEqual(
+    listedFiles?.files.map((file) => [file.path, file.patch]),
+    [['net.mjs', null]],
+  );
+  // A task command that the controller refuses exits 2.
+  const refusal = capture();
+  assert.equal(await runCli(['task', 'changes', taskId, '--home', home], refusal.output), 2);
+  assert.equal(refusal.io.out, 'candidate-not-ready\n');
+
+  // A refused first message leaves no thread behind, however it was refused.
+  const threadsBefore = (await listThreadIds(home)).length;
+  const missing = join(tmpdir(), 'crewkite-no-such-file.txt');
+  for (const args of [
+    ['thread', 'new', projectId, 'Read this', '--file', missing],
+    ['-p', 'Read this', '--project', projectId, '--file', missing],
+  ]) {
+    const refused = capture();
+    const code = await runCli(
+      [...args, '--model', 'anthropic/fixture-model', '--home', home],
+      refused.output,
+    );
+    assert.notEqual(code, 0, refused.io.err);
+    assert.equal((await listThreadIds(home)).length, threadsBefore, args.join(' '));
+  }
+
+  // A malformed ID is one line and status 2, before the controller is asked anything.
+  for (const [args, line] of [
+    [['thread', 'show', 'tsk_nope'], /^That is not a thread ID\.[^\n]*\n$/],
+    [['thread', 'new', 'prj_nope', 'Hi'], /^That is not a project ID\.[^\n]*\n$/],
+    [['-p', 'Hi', '--project', 'prj_nope'], /^That is not a project ID\.[^\n]*\n$/],
+    [['-p', 'Hi', '--thread', 'tsk_nope'], /^That is not a thread ID\.[^\n]*\n$/],
+  ] as const) {
+    const refused = capture();
+    assert.equal(await runCli([...args, '--home', home], refused.output), 2, args.join(' '));
+    assert.match(refused.io.err, line, args.join(' '));
+    assert.equal(refused.io.out, '', args.join(' '));
+  }
+
   // Accept makes a local branch. Push without --confirm sends nothing and says what it would do.
   const accept = capture(parse);
   assert.equal(
@@ -267,4 +336,25 @@ test('thread commands with --json write only lines the published schema accepts'
     last?.kind === 'error' ? last.message : '',
     /cli\/clamp-discount to origin[\s\S]*--confirm/,
   );
+});
+
+test('a computer without git reports degraded health and names git when it refuses a project', {
+  timeout: 60_000,
+}, async (t) => {
+  const rows = [
+    { state: 'missing', line: 'git was not found' },
+    { state: 'broken', line: 'git failed to run' },
+  ] as const;
+  for (const row of rows) {
+    const { home, directory } = await startScriptedController(t, [], { gitState: () => row.state });
+    const health = capture();
+    assert.equal(await runCli(['health', '--home', home], health.output), 0);
+    assert.equal(health.io.out, `degraded\n${row.line}\n`, row.state);
+    // A folder that is no repository gets the same answer, since git cannot be asked.
+    const folder = mkdtempSync(join(directory, 'plain-'));
+    const refused = capture();
+    assert.equal(await runCli(['project', 'add', folder, '--home', home], refused.output), 2);
+    assert.match(refused.io.out, new RegExp(`^git-unavailable\\n${row.line}\\.`), row.state);
+    assert.doesNotMatch(refused.io.out, /Choose a readable/, row.state);
+  }
 });

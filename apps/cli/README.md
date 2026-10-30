@@ -101,6 +101,7 @@ pnpm crewkite thread push <task-id> [--remote origin] --confirm
 pnpm crewkite thread pr <task-id> [--title text] [--body text]
 pnpm crewkite thread list
 pnpm crewkite thread show <task-id>
+pnpm crewkite thread changes <task-id> [--json]
 pnpm crewkite -p "message" [--thread task-id | --project project-id | --register] [--model family[/model[:effort]]] [--permission-policy policy] [--file path ...]
 ```
 
@@ -110,7 +111,9 @@ pnpm crewkite -p "message" [--thread task-id | --project project-id | --register
 
 Print mode sends one message and streams the reply to stdout; tool lines, permission requests and failures go to stderr. Without `--thread` it starts a new thread in the registered project of the Git checkout you ran it in, found the way the interactive mode finds it, with every `GIT_` variable left out. It registers nothing on its own: a checkout the controller does not hold needs `--project`, or `--register` to register it, and the refusal names both. `-p` counts only before the first positional argument.
 
-`--permission-policy ask`, `allow-edits` or `allow-all` sets the new thread's policy for this run, and print mode prints the policy in use to stderr. A permission request waits for an answer from `thread permit` or `thread deny` in another terminal, the interactive mode or the desktop. If the connection to the controller ends and does not come back, print mode and `thread watch` say so and exit 1; the turn may still run in the controller. After a gap in the stream they read the thread again. `thread watch --follow` prints each later turn as its record arrives.
+`--permission-policy ask`, `allow-edits` or `allow-all` sets the new thread's policy for this run, and print mode prints the policy in use to stderr. A permission request waits for an answer from `thread permit` or `thread deny` in another terminal, the interactive mode or the desktop. When the connection to the controller drops, print mode and `thread watch` print `Lost the controller. Reconnecting for up to 60 seconds.` to stderr and keep trying. If it does not come back they say so and exit 1; the turn may still run in the controller. After a gap in the stream they read the thread again. `thread watch --follow` prints each later turn as its record arrives. `thread changes` prints one line for each changed file with its added and removed line counts, and with `--json` one `result` line that holds the same list without the patches. A thread ID or project ID that is not in the contract's shape is refused with one line and status 2 before the controller is asked anything. A new thread whose first message is refused, for example because an attached file is missing, is removed again, so a refusal leaves no empty thread behind.
+
+`crewkite --version`, `-v` and `crewkite version` print the version. `crewkite help` prints the same text as `--help`, and `crewkite usage` with no action lists the usage commands and exits 0.
 
 ### Exit status
 
@@ -153,7 +156,7 @@ pnpm crewkite project add /path/to/repository --json
 pnpm crewkite task create <project-id> --title "Repair the total" --outcome "Return the correct total" --criterion "The discount cannot make the total negative" --criterion "Invalid inputs are rejected" --json
 ```
 
-Use the project ID returned by registration. Repeating registration for the same checkout returns the existing project. Task creation requires a title, an outcome and at least one `--criterion`. It creates a draft with no run or provider work. Preparation and Start remain separate actions.
+`health` prints `ready`, or `degraded` followed by one line for each blocker. A computer where git is not on the path, or where it fails to run, is degraded with `git was not found` or `git failed to run`, and a refused `project add` names the same cause. Use the project ID returned by registration. Repeating registration for the same checkout returns the existing project. Task creation requires a title, an outcome and at least one `--criterion`. It creates a draft with no run or provider work. Preparation and Start remain separate actions.
 
 Task commands use IDs returned by the controller:
 
