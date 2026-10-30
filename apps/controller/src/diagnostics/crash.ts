@@ -4,6 +4,7 @@ import {
   constants,
   fstatSync,
   fsyncSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -64,6 +65,16 @@ function serialize(record: CrashRecord): string {
   return text;
 }
 
+/** The crashes folder, made on demand. A link or a file in its place is refused. */
+function crashDirectory(home: string, create: boolean): string | null {
+  const directory = join(home, CRASH_DIRECTORY);
+  const state = lstatSync(directory, { throwIfNoEntry: false });
+  if (state) return state.isDirectory() ? directory : null;
+  if (!create) return null;
+  mkdirSync(directory, { mode: 0o700 });
+  return directory;
+}
+
 function recordNames(directory: string): string[] {
   try {
     return readdirSync(directory)
@@ -71,6 +82,14 @@ function recordNames(directory: string): string[] {
       .sort();
   } catch {
     return [];
+  }
+}
+
+function removeQuietly(path: string) {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Already gone, or not ours to remove. Pruning goes on with the next file.
   }
 }
 
@@ -98,8 +117,8 @@ export function writeCrashRecord(
       stack: redact(input.stack, STACK_CHARACTERS),
       detail: redact(input.detail, DETAIL_CHARACTERS),
     };
-    const directory = join(home, CRASH_DIRECTORY);
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
+    const directory = crashDirectory(home, true);
+    if (!directory) return null;
     const name = `crash-${now.replace(/[^0-9A-Za-z]/g, '-')}-${options.id?.() ?? randomUUID().slice(0, 8)}.json`;
     const file = openSync(
       join(directory, name),
@@ -109,12 +128,15 @@ export function writeCrashRecord(
     try {
       writeSync(file, serialize(record));
       fsyncSync(file);
-    } finally {
+    } catch (failure) {
       closeSync(file);
+      removeQuietly(join(directory, name));
+      throw failure;
     }
+    closeSync(file);
     const names = recordNames(directory);
     for (const old of names.slice(0, Math.max(0, names.length - (options.keep ?? CRASH_KEEP))))
-      unlinkSync(join(directory, old));
+      removeQuietly(join(directory, old));
     return name;
   } catch {
     return null;
@@ -143,9 +165,10 @@ function readSmall(path: string, limit: number): string | null {
 export function unseenCrash(
   home: string,
 ): { name: string; at: string; source: CrashRecord['source']; kind: CrashRecord['kind'] } | null {
-  const directory = join(home, CRASH_DIRECTORY);
-  const name = recordNames(directory).at(-1);
-  if (!name || readSmall(join(directory, DISMISSED), 256)?.trim() === name) return null;
+  const directory = crashDirectory(home, false);
+  const name = directory ? recordNames(directory).at(-1) : undefined;
+  if (!directory || !name || readSmall(join(directory, DISMISSED), 256)?.trim() === name)
+    return null;
   try {
     const text = readSmall(join(directory, name), CRASH_RECORD_BYTES);
     const record = text === null ? null : (JSON.parse(text) as Partial<CrashRecord>);
@@ -165,10 +188,11 @@ export function unseenCrash(
 /** Remembers that the person saw this record. The record itself stays on disk. */
 export function dismissCrash(home: string, name: string): boolean {
   if (!RECORD_NAME.test(name)) return false;
+  let temporary: string | null = null;
   try {
-    const directory = join(home, CRASH_DIRECTORY);
-    mkdirSync(directory, { recursive: true, mode: 0o700 });
-    const temporary = join(directory, `.${DISMISSED}.${process.pid}`);
+    const directory = crashDirectory(home, true);
+    if (!directory) return false;
+    temporary = join(directory, `.${DISMISSED}.${process.pid}`);
     const file = openSync(
       temporary,
       constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
@@ -183,6 +207,7 @@ export function dismissCrash(home: string, name: string): boolean {
     renameSync(temporary, join(directory, DISMISSED));
     return true;
   } catch {
+    if (temporary) removeQuietly(temporary);
     return false;
   }
 }
@@ -193,14 +218,39 @@ export function dismissCrash(home: string, name: string): boolean {
  */
 export function installCrashCapture(home: string, source: CrashRecord['source'] = 'controller') {
   process.on('uncaughtExceptionMonitor', (error: unknown, origin: string) => {
-    const kind = origin === 'unhandledRejection' ? 'unhandled-rejection' : 'uncaught-exception';
-    const message = error instanceof Error ? `${error.name}: ${error.message}` : String(error);
-    writeCrashRecord(home, {
-      source,
-      kind,
-      message,
-      stack: error instanceof Error ? (error.stack ?? '') : '',
-    });
-    appendControllerLog(home, `${source} ${kind}: ${message}`);
+    // This runs while the process is already failing. Nothing here may throw, or Node exits with
+    // a different status and loses the original error.
+    try {
+      const kind = origin === 'unhandledRejection' ? 'unhandled-rejection' : 'uncaught-exception';
+      const { message, stack } = describe(error);
+      writeCrashRecord(home, { source, kind, message, stack });
+      appendControllerLog(home, `${source} ${kind}: ${message}`);
+    } catch {
+      // The record is a courtesy.
+    }
   });
+}
+
+/** Text for any thrown value, including one with no prototype or with getters that throw. */
+function describe(error: unknown): { message: string; stack: string } {
+  const attempt = (read: () => unknown) => {
+    try {
+      const value = read();
+      return typeof value === 'string' ? value : '';
+    } catch {
+      return '';
+    }
+  };
+  if (error instanceof Error) {
+    const name = attempt(() => error.name);
+    const message = attempt(() => error.message);
+    return {
+      message: `${name}: ${message}`.replace(/^: /, ''),
+      stack: attempt(() => error.stack),
+    };
+  }
+  return {
+    message: attempt(() => String(error)) || 'A value without a description was thrown.',
+    stack: '',
+  };
 }

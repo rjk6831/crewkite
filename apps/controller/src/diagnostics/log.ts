@@ -6,6 +6,7 @@ import {
   openSync,
   readSync,
   renameSync,
+  unlinkSync,
   writeSync,
 } from 'node:fs';
 import { join } from 'node:path';
@@ -79,18 +80,27 @@ export function appendControllerLog(
     if (size > LOG_LIMIT) {
       const kept = readTail(path, LOG_KEEP) ?? '';
       const temporary = join(home, `.${LOG_FILE}.${process.pid}`);
-      const out = openSync(
-        temporary,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-        0o600,
-      );
       try {
-        writeSync(out, kept);
-        fsyncSync(out);
-      } finally {
-        closeSync(out);
+        const out = openSync(
+          temporary,
+          constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+          0o600,
+        );
+        try {
+          writeSync(out, kept);
+          fsyncSync(out);
+        } finally {
+          closeSync(out);
+        }
+        renameSync(temporary, path);
+      } catch (failure) {
+        try {
+          unlinkSync(temporary);
+        } catch {
+          // Never created, or already gone.
+        }
+        throw failure;
       }
-      renameSync(temporary, path);
     }
   } catch {
     // The log is a courtesy. A full disk or a read only home never stops the controller.

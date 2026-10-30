@@ -1,8 +1,19 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readdirSync, readFileSync, rmSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { pathToFileURL } from 'node:url';
 import {
   CRASH_DIRECTORY,
   CRASH_KEEP,
@@ -59,4 +70,51 @@ test('a crash record stays within its size bound, keeps the newest few and reads
   writeCrashRecord(home, { source: 'controller', kind: 'unhandled-rejection' }, options);
   assert.equal(unseenCrash(home)?.kind, 'unhandled-rejection');
   assert.equal(dismissCrash(home, '../escape.json'), false);
+});
+
+test('crash capture never changes how the process fails, and a link in place of the crashes folder is refused', (t) => {
+  const root = mkdtempSync(join(tmpdir(), 'crewkite-crash-run-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const capture = pathToFileURL(join(import.meta.dirname, 'crash.ts')).href;
+  const throwingGetters =
+    "const e = new Error('getter failure'); " +
+    "Object.defineProperty(e, 'message', { get() { throw new Error('inner'); } }); " +
+    "Object.defineProperty(e, 'stack', { get() { throw new Error('inner'); } }); throw e;";
+  const cases = [
+    { name: 'error', body: "throw new Error('original failure');", stderr: 'original failure' },
+    { name: 'no-prototype', body: 'throw Object.create(null);', stderr: 'null prototype' },
+    { name: 'getters', body: throwingGetters, stderr: '' },
+    {
+      name: 'rejection',
+      body: "Promise.reject(new Error('rejected failure'));",
+      stderr: 'rejected failure',
+    },
+  ];
+  for (const { name, body, stderr } of cases) {
+    const home = join(root, name);
+    mkdirSync(home);
+    const script = join(root, `${name}.mjs`);
+    writeFileSync(
+      script,
+      `import { installCrashCapture } from ${JSON.stringify(capture)};\ninstallCrashCapture(${JSON.stringify(home)});\n${body}\n`,
+    );
+    const run = spawnSync(process.execPath, [script], { encoding: 'utf8' });
+    assert.equal(run.status, 1, `${name}: exit status`);
+    assert.ok(run.stderr.includes(stderr), `${name}: stderr`);
+    const records = readdirSync(join(home, CRASH_DIRECTORY)).filter((file) =>
+      file.endsWith('.json'),
+    );
+    assert.equal(records.length, 1, `${name}: one record`);
+  }
+
+  // A link in place of the folder gets no record and shows no crash.
+  const home = join(root, 'linked');
+  const elsewhere = join(root, 'elsewhere');
+  mkdirSync(home);
+  mkdirSync(elsewhere);
+  symlinkSync(elsewhere, join(home, CRASH_DIRECTORY));
+  assert.equal(writeCrashRecord(home, { source: 'controller', kind: 'uncaught-exception' }), null);
+  assert.deepEqual(readdirSync(elsewhere), []);
+  assert.equal(unseenCrash(home), null);
+  assert.equal(dismissCrash(home, 'crash-x.json'), false);
 });
