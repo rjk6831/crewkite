@@ -1,12 +1,22 @@
-import { closeSync, constants, openSync, readFileSync, renameSync, writeSync } from 'node:fs';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  fsyncSync,
+  openSync,
+  readSync,
+  renameSync,
+  unlinkSync,
+  writeSync,
+} from 'node:fs';
 import { join } from 'node:path';
-import { type BrowserWindow, ipcMain } from 'electron';
-import { assertSender } from './security.ts';
+
+const LIMIT = 256;
 
 /**
  * Whether the first-run welcome has ended, one small file in the desktop profile. A missing,
- * unreadable or oversized file reads as not finished, and the welcome still hides itself for a
- * person who already has a project and a connected provider.
+ * linked, special, oversized or corrupt file reads as not finished, and the welcome still hides
+ * itself for a person who already has a project.
  */
 export class OnboardingStore {
   private readonly path: string;
@@ -14,10 +24,23 @@ export class OnboardingStore {
     this.path = join(profile, 'onboarding.json');
   }
   finished(): boolean {
+    let file: number;
     try {
-      const text = readFileSync(this.path, { encoding: 'utf8' });
-      if (text.length > 256) return false;
-      const value: unknown = JSON.parse(text);
+      file = openSync(this.path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+    } catch {
+      return false;
+    }
+    try {
+      const state = fstatSync(file);
+      if (!state.isFile() || state.size > LIMIT) return false;
+      const bytes = Buffer.alloc(state.size);
+      let count = 0;
+      while (count < bytes.length) {
+        const read = readSync(file, bytes, count, bytes.length - count, null);
+        if (read === 0) break;
+        count += read;
+      }
+      const value: unknown = JSON.parse(bytes.subarray(0, count).toString('utf8'));
       return (
         value !== null &&
         typeof value === 'object' &&
@@ -25,29 +48,27 @@ export class OnboardingStore {
       );
     } catch {
       return false;
+    } finally {
+      closeSync(file);
     }
   }
   setFinished(finished: boolean) {
     const next = `${this.path}.next`;
-    const file = openSync(next, constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, 0o600);
+    // A stale file from an interrupted write has no authority, so it is removed first.
+    try {
+      unlinkSync(next);
+    } catch {}
+    const file = openSync(
+      next,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
     try {
       writeSync(file, JSON.stringify({ finished }));
+      fsyncSync(file);
     } finally {
       closeSync(file);
     }
     renameSync(next, this.path);
   }
-}
-
-export function installOnboarding(window: BrowserWindow, store: OnboardingStore) {
-  for (const channel of ['read', 'write']) ipcMain.removeHandler(`crewkite:onboarding-${channel}`);
-  ipcMain.handle('crewkite:onboarding-read', (event) => {
-    assertSender(event, window);
-    return store.finished();
-  });
-  ipcMain.handle('crewkite:onboarding-write', (event, finished: unknown) => {
-    assertSender(event, window);
-    if (typeof finished !== 'boolean') throw new Error('The welcome flag is invalid.');
-    store.setFinished(finished);
-  });
 }
