@@ -18,15 +18,7 @@ import {
   Sun,
   X,
 } from 'lucide-react';
-import {
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
@@ -36,6 +28,13 @@ import { ExternalLink } from './external-link.tsx';
 import { SUGGESTED_FIRST_MESSAGE } from './onboarding/flow.ts';
 import { Onboarding } from './onboarding/onboarding.tsx';
 import { useOnboarding } from './onboarding/use-onboarding.ts';
+import {
+  buildPaletteCommands,
+  FuzzyText,
+  type PaletteCommand,
+  rankCommands,
+} from './palette/commands.tsx';
+import { focusSection } from './palette/focus-section.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { RailSearch } from './rail-search.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
@@ -84,15 +83,6 @@ function useSystemTheme() {
   return dark ? 'dark' : 'light';
 }
 
-type PaletteCommand = {
-  id: string;
-  label: string;
-  icon: ReactNode;
-  run: () => void;
-  disabled?: boolean;
-  // Commands with consequences are never highlighted for you, so Enter after typing cannot run them.
-  explicit?: boolean;
-};
 type TextMatch = { index: number; length: number };
 const paletteTaskPageSize = 5;
 
@@ -209,10 +199,8 @@ function CommandPalette({
     ? new RegExp(trimmed.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'iu')
     : null;
   const projectNames = new Map(projects.map((project) => [project.id, project.name]));
-  const commandResults = commands.flatMap((command) => {
-    const match = findMatch(pattern, command.label);
-    return !pattern || match ? [{ command, match }] : [];
-  });
+  // Commands match by fuzzy subsequence, so "chg" finds Show changes.
+  const commandResults = rankCommands(commands, trimmed);
   const taskResults = (search.query === trimmed ? search.rows : []).map((task) => {
     const field = task.match;
     const label =
@@ -388,8 +376,9 @@ function CommandPalette({
                   </span>
                   <span className="palette-option-text">
                     <span className="palette-option-title">
-                      <Highlight text={command.label} match={match} />
+                      <FuzzyText text={command.label} match={match} />
                     </span>
+                    {command.hint && <span className="palette-option-meta">{command.hint}</span>}
                   </span>
                   <ArrowRight size={14} aria-hidden="true" />
                 </button>
@@ -1101,26 +1090,26 @@ export function App() {
       {palette && (
         <Dialog title="Search threads and commands" onClose={() => setPalette(false)}>
           <CommandPalette
-            commands={[
-              {
-                id: 'new-thread',
-                label: 'New thread',
-                icon: <SquarePen size={17} />,
-                run: () => startThread(),
+            commands={buildPaletteCommands({
+              newThread: () => startThread(),
+              openSettings: () => setPage('settings'),
+              openSettingsSection: (id) => {
+                setPage('settings');
+                focusSection(id);
               },
-              {
-                id: 'settings',
-                label: 'Open settings',
-                icon: <Settings size={17} />,
-                run: () => setPage('settings'),
+              about: () => setAbout(true),
+              switchThread: (step) => {
+                const next = adjacentThread(keys.current.order, keys.current.current, step);
+                if (next && next !== keys.current.current) openThread(next);
               },
-              {
-                id: 'about',
-                label: 'About and acknowledgments',
-                icon: <Info size={17} />,
-                run: () => setAbout(true),
-              },
-            ]}
+              addProject: workspace.canPickProject ? () => void addProject() : null,
+              reconnect:
+                !preview && connection !== 'connected' ? () => void workspace.reconnect() : null,
+              theme,
+              toggleTheme: () => setThemeMode(theme === 'dark' ? 'light' : 'dark'),
+              sidebarCollapsed: collapsed,
+              toggleSidebar: () => setCollapsed(!collapsed),
+            })}
             workspace={workspace}
             projects={projects}
             onOpenTask={(id) => {
