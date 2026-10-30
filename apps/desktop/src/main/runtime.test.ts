@@ -14,7 +14,14 @@ test('a source desktop on the real controller starts apps/controller and never t
   skip: process.versions.node !== '24.22.0',
 }, (t) => {
   const state = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-runtime-')));
-  t.after(() => rmSync(state, { recursive: true, force: true }));
+  // The guard takes the person's home folder from the system, which follows HOME.
+  const savedHome = process.env.HOME;
+  process.env.HOME = state;
+  t.after(() => {
+    if (savedHome === undefined) delete process.env.HOME;
+    else process.env.HOME = savedHome;
+    rmSync(state, { recursive: true, force: true });
+  });
   const environment = {
     CREWKITE_HOME: join(state, '.crewkite'),
     CREWKITE_PROFILE: join(state, '.crewkite-desktop'),
@@ -33,6 +40,11 @@ test('a source desktop on the real controller starts apps/controller and never t
         ...environment,
         CREWKITE_HOME: join(paths.root, 'internal', 'demo-home'),
       }),
-    /internal folder/,
+    /in or around this checkout/,
+  );
+  // A state root that is not the person's home folder is refused.
+  assert.throws(
+    () => resolveRuntime(app, { ...environment, CREWKITE_SOURCE_STATE_ROOT: tmpdir() }),
+    /must be your home folder/,
   );
 });
