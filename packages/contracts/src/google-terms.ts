@@ -11,7 +11,6 @@ export const GOOGLE_TERMS_SUMMARY = [
   'Google says in its third-party access FAQ that third-party access through its coding client login violates its terms. Its headless FAQ also excludes consumer CLI wrappers.',
   'CrewKite is not named by Google and has no exception.',
   'Using this route is your own choice and your own risk.',
-  'Roots No Limits LLC accepts no liability for action Google takes against your account.',
 ];
 
 export const GOOGLE_TERMS_CHECKBOX =
