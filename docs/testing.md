@@ -326,3 +326,13 @@ These are changes to existing claims. No new claim is added.
 - The Google writer rows in the native controller tables and the Google quota rows acknowledge the current terms in their setup, because they protect the writer and quota authority. The gate keeps its own claim.
 - The control socket claim in `packages/client/src/output.test.ts` keeps its folders under `/tmp`. A macOS temporary directory is long enough that the per-user socket path would pass the 100 byte bound, and the controller would then bind under `/tmp` by design. The test checks that the preferred path fits before it relies on it.
 - The Google writer claim checks a descendant that holds the group open with a scripted child, clock and group probe. A real descendant outlives its leader, and how soon the system's init reaps it decides whether cleanup sees the group gone. That made the row depend on the machine.
+
+## Benchmark harness
+
+Two test files in `packages/bench/src` cover the harness. Neither starts a provider or uses the network.
+
+- The verification table in `run.test.ts` builds a small git repository in a temporary folder and checks that a task verifies only when its checks fail on the base commit and pass on the solution commit. The rows are a visible check, a check on a hidden file, a check that already passes on the base, a check that fails on the solution and a task with no solution.
+- The scripted run in `run.test.ts` sends two tasks through the controller's chat thread path with a scripted adapter, real SQLite and a review step. It checks that the run file holds both results with their outcomes, that tokens a client did not report stay null and print as unknown, that the changed file count and the review findings are recorded, that `bugsFoundAfter` is null, and that a task with no verification record is listed as an exclusion with its reason. The table has a row for each task and the summary line counts requested, ran, passed and excluded tasks.
+- The manifest table in `manifest.test.ts` checks the schema row by row: a complete file, defaults, and the refusals for a bad id, a relative repository, a short base hash, text with diff lines, a hidden path that climbs out of the copy, a duplicate check name, an unknown difficulty and an unknown field. The folder test checks that a file name must match its task id and that a file that fails the schema stops the load with its name. A last test loads the shipped tasks and checks that each one carries a verification record with at least one check that failed on the base.
+
+These tests establish the harness's mechanics. They say nothing about how any model performs, and a live run through an installed client needs the owner's machine.
