@@ -1,4 +1,5 @@
 import { type SlashName, slashCommands } from '@crewkite/client';
+import { familyName } from '../family-name.ts';
 import type { provision } from './actions.ts';
 
 // The commands the palette lists. Every entry calls an action that already exists: an app function
@@ -54,10 +55,10 @@ export type PaletteApp = {
 /** Heading ids on the settings page. */
 export const SETTINGS_SECTIONS: readonly { id: string; label: string }[] = [
   { id: 'settings-general', label: 'General' },
-  { id: 'st-card-openai', label: 'OpenAI' },
-  { id: 'st-card-anthropic', label: 'Anthropic' },
-  { id: 'st-card-google', label: 'Google' },
-  { id: 'st-card-local', label: 'Local' },
+  { id: 'st-card-openai', label: familyName('openai') },
+  { id: 'st-card-anthropic', label: familyName('anthropic') },
+  { id: 'st-card-google', label: familyName('google') },
+  { id: 'st-card-local', label: familyName('local') },
   { id: 'settings-mcp', label: 'MCP servers' },
   { id: 'settings-extensions', label: 'Extensions' },
   { id: 'settings-prompts', label: 'Prompts' },

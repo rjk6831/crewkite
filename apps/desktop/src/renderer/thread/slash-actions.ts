@@ -85,3 +85,11 @@ export function slashEffect(
       return { action: 'prompt', note: null };
   }
 }
+
+/**
+ * Whether running a command empties the message box. A typed command replaces what was typed. The
+ * palette runs the same commands and passes `keepDraft`, since the person never typed them there.
+ * A command that only shows a note or fills the box leaves the box alone.
+ */
+export const clearsDraft = (action: SlashAction, keepDraft: boolean): boolean =>
+  !keepDraft && action !== 'none' && action !== 'prompt';

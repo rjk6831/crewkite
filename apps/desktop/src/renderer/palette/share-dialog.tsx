@@ -110,9 +110,9 @@ export function ShareDialog({
             <p className="share-note" role="status">
               The page could not be drawn here, so this is the file as text. It is what Save writes.
             </p>
-            <pre className="share-text" aria-label="Text of the share page">
-              {preview.share.html}
-            </pre>
+            <section aria-label="Text of the share page">
+              <pre className="share-text">{preview.share.html}</pre>
+            </section>
           </>
         )}
       </div>

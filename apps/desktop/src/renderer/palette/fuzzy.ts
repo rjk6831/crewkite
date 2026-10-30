@@ -1,6 +1,7 @@
-// Fuzzy matching for the command palette. Every word of the query must appear in the text in
-// order, not necessarily next to each other. A match that starts a word, or continues the one
-// before it, scores higher, so "set" finds "Settings" before "Pick a model, set".
+// Fuzzy matching for the command palette. The letters of each word of the query must appear in the
+// text in that order, not necessarily next to each other, and the words may match anywhere and in
+// any order. A match that starts a word, or continues the one before it, scores higher, so "set"
+// finds "Settings" before "Pick a model, set".
 
 export type FuzzyMatch = {
   score: number;

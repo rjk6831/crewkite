@@ -53,7 +53,7 @@ import { InstructionChip } from './instruction-chip.tsx';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 import { NotesChip } from './project-notes.tsx';
 import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
-import { slashEffect } from './slash-actions.ts';
+import { clearsDraft, slashEffect } from './slash-actions.ts';
 
 /**
  * A file in the composer. In a saved thread the controller stores it as soon as it is added, so
@@ -377,7 +377,7 @@ export function Composer({
       return;
     }
     if (action === 'ask') {
-      if (!keepDraft) clearBox();
+      if (clearsDraft(action, keepDraft)) clearBox();
       if (argument) fillBox(argument);
       const why = roles.why('ask');
       if (why) setNote(why);
@@ -386,7 +386,7 @@ export function Composer({
     }
     // A command the view cannot run, and /help, leave the box as it is.
     if (action === 'none') return;
-    if (!keepDraft) clearBox();
+    if (clearsDraft(action, keepDraft)) clearBox();
     if (action === 'new-thread') onNewThread?.();
     else if (action === 'open-settings') onOpenSettings?.();
     else if (action === 'open-crew') onOpenCrew?.();

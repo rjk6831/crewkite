@@ -1,9 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { slashCommands } from '@crewkite/client';
+import { clearsDraft } from '../thread/slash-actions.ts';
 import { provision } from './actions.ts';
 import { type PaletteApp, paletteEntries } from './entries.ts';
 import { fuzzyMatch, rankCommands } from './fuzzy.ts';
+import { selectedOption } from './select.ts';
 
 test('fuzzy matching finds words in order, prefers word starts and marks what matched', () => {
   const table: { query: string; text: string; indexes: number[] | null }[] = [
@@ -88,4 +90,59 @@ test('every palette entry runs an action that exists and grants nothing of its o
   for (const id of ['slash-changes', 'slash-model', 'export-markdown', 'share-page'])
     active.find((entry) => entry.id === id)?.run();
   assert.deepEqual(ran, ['changes:""', 'model:""', 'markdown', 'share']);
+});
+
+test('Enter runs the top match only when it is not explicit, and never skips to a lower one', () => {
+  const views = () => ({
+    slash: () => {},
+    exporter: { markdown: () => {}, share: () => {} },
+  });
+  const entries = paletteEntries(app([]), views as never, (action) => action());
+  const options = (query: string) =>
+    rankCommands(entries, query)
+      .map(({ command }) => command)
+      .filter((command) => !command.disabled)
+      .map((command) => ({ key: command.id, explicit: Boolean(command.explicit) }));
+  const picked = (query: string, active: string | null = null) =>
+    selectedOption(options(query), active)?.key ?? null;
+
+  // The top match is an explicit command: Enter does nothing until the person moves to something.
+  assert.equal(options('push')[0]?.key, 'slash-push');
+  assert.equal(picked('push'), null);
+  assert.equal(picked('push', 'slash-push'), 'slash-push');
+  assert.equal(picked('share'), null);
+  assert.equal(options('ext')[0]?.key, 'export-markdown');
+  assert.equal(picked('ext'), null);
+  // A top match that is not explicit runs, and an arrow choice wins over it.
+  assert.equal(picked('set'), 'settings-settings-general');
+  assert.equal(picked('set', 'slash-settings'), 'slash-settings');
+  // A key that is no longer listed falls back to the same rule, and an empty list picks nothing.
+  assert.equal(picked('set', 'gone'), 'settings-settings-general');
+  assert.equal(selectedOption([], null), null);
+  // Lower matches are not reached around an explicit top match.
+  assert.deepEqual(
+    selectedOption(
+      [
+        { key: 'a', explicit: true },
+        { key: 'b', explicit: false },
+      ],
+      null,
+    ),
+    null,
+  );
+});
+
+test('a palette command leaves the draft in the box and a typed command clears it', () => {
+  const table: [Parameters<typeof clearsDraft>[0], boolean, boolean][] = [
+    ['new-thread', false, true],
+    ['open-settings', false, true],
+    ['ask', false, true],
+    ['new-thread', true, false],
+    ['open-changes', true, false],
+    ['ask', true, false],
+    ['none', false, false],
+    ['prompt', false, false],
+  ];
+  for (const [action, keepDraft, clears] of table)
+    assert.equal(clearsDraft(action, keepDraft), clears, `${action} ${keepDraft}`);
 });

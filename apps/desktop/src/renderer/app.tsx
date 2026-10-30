@@ -35,6 +35,7 @@ import {
   rankCommands,
 } from './palette/commands.tsx';
 import { focusSection } from './palette/focus-section.ts';
+import { selectedOption } from './palette/select.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { RailSearch } from './rail-search.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
@@ -243,10 +244,7 @@ function CommandPalette({
     })),
   ];
   const enabled = options.filter((option) => !option.disabled);
-  const current =
-    enabled.find((option) => option.key === active) ??
-    enabled.find((option) => !option.explicit) ??
-    null;
+  const current = selectedOption(enabled, active);
   const optionId = (key: string) => `${id}-${key}`;
   const activeId = current ? optionId(current.key) : undefined;
   useEffect(() => {

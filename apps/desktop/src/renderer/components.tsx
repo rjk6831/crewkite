@@ -2,11 +2,10 @@ import type { Effect, Route, Run, Snapshot, SourceDetails, Task } from '@crewkit
 import { parseReviewTarget } from '@crewkite/contracts';
 import { Check, GitBranch, Info, X } from 'lucide-react';
 import { type KeyboardEvent, type ReactNode, useEffect, useId, useRef, useState } from 'react';
+import { familyName } from './family-name.ts';
 import { formatSpan } from './usage-gauges.tsx';
 
-export const familyName = (family: string) =>
-  ({ openai: 'OpenAI', anthropic: 'Anthropic', google: 'Google', local: 'Local' })[family] ??
-  family;
+export { familyName };
 export const familyClass = (family: string) => `family-${family}`;
 export const short = (value: string) => value.slice(0, 10);
 export const titleCase = (value: string) =>
