@@ -194,6 +194,16 @@ label select,
 label textarea {
   color: var(--text);
 }
+label.check-row {
+  flex-direction: row;
+  align-items: flex-start;
+  gap: 10px;
+}
+label.check-row input[type="checkbox"] {
+  width: auto;
+  flex: none;
+  margin: 3px 0 0;
+}
 fieldset {
   margin: 0;
   padding: 0;

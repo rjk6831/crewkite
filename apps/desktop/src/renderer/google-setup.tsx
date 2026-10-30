@@ -244,13 +244,13 @@ export function GoogleSetup({
       {termsAcknowledged ? (
         <p className="muted small">You acknowledged this on {setup?.googleTerms?.at}.</p>
       ) : (
-        <label className="small">
+        <label className="check-row small">
           <input
             type="checkbox"
             checked={termsChecked}
             onChange={(event) => setTermsChecked(event.target.checked)}
-          />{' '}
-          {GOOGLE_TERMS_CHECKBOX}
+          />
+          <span>{GOOGLE_TERMS_CHECKBOX}</span>
         </label>
       )}
       {!termsAcknowledged && (ready || needsRepair) && (
