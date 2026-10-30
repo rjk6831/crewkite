@@ -63,6 +63,7 @@ import {
   runPrint,
   runThreadCommand,
   threadIdArg,
+  UsageError,
 } from './chat/scripting.ts';
 import { runSearchCommand } from './chat/search.ts';
 import { runDiagnosticsCommand } from './diagnostics.ts';
@@ -214,9 +215,9 @@ export async function runCli(
         'confirm-quota-account': { type: 'boolean' },
       },
     });
-    if (values.version || (positionals.length === 1 && positionals[0] === 'version')) {
+    if (values.version || positionals[0] === 'version') {
       if (positionals.length > (values.version ? 0 : 1))
-        throw new Error('Use crewkite --version alone. Use --help.');
+        throw new UsageError('Use crewkite --version alone. Use --help.');
       output.out(`${CREWKITE_VERSION}\n`);
       return 0;
     }

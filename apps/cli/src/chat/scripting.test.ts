@@ -179,7 +179,7 @@ test('print mode streams the reply, uses only a registered checkout and exits wi
   assert.equal(await losing, 1);
   assert.match(lost.io.out, /connection to the controller ended/);
   assert.equal(
-    lost.io.err.match(/^Lost the controller\. Reconnecting for up to 60 seconds\.$/gm)?.length,
+    lost.io.err.match(/^Lost the controller\. Reconnecting for about a minute\.$/gm)?.length,
     1,
   );
 });
@@ -306,6 +306,37 @@ test('thread commands with --json write only lines the published schema accepts'
     assert.notEqual(code, 0, refused.io.err);
     assert.equal((await listThreadIds(home)).length, threadsBefore, args.join(' '));
   }
+
+  // A send whose answer is lost may have been accepted, so its thread stays and its id prints.
+  const beforeUnknown = (await listThreadIds(home)).length;
+  const unknown = capture();
+  const unknownCode = await runCli(
+    [
+      'thread',
+      'new',
+      projectId,
+      'Maybe sent',
+      '--model',
+      'anthropic/fixture-model',
+      '--home',
+      home,
+    ],
+    unknown.output,
+    async (path) => {
+      const client = await connectChat(path);
+      const command = client.transport.command.bind(client.transport);
+      client.transport.command = async (input) => {
+        const result = await command(input);
+        return input.command === 'SendChatMessage'
+          ? { outcome: 'outcome-unknown', reason: 'connection-lost' }
+          : result;
+      };
+      return client;
+    },
+  );
+  assert.equal(unknownCode, 2);
+  assert.equal((await listThreadIds(home)).length, beforeUnknown + 1);
+  assert.match(unknown.io.out, /^tsk_\w+\n$/);
 
   // A malformed ID is one line and status 2, before the controller is asked anything.
   for (const [args, line] of [

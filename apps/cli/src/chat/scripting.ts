@@ -278,7 +278,7 @@ export function followThread(
     if (state === 'connected') announced = false;
     else if (state === 'offline' && !announced) {
       announced = true;
-      io.err('Lost the controller. Reconnecting for up to 60 seconds.\n');
+      io.err('Lost the controller. Reconnecting for about a minute.\n');
     }
   });
   // After a gap in the stream the thread is read again, so a turn that ended meanwhile settles.
@@ -418,10 +418,12 @@ async function applyPolicy(
  * leaves no empty thread behind. The controller refuses to delete a thread that has a reply
  * running, so a thread that did start work stays.
  */
-async function dropThread(client: ChatClient, taskId: string) {
+async function dropThread(client: ChatClient, taskId: string): Promise<boolean> {
   try {
-    await client.send('DeleteChatThread', { taskId });
-  } catch {}
+    return applied(await client.send('DeleteChatThread', { taskId }));
+  } catch {
+    return false;
+  }
 }
 
 /** Runs a step before the first message and drops the thread this command made when it throws. */
@@ -471,9 +473,12 @@ async function sendAndFollow(
       selection: input.selection,
       files: stored,
     });
-    if (!applied(result) && input.created) await dropThread(client, input.taskId);
+    // An unknown outcome may be a message the controller accepted, so that thread stays.
+    const refused = !applied(result) && result.outcome !== 'outcome-unknown';
+    // The id is printed unless the thread was removed, so a thread that stays can be found.
+    const removed = refused && input.created && (await dropThread(client, input.taskId));
     if (input.json) await io.out(jsonLine(resultLine(input.command, result, input.taskId)));
-    else if (!input.watch && (applied(result) || !input.created)) await io.out(`${input.taskId}\n`);
+    else if (!input.watch && !removed) await io.out(`${input.taskId}\n`);
     if (!applied(result)) {
       if (!input.json) io.err(`${result.next ?? result.reason ?? 'The message was not sent.'}\n`);
       return CLI_EXIT.notDone;
