@@ -32,7 +32,7 @@ import {
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
 import { startGoogleAcpSetup } from '../providers/google/acp/writer.ts';
-import { probeLocalWithoutToken } from '../providers/local/chat-connect.ts';
+import { type LocalProbe, probeLocal } from '../providers/local/chat-connect.ts';
 import {
   localConfiguredConnectionHash,
   resolveLocalConnection,
@@ -45,7 +45,11 @@ import {
   type NativeProfileResolution,
   unavailableNativeProfile,
 } from '../providers/openai/profile.ts';
-import { localTokenRefusal } from '../providers/platform.ts';
+import {
+  LOCAL_SERVER_WANTS_TOKEN,
+  LOCAL_TOKEN_SETUP_NOTICE,
+  localTokenRefusal,
+} from '../providers/platform.ts';
 import type { Controller } from './controller.ts';
 import { googleTermsAcknowledged } from './google-terms.ts';
 import {
@@ -56,6 +60,10 @@ import {
 } from './schemas.ts';
 
 // Provider setup: ACP install and sign-in, connection checks, the Local connection and profiles.
+// The connection revision at which a no-authentication connect met a runtime that wants a token.
+// Memory only: the next connect probes again.
+const tokenAsked = new WeakMap<object, number>();
+
 export class ProviderCommands {
   executeAcpSetup(
     this: Controller,
@@ -825,7 +833,18 @@ export class ProviderCommands {
                           : choice.state !== 'loaded-eligible'
                             ? 'model-incompatible'
                             : 'qualification-pending');
+    // The runtime asked a no-authentication connection for a token, or token mode was saved on a
+    // computer that cannot take one. The view shows these lines in place of the generic reason.
+    const notice =
+      this.localTokenRefusal() && control.endpoint
+        ? control.authMode === 'token'
+          ? LOCAL_TOKEN_SETUP_NOTICE
+          : tokenAsked.get(this) === control.connectionRevision && !connected
+            ? LOCAL_SERVER_WANTS_TOKEN
+            : undefined
+        : undefined;
     return LocalSetupSchema.parse({
+      ...(notice ? { notice } : {}),
       revision: control.revision,
       connectionRevision: control.connectionRevision,
       connectorId: 'local-sdk-v1',
@@ -1350,15 +1369,35 @@ export class ProviderCommands {
         // runtime can miss the first probe, so a miss is tried once more before the window opens.
         const endpoint = control.endpoint;
         if (!endpoint) throw Error('Local endpoint is unavailable.');
-        const probe = this.options.localProbe ?? probeLocalWithoutToken;
+        const injected = this.options.localProbe;
+        const probe: (endpoint: string) => Promise<LocalProbe> = injected
+          ? async (value) => {
+              const found = await injected(value);
+              return found === true ? 'open' : found === false ? 'unavailable' : found;
+            }
+          : probeLocal;
         void (async () => {
-          let open = await probe(endpoint).catch(() => false);
-          if (!open && !runtime.stopped && !this.closed)
-            open = await probe(endpoint).catch(() => false);
-          return open;
-        })().then((open) => {
+          let found = await probe(endpoint).catch((): LocalProbe => 'unavailable');
+          if (found === 'unavailable' && !runtime.stopped && !this.closed)
+            found = await probe(endpoint).catch((): LocalProbe => 'unavailable');
+          return found;
+        })().then((found) => {
+          const open = found === 'open';
+          tokenAsked.delete(this);
           const supplied =
             this.localSecret?.supplied && this.localSecretMatches(this.localControl());
+          if (
+            found === 'token-required' &&
+            !supplied &&
+            this.localTokenRefusal() &&
+            !runtime.stopped &&
+            !this.closed
+          ) {
+            // The runtime asked for a token and this computer cannot take one. No window opens;
+            // the setup says so until the next connect finds the runtime open.
+            tokenAsked.set(this, control.connectionRevision);
+            return finish(null);
+          }
           if (!open && supplied && !runtime.stopped && !this.closed) {
             // The desktop supplied the token for this connect. No window opens.
             if (this.localSecret) this.localSecret.supplied = false;

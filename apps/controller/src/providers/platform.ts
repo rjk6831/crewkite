@@ -36,6 +36,14 @@ export function platformGate(family: PlatformFamily, host: Host = process): Plat
 export const LOCAL_TOKEN_NEEDS_MACOS =
   'Token entry needs the macOS keychain in this preview, so choose no authentication for a runtime on this device.';
 
+/** The setup line on a computer that saved token mode but cannot take a token. */
+export const LOCAL_TOKEN_SETUP_NOTICE =
+  'Loopback works without a token. Token entry needs the macOS keychain in this preview.';
+
+/** The setup line when a no-authentication connection met a runtime that asks for a token. */
+export const LOCAL_SERVER_WANTS_TOKEN =
+  'The server asks for a token, and this preview supports token entry only on macOS, so turn off authentication in the server or use a Mac.';
+
 /** The refusal for Local token mode, or null where the macOS input helper can run. */
 export function localTokenRefusal(platform: string = process.platform): string | null {
   return platform === 'darwin' ? null : LOCAL_TOKEN_NEEDS_MACOS;

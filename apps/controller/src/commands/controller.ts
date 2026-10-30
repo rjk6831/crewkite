@@ -178,7 +178,7 @@ export type ControllerOptions = {
   localInputHelper?: LocalInputHelper;
   localInput?: Parameters<typeof startLocalSecretInput>[2];
   /** True when the runtime at the endpoint answers without a token. Tests pass their own. */
-  localProbe?: (endpoint: string) => Promise<boolean>;
+  localProbe?: (endpoint: string) => Promise<boolean | 'token-required' | 'unavailable' | 'open'>;
   localDiscovery?: Omit<Parameters<typeof startLocalDiscovery>[2], 'lifecycle'>;
   localWriter?: Omit<Parameters<typeof startLocalReplacement>[2], 'lifecycle' | 'onSubmitted'>;
   prepareVerification?: typeof prepareToolchain;

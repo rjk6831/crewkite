@@ -53,13 +53,24 @@ export async function connectLocalModel(input: {
   }
 }
 
+/** What the loopback probe found: auth off, a runtime that asked for a token, or anything else. */
+export type LocalProbe = 'open' | 'token-required' | 'unavailable';
+
 /**
- * True when the runtime at a loopback endpoint lists its models without a token, which means its
- * auth is off. The SDK reads LM_API_TOKEN when no token is passed, so with that set the probe sends
- * nothing and answers false. Any failure, including a runtime that wants a token, is false.
+ * A rejected handshake with status 401 or 403 means the runtime wants a token. The socket library
+ * reports it as "Unexpected server response: 401". Any other failure says nothing about auth.
  */
-export async function probeLocalWithoutToken(endpoint: string, timeoutMs = 2000) {
-  if (Object.hasOwn(process.env, 'LM_API_TOKEN')) return false;
+export function localProbeFailure(error: unknown): 'token-required' | 'unavailable' {
+  const message = error instanceof Error ? error.message : '';
+  return /Unexpected server response: 40[13]\b/.test(message) ? 'token-required' : 'unavailable';
+}
+
+/**
+ * Probe a loopback endpoint with no token. The SDK reads LM_API_TOKEN when no token is passed, so
+ * with that set the probe sends nothing and answers unavailable.
+ */
+export async function probeLocal(endpoint: string, timeoutMs = 2000): Promise<LocalProbe> {
+  if (Object.hasOwn(process.env, 'LM_API_TOKEN')) return 'unavailable';
   const runtime = new LMStudioClient({
     baseUrl: endpoint,
     verboseErrorMessages: false,
@@ -68,15 +79,23 @@ export async function probeLocalWithoutToken(endpoint: string, timeoutMs = 2000)
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([
-      runtime.llm.listLoaded().then(() => true),
-      new Promise<boolean>((resolve) => {
-        timer = setTimeout(() => resolve(false), timeoutMs);
+      runtime.llm.listLoaded().then((): LocalProbe => 'open'),
+      new Promise<LocalProbe>((resolve) => {
+        timer = setTimeout(() => resolve('unavailable'), timeoutMs);
       }),
     ]);
-  } catch {
-    return false;
+  } catch (error) {
+    return localProbeFailure(error);
   } finally {
     clearTimeout(timer);
     runtime[Symbol.asyncDispose]().catch(() => {});
   }
+}
+
+/**
+ * True when the runtime at a loopback endpoint lists its models without a token, which means its
+ * auth is off. Any failure, including a runtime that wants a token, is false.
+ */
+export async function probeLocalWithoutToken(endpoint: string, timeoutMs = 2000) {
+  return (await probeLocal(endpoint, timeoutMs)) === 'open';
 }
