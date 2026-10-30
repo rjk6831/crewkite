@@ -1,6 +1,10 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { LOCAL_SERVER_WANTS_TOKEN, LOCAL_TOKEN_SETUP_NOTICE } from '../providers/platform.ts';
+import {
+  LOCAL_SERVER_WANTS_TOKEN,
+  LOCAL_TOKEN_NEEDS_MACOS,
+  LOCAL_TOKEN_SETUP_NOTICE,
+} from '../providers/platform.ts';
 import { setup } from '../store/controller-fixture.ts';
 
 // Claim: the setup carries the controller's own line, so the card shows what to do in place of
@@ -72,4 +76,33 @@ test('a saved token mode on Linux shows the loopback and keychain line in place 
   };
   assert.equal(state()?.reason, 'capability-unavailable');
   assert.equal(state()?.notice, LOCAL_TOKEN_SETUP_NOTICE);
+});
+
+// Claim: a configured input helper does not lift the refusal, so a saved token mode on a computer
+// without the keychain never reaches the token window or a model read.
+test('a configured input helper does not let token mode connect on Linux', async (t) => {
+  const { controller, command } = await setup(t, {
+    localInput: { platform: 'darwin', arch: 'arm64' },
+    localProbe: async () => false,
+  });
+  const state = () => controller.snapshot().localSetup;
+  const local = (name: string, payload: object = {}) =>
+    controller.execute(command(name, payload, state()?.revision ?? 0), 'local-owner');
+  await local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:12345' });
+  const options = (controller as unknown as { options: Record<string, unknown> }).options;
+  options.localInput = { platform: 'linux', arch: 'x64' };
+  options.localInputHelper = {
+    root: process.cwd(),
+    sha256: 'a'.repeat(64),
+    sourceHash: 'b'.repeat(64),
+    target: 'darwin-arm64',
+  };
+  for (const name of ['BeginLocalConnectionInput', 'RefreshLocalModels']) {
+    const refused = await local(name, { consent: 'explicit' });
+    assert.equal(refused.outcome, 'blocked', name);
+    assert.equal(refused.reason, 'local-token-needs-macos', name);
+    assert.equal(refused.next, LOCAL_TOKEN_NEEDS_MACOS, name);
+  }
+  assert.equal(state()?.operation, null, 'no window opened');
+  assert.equal(state()?.reason, 'capability-unavailable');
 });

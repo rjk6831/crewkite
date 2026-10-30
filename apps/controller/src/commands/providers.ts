@@ -1059,8 +1059,10 @@ export class ProviderCommands {
       });
       return applied();
     }
-    if (control.authMode === 'token' && !this.options.localInputHelper) {
-      const refusal = this.localTokenRefusal();
+    // A configured helper does not lift the refusal: token entry needs the macOS keychain.
+    const tokenRefusal = control.authMode === 'token' ? this.localTokenRefusal() : null;
+    if (control.authMode === 'token' && (!this.options.localInputHelper || tokenRefusal)) {
+      const refusal = tokenRefusal;
       return {
         outcome: 'blocked',
         reason: refusal ? 'local-token-needs-macos' : 'local-input-unavailable',

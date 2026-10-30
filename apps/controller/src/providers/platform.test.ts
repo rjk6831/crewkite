@@ -94,12 +94,12 @@ test('the shared client gate gives the platform line first and then the home lin
   assert.equal(noHome?.detail, 'Codex needs HOME set to your own home folder.');
 });
 
-test('Local connection setup passes the platform gate on Linux and stops at it on Windows', () => {
+test('the Local writer connection stays on macOS arm64 and refuses Linux with the platform reason', () => {
   const secretConfigured = false;
   for (const [name, expected] of [
     ['macOS arm64', 'not-configured'],
-    ['Linux x64', 'not-configured'],
-    ['Linux arm64', 'not-configured'],
+    ['Linux x64', 'unsupported-platform'],
+    ['Linux arm64', 'unsupported-platform'],
     ['macOS x64', 'unsupported-platform'],
     ['Windows x64', 'unsupported-platform'],
   ] as const)

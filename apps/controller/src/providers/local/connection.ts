@@ -8,7 +8,6 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
-import { platformGate } from '../platform.ts';
 import { localProposalBudget } from './budget.ts';
 
 export const LocalEndpointSchema = z
@@ -70,7 +69,10 @@ export function resolveLocalConnection(
     }),
     connection: null,
   });
-  if (!platformGate('local', capability).allowed) return unavailable('unsupported-platform');
+  // This resolves the Local writer and its profile. The writer stays on macOS arm64: Linux takes
+  // Local chat in the no-authentication loopback mode only (ADR 0013, amendment of 2026-10-31).
+  if (capability.platform !== 'darwin' || capability.arch !== 'arm64')
+    return unavailable('unsupported-platform');
   if (input === null || input === undefined) return unavailable('not-configured');
   const configuration = configurationSchema.safeParse(input);
   if (!configuration.success) return unavailable('model-setup-unavailable');
