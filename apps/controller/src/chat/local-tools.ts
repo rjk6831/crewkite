@@ -28,6 +28,7 @@ import {
   ThreadTurnsResultSchema,
 } from '@crewkite/contracts';
 import { z } from 'zod';
+import { withGitCeiling } from '../host/git-ceiling.ts';
 import { groupAbsent } from '../host/worker.ts';
 import type { ThreadReads } from './thread-reader.ts';
 
@@ -443,7 +444,7 @@ export function listFiles(scratch: string, environment: NodeJS.ProcessEnv) {
         // repository that holds it and lists nothing when that repository ignores the copy, as a
         // checkout ignores a home under internal/. Outside a checkout Git fails and the walk below
         // lists the copy.
-        env: { ...environment, GIT_CEILING_DIRECTORIES: dirname(root) },
+        env: withGitCeiling(environment, root),
         maxBuffer: 64 * 1024 * 1024,
         timeout: 10_000,
         stdio: ['ignore', 'pipe', 'ignore'],

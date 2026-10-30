@@ -55,7 +55,15 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import {
@@ -262,11 +270,13 @@ function turn(
   const usage: OpenAiUsage[] = [];
   const environment = { HOME: home, PATH: process.env.PATH };
   let args: string[] = [];
+  let launchEnvironment: NodeJS.ProcessEnv = {};
   const adapter = openAiChatAdapter({
     launch: () => ({ executable, sha256, directory: work, repositoryRoot: home, environment }),
     onUsage: (value) => usage.push(value),
     spawn: (path, clientArgs, spawnOptions) => {
       args = clientArgs;
+      launchEnvironment = spawnOptions.env;
       const input = JSON.stringify(options.detail ?? null);
       return spawn(process.execPath, [path, scenario, frames, input], spawnOptions);
     },
@@ -303,6 +313,7 @@ function turn(
     scratch,
     work,
     args: () => args,
+    launchEnvironment: () => launchEnvironment,
     frames: () =>
       readFileSync(frames, 'utf8')
         .trimEnd()
@@ -908,4 +919,13 @@ test('a client that fails before its turn runs leaves its error output and last 
     const { nextAction: _nextAction, resetsAt: _resetsAt, ...kept } = failure ?? {};
     assert.deepEqual(kept, row.failure, row.scenario);
   }
+});
+
+test('the client starts with Git held to the scratch copy', async () => {
+  const run = turn('stream');
+  await run.settled();
+  assert.equal(
+    run.launchEnvironment().GIT_CEILING_DIRECTORIES,
+    realpathSync.native(dirname(run.scratch)),
+  );
 });

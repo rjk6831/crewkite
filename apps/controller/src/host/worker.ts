@@ -55,6 +55,7 @@ const commandEnvironmentNames = new Set([
   'GH_HOST',
   'GH_PAGER',
   'GH_PROMPT_DISABLED',
+  'GIT_CEILING_DIRECTORIES',
   'HOME',
   'LANG',
   'LC_ALL',

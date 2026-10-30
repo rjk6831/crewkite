@@ -54,6 +54,7 @@ import {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   statSync,
   symlinkSync,
@@ -211,12 +212,14 @@ function run(
   const waiting = new Map<string, (event: AgentEvent) => void>();
   const launched = {
     argv: [] as string[],
+    env: {} as NodeJS.ProcessEnv,
     input: [] as string[],
     config: null as { path: string; mode: number; text: string } | null,
   };
   const usage: unknown[] = [];
   const spawn: Spawn = (executable, argv, options) => {
     launched.argv = argv;
+    launched.env = options.env;
     // The config file when the client was given a path: what it held and its mode at launch.
     const path = argv[argv.indexOf('--mcp-config') + 1] ?? '';
     if (path.endsWith('mcp.json'))
@@ -1088,4 +1091,11 @@ test('the model read sends one initialize request and no prompt, keeps the picke
   // A client that exits without answering, and one that answers with no rows, both read as none.
   assert.equal((await read(['read', { exit: 1 }])).models, null);
   assert.equal((await read(answer([]))).models, null);
+});
+
+test('the client starts with Git held to the scratch copy', async (t) => {
+  const turn = run(streamed());
+  t.after(turn.cleanup);
+  await turn.handle.result;
+  assert.equal(turn.launched.env.GIT_CEILING_DIRECTORIES, realpathSync.native(dirname(turn.work)));
 });

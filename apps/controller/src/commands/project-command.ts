@@ -9,6 +9,7 @@ import {
   realpathSync,
 } from 'node:fs';
 import { isAbsolute, relative, resolve } from 'node:path';
+import { gitCeiling } from '../host/git-ceiling.ts';
 
 const recipeNames = ['lint', 'test', 'build'] as const;
 const environmentNames = new Set([
@@ -327,7 +328,11 @@ export function startProjectCommand(
     executableSha256: command.executableSha256,
     argv: [...command.argv],
     cwd: command.cwd,
-    environment: { ...command.environment },
+    // The scratch copy has no .git, so Git run from inside it must not search the folders above.
+    environment: {
+      ...command.environment,
+      GIT_CEILING_DIRECTORIES: gitCeiling(command.scratchRoot),
+    },
     shell: false,
   };
   const execution = dependencies.runner.launch(request, dependencies.lifecycle);

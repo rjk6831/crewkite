@@ -14,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { createOwnedProjectCommandRunner } from './owned-runner.ts';
 import {
   type OwnedProjectCommandExecution,
   type OwnedProjectCommandLifecycle,
@@ -252,4 +253,62 @@ test('project commands retain streamed output and classify success, failure and 
   assert.equal(failed.status, 'failed');
   assert.equal(failed.reason, 'output');
   assert.equal(stops, 1);
+});
+
+test('a project command runs with Git held to the folder that holds the scratch copy', (t) => {
+  const { root, definition } = fixture(t);
+  const launched: NodeJS.ProcessEnv[] = [];
+  const execution: OwnedProjectCommandExecution = {
+    stdout: asyncBytes([]),
+    stderr: asyncBytes([]),
+    terminal: Promise.resolve({ code: 0, signal: null, quiescent: true, reason: 'exit' }),
+    stop() {},
+  };
+  // The command may start in a folder of the copy, and the ceiling still sits above the whole copy.
+  for (const cwd of [definition.scratchRoot, definition.cwd]) {
+    startProjectCommand(
+      { ...definition, cwd },
+      {
+        lifecycle: lifecycle(),
+        publishStream,
+        runner: {
+          launch(request) {
+            launched.push(request.environment);
+            return execution;
+          },
+        },
+      },
+    );
+  }
+  assert.deepEqual(
+    launched.map((environment) => environment.GIT_CEILING_DIRECTORIES),
+    [root, root],
+  );
+  assert.equal(launched[0].HOME, definition.environment.HOME);
+});
+
+test('the owned runner passes the ceiling to the program it starts', async (t) => {
+  const { root, definition } = fixture(t);
+  const executable = realpathSync(process.execPath);
+  const published: Buffer[] = [];
+  const operation = startProjectCommand(
+    {
+      ...definition,
+      executable,
+      executableSha256: createHash('sha256').update(readFileSync(executable)).digest('hex'),
+      argv: ['-e', 'process.stdout.write(process.env.GIT_CEILING_DIRECTORIES ?? "none")'],
+      environment: { ...definition.environment, PATH: process.env.PATH ?? '' },
+    },
+    {
+      lifecycle: lifecycle(),
+      runner: createOwnedProjectCommandRunner({ deadlineMs: 20_000 }),
+      publishStream: async (source) => {
+        for await (const chunk of source) published.push(Buffer.from(chunk));
+        return { hash: '0'.repeat(64), bytes: 0 };
+      },
+    },
+  );
+  const outcome = await operation.result;
+  assert.equal(outcome.status, 'succeeded');
+  assert.equal(Buffer.concat(published).toString('utf8'), root);
 });

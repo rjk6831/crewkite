@@ -32,7 +32,7 @@
 //   session/prompt error       {code:-32603, message}
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -147,8 +147,10 @@ async function run(
 ) {
   const events: AgentEvent[] = [];
   const frames: Frame[] = [];
+  let launched: NodeJS.ProcessEnv = {};
   const spawn: AcpSpawn = (executable, args, options) => {
     assert.equal(options.env.SECRET_TOKEN, undefined);
+    launched = options.env;
     const child = spawnCheckChild(executable, args, options);
     const write = child.stdin.write.bind(child.stdin);
     child.stdin.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
@@ -182,7 +184,7 @@ async function run(
   const last = events.at(-1);
   assert.equal(last?.type, 'turn.completed');
   assert.equal(events[0]?.type, 'turn.started');
-  return { events, frames, result, handle, capabilities };
+  return { events, frames, result, handle, capabilities, launched };
 }
 
 /** A file stored the way the controller stores one, under the rig's home. */
@@ -1101,6 +1103,16 @@ test('an unknown update or method goes to the frame trace and never the thread, 
     ]);
     assert.equal(turn.result.stopReason, 'done');
     assert.equal(turn.result.assistantText, 'still here');
+  } finally {
+    f.dispose();
+  }
+});
+
+test('the client starts with Git held to the scratch copy', async () => {
+  const f = rig('chat-stream');
+  try {
+    const turn = await run(f, request(f));
+    assert.equal(turn.launched.GIT_CEILING_DIRECTORIES, realpathSync.native(f.home));
   } finally {
     f.dispose();
   }

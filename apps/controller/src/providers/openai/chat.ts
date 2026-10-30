@@ -37,6 +37,7 @@ import {
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
+import { withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
   type OpenAiUsageHook,
@@ -495,7 +496,10 @@ class OpenAiChatTurn {
       const executable = verifiedClient(launch);
       step = 'storage';
       const directory = privateStorage(launch);
-      const env = nativeDiscoveryEnvironment(launch.environment);
+      const env = withGitCeiling(
+        nativeDiscoveryEnvironment(launch.environment),
+        this.request.scratch.directory,
+      );
       step = 'spawn';
       const args = nativeChatArguments(directory, this.request);
       const child = (deps.spawn ?? spawn)(executable, args, {

@@ -61,6 +61,7 @@ import {
 import { cachedRepoMap } from '../../chat/repo-map.ts';
 import type { ThreadReads } from '../../chat/thread-reader.ts';
 import { frameTrace } from '../../chat/trace.ts';
+import { withGitCeiling } from '../../host/git-ceiling.ts';
 import { localPromptRoom, localThreadReadBytes } from './budget.ts';
 
 // Local chat over the LM Studio SDK. The model has no agent loop of its own, so CrewKite runs
@@ -870,7 +871,7 @@ function startLocalTurn(
     const context = {
       ...(threads ? { threads, threadBytes } : {}),
       scratch: request.scratch.directory,
-      environment: request.environment,
+      environment: withGitCeiling(request.environment, request.scratch.directory),
       signal: abort.signal,
       permitted: false,
       onGroup: (group: number) => groups.push(group),

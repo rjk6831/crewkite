@@ -37,6 +37,7 @@ import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
+import { withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
 
@@ -632,7 +633,7 @@ function startTurn(
     if (!isAbsolute(scratch) || !isAbsolute(request.work.directory)) throw new Error();
     const temporary = join(request.work.directory, 'tmp');
     mkdirSync(temporary, { recursive: true, mode: 0o700 });
-    environment = chatEnvironment(request.environment, temporary);
+    environment = withGitCeiling(chatEnvironment(request.environment, temporary), scratch);
   } catch {
     return refuse(
       chatFailure({

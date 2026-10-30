@@ -22,6 +22,7 @@ import { attachedLine, attachedSection, stripTurnNotes } from '../../chat/prompt
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
+import { withGitCeiling } from '../../host/git-ceiling.ts';
 import type { Schedule } from '../../host/worker.ts';
 import {
   type AcpConnection,
@@ -1324,7 +1325,10 @@ export function googleChatAdapter(deps: {
               // The client keeps its own tmp folder here, so this is the private work folder
               // and the session working directory below is the scratch copy.
               directory: request.work.directory,
-              environment: launch.environment ?? request.environment,
+              environment: withGitCeiling(
+                launch.environment ?? request.environment,
+                request.scratch.directory,
+              ),
               lifecycle: launch.lifecycle ?? noJournal,
               timeoutMs: Math.min(maximumTurnMs, Math.max(2000, timeout)),
               limits: chatAcpLimits,
