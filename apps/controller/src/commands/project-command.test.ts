@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -85,6 +86,11 @@ test('project command definitions stay bound to their source, scratch, executabl
   const { root, definition } = fixture(t);
   const linked = join(root, 'linked');
   const dotted = join(definition.scratchRoot, '..cache');
+  // The shell row needs a regular file named like a shell. /bin/sh is a link on Linux, which the
+  // identity check refuses before the shell check runs.
+  const shell = join(root, 'sh');
+  copyFileSync('/bin/sh', shell);
+  chmodSync(shell, 0o755);
   symlinkSync(definition.cwd, linked);
   mkdirSync(dotted);
   const cases: Array<{ name: string; value: ProjectCommandDefinition; message: RegExp }> = [
@@ -112,8 +118,8 @@ test('project command definitions stay bound to their source, scratch, executabl
       name: 'shell executable',
       value: {
         ...definition,
-        executable: '/bin/sh',
-        executableSha256: createHash('sha256').update(readFileSync('/bin/sh')).digest('hex'),
+        executable: shell,
+        executableSha256: createHash('sha256').update(readFileSync(shell)).digest('hex'),
       },
       message: /shell authority/,
     },

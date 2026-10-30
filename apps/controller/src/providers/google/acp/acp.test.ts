@@ -267,7 +267,9 @@ function writer(
   });
 }
 
-test('the acp writer binds an imported client and observed configuration before one prompt', async () => {
+test('the acp writer binds an imported client and observed configuration before one prompt', {
+  skip: process.platform !== 'darwin' && 'the ACP client bundle is the signed macOS arm64 build',
+}, async () => {
   const large = fixture('complete');
   try {
     const staged = join(large.home, 'imports/google-acp-v1');

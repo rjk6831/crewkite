@@ -337,3 +337,14 @@ Two test files in `packages/bench/src` cover the harness, three tests in `run.te
 - The manifest table in `manifest.test.ts` checks the schema row by row: a complete file, defaults, and the refusals for a bad id, a relative repository, a short base hash, text with diff lines, a hidden path that climbs out of the copy, a duplicate check name, an unknown difficulty and an unknown field. Rows for the verification record check that it needs the base failure kind and refuses a kind that is not defined. The folder test checks that a file name must match its task id and that a file that fails the schema stops the load with its name. A last test loads the shipped tasks and checks that each one carries a verification record with at least one check that failed on the base.
 
 These tests establish the harness's mechanics. They say nothing about how any model performs, and a live run through an installed client needs the owner's machine.
+
+## Platform-scoped claims
+
+CI runs the full suite on macOS 15 arm64, and a Linux container reports the claims below as skipped with a reason, not as failed. Each keeps running on macOS.
+
+- Candidate evidence runs its formatter section only on macOS, because the verify recipe pins the macOS arm64 Biome binary. The identity and historical checks before that section run everywhere.
+- The ACP writer claim runs only on macOS, because the client bundle is the signed macOS arm64 build.
+- The package upgrade claim skips its `installed` and `installed-initialized-owner` rows elsewhere, because they run the real activity check at the macOS `/usr/sbin/lsof` path. Its other rows run everywhere.
+- The retained descendant claim, the owned command stream claim and the authentication metadata cleanup claim skip outside macOS because Linux process ownership is unqualified. A Linux group can outlive the close of its streams for a few milliseconds, and an orphan that init never reaps stays in its group after SIGKILL, so the group absence proof does not settle. I record this as a Linux product gap.
+
+The project command claim has no platform scope. Its shell row copies a regular file named `sh`, because `/bin/sh` is a link on Linux and the identity check refuses a link before the shell check runs.

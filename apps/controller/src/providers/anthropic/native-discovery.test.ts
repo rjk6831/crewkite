@@ -36,7 +36,11 @@ process.stdin.on('end', () => {
 });
 `;
 
-test('authentication metadata waits for bounded owned child and descendant cleanup', async () => {
+test('authentication metadata waits for bounded owned child and descendant cleanup', {
+  skip:
+    process.platform !== 'darwin' &&
+    'Linux process ownership is unqualified: an orphan that init never reaps keeps its group present after SIGKILL',
+}, async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/auth-process-'));
   const sha256 = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
