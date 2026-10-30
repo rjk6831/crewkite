@@ -44,3 +44,16 @@ Sprint 2
 - I made print mode say when it loses the controller, and keep trying for the same time as before.
 - I made health report `git was not found` or `git failed to run`, and made a refused `project add` say the same.
 - I added `pnpm desktop`, which opens the desktop from source on the real controller and your own CrewKite home.
+- I made the Changes list load in pages with no file cap, and added Accept and Discard for each hunk.
+- I added review comments that quote the lines of a hunk and join the thread as a message.
+- I made long threads mount only the rows near the screen.
+- I made Accept batch its object lookups and writes, and made hunk actions check hunk bytes, folders and fences before acting.
+- I confined plan slice reviews to their own copy, and held Blocked slices out of the thread's copy.
+- I cut the thread history sent to a Local model to the room its prompt has left.
+- I held git to the scratch copy for every client and check.
+- I back up the database before a migration, and keep the newest backup when I prune.
+- I released the message queue after a restart, and made Stop report how many messages it cleared.
+- I made the shared redaction close more secret shapes, and made a crash capture leave the way a process fails unchanged.
+- I made the Anthropic turn refuse a pre-placed `mcp.json` or link.
+- I kept a gauge row for every provider, put the Google terms checkbox inline with its label, and showed Ctrl K for search off macOS.
+- I skipped the welcome for anyone who already has a project.
