@@ -49,6 +49,7 @@ import {
   TaskSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { type createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { syntheticCheckDefinition, writeChallengeSolution } from '@crewkite/testkit/repository';
 import { fakeWorkerPath } from '@crewkite/testkit/worker';
@@ -779,7 +780,7 @@ test('a stale task revision leaves the current task and event cursor intact', as
   await controller.execute(command('GetUsage', {}), 'local-owner');
   assert.deepEqual(await controller.execute(command('GetHealth', {}), 'local-owner'), {
     outcome: 'applied',
-    data: { kind: 'health', status: 'ready', version: '0.0.0', blockers: [] },
+    data: { kind: 'health', status: 'ready', version: CREWKITE_VERSION, blockers: [] },
   });
   assert.equal(
     controller.store.db.prepare('SELECT COUNT(*) AS count FROM receipts').get()?.count,

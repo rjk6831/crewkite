@@ -1,4 +1,5 @@
 import { ConversationModelCatalogEntriesSchema, type Observation } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { z } from 'zod';
 
 const MAX_LINE_BYTES = 65_536;
@@ -14,7 +15,7 @@ const outgoing = z.union([
       clientInfo: z.strictObject({
         name: z.literal('crewkite'),
         title: z.literal('CrewKite'),
-        version: z.literal('0.0.0'),
+        version: z.literal(CREWKITE_VERSION),
       }),
       capabilities: z.strictObject({
         experimentalApi: z.literal(false),
@@ -58,7 +59,7 @@ const requests: z.input<typeof outgoing>[][] = [
       id: 1,
       method: 'initialize',
       params: {
-        clientInfo: { name: 'crewkite', title: 'CrewKite', version: '0.0.0' },
+        clientInfo: { name: 'crewkite', title: 'CrewKite', version: CREWKITE_VERSION },
         capabilities: { experimentalApi: false, explicitGatewayOauth: true },
       },
     },

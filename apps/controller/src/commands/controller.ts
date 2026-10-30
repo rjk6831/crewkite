@@ -39,6 +39,7 @@ import {
   TimestampSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { readAnalytics } from '../chat/analytics.ts';
@@ -1943,7 +1944,7 @@ export class Controller {
           data: {
             kind: 'health',
             status: 'ready',
-            version: '0.0.0',
+            version: CREWKITE_VERSION,
             blockers: [],
           },
         };

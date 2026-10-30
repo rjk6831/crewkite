@@ -18,6 +18,7 @@ import {
   type ChatPermissionOption,
   type ChatToolKind,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { z } from 'zod';
 import {
   type ChatAdapter,
@@ -547,7 +548,7 @@ class OpenAiChatTurn {
     this.call(
       'initialize',
       {
-        clientInfo: { name: 'crewkite', title: 'CrewKite', version: '0.0.0' },
+        clientInfo: { name: 'crewkite', title: 'CrewKite', version: CREWKITE_VERSION },
         capabilities: { experimentalApi: false, explicitGatewayOauth: true },
       },
       (reply) => {

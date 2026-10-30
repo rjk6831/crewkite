@@ -5,10 +5,11 @@ import {
   type ReadDiagnosticsPayload,
   type Task,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
 import { taskActivityPage } from '../store/activity.ts';
 import type { Store } from '../store/index.ts';
-import { buildDiagnostics, type ProviderClientFact, readControllerVersion } from './bundle.ts';
+import { buildDiagnostics, type ProviderClientFact } from './bundle.ts';
 
 /** The newest events of a thread, oldest first, from as many activity pages as it takes. */
 function newestEvents(store: Store, taskId: string, count: number): Event[] {
@@ -52,7 +53,7 @@ export function readDiagnostics(
   const files = buildDiagnostics(
     {
       home: deps.home,
-      controllerVersion: readControllerVersion(),
+      controllerVersion: CREWKITE_VERSION,
       clients: () => clientFacts(deps.profiles()),
       events: (taskId, count) => newestEvents(deps.store, taskId, count ?? DIAGNOSTIC_EVENTS),
     },

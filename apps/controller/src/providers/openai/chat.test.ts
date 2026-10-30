@@ -8,7 +8,7 @@
 // its own read-only list.
 //
 // Client to server, ids counted from 1 per process:
-//   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.0.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
+//   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.1.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
 //   {"method":"initialized"}
 //   {"id":2,"method":"account/read","params":{"refreshToken":false}}
 //   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}

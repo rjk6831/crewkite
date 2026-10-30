@@ -10,6 +10,7 @@ import {
   DiagnosticsReadSchema,
   type Event,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { buildDiagnostics } from './bundle.ts';
 
 test('the diagnostics bundle holds exactly the listed parts, redacted, from a fixture home', (t) => {
@@ -109,10 +110,11 @@ test('the diagnostics bundle holds exactly the listed parts, redacted, from a fi
   };
   assert.ok(system.arch && system.memory.totalBytes > 0);
 
-  // Without a desktop or a thread, the parts are still all there and say what is missing.
+  // Without a desktop or a thread, the parts are still all there. The bundle names the product
+  // version the controller holds and says which thread is missing.
   const bare = buildDiagnostics({ ...source, home: join(root, 'empty') });
   assert.equal(bare.length, DIAGNOSTIC_PART_NAMES.length);
-  assert.equal(JSON.parse(bare[0]?.text ?? '{}').crewkite, null);
+  assert.equal(JSON.parse(bare[0]?.text ?? '{}').crewkite, CREWKITE_VERSION);
   assert.equal(JSON.parse(bare[4]?.text ?? '{}').taskId, null);
 
   // The folder writer produces one file per part and never replaces an existing folder.

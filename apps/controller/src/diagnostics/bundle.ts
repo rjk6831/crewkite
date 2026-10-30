@@ -1,12 +1,4 @@
-import {
-  closeSync,
-  constants,
-  fstatSync,
-  openSync,
-  readFileSync,
-  readSync,
-  statfsSync,
-} from 'node:fs';
+import { closeSync, constants, fstatSync, openSync, readSync, statfsSync } from 'node:fs';
 import {
   arch,
   availableParallelism,
@@ -28,6 +20,7 @@ import {
   type Event,
   type ReadDiagnosticsPayload,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { readControllerLogTail } from './log.ts';
 import { redactDiagnosticText, redactDiagnosticValue } from './redact.ts';
 
@@ -135,7 +128,7 @@ export function buildDiagnostics(
   const log = readControllerLogTail(source.home, DIAGNOSTIC_LOG_BYTES);
   const text: Record<(typeof DIAGNOSTIC_PARTS)[number]['name'], string> = {
     'versions.json': json({
-      crewkite: payload.desktop?.app ?? null,
+      crewkite: payload.desktop?.app ?? CREWKITE_VERSION,
       controller: source.controllerVersion,
       electron: payload.desktop?.electron ?? null,
       chrome: payload.desktop?.chrome ?? null,
@@ -160,16 +153,4 @@ export function buildDiagnostics(
     about: part.about,
     text: text[part.name],
   }));
-}
-
-/** The version in the controller package, or unknown when the package file is not beside it. */
-export function readControllerVersion(): string {
-  try {
-    const value = JSON.parse(
-      readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
-    ) as { version?: unknown };
-    return typeof value.version === 'string' ? value.version.slice(0, 64) : 'unknown';
-  } catch {
-    return 'unknown';
-  }
 }
