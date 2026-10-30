@@ -167,6 +167,57 @@ function installedBiome() {
   };
 }
 
+// Returns the database to the shape a fresh database has at user_version 4, whatever later
+// migrations added. The expected shape comes from the first four migration files applied to a
+// temp database, so a new migration needs no edit here. Triggers go first, then indexes, then
+// virtual tables (which take their shadow tables along), then plain tables with the tables that
+// reference others dropped before the tables they reference. Foreign keys stay off meanwhile.
+function dropBeyondVersionFour(db: DatabaseSync, migrationsDirectory: string) {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-version-four-'));
+  const fresh = new DatabaseSync(join(directory, 'state.sqlite'));
+  try {
+    for (const file of readdirSync(migrationsDirectory)
+      .filter((name) => /^\d{3}-[a-z0-9-]+\.sql$/.test(name) && Number(name.slice(0, 3)) <= 4)
+      .sort())
+      fresh.exec(readFileSync(join(migrationsDirectory, file), 'utf8'));
+    const objects = (database: DatabaseSync) =>
+      database
+        .prepare(
+          "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
+        )
+        .all() as { type: string; name: string; sql: string }[];
+    const kept = new Set(objects(fresh).map((object) => `${object.type}:${object.name}`));
+    const extra = (type: string) =>
+      objects(db).filter((object) => object.type === type && !kept.has(`${type}:${object.name}`));
+    const foreignKeys = db.prepare('PRAGMA foreign_keys').get()?.foreign_keys;
+    db.exec('PRAGMA foreign_keys=OFF');
+    for (const trigger of extra('trigger')) db.exec(`DROP TRIGGER "${trigger.name}"`);
+    for (const index of extra('index')) db.exec(`DROP INDEX "${index.name}"`);
+    for (const table of extra('table').filter((object) => /^CREATE VIRTUAL/i.test(object.sql)))
+      db.exec(`DROP TABLE "${table.name}"`);
+    const tables = extra('table').map((object) => object.name);
+    const parents = new Map(
+      tables.map((name) => [
+        name,
+        (db.prepare(`PRAGMA foreign_key_list("${name}")`).all() as { table: string }[]).map(
+          (key) => key.table,
+        ),
+      ]),
+    );
+    while (tables.length) {
+      const next = tables.findIndex(
+        (name) => !tables.some((other) => other !== name && parents.get(other)?.includes(name)),
+      );
+      db.exec(`DROP TABLE "${tables.splice(next < 0 ? 0 : next, 1)[0]}"`);
+    }
+    db.exec(`PRAGMA foreign_keys=${foreignKeys ? 'ON' : 'OFF'}`);
+    db.exec('PRAGMA user_version=4');
+  } finally {
+    fresh.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
+}
+
 // Tabs differ from the layout the fixture writers produce, so their bytes carry a layout defect.
 const tabConfiguration =
   '{"formatter":{"indentStyle":"tab"},"linter":{"enabled":false},"assist":{"enabled":false}}\n';
@@ -5013,8 +5064,10 @@ test('an appointed native proposal is retained and applied once after every phas
           'utf8',
         ),
       );
-      controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TRIGGER chat_search_title_insert; DROP TRIGGER chat_search_title_update; DROP TRIGGER chat_search_task_delete; DROP TRIGGER chat_search_message; DROP TRIGGER chat_search_tool_started; DROP TRIGGER chat_search_tool_completed; DROP TABLE chat_search; DROP TABLE chat_search_docs; DROP TABLE chat_turns; DROP TABLE chat_threads; DROP TABLE task_operations; DROP TABLE activity_output; DROP TABLE combined_ref_intents; DROP TABLE combined_dispatches; DROP TABLE combined_members; DROP TABLE combined_groups; DROP TABLE conversation_entries; DROP TABLE task_conversations; DROP TABLE run_purposes; DROP TABLE local_control; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP INDEX events_task_cursor; DROP INDEX entities_kind_id; DROP INDEX task_project_id; DROP INDEX entities_task_id; DROP INDEX entities_run_id; PRAGMA user_version=4',
+      controller.store.db.exec('INSERT INTO native_processes SELECT * FROM native_processes_saved');
+      dropBeyondVersionFour(
+        controller.store.db,
+        new URL('../../migrations/', import.meta.url).pathname,
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);

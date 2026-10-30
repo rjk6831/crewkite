@@ -463,7 +463,9 @@ test('the migration indexes threads that exist before it, the way live writes in
       );
   });
   store.applyMigrations(migrations);
-  assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 18);
+  const applied = readdirSync(migrations).filter((name) => /^\d{3}-[a-z0-9-]+\.sql$/.test(name));
+  assert.ok(applied.length >= 18);
+  assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, applied.length);
   const migrated = docs(store);
   assert.deepEqual(found(search(store, 'src/totals')), [[taskId(1), ['path']]]);
   assert.deepEqual(found(search(store, 'changed one line')), [[taskId(1), ['tool']]]);
