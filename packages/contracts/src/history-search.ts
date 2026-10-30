@@ -24,7 +24,12 @@ export type ChatSearchKind = z.infer<typeof ChatSearchKindSchema>;
 
 export const SearchChatHistoryPayloadSchema = z.strictObject({
   /** Words, all of which have to appear in one place. Each needs three characters or more. */
-  query: z.string().trim().min(1).max(MAX_CHAT_SEARCH_QUERY),
+  query: z
+    .string()
+    .trim()
+    .min(1)
+    .max(MAX_CHAT_SEARCH_QUERY)
+    .refine((value) => !value.includes('\0'), 'A query holds no NUL character.'),
   /** Threads in the page. */
   limit: z.number().int().min(1).max(MAX_CHAT_SEARCH_THREADS).default(20),
   /** Hits listed under each thread. */

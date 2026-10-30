@@ -30,6 +30,7 @@ test('the search payload and its page keep the bounds the controller relies on',
       true,
     ],
     ['a blank query is refused', SearchChatHistoryPayloadSchema, { query: '   ' }, false],
+    ['a query with a NUL is refused', SearchChatHistoryPayloadSchema, { query: 'ab\0cd' }, false],
     [
       'a query over its length is refused',
       SearchChatHistoryPayloadSchema,
