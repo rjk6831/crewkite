@@ -462,6 +462,11 @@ export const LocalSetupSchema = z
     /** Memory the system reported available at the same read. Null when it could not be read. */
     availableMemoryBytes: RevisionSchema.nullable().optional(),
     selection: LocalModelSelectionSchema.nullable(),
+    /**
+     * One plain line from the controller that the view shows in place of the generic line for
+     * the reason, when this computer or the runtime needs the person to do something specific.
+     */
+    notice: z.string().min(1).max(512).optional(),
     reason: z
       .enum([
         'unconfigured',
