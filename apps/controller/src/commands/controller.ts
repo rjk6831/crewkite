@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
 } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
@@ -42,6 +43,7 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { readAnalytics } from '../chat/analytics.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
+import { exportThread } from '../chat/export.ts';
 import { McpRegistry } from '../chat/mcp-servers.ts';
 import { ProjectNotes } from '../chat/project-notes.ts';
 import { notesCommand, notesMutations } from '../chat/project-notes-command.ts';
@@ -1592,6 +1594,20 @@ export class Controller {
               ? { kind: 'chat-mentions', ...this.chat().completeMention(command.payload) }
               : { kind: 'chat-instructions', ...this.chat().readInstructions(command.payload) },
         };
+      case 'ExportChatThread': {
+        const exported = exportThread(
+          {
+            store: this.store,
+            projectPath: (projectId) => this.projectPath(projectId),
+            scratchDirectory: (taskId) => join(this.home, 'chat', taskId, 'scratch'),
+            homes: [homedir()],
+          },
+          command.payload,
+        );
+        return exported
+          ? { outcome: 'applied', data: { kind: 'chat-export', ...exported } }
+          : { outcome: 'blocked', reason: 'task-not-found' };
+      }
       case 'ReadChatPrompts':
       case 'SaveChatPrompt':
       case 'DeleteChatPrompt':
