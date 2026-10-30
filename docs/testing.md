@@ -271,14 +271,16 @@ Mac steps for the reference Mac:
 
 ## Project notes
 
-Project notes are short facts the controller stores for a project and sends with every turn. Four claims protect them.
+Project notes are short facts the controller stores for a project and sends with every turn. The claims below protect them.
 
-The size rule lives in a pure function, so one table in `packages/contracts/src/notes.test.ts` pins it. It covers no notes, a note at the cap, one byte over, multibyte text counted in bytes, and the 200-note count limit. The same file checks that note text refuses control characters and lone surrogates, that Save as note offers the selection or else the first paragraph, and that the Markdown export lists notes oldest first.
+The size rule lives in a pure function, so one table in `packages/contracts/src/notes.test.ts` pins it. It covers no notes, a note at the cap, one byte over, multibyte text counted in bytes, and the 200-note count limit. The same file checks that note text refuses control characters and lone surrogates, that Save as note offers the selection or else the first paragraph and never cuts a surrogate pair, and that the Markdown export lists notes oldest first with each note line in a block quote, so a note cannot open a section of its own.
 
 The store claims run on real SQLite in `apps/controller/src/chat/project-notes.test.ts`. A restart keeps the list, ordering is created time then id, an edit keeps its note in place, and the cap and count limits hold per project with a refusal reason for each case.
 
-The packet claims share one table in the same file. Notes reach all four families. A new session reads them in its system context, and a resumed session gets them in front of its message. The notes and the instruction files share 64 KiB, with the notes capped at 16 KiB, so the instruction files keep at least 48 KiB. The adapter tests already prove each family sends its system context on a new session, so this table stops at the request the controller builds.
+The packet claims run in the same file. Notes reach all four families. A new session reads them in its system context, and a resumed session gets them in front of its message only when they differ from the hash of the notes that session last received. One table sends six turns to each family: the first turn reads the notes in its context, two resumed turns with unchanged notes send none, an edited note goes again and goes once, and removing every note tells the session so. Another table checks the block for a session that held other notes, none, or was saved before notes existed. A resumed turn counts the block against the 96 KiB packet cap, so a 90 KiB reply from another family plus a changed 16 KiB list still fits. The notes and the instruction files share 64 KiB, with the notes capped at 16 KiB, so the instruction files keep at least 48 KiB. The adapter tests already prove each family sends its system context on a new session, so these tables stop at the request the controller builds.
 
-The command line claim in `apps/cli/src/chat/notes.test.ts` drives list, add and remove through a real controller socket and checks each refusal sentence and exit status.
+When a resume fails and a new session starts, the notes block is taken out of the message because the new session reads the notes in its system context. One row each in `apps/controller/src/providers/openai/chat.test.ts` and `apps/controller/src/providers/google/chat.test.ts` covers this.
 
-The migration in this lane applies in file order on a gap-free copy in these tests, so a renumber at integration changes nothing in them.
+The command line claim in `apps/cli/src/chat/notes.test.ts` drives list, add and remove through a real controller socket and checks each refusal sentence and exit status. A change answers with the project and its byte count, and the command line reads the list again.
+
+The migration for notes is number 020. Until migrations 018 and 019 from other lanes merge, the tests in `project-notes.test.ts` apply the migrations from a copy numbered without gaps, so they pass. The command line test starts a controller on the real migration folder, so it fails until 018 and 019 are present.
