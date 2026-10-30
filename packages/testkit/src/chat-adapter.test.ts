@@ -29,6 +29,7 @@ async function play(input: {
   steps: ChatScriptStep[];
   policy: ChatPermissionPolicy;
   grants?: ChatToolKind[];
+  readOnly?: boolean;
   /** The person's answer, given when the ask arrives. Absent leaves the ask open. */
   answer?: string;
 }) {
@@ -48,6 +49,7 @@ async function play(input: {
         scratch: { directory, base: directory, projectName: 'shop' },
         permissionPolicy: input.policy,
         permissionGrants: input.grants,
+        readOnly: input.readOnly,
       },
       (event) => {
         events.push(event);
@@ -81,6 +83,7 @@ test('a scripted ask guards the tool after it, and the answer or the thread poli
     steps: ChatScriptStep[];
     policy: ChatPermissionPolicy;
     grants?: ChatToolKind[];
+    readOnly?: boolean;
     answer?: string;
     callId: string;
     landed: boolean;
@@ -143,6 +146,16 @@ test('a scripted ask guards the tool after it, and the answer or the thread poli
       landed: false,
       choice: null,
       status: null,
+    },
+    {
+      claim: 'a read-only turn declines the ask even under allow-all',
+      steps: [editAsk, edit],
+      policy: 'allow-all',
+      readOnly: true,
+      callId: 'edit-1',
+      landed: false,
+      choice: 'deny',
+      status: 'denied',
     },
     {
       claim: 'allow-edits still waits for the person on a command',

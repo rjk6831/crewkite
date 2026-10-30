@@ -19,7 +19,8 @@ import type {
 // asks before it runs a call. The tool starts, the ask names its call, and the tool then runs or
 // reports that it was denied. The thread policy the controller passes answers the ask without
 // the person: allow-all allows it, allow-edits allows an edit, and a kind granted for the thread
-// is allowed. Any other ask waits for respondPermission.
+// is allowed. Any other ask waits for respondPermission. The ask offers Allow once and Deny only,
+// so a grant for the thread cannot be created through the fake, only read from the request.
 
 export type ChatScriptStep =
   /** Stream chunks for one text item. `complete: false` leaves the item open. */
