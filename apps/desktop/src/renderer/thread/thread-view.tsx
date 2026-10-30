@@ -28,6 +28,7 @@ import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { outputLimitLine } from './output-limit.ts';
 import { PlanCard } from './plan-card.tsx';
+import { ProjectNotesProvider } from './project-notes.tsx';
 import { QueuedList } from './queued-list.tsx';
 import {
   announcements,
@@ -74,7 +75,19 @@ function changeCount(items: ReturnType<typeof useThread>['items']) {
   return count;
 }
 
+/** The thread inside its project's notes, which the chip and Save as note read. */
 export function ThreadView({
+  projectId,
+  ...props
+}: Parameters<typeof ThreadBody>[0] & { projectId?: string }) {
+  return (
+    <ProjectNotesProvider source={props.source} projectId={projectId ?? null}>
+      <ThreadBody {...props} />
+    </ProjectNotesProvider>
+  );
+}
+
+function ThreadBody({
   source,
   task,
   projectName,

@@ -1,5 +1,6 @@
 import {
   AcceptChatChangesPayloadSchema,
+  AddProjectNotePayloadSchema,
   type ChatAttachment,
   ChatAttachmentSchema,
   type ChatBranchStatus,
@@ -24,9 +25,13 @@ import {
   DeleteChatPromptPayloadSchema,
   DeleteChatThreadPayloadSchema,
   DiscardChatChangePayloadSchema,
+  EditProjectNotePayloadSchema,
   HandoffChatThreadPayloadSchema,
   ImportChatAttachmentPayloadSchema,
+  normalizeNoteText,
   OpenChatPullRequestPayloadSchema,
+  type ProjectNotesRead,
+  ProjectNotesReadSchema,
   PushChatBranchPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
@@ -35,7 +40,9 @@ import {
   ReadChatPromptsPayloadSchema,
   ReadChatThreadPayloadSchema,
   ReadChatTurnEventsPayloadSchema,
+  ReadProjectNotesPayloadSchema,
   RefreshChatModelsPayloadSchema,
+  RemoveProjectNotePayloadSchema,
   RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   RetryChatTurnPayloadSchema,
@@ -184,6 +191,52 @@ async function promptList(source: ThreadSource, command: string, payload: unknow
   const { kind: _kind, ...rest } = (data ?? {}) as Record<string, unknown>;
   return SavedPromptsSchema.parse(rest);
 }
+
+/**
+ * A project's notes. Every change answers with the whole list, so the view never patches its own
+ * copy. The text is cleaned the way the CLI cleans it, and the controller checks it again.
+ */
+export const readNotes = (source: ThreadSource, projectId: string): Promise<ProjectNotesRead> =>
+  read(
+    source,
+    'ReadProjectNotes',
+    ReadProjectNotesPayloadSchema.parse({ projectId }),
+    ProjectNotesReadSchema,
+  );
+export const addNote = (
+  source: ThreadSource,
+  projectId: string,
+  text: string,
+): Promise<ProjectNotesRead> =>
+  read(
+    source,
+    'AddProjectNote',
+    AddProjectNotePayloadSchema.parse({ projectId, text: normalizeNoteText(text) }),
+    ProjectNotesReadSchema,
+  );
+export const editNote = (
+  source: ThreadSource,
+  projectId: string,
+  noteId: string,
+  text: string,
+): Promise<ProjectNotesRead> =>
+  read(
+    source,
+    'EditProjectNote',
+    EditProjectNotePayloadSchema.parse({ projectId, noteId, text: normalizeNoteText(text) }),
+    ProjectNotesReadSchema,
+  );
+export const removeNote = (
+  source: ThreadSource,
+  projectId: string,
+  noteId: string,
+): Promise<ProjectNotesRead> =>
+  read(
+    source,
+    'RemoveProjectNote',
+    RemoveProjectNotePayloadSchema.parse({ projectId, noteId }),
+    ProjectNotesReadSchema,
+  );
 
 export const sendMessage = (
   source: ThreadSource,

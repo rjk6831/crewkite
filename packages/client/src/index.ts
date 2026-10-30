@@ -61,6 +61,8 @@ export interface DesktopSource {
   exportDiagnostics?(input: { taskId?: string }): Promise<'saved' | 'cancelled'>;
   /** Hide the line about the last unexpected close. */
   dismissCrash?(): Promise<void>;
+  /** Save one project's notes as a Markdown file. Main reads them and shows the dialog. */
+  saveNotes?(projectId: string): Promise<'saved' | 'cancelled'>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;

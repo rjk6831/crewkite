@@ -50,6 +50,7 @@ import { canSend, isMacPlatform, shortcutFor } from './composer-rules.ts';
 import { deliveryNote, deliveryOf } from './file-fit.ts';
 import { InstructionChip } from './instruction-chip.tsx';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
+import { NotesChip } from './project-notes.tsx';
 import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
 import { slashEffect } from './slash-actions.ts';
 
@@ -543,7 +544,12 @@ export function Composer({
             field.current?.focus();
           }}
         />
-        {taskId && <InstructionChip source={source} taskId={taskId} refreshKey={running} />}
+        {taskId && (
+          <div className="th-chip-row">
+            <InstructionChip source={source} taskId={taskId} refreshKey={running} />
+            <NotesChip refreshKey={running} />
+          </div>
+        )}
         {menuOpen && (
           <CompleteMenu
             id="th-complete"

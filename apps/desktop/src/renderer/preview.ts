@@ -3,6 +3,7 @@ import {
   type CommandResult,
   canonicalJson,
   type Event,
+  PROJECT_NOTES_BYTES,
   type ProjectPageRequest,
   type Task,
   type TaskPageRequest,
@@ -68,8 +69,45 @@ export function createPreviewSource(): DesktopSource {
       .map(([name, body]) => ({ name, body }))
       .sort((a, b) => (a.name < b.name ? -1 : 1)),
   });
+  const notes = new Map<string, { id: string; text: string; createdAt: string }[]>();
+  const noteList = (projectId: string) => {
+    const rows = notes.get(projectId) ?? [];
+    return {
+      kind: 'project-notes',
+      projectId,
+      projectName: state.projects.find(({ id }) => id === projectId)?.name ?? 'Project',
+      notes: rows,
+      bytes: rows.reduce((total, row) => total + row.text.length + 3, 0),
+      capBytes: PROJECT_NOTES_BYTES,
+    };
+  };
+  function noteCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
+    if (
+      !['ReadProjectNotes', 'AddProjectNote', 'EditProjectNote', 'RemoveProjectNote'].includes(name)
+    )
+      return null;
+    const projectId = String(payload.projectId);
+    const rows = notes.get(projectId) ?? [];
+    if (name === 'AddProjectNote')
+      rows.push({
+        id: `not_${String(rows.length + 1).padStart(26, '0')}`,
+        text: String(payload.text),
+        createdAt: new Date(0).toISOString(),
+      });
+    if (name === 'EditProjectNote')
+      for (const row of rows) if (row.id === payload.noteId) row.text = String(payload.text);
+    if (name === 'RemoveProjectNote')
+      notes.set(
+        projectId,
+        rows.filter((row) => row.id !== payload.noteId),
+      );
+    else notes.set(projectId, rows);
+    return { outcome: 'applied', data: noteList(projectId) } as CommandResult;
+  }
   function composerCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
     const applied = (data: unknown) => ({ outcome: 'applied', data }) as CommandResult;
+    const noted = noteCommand(name, payload);
+    if (noted) return noted;
     const taskId = typeof payload.taskId === 'string' ? payload.taskId : fixtures.task.id;
     if (name === 'CompleteChatMention')
       return applied({

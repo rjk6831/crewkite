@@ -85,3 +85,19 @@
 .th-note-lines {
   white-space: pre-line;
 }
+
+.th-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0 6px;
+}
+.th-notes-list {
+  max-height: 220px;
+  margin: 0 0 6px;
+  padding-left: 18px;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

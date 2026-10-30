@@ -264,3 +264,8 @@
   flex-wrap: wrap;
   gap: 8px;
 }
+
+.st-note-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

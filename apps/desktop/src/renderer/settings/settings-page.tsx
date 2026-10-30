@@ -8,6 +8,7 @@ import { GeneralCard } from './general-card.tsx';
 import { GoogleCard } from './google-card.tsx';
 import { LocalCard } from './local-card.tsx';
 import { McpCard } from './mcp-card.tsx';
+import { NotesCard } from './notes-card.tsx';
 import { OpenAiCard } from './openai-card.tsx';
 import { PromptsCard } from './prompts-card.tsx';
 import { useProviderActions } from './provider-actions.ts';
@@ -80,6 +81,7 @@ export function SettingsPage({
         <McpCard />
         <ExtensionsCard source={workspace.source} />
         {workspace.source && <PromptsCard source={workspace.source} />}
+        {workspace.source && <NotesCard source={workspace.source} projects={workspace.projects} />}
       </div>
     </main>
   );

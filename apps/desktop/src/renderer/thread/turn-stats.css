@@ -59,3 +59,37 @@
 .th-reply-said {
   font-size: 11px;
 }
+
+/* Save as note: the editor opens above the reply menu and stays inside the thread's width. */
+.th-note-editor {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 8px);
+  z-index: 20;
+  display: grid;
+  gap: 6px;
+  width: min(420px, 80vw);
+  padding: 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+}
+.th-note-editor label {
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.th-note-editor textarea {
+  width: 100%;
+  resize: vertical;
+  font-size: 12.5px;
+}
+.th-note-editor-foot {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+}
+.th-note-editor-foot .th-muted {
+  margin-right: auto;
+}

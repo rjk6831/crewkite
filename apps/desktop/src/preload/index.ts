@@ -167,6 +167,14 @@ const bridge: DesktopSource = {
       throw plain(failure);
     }
   },
+  saveNotes: async (projectId) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-notes', projectId);
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
   dismissCrash: async () => {
     await ipcRenderer.invoke('crewkite:dismiss-crash');
   },

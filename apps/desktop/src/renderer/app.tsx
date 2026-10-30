@@ -1059,6 +1059,7 @@ export function App() {
             key={task.id}
             source={threadSource}
             task={task}
+            projectId={task.projectId}
             projectName={projects.find(({ id }) => id === task.projectId)?.name ?? 'Project'}
             header={header}
             preview={preview}

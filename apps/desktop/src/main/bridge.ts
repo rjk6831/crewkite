@@ -27,6 +27,8 @@ import {
   MAX_FRAME_BYTES,
   type McpServerInput,
   type McpState,
+  projectNotesMarkdown,
+  ReadProjectNotesPayloadSchema,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
@@ -189,6 +191,7 @@ export async function installBridge(
     'open-link',
     'attach',
     'open-attachment',
+    'save-notes',
     'local-token-status',
     'local-token-remember',
     'local-token-forget',
@@ -294,6 +297,10 @@ export async function installBridge(
         'ReadChatPrompts',
         'SaveChatPrompt',
         'DeleteChatPrompt',
+        'ReadProjectNotes',
+        'AddProjectNote',
+        'EditProjectNote',
+        'RemoveProjectNote',
         'RefreshChatModels',
         'ReadChatBranchStatus',
         'PushChatBranch',
@@ -626,6 +633,49 @@ export async function installBridge(
       );
       try {
         writeFileSync(file, promptsToJson(read.data.prompts));
+        fsyncSync(file);
+      } finally {
+        closeSync(file);
+      }
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return 'saved';
+  });
+  // A project's notes are the controller's. Main reads them, so the page never supplies the text,
+  // and the person picks where the Markdown file goes.
+  ipcMain.handle('crewkite:save-notes', async (event, projectId: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const payload = ReadProjectNotesPayloadSchema.safeParse({ projectId });
+    if (!payload.success) throw new Error('Choose a project to export.');
+    const read = await send(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'ReadProjectNotes',
+        payload: payload.data,
+      }),
+    );
+    if (!applied(read) || read.data?.kind !== 'project-notes')
+      throw new Error('The notes could not be read.');
+    const { projectName, notes } = read.data;
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Export project notes',
+      defaultPath: `${projectName.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 80) || 'project'}-notes.md`,
+      filters: [{ name: 'Markdown', extensions: ['md'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      const file = openSync(
+        choice.filePath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(file, projectNotesMarkdown(projectName, notes));
         fsyncSync(file);
       } finally {
         closeSync(file);
