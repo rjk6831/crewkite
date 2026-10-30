@@ -1,0 +1,74 @@
+name: Bug report
+description: Report something that does not work as the docs say
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for the report. Never paste a token, a key, a password or the contents of a credential file into this form. If a detail might hold a secret, leave it out and say so.
+  - type: input
+    id: version
+    attributes:
+      label: CrewKite version
+      description: Run `crewkite --version` and paste the output.
+      placeholder: "0.1.0"
+    validations:
+      required: true
+  - type: input
+    id: macos
+    attributes:
+      label: macOS version
+      description: Apple menu, About This Mac. Name the platform if you are on Linux.
+      placeholder: "macOS 15.1 on Apple silicon"
+    validations:
+      required: true
+  - type: dropdown
+    id: family
+    attributes:
+      label: Family
+      description: The family the thread was using when the problem happened.
+      options:
+        - OpenAI
+        - Anthropic
+        - Google
+        - Local
+        - More than one
+        - Not tied to a family
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: What you did, in order.
+      placeholder: |
+        1. Open a thread in a project
+        2. Send a message
+        3. ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected
+      description: What you expected to happen.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual
+      description: What happened. Paste the exact message the app showed.
+    validations:
+      required: true
+  - type: dropdown
+    id: diagnostics
+    attributes:
+      label: Diagnostics bundle
+      description: Settings > General > Diagnostics, or `crewkite diagnostics export <folder>`, writes a bundle with secrets, home paths and email addresses removed. Read it before you share it.
+      options:
+        - I can share a diagnostics bundle if you ask
+        - I will attach a diagnostics bundle to this issue
+        - I cannot share a diagnostics bundle
+    validations:
+      required: true
