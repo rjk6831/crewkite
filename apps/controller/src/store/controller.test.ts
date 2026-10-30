@@ -7834,6 +7834,8 @@ test('google quota authority survives retries and restart while sharing one oper
   const context = await setup(t, options, () => controller.close());
   controller = context.controller;
   t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
+  // These rows protect quota authority. The gate has its own claim in google-terms.test.ts.
+  await acknowledgeGoogleTerms(context);
   const refresh = () => context.command('ObserveUsage', { family: 'google' }, 0);
   assert.equal(controller.snapshot().usageReaders[0]?.available, true);
   assert.equal('enabled' in controller.snapshot().usageReaders[0], false);
@@ -8295,6 +8297,7 @@ test('google quota authority survives retries and restart while sharing one oper
     now: context.clock.now,
     id: context.id,
   });
+  await acknowledgeGoogleTerms({ controller, command: context.command });
   const interrupted = refresh();
   controller.store.transaction(() => {
     controller.store.beginGoogleMetadata(

@@ -20,9 +20,18 @@ test('a Google connection step is refused until the current terms are acknowledg
     result.reason === 'google-terms-not-acknowledged';
 
   assert.ok(refused(await connect()), 'a first connection without an acknowledgement is refused');
-  const usage = () =>
-    controller.execute(command('ObserveUsage', { family: 'google' }, 0), 'local-owner');
+  const read = command('ObserveUsage', { family: 'google' }, 0);
+  const usage = () => controller.execute(read, 'local-owner');
   assert.ok(refused(await usage()), 'a Google usage read is refused too');
+  // The gate answers before the receipt path, so a refusal stores nothing and a changed
+  // command under the same key meets the gate as well, never an idempotency conflict.
+  assert.equal(controller.store.receipt(read.key), undefined, 'a refusal stores no receipt');
+  assert.ok(
+    refused(
+      await controller.execute({ ...read, actor: { id: 'other', kind: 'cli' } }, 'local-owner'),
+    ),
+    'a changed command under the same key meets the gate first',
+  );
   assert.equal(controller.refreshGoogleUsage('start'), undefined, 'so is a start-up read');
   const prepare = { command: 'PrepareNativeRun', payload: { profileId: 'google-acp-v1' } } as never;
   const start = { command: 'StartRun', payload: { runId: 'run_x' } } as never;
@@ -47,6 +56,9 @@ test('a Google connection step is refused until the current terms are acknowledg
     'start passes',
   );
   assert.ok(!refused(await connect()), 'the current acknowledgement lets the step reach setup');
+  const reread = await usage();
+  assert.ok(!refused(reread), 'the refused key reaches the read after acknowledgement');
+  assert.notEqual(reread.reason, 'idempotency-key-reused');
 
   const setupRecord = controller.store.googleAcpSetup();
   controller.store.transaction(() =>

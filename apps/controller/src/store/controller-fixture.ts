@@ -535,6 +535,9 @@ async function nativeSetup(
     `${mode}/${targetPath}/setup`,
     Promise.resolve().then(() => setup(t, nativeOptions, close)),
   );
+  // A Google writer row prepares a Google run, which the terms gate holds until the person
+  // acknowledges the current text. These rows protect the writer, so the person has done that.
+  if (google) await acknowledgeGoogleTerms(context);
   if (targetPath !== 'net.mjs') {
     const files = [
       { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },
