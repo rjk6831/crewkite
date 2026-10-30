@@ -3,6 +3,7 @@ import {
   closeSync,
   constants,
   copyFileSync,
+  existsSync,
   fstatSync,
   lstatSync,
   mkdirSync,
@@ -75,6 +76,7 @@ export function laneFolder(threadScratch: string, sliceId: number): string {
 
 export const laneCopy = (folder: string) => join(folder, 'copy');
 const startFile = (folder: string) => join(folder, 'start.json');
+const ownFile = (folder: string) => join(folder, 'own.json');
 
 /**
  * Make a slice's scratch copy: the thread's base through `copyScratch`, then every file the
@@ -108,24 +110,88 @@ export function prepareLaneCopy(input: {
   writeFileSync(startFile(folder), JSON.stringify(start), { mode: 0o600 });
 }
 
-export type Replay = { applied: string[]; conflicts: string[] };
+type Owned = { own: string[]; seen: Record<string, State> };
+
+/**
+ * Record what one step of a slice's review chain changed in the lane copy. A path the builder or
+ * a fixer changed is the slice's own. A path only a review changed is not, and the replay leaves
+ * it out, so a reviewer cannot change other slices' merged work or any other path.
+ */
+export function recordStep(input: {
+  root: string;
+  base: string;
+  folder: string;
+  writer: boolean;
+}): void {
+  const { folder } = input;
+  const { lane, startOf, changed } = laneState(input.root, input.base, folder);
+  const owned: Owned = existsSync(ownFile(folder))
+    ? (JSON.parse(readFileSync(ownFile(folder), 'utf8')) as Owned)
+    : { own: [], seen: {} };
+  const was = (path: string) => (path in owned.seen ? owned.seen[path] : startOf(path));
+  const moved = [...new Set([...changed, ...Object.keys(owned.seen)])].filter(
+    (path) => !same(stateOf(lane.get(path)), was(path)),
+  );
+  const own = input.writer ? [...new Set([...owned.own, ...moved])].sort() : owned.own;
+  const seen = Object.fromEntries(changed.map((path) => [path, stateOf(lane.get(path))]));
+  writeFileSync(ownFile(folder), JSON.stringify({ own, seen } satisfies Owned), { mode: 0o600 });
+}
+
+/** `dropped` holds the paths only a review changed, outside the slice's own changes. */
+export type Replay = { applied: string[]; conflicts: string[]; dropped: string[] };
 
 /**
  * Put a slice's changes on the thread copy. A path the slice changed is written when the thread
  * copy still holds what the slice started from, skipped when the thread copy already matches the
- * slice, and a conflict otherwise. Clean paths are written even when others conflict, so the
- * resolve turn has only the conflicts left to merge. A path that would lead out of the thread
- * copy through a link counts as a conflict.
+ * slice, and a conflict otherwise. A path that would lead out of the thread copy through a link
+ * counts as a conflict. A slice with any conflict writes nothing, so a resolve turn that fails
+ * leaves the thread copy as the finished slices left it. After the resolve turn, `resolved`
+ * writes the clean paths and leaves each path the thread copy changed as the orchestrator left
+ * it. A path only a review changed, outside the slice's own changes, is dropped.
  */
 export function replayLane(input: {
   root: string;
   base: string;
   threadScratch: string;
   folder: string;
+  resolved?: boolean;
 }): Replay {
   const { root, base, threadScratch, folder } = input;
-  const plan = scratchPlan(root, base);
+  const { plan, lane, startOf, changed } = laneState(root, base, folder);
+  // A lane with no review chain records nothing, and all it changed is its own.
+  const own = existsSync(ownFile(folder))
+    ? new Set((JSON.parse(readFileSync(ownFile(folder), 'utf8')) as Owned).own)
+    : null;
+  const thread = byPath(hashCandidateFiles(threadScratch, root, plan));
+  const clean: string[] = [];
+  const conflicts: string[] = [];
+  const dropped: string[] = [];
+  for (const path of changed) {
+    const mine = stateOf(lane.get(path));
+    const theirs = stateOf(thread.get(path));
+    if (same(theirs, mine)) continue;
+    if (own && !own.has(path)) {
+      dropped.push(path);
+      continue;
+    }
+    if (!same(theirs, startOf(path)) || !inside(threadScratch, path)) {
+      if (!input.resolved) conflicts.push(path);
+      continue;
+    }
+    clean.push(path);
+  }
+  if (conflicts.length) return { applied: [], conflicts, dropped };
   const copy = laneCopy(folder);
+  for (const path of clean) {
+    const mine = lane.get(path);
+    put(threadScratch, path, mine ? join(copy, path) : null, mine?.mode);
+  }
+  return { applied: clean, conflicts, dropped };
+}
+
+/** The lane copy by path, where it started, and the paths it changed since, sorted. */
+function laneState(root: string, base: string, folder: string) {
+  const plan = scratchPlan(root, base);
   const start = new Map(
     Object.entries(JSON.parse(readFileSync(startFile(folder), 'utf8')) as Record<string, State>),
   );
@@ -135,28 +201,13 @@ export function replayLane(input: {
     const file = baseOf.get(path);
     return file ? { oid: file.oid, mode: file.mode } : null;
   };
-  const lane = byPath(hashCandidateFiles(copy, root, plan));
-  const thread = byPath(hashCandidateFiles(threadScratch, root, plan));
+  const lane = byPath(hashCandidateFiles(laneCopy(folder), root, plan));
   const paths = new Set([
     ...changedPaths(plan, [...lane.values()]).map((entry) => entry.path),
     ...start.keys(),
   ]);
-  const applied: string[] = [];
-  const conflicts: string[] = [];
-  for (const path of [...paths].sort()) {
-    const mine = stateOf(lane.get(path));
-    const from = startOf(path);
-    if (same(mine, from)) continue;
-    const theirs = stateOf(thread.get(path));
-    if (same(theirs, mine)) continue;
-    if (!same(theirs, from) || !inside(threadScratch, path)) {
-      conflicts.push(path);
-      continue;
-    }
-    put(threadScratch, path, mine ? join(copy, path) : null, mine?.mode);
-    applied.push(path);
-  }
-  return { applied, conflicts };
+  const changed = [...paths].sort().filter((path) => !same(stateOf(lane.get(path)), startOf(path)));
+  return { plan, lane, startOf, changed };
 }
 
 const FILE_CHARACTERS = 16_000;
@@ -183,7 +234,7 @@ export function resolveBrief(input: {
     return `${path}, as the slice left it:\n\n\`\`\`\n${text.replace(/\n$/, '')}\n\`\`\``;
   });
   return [
-    `Slice ${input.slice.id} (${input.slice.title}) finished, and the thread copy changed the same files after the slice started. Its other files are merged.`,
+    `Slice ${input.slice.id} (${input.slice.title}) finished, and the thread copy changed the same files after the slice started. Its other files merge into the scratch copy when your turn ends.`,
     'Merge these files by hand in the scratch copy. Keep what the scratch copy holds now and add what the slice changed. Read each file before you change it.',
     input.brief ? `The slice's brief:\n\n${input.brief}` : '',
     files.join('\n\n'),

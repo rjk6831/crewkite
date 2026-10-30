@@ -350,3 +350,12 @@ CI runs the full suite on macOS 15 arm64, and a Linux container reports the clai
 The project command claim has no platform scope. Its shell row copies a regular file named `sh`, because `/bin/sh` is a link on Linux and the identity check refuses a link before the shell check runs.
 
 The acceptance claim and the ACP scratch permission claim skip when the Node runtime that runs the tests belongs to another user. Both use that runtime as the native client, and the controller refuses a client that the running user does not own. This is the case in a container that runs as root with a Node install owned by a service account. Both pass when the runtime belongs to the user who runs the tests.
+
+## Plan slice review leftovers
+
+Two rows extend the parallel plan slice claims.
+
+- The replay table in the plan tests runs on a synthetic repository with a real thread copy and real slice copies. A builder with no review chain replays every path it changed. A review that edits another slice's merged file and adds a file has both left out, while its edit to a path the builder changed stays. A fix after a review counts as the slice's own change. A slice with a conflict writes none of its clean paths, and the replay after a resolve turn ends done writes them and keeps the orchestrator's merge. Without that second replay the thread copy holds neither.
+- The read-only row in the service lane test replaces a base link in the thread copy before the slice starts. The slice's ask packet lists no changed files, since the slice copy never holds that change.
+
+These rows use scripted adapters. They do not cover a live reviewer that edits outside its slice.

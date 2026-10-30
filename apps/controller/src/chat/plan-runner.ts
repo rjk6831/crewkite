@@ -26,6 +26,7 @@ import {
   order,
   prepareLaneCopy,
   readySlices,
+  recordStep,
   replayLane,
   resolveBrief,
 } from './plan-lanes.ts';
@@ -422,15 +423,31 @@ export class PlanRunner {
     }
     const next = (change: Partial<Lane>) => ({ [id]: { lane: { ...lane, ...change } } });
     if (lane.step === 'resolve') {
-      this.put(task, thread, plan, {
-        [id]: { status: 'done', turnId: lane.build, lane: undefined, conflicts: undefined },
-      });
-      this.host.line(task, `Slice ${id} finished: the orchestrator merged it in the thread copy.`);
-      return true;
+      // The slice's clean paths go in only now, beside the conflicts the orchestrator merged.
+      const after = this.merge(task, thread, slice, false, true);
+      return after.plan?.phase === 'running';
     }
+    const reviewer = thread.crew?.members.some((member) => member.role === 'reviewer');
+    const chain = !slice.readOnly && reviewer && thread.flightMode !== 'manual';
+    // A slice's own changes are what its builder and fixes changed. What only a review changed,
+    // such as another slice's merged work in this copy, stays out of the replay.
+    if (lane.step !== 'build' || chain)
+      try {
+        const root = this.host.projectPath(task);
+        if (!root || !thread.base) throw Error('The project is no longer registered.');
+        recordStep({
+          root,
+          base: thread.base,
+          folder: laneFolder(this.host.scratchDirectory(task.id), id),
+          writer: lane.step !== 'review',
+        });
+      } catch (error) {
+        this.put(task, thread, plan, { [id]: { status: 'failed', lane: undefined } });
+        const why = error instanceof Error ? ` ${error.message}` : '';
+        this.halt(task, `slice ${id} could not record its changes.${why}`.replace(/\.$/, ''), true);
+        return false;
+      }
     if (lane.step === 'build') {
-      const reviewer = thread.crew?.members.some((member) => member.role === 'reviewer');
-      const chain = !slice.readOnly && reviewer && thread.flightMode !== 'manual';
       this.put(task, thread, plan, next(chain ? { step: 'review', pending: true } : merge));
       return true;
     }
@@ -611,9 +628,16 @@ export class PlanRunner {
 
   /**
    * Replay a finished slice onto the thread copy. A conflict blocks it for the orchestrator, or,
-   * while the plan stops, for the card to run again.
+   * while the plan stops, for the card to run again, and a blocked slice writes nothing until
+   * its resolve turn ends done. `resolved` replays after that turn.
    */
-  private merge(task: Task, thread: ChatThread, slice: Slice, stopping = false): ChatThread {
+  private merge(
+    task: Task,
+    thread: ChatThread,
+    slice: Slice,
+    stopping = false,
+    resolved = false,
+  ): ChatThread {
     const plan = thread.plan as ChatPlanState;
     const lane = slice.lane as Lane;
     const id = slice.id;
@@ -623,12 +647,13 @@ export class PlanRunner {
     try {
       if (!root || !thread.base) throw Error('The project is no longer registered.');
       replay = slice.readOnly
-        ? { applied: [], conflicts: [] }
+        ? { applied: [], conflicts: [], dropped: [] }
         : replayLane({
             root,
             base: thread.base,
             threadScratch: this.host.scratchDirectory(task.id),
             folder,
+            resolved,
           });
     } catch (error) {
       const failed = this.put(task, thread, plan, { [id]: { status: 'failed', lane: undefined } });
@@ -637,16 +662,21 @@ export class PlanRunner {
       this.halt(task, `slice ${id} could not merge.${why}`.replace(/\.$/, ''), true);
       return this.host.thread(task.id);
     }
-    const { applied, conflicts } = replay;
+    const { applied, conflicts, dropped } = replay;
     if (!conflicts.length) {
       const saved = this.put(task, thread, plan, {
-        [id]: { status: 'done', turnId: lane.build, lane: undefined },
+        [id]: { status: 'done', turnId: lane.build, lane: undefined, conflicts: undefined },
       });
+      const left = dropped.length
+        ? ` Left out ${plural(dropped.length, 'path', 'paths')} the review chain changed outside the slice's own changes: ${listedConflicts(dropped).join(', ')}${dropped.length > listedConflicts(dropped).length ? ' and more' : ''}.`
+        : '';
       this.host.line(
         task,
         slice.readOnly
           ? `Slice ${id} finished: it only read.`
-          : `Slice ${id} finished: ${plural(applied.length, 'file', 'files')} merged.`,
+          : resolved
+            ? `Slice ${id} finished: the orchestrator merged it in the thread copy.${left}`
+            : `Slice ${id} finished: ${plural(applied.length, 'file', 'files')} merged.${left}`,
       );
       return saved;
     }

@@ -2447,6 +2447,18 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       files: {},
       unplugged: true,
     },
+    {
+      // The thread copy replaced a base link, which never reaches a slice copy. The read-only
+      // slice's packet lists what its own copy changed against the base, so it lists nothing.
+      name: "a read-only slice's packet carries its own copy's diff, not the thread copy's",
+      slices: [{ ...slice(1, 'easy'), readOnly: true }],
+      openai: [],
+      local: [[reply('Read it.')]],
+      line: 'Crew finished: 1 slice, 0 reviews, 0 fixes.',
+      card: ['finished', 'done'],
+      files: { 'NOTES.md': 'a file now\n' },
+      linked: true,
+    },
   ];
   for (const row of rows) {
     const now = createTestClock().now();
@@ -2460,6 +2472,10 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       ...adapter,
       startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
         held[request.turnId] = existsSync(join(request.scratch.directory, 'a.txt'));
+        if ('linked' in row && request.role === 'orchestrator') {
+          rmSync(join(request.scratch.directory, 'NOTES.md'));
+          writeFileSync(join(request.scratch.directory, 'NOTES.md'), 'a file now\n');
+        }
         return adapter.startTurn(request, emit);
       },
     });
@@ -2474,6 +2490,23 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       localSliceFits: () => true,
     });
     const { store, service, taskId } = thread;
+    if ('linked' in row) {
+      // The base gains a link to net.mjs, committed without touching the checkout.
+      const repo = (args: string[], input?: string) =>
+        git(thread.root, args, input, {
+          name: 'Fixture',
+          email: 'fixture@example.invalid',
+          at: '2026-10-15T18:00:00Z',
+        })
+          .toString('utf8')
+          .trim();
+      const blob = repo(['hash-object', '-w', '--stdin'], 'net.mjs');
+      const tree = repo(
+        ['mktree'],
+        `${repo(['ls-tree', 'HEAD'])}\n120000 blob ${blob}\tNOTES.md\n`,
+      );
+      repo(['update-ref', 'refs/heads/main', repo(['commit-tree', tree, '-p', 'HEAD'], 'link\n')]);
+    }
     const crew: ChatCrew = {
       name: 'Plan crew',
       members: [
@@ -2608,6 +2641,16 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       const stopped = read.turns.find((turn) => turn.slice === 1);
       assert.equal(stopped?.state, 'stopped', row.name);
       assert.ok(lines.includes('Slice 2 finished: 1 file merged.'), row.name);
+    }
+    if ('linked' in row) {
+      const asked = local.requests.at(-1);
+      assert.equal(asked?.role, 'ask', row.name);
+      assert.ok(asked?.scratch.directory.endsWith(join('slices', '1', 'copy')), row.name);
+      assert.match(
+        asked?.prompt ?? '',
+        /^Files changed in the scratch copy against the base commit:\nNo files changed yet\.$/m,
+        row.name,
+      );
     }
     if ('unplugged' in row) {
       assert.equal(read.turns.find((turn) => turn.slice === 1)?.state, 'stopped', row.name);

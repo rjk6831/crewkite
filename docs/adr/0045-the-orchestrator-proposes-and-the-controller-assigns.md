@@ -84,3 +84,7 @@ Consequences of this amendment:
 - A shell command that the thread's policy allows can still name a path outside the slice's copy. The working folder, the thread tools and the automatic answers are bound to the copy, and the other copies are not named to the model.
 - The orchestrator's resolve turn counts as a fix in the closing line.
 - The lanes, the replay and the restart line have fixture coverage and no live run on record.
+
+2026-10-31: A blocked slice writes none of its paths to the thread's copy until its resolve turn ends done. The clean paths then merge beside the conflicts the orchestrator merged. When the resolve turn fails or stops, or the plan stops with the slice blocked, the thread's copy holds only the finished slices' work, so no state reaches Accept that the checks and the challenger did not read. I chose this over running the checks and the challenger after a failed resolve because a halt merges only finished slices and runs neither of them, and a blocked slice is not finished. The resolve turn's own edits in the thread's copy stay, as any stopped fixer's do.
+
+2026-10-31: A slice's own changes are the paths its builder and its fixes changed in its copy. The replay leaves out a path only a review changed, such as another slice's merged work in that copy, and the finished line names what it left out. The writer side is confined the same way, at the copy and at replay, so the reviewer is confined at replay too. A read-only slice's packet lists its own copy's diff against the base.

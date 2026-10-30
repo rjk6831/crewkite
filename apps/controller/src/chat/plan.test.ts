@@ -1,4 +1,7 @@
 import assert from 'node:assert/strict';
+import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import type {
   ChatCatalogEntry,
@@ -7,8 +10,16 @@ import type {
   ChatPlan,
   ChatPlanSlice,
 } from '@crewkite/contracts';
+import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
-import { readySlices } from './plan-lanes.ts';
+import {
+  laneCopy,
+  laneFolder,
+  prepareLaneCopy,
+  readySlices,
+  recordStep,
+  replayLane,
+} from './plan-lanes.ts';
 
 const NOW = Date.parse('2026-10-28T00:00:00.000Z');
 const hours = (value: number) => new Date(NOW + value * 3_600_000).toISOString();
@@ -319,4 +330,103 @@ test('ready slices start together with every dependency done, one per family, no
       row.ready,
       row.name,
     );
+});
+
+test('a slice replays only its own changes, and a blocked slice writes nothing until it is resolved', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-lanes-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const repository = createSyntheticRepository(join(directory, 'demo-shop'));
+  const root = repository.directory;
+  const base = repository.base;
+  // The thread copy is the base plus slice 1's merged work, a.txt.
+  const threadScratch = join(directory, 'chat', 'scratch');
+  cpSync(root, threadScratch, { recursive: true, filter: (path) => !path.endsWith('/.git') });
+  writeFileSync(join(threadScratch, 'a.txt'), 'slice one\n');
+  const at = (path: string) =>
+    existsSync(join(threadScratch, path)) ? readFileSync(join(threadScratch, path), 'utf8') : null;
+  type Replayed = { applied: string[]; conflicts: string[]; dropped: string[] };
+  type Step = { step: 'build' | 'review' | 'fix'; writes: Record<string, string> };
+  const rows: {
+    name: string;
+    steps: Step[];
+    /** The thread copy changes these paths after the slice copy was made. */
+    thread?: Record<string, string>;
+    /** What the orchestrator's resolve turn writes in the thread copy. */
+    resolve?: Record<string, string>;
+    want: Replayed;
+    after?: Replayed;
+    files: Record<string, string | null>;
+  }[] = [
+    {
+      name: 'a builder with no review chain replays everything it changed',
+      steps: [{ step: 'build', writes: { 'b.txt': 'two\n' } }],
+      want: { applied: ['b.txt'], conflicts: [], dropped: [] },
+      files: { 'a.txt': 'slice one\n', 'b.txt': 'two\n' },
+    },
+    {
+      // Ownership is by path: a path the builder changed stays the slice's own.
+      name: "a reviewer's edits outside the slice's own paths are left out, its merged file and a new one",
+      steps: [
+        { step: 'build', writes: { 'b.txt': 'two\n' } },
+        {
+          step: 'review',
+          writes: { 'a.txt': 'reviewer\n', 'b.txt': 'reviewed\n', 'e.txt': 'extra\n' },
+        },
+      ],
+      want: { applied: ['b.txt'], conflicts: [], dropped: ['a.txt', 'e.txt'] },
+      files: { 'a.txt': 'slice one\n', 'b.txt': 'reviewed\n', 'e.txt': null },
+    },
+    {
+      name: "a fix after a review counts as the slice's own change, and the review's edit stays out",
+      steps: [
+        { step: 'build', writes: { 'b.txt': 'two\n' } },
+        { step: 'review', writes: { 'a.txt': 'reviewer\n' } },
+        { step: 'fix', writes: { 'b.txt': 'two fixed\n' } },
+      ],
+      want: { applied: ['b.txt'], conflicts: [], dropped: ['a.txt'] },
+      files: { 'a.txt': 'slice one\n', 'b.txt': 'two fixed\n' },
+    },
+    {
+      name: 'a conflict writes none of the clean paths, and the resolve then writes them',
+      steps: [{ step: 'build', writes: { 'net.mjs': 'slice\n', 'c.txt': 'clean\n' } }],
+      thread: { 'net.mjs': 'thread\n' },
+      resolve: { 'net.mjs': 'merged\n' },
+      want: { applied: [], conflicts: ['net.mjs'], dropped: [] },
+      after: { applied: ['c.txt'], conflicts: [], dropped: [] },
+      files: { 'net.mjs': 'merged\n', 'c.txt': 'clean\n' },
+    },
+    {
+      name: 'a resolve that never ends done leaves the thread copy without the clean paths',
+      steps: [{ step: 'build', writes: { 'net.mjs': 'slice\n', 'c.txt': 'clean\n' } }],
+      thread: { 'net.mjs': 'thread\n' },
+      want: { applied: [], conflicts: ['net.mjs'], dropped: [] },
+      files: { 'net.mjs': 'thread\n', 'c.txt': null },
+    },
+  ];
+  rows.forEach((row, index) => {
+    const folder = laneFolder(threadScratch, index + 2);
+    const saved = new Map(['net.mjs', 'b.txt', 'c.txt'].map((path) => [path, at(path)] as const));
+    prepareLaneCopy({ root, base, threadScratch, folder });
+    const reviewed = row.steps.some((step) => step.step === 'review');
+    for (const { step, writes } of row.steps) {
+      for (const [path, text] of Object.entries(writes))
+        writeFileSync(join(laneCopy(folder), path), text);
+      // The runner records each step of a lane that has a review chain.
+      if (reviewed) recordStep({ root, base, folder, writer: step !== 'review' });
+    }
+    for (const [path, text] of Object.entries(row.thread ?? {}))
+      writeFileSync(join(threadScratch, path), text);
+    const input = { root, base, threadScratch, folder };
+    assert.deepEqual(replayLane(input), row.want, row.name);
+    if (row.resolve) {
+      for (const [path, text] of Object.entries(row.resolve))
+        writeFileSync(join(threadScratch, path), text);
+      assert.deepEqual(replayLane({ ...input, resolved: true }), row.after, row.name);
+    }
+    for (const [path, text] of Object.entries(row.files)) assert.equal(at(path), text, row.name);
+    // Each row starts from the same thread copy.
+    for (const [path, text] of saved)
+      if (text === null) rmSync(join(threadScratch, path), { force: true });
+      else writeFileSync(join(threadScratch, path), text);
+  });
 });

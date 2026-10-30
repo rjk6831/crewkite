@@ -1790,6 +1790,7 @@ export class ChatService {
           prompt,
           files,
           threadTools,
+          directory,
         })
       : (caught?.prompt ?? prompt);
     return {
@@ -3005,9 +3006,11 @@ export class ChatService {
       prompt: string;
       files: NonNullable<ChatTurnRequest['files']>;
       threadTools: boolean;
+      /** The copy the turn works in. A read-only plan slice reads its own copy's diff. */
+      directory: string;
     },
   ): string {
-    const changes = this.scratchDiff(turn.taskId, input.root, input.base);
+    const changes = this.scratchDiff(turn.taskId, input.root, input.base, input.directory);
     const stopped = this.stoppedLines(turn);
     const checks = this.checkLines(turn.taskId);
     const build = (history: readonly ChatHistoryEntry[], patches: readonly string[]) =>
@@ -3024,7 +3027,7 @@ export class ChatService {
         ],
         prompt: input.prompt,
         threadTools: input.threadTools,
-        instructions: presentInstructions(this.scratchDirectory(turn.taskId)),
+        instructions: presentInstructions(input.directory),
         earlier: input.files.flatMap((file) =>
           file.earlier
             ? [
