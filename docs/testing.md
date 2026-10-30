@@ -227,3 +227,11 @@ One table in `apps/controller/src/providers/local/budget.test.ts` covers the roo
 One row in the Anthropic chat table in `apps/controller/src/providers/anthropic/chat.test.ts` covers the file that holds the person's MCP servers for a turn.
 
 - The adapter creates `mcp.json` with mode 0600 and with O_EXCL and O_NOFOLLOW, so a link or a file already at that path refuses the turn with one plain line at the launch stage. The client never starts. Nothing is written through the link or over the file, the placed link or file stays where it was, and the turn removes only a file it created itself.
+
+## First-run welcome
+
+One table in `apps/desktop/src/renderer/onboarding/flow.test.ts` covers which welcome step shows.
+
+- The welcome stays hidden until the desktop has read its flag and the workspace and model catalog have loaded, and it stays hidden once it ended. A first launch starts on the provider step, and Continue turns on only when a family is ready. Google counts as ready only after the current terms acknowledgement is stored, so a connected Google family without it leaves Continue off. A person with a project and a ready family, or with threads, never sees the welcome, unless they ask for it again from Settings. Once the welcome is on screen, adding a project or connecting a family does not hide it. A family that disconnects sends the person back to the provider step, and a missing project back to the project step. Skip reads "Skip for now" only on the provider step with no ready family.
+
+This is a pure function test with no controller, no window and no network. What a Mac can show is the layout in both themes, the focus move at each step and the folder picker.

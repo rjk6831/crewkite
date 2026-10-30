@@ -66,6 +66,16 @@ These steps add to the walkthrough. Each is optional and can be tried in any ord
 4. Add MCP servers. Open Settings and find MCP servers. Add a server with a name, a command such as `npx`, and its arguments, one per line. Secret arguments and `NAME=value` variables are stored encrypted, and their values are not shown back. Read tools lists the tool names that only read, separated by commas, with a trailing star for a prefix. Every server starts off. Once you have added one, the inspector's Thread tab has an MCP servers section. It turns each server on for that thread and picks Ask each time, Allow reads or Allow all. A server's policy never goes past the thread's permission policy. Anthropic asks the controller about every call. Google takes servers only while the thread asks for everything, and then every call asks. OpenAI and Local do not run them. Only the desktop app supplies servers, so the CLI sees none. [ADR 0046](adr/0046-the-persons-servers-join-a-thread-only-by-the-controllers-config.md) records the rules.
 5. Turn on an extension. An extension is code that runs in the controller with your permissions. From a source checkout, copy `packages/testkit/src/extensions/thread-stats` into the `extensions` folder of your CrewKite home. Settings > Extensions lists it as off, with its manifest and the authority it asks for. Turn on opens that view, and Run its code and turn on loads it. When it is on, Count messages appears as a thread action. Changing any file in the folder turns it off again. Turn on only extensions whose source you trust. The [extensions guide](extensions.md) lists the authority and the slots.
 
+## The welcome on first launch
+
+A first launch opens a three step welcome in place of the empty workspace. It covers steps 1 to 3 of the walkthrough above in one flow, and it uses the same settings cards and the same project picker.
+
+1. Connect a provider. The four families show their setup state. Press Set up on a family to open the same card Settings has, with its own connect steps. Google keeps its terms summary and the acknowledgement box, and Connect stays off until you tick it. Google counts as ready only after the acknowledgement is stored. Local shows its loopback setup. Continue turns on once one family is ready. With none ready, the button beside the title reads Skip for now.
+2. Add a project. Add project opens the folder picker and registers the repository. With projects already added, a menu picks one and Add another project adds more.
+3. Open the composer. The last step shows a suggested first message, "Give me a short tour of this repository and suggest one small first change." Open the composer starts a new thread in the project with that text in the box. CrewKite never sends it for you.
+
+Skip is on every step and ends the welcome for good. The desktop keeps that flag in its profile, so the welcome does not come back after a restart. It does not show for anyone who already has a project and a connected provider, or who already has threads. Settings > General has Show the welcome again. Each step moves focus to its heading, and every control is a button, a menu or a checkbox that the keyboard reaches.
+
 ## Keyboard
 
 | Keys | Action |

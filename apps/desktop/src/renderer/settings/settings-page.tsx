@@ -23,11 +23,13 @@ export function SettingsPage({
   header,
   theme,
   onTheme,
+  onShowWelcome,
 }: {
   workspace: Workspace;
   header: WorkspaceState;
   theme: string;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
+  onShowWelcome?: () => void;
 }) {
   const { catalog, error, modelRead } = useCatalog(workspace.source, header);
   const actions = useProviderActions(workspace);
@@ -60,7 +62,12 @@ export function SettingsPage({
             {error} Model lists and connection state are unavailable until it reads again.
           </p>
         )}
-        <GeneralCard catalog={catalog} theme={theme} onTheme={onTheme} />
+        <GeneralCard
+          catalog={catalog}
+          theme={theme}
+          onTheme={onTheme}
+          onShowWelcome={onShowWelcome}
+        />
         <OpenAiCard {...card} entry={entry('openai')} modelRead={modelRead} />
         <AnthropicCard {...card} entry={entry('anthropic')} />
         <GoogleCard {...card} entry={entry('google')} />

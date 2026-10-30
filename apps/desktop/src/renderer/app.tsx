@@ -32,6 +32,9 @@ import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
+import { SUGGESTED_FIRST_MESSAGE } from './onboarding/flow.ts';
+import { Onboarding } from './onboarding/onboarding.tsx';
+import { useOnboarding } from './onboarding/use-onboarding.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
@@ -517,6 +520,8 @@ export function App() {
         : titleCase(connection);
   const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
+  const onboarding = useOnboarding(workspace);
+  const [prefill, setPrefill] = useState<string | null>(null);
   // Threads deleted here leave the rail at once, before the workspace read catches up.
   const [removed, setRemoved] = useState<ReadonlySet<string>>(() => new Set());
   const [deleting, setDeleting] = useState<{ id: string; title: string } | null>(null);
@@ -572,7 +577,16 @@ export function App() {
     setAddedProject(project.data.id);
     startThread(project.data.id);
   }
+  // The last welcome step opens a new thread in the project with the suggested message in the box.
+  function finishWelcome(projectId: string) {
+    onboarding.finish();
+    setPrefill(SUGGESTED_FIRST_MESSAGE);
+    setAddedProject(projectId);
+    startThread(projectId);
+  }
   function openThread(id: string) {
+    // A thread in view means the person is under way, so the welcome ends.
+    if (onboarding.view.visible) onboarding.finish();
     setNewThread(null);
     setSelected(id);
     setPage('tasks');
@@ -980,6 +994,23 @@ export function App() {
             header={header}
             theme={themeMode}
             onTheme={setThemeMode}
+            onShowWelcome={() => {
+              onboarding.restart();
+              setNewThread(null);
+              setPage('tasks');
+            }}
+          />
+        ) : onboarding.view.visible && newThread === null ? (
+          <Onboarding
+            workspace={workspace}
+            header={header}
+            catalog={onboarding.catalog}
+            modelRead={onboarding.modelRead}
+            view={onboarding.view}
+            onContinue={onboarding.next}
+            onBack={onboarding.back}
+            onSkip={onboarding.finish}
+            onFinish={finishWelcome}
           />
         ) : !threadSource ? (
           <div className="loading-workspace" role="alert">
@@ -996,6 +1027,8 @@ export function App() {
             onOpenSettings={() => setPage('settings')}
             onAddProject={workspace.canPickProject ? () => void addProject() : null}
             focusComposer={addedProject === newThread}
+            prefill={prefill}
+            onPrefilled={() => setPrefill(null)}
             localSetup={header?.localSetup}
             refresh={workspace.refresh}
             blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}

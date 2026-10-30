@@ -157,10 +157,12 @@ export function GeneralCard({
   catalog,
   theme,
   onTheme,
+  onShowWelcome,
 }: {
   catalog: ChatCatalogRead | null;
   theme: string;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
+  onShowWelcome?: () => void;
 }) {
   const [saved, setSaved] = useState<ThreadDefaults>(() => readThreadDefaults());
   const change = (next: ThreadDefaults) => {
@@ -314,6 +316,26 @@ export function GeneralCard({
             </fieldset>
           </div>
         </div>
+        {onShowWelcome && (
+          <div className="st-row">
+            <span className="st-field" id="settings-welcome">
+              <span className="st-name">Welcome</span>
+              <small className="st-hint">
+                The first-run steps: connect a provider, add a project and start a thread.
+              </small>
+            </span>
+            <div className="st-controls">
+              <button
+                type="button"
+                className="button secondary"
+                aria-describedby="settings-welcome"
+                onClick={onShowWelcome}
+              >
+                Show the welcome again
+              </button>
+            </div>
+          </div>
+        )}
       </div>
     </section>
   );
