@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { ChatChecksEditSchema, ChatChecksStateSchema } from './checks.ts';
+import { ClientVersionStatusSchema } from './client-versions.ts';
 import { ChatPlanConflictsSchema, chatPlanLaneSchema } from './plan-lanes.ts';
 
 // Shared shape of a chat thread, its turns and the live agent stream.
@@ -1047,6 +1048,8 @@ export const ChatCatalogEntrySchema = z.strictObject({
    * native. Missing when the family reports nothing.
    */
   unlisted: ChatAttachmentDeliverySchema.exclude(['native']).optional(),
+  /** The installed client against the tested build. Missing for a family without one. */
+  client: ClientVersionStatusSchema.optional(),
 });
 export const ChatCatalogReadSchema = z.strictObject({
   families: z.array(ChatCatalogEntrySchema).max(4),

@@ -47,6 +47,7 @@ import {
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
+import { ClientVersionStatusSchema } from './client-versions.ts';
 import {
   ChatInstructionsReadSchema,
   ChatMentionsReadSchema,
@@ -1094,7 +1095,12 @@ export const UsageReaderSchema = z
       'client-build-mismatch',
       'not-configured',
       'configuration-location-unsupported',
+      'client-version-unsupported',
+      'client-version-unreadable',
+      'client-untrusted',
     ]),
+    /** The installed client against the tested build, for readers that accept a range. */
+    client: ClientVersionStatusSchema.optional(),
     readState: z.enum(['idle', 'intent', 'owned', 'quiescent', 'unknown']).optional(),
     readReason: label.nullable().optional(),
     lastRequest: label.nullable().optional(),
@@ -3894,6 +3900,7 @@ export * from './changes.ts';
 export * from './chat.ts';
 export * from './checks.ts';
 export * from './cli.ts';
+export * from './client-versions.ts';
 export * from './composer.ts';
 export * from './diagnostics.ts';
 export * from './export.ts';
