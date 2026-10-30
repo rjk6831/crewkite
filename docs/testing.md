@@ -317,3 +317,12 @@ I protect these claims at the lowest layer that can see each one, with no networ
 - The palette tests in `apps/desktop/src/renderer/palette/palette.test.ts` check fuzzy matching and ranking, including the marked letters of an astral character, and that every slash command has an entry. They also check that an entry with no composer or thread open is off and says why, that accept, push, pull request, export and share are never the entry Enter picks, and that a view's action runs only through what the view provided. The Enter rows check that typing "push" or "ext" and pressing Enter runs nothing while the top match is explicit, that an arrow choice runs, and that Enter never skips to a lower match. A last row checks that a palette command leaves the draft in the box and a typed command clears it.
 
 Redaction matches known patterns and ADR 0044 says it misses other shapes, so both exports say the same in their header. These tests do not show the system save dialog, the sandboxed preview frame inside a real window, the text view that replaces a frame that never loads, or how the palette sounds in a screen reader. A person on a Mac checks those.
+
+## macOS CI failures closed in sprint 2
+
+These are changes to existing claims. No new claim is added.
+
+- The Google gate claim in `apps/controller/src/commands/google-terms.test.ts` also covers order. A refused Google usage read stores no receipt, a changed command under the same key meets the gate before any idempotency check, and after the acknowledgement the same key reaches the read.
+- The Google writer rows in the native controller tables and the Google quota rows acknowledge the current terms in their setup, because they protect the writer and quota authority. The gate keeps its own claim.
+- The control socket claim in `packages/client/src/output.test.ts` keeps its folders under `/tmp`. A macOS temporary directory is long enough that the per-user socket path would pass the 100 byte bound, and the controller would then bind under `/tmp` by design. The test checks that the preferred path fits before it relies on it.
+- The Google writer claim checks a descendant that holds the group open with a scripted child, clock and group probe. A real descendant outlives its leader, and how soon the system's init reaps it decides whether cleanup sees the group gone. That made the row depend on the machine.
