@@ -3,6 +3,11 @@ import { useEffect, useRef, useState } from 'react';
 import { Dialog } from '../components.tsx';
 import './share-dialog.css';
 
+// How long the frame has to report that it drew the page. After that the person reads the file as
+// text, which is also exactly what Save writes.
+const FRAME_SECONDS = 4;
+
+type Frame = 'waiting' | 'drawn' | 'text';
 type Preview =
   | { status: 'loading' }
   | { status: 'ready'; share: DesktopShare }
@@ -10,8 +15,10 @@ type Preview =
 
 /**
  * The share page as it will be saved, in a frame that runs nothing. The frame has an empty sandbox,
- * so even a page that held markup would have no script, no form and no origin. Saving goes
- * through the system save dialog, and CrewKite hosts and uploads nothing.
+ * so even a page that held markup would have no script, no form and no origin. Save stays off until
+ * the frame reports that it drew the page. A frame that does not draw it gives way to the same
+ * text as escaped plain text, so the person always sees what they save. Saving goes through the
+ * system save dialog, and CrewKite hosts and uploads nothing.
  */
 export function ShareDialog({
   source,
@@ -23,6 +30,7 @@ export function ShareDialog({
   onClose: () => void;
 }) {
   const [preview, setPreview] = useState<Preview>({ status: 'loading' });
+  const [frame, setFrame] = useState<Frame>('waiting');
   const [note, setNote] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const opener = useRef<HTMLElement | null>(
@@ -53,6 +61,16 @@ export function ShareDialog({
     };
   }, [source, taskId]);
 
+  const ready = preview.status === 'ready';
+  useEffect(() => {
+    if (!ready) return;
+    const timer = setTimeout(
+      () => setFrame((current) => (current === 'waiting' ? 'text' : current)),
+      FRAME_SECONDS * 1000,
+    );
+    return () => clearTimeout(timer);
+  }, [ready]);
+
   async function save() {
     if (!source.saveExport) return;
     setSaving(true);
@@ -76,14 +94,26 @@ export function ShareDialog({
         </p>
         {preview.status === 'loading' && <p role="status">Making the page</p>}
         {preview.status === 'failed' && <p role="alert">{preview.message}</p>}
-        {preview.status === 'ready' && (
+        {preview.status === 'ready' && frame !== 'text' && (
           <iframe
             className="share-frame"
             title="Preview of the share page"
             sandbox=""
             referrerPolicy="no-referrer"
             srcDoc={preview.share.html}
+            onLoad={() => setFrame('drawn')}
+            onError={() => setFrame('text')}
           />
+        )}
+        {preview.status === 'ready' && frame === 'text' && (
+          <>
+            <p className="share-note" role="status">
+              The page could not be drawn here, so this is the file as text. It is what Save writes.
+            </p>
+            <pre className="share-text" aria-label="Text of the share page">
+              {preview.share.html}
+            </pre>
+          </>
         )}
       </div>
       <div className="dialog-footer">
@@ -94,7 +124,7 @@ export function ShareDialog({
         <button
           type="button"
           className="button primary"
-          disabled={preview.status !== 'ready' || saving || !source.saveExport}
+          disabled={!ready || frame === 'waiting' || saving || !source.saveExport}
           onClick={() => void save()}
         >
           Save page

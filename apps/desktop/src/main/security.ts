@@ -2,6 +2,7 @@ import { globSync, readFileSync, realpathSync, statSync } from 'node:fs';
 import { relative, resolve, sep } from 'node:path';
 import { type BrowserWindow, dialog, type IpcMainInvokeEvent, type Session, shell } from 'electron';
 import { externalLink, type OpenLinkResult } from '../shared/external-link.ts';
+import { allowsFrameNavigation } from '../shared/frame-navigation.ts';
 
 export const rendererURL = 'app://crewkite/index.html';
 const contentTypes: Record<string, string> = {
@@ -76,7 +77,12 @@ export function secureWindow(window: BrowserWindow) {
   });
   contents.on('will-attach-webview', (event) => event.preventDefault());
   contents.on('will-navigate', (event) => event.preventDefault());
-  contents.on('will-frame-navigate', (event) => event.preventDefault());
+  // The share preview is a sandboxed frame made from text. Its own first load is the one frame
+  // navigation allowed, and the page never names an address for it.
+  contents.on('will-frame-navigate', (event) => {
+    if (allowsFrameNavigation(event)) return;
+    event.preventDefault();
+  });
   contents.on('will-redirect', (event) => event.preventDefault());
 }
 

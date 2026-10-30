@@ -18,3 +18,16 @@
   border-radius: 6px;
   background: #fff;
 }
+.share-text {
+  margin: 0;
+  height: min(56dvh, 520px);
+  overflow: auto;
+  padding: 10px 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text);
+  font-size: 11px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

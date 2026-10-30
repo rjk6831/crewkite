@@ -1,4 +1,14 @@
-import { closeSync, constants, fsyncSync, openSync, writeFileSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  fsyncSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import type { ChatExport, ExportFormat } from '@crewkite/contracts';
 
 // Saving an export. The controller renders the text and main holds it, so the window never
@@ -14,6 +24,34 @@ export type ExportDeps = {
     filters: { name: string; extensions: string[] }[];
   }): Promise<SaveChoice>;
 };
+
+/**
+ * Writes a sibling file the person alone can read, syncs it, then renames it over the chosen path.
+ * A file that was already there is never left half written, and a link at the path is replaced
+ * and not followed.
+ */
+export function writeAtomically(path: string, content: string): void {
+  const temporary = join(dirname(path), `.${basename(path)}.${randomBytes(6).toString('hex')}.tmp`);
+  const file = openSync(
+    temporary,
+    constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  );
+  try {
+    try {
+      writeFileSync(file, content);
+      fsyncSync(file);
+    } finally {
+      closeSync(file);
+    }
+    renameSync(temporary, path);
+  } catch (failure) {
+    try {
+      unlinkSync(temporary);
+    } catch {}
+    throw failure;
+  }
+}
 
 const TASK_ID = /^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/;
 
@@ -53,17 +91,7 @@ export class ExportStage {
     });
     if (choice.canceled || !choice.filePath) return 'cancelled';
     try {
-      const file = openSync(
-        choice.filePath,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-        0o600,
-      );
-      try {
-        writeFileSync(file, exported.content);
-        fsyncSync(file);
-      } finally {
-        closeSync(file);
-      }
+      writeAtomically(choice.filePath, exported.content);
     } catch {
       throw new Error('The file could not be written there. Choose another place.');
     }
