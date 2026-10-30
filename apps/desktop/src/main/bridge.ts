@@ -34,6 +34,7 @@ import { type BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electro
 import { attachRequest } from '../shared/attach.ts';
 import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
+import { installDiagnostics } from './diagnostics.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
 import {
   controllerPort,
@@ -191,8 +192,16 @@ export async function installBridge(
     'local-token-status',
     'local-token-remember',
     'local-token-forget',
+    'export-diagnostics',
+    'dismiss-crash',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
+  const diagnostics = installDiagnostics({
+    window,
+    home: controller.paths.home,
+    send,
+    notice,
+  });
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
     assertSender(event, window);
     if (
@@ -630,6 +639,7 @@ export async function installBridge(
     listening = true;
     notice(connection);
     notice({ kind: 'retry', available: receipts.commands.length > 0 });
+    diagnostics.announce();
     if (droppedThrough !== '0') notice({ kind: 'history-gap', after: droppedThrough });
     for (const row of events) window.webContents.send('crewkite:event', row);
   });

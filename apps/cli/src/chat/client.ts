@@ -20,6 +20,8 @@ import {
   type CommandResult,
   CommandSchema,
   ConversationEntrySchema,
+  type DiagnosticsRead,
+  DiagnosticsReadSchema,
   type Event,
   type ProjectPage,
   type ProjectPageRequest,
@@ -120,6 +122,8 @@ export function chatClient(
       ) as Promise<ChatTurnEventsRead>,
     readChanges: (taskId: string): Promise<ChatChangesRead> =>
       read('ReadChatChanges', { taskId }, ChatChangesReadSchema),
+    readDiagnostics: (taskId?: string): Promise<DiagnosticsRead> =>
+      read('ReadDiagnostics', taskId ? { taskId } : {}, DiagnosticsReadSchema),
     readPrompts: (): Promise<SavedPrompts> => read('ReadChatPrompts', {}, SavedPromptsSchema),
     readCatalog: (taskId?: string): Promise<ChatCatalogRead> =>
       read('ReadChatCatalog', taskId ? { taskId } : {}, ChatCatalogReadSchema),

@@ -24,12 +24,15 @@ export function SettingsPage({
   theme,
   onTheme,
   onShowWelcome,
+  threadId,
 }: {
   workspace: Workspace;
   header: WorkspaceState;
   theme: string;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
   onShowWelcome?: () => void;
+  /** The open thread, whose last events the diagnostics export carries. */
+  threadId?: string;
 }) {
   const { catalog, error, modelRead } = useCatalog(workspace.source, header);
   const actions = useProviderActions(workspace);
@@ -67,6 +70,8 @@ export function SettingsPage({
           theme={theme}
           onTheme={onTheme}
           onShowWelcome={onShowWelcome}
+          source={workspace.source}
+          threadId={threadId}
         />
         <OpenAiCard {...card} entry={entry('openai')} modelRead={modelRead} />
         <AnthropicCard {...card} entry={entry('anthropic')} />

@@ -1,6 +1,8 @@
+import type { DesktopSource } from '@crewkite/client';
 import type { ChatCatalogRead, ChatModelSelection } from '@crewkite/contracts';
 import { useState } from 'react';
 import { familyName } from '../components.tsx';
+import { runExport } from '../diagnostics.tsx';
 import { EffortSelect } from '../thread/model-picker.tsx';
 import {
   type CrewPreset,
@@ -158,12 +160,17 @@ export function GeneralCard({
   theme,
   onTheme,
   onShowWelcome,
+  source,
+  threadId,
 }: {
   catalog: ChatCatalogRead | null;
   theme: string;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
   onShowWelcome?: () => void;
+  source?: Pick<DesktopSource, 'exportDiagnostics'>;
+  threadId?: string;
 }) {
+  const [exportNote, setExportNote] = useState<string | null>(null);
   const [saved, setSaved] = useState<ThreadDefaults>(() => readThreadDefaults());
   const change = (next: ThreadDefaults) => {
     setSaved(next);
@@ -336,7 +343,30 @@ export function GeneralCard({
             </div>
           </div>
         )}
+        <div className="st-row">
+          <span className="st-field">
+            <span className="st-name">Diagnostics</span>
+            <small className="st-hint">
+              Saves a folder with versions, the end of the controller log and the last 200 events of
+              the open thread. Secrets, your home folder and email addresses are removed, and
+              nothing is sent anywhere.
+            </small>
+          </span>
+          <div className="st-controls">
+            <button
+              type="button"
+              onClick={() => void runExport(source, threadId).then(setExportNote)}
+            >
+              Export diagnostics
+            </button>
+          </div>
+        </div>
       </div>
+      {exportNote && (
+        <p className="st-note" role="status">
+          {exportNote}
+        </p>
+      )}
     </section>
   );
 }

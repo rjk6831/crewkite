@@ -57,6 +57,10 @@ export interface DesktopSource {
   openAttachment?(target: DesktopAttachmentTarget): Promise<'done' | 'cancelled'>;
   /** Save the controller's saved prompts as a JSON file. Main reads them and shows the dialog. */
   savePrompts?(): Promise<'saved' | 'cancelled'>;
+  /** List what the diagnostics bundle holds, then save it as a folder the person names. */
+  exportDiagnostics?(input: { taskId?: string }): Promise<'saved' | 'cancelled'>;
+  /** Hide the line about the last unexpected close. */
+  dismissCrash?(): Promise<void>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;

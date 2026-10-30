@@ -53,6 +53,7 @@ import {
 } from '@crewkite/contracts';
 import { connectChat } from './chat/connect.ts';
 import { type Connect, notDone, runPrint, runThreadCommand } from './chat/scripting.ts';
+import { runDiagnosticsCommand } from './diagnostics.ts';
 
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
@@ -60,6 +61,7 @@ const googleAcpLabel =
 const help = `Usage: crewkite                     interactive mode in a terminal [--no-animation]
        crewkite -p <message> [--thread task-id | --project project-id] [--model family[/model]] [--json]
        crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show> ... (crewkite thread --help)
+       crewkite diagnostics export <folder> [--thread task-id] [--home path]
        crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
@@ -136,6 +138,7 @@ export async function runCli(
   connect: Connect = connectChat,
 ): Promise<number> {
   if (args[0] === 'thread') return runThreadCommand(args.slice(1), output, connect);
+  if (args[0] === 'diagnostics') return runDiagnosticsCommand(args.slice(1), output, connect);
   if (printRequested(args)) return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
   const streamWrite = async (text: string) => {

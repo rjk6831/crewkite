@@ -159,6 +159,17 @@ const bridge: DesktopSource = {
       throw plain(failure);
     }
   },
+  exportDiagnostics: async (input) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:export-diagnostics', input);
+      return value === 'saved' ? 'saved' : 'cancelled';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  dismissCrash: async () => {
+    await ipcRenderer.invoke('crewkite:dismiss-crash');
+  },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
     await ipcRenderer.invoke('crewkite:reconnect');

@@ -30,6 +30,7 @@ import {
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
+import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
 import { SUGGESTED_FIRST_MESSAGE } from './onboarding/flow.ts';
@@ -954,6 +955,7 @@ export function App() {
             </button>
           </div>
         )}
+        <CrashBanner source={workspace.source} taskId={task?.id} />
         {workspaceError && (
           <div className="error-banner" role="alert">
             <AlertTriangle size={16} />
@@ -996,6 +998,7 @@ export function App() {
             header={header}
             theme={themeMode}
             onTheme={setThemeMode}
+            threadId={task?.id}
             onShowWelcome={() => {
               onboarding.restart();
               setNewThread(null);

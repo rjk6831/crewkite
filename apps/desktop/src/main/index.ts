@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
 import { installThreadAttention } from './attention.ts';
 import { installBridge } from './bridge.ts';
+import { watchRendererCrashes } from './diagnostics.ts';
 import { installOnboarding } from './onboarding-ipc.ts';
 import { OnboardingStore } from './onboarding-store.ts';
 import { DesktopController, prepareStateDirectory, resolveRuntime } from './runtime.ts';
@@ -68,6 +69,7 @@ async function start() {
       },
     });
     secureWindow(window);
+    watchRendererCrashes(window, paths.home);
     // Move and resize fire many times a second, so the file is written once the window settles.
     let settle: NodeJS.Timeout | undefined;
     const remember = (target: BrowserWindow) => {
