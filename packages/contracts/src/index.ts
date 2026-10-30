@@ -47,7 +47,7 @@ import {
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
-import { ClientVersionStatusSchema } from './client-versions.ts';
+import { CheckProviderClientPayloadSchema, ClientVersionStatusSchema } from './client-versions.ts';
 import {
   ChatInstructionsReadSchema,
   ChatMentionsReadSchema,
@@ -2531,6 +2531,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatThread', ReadChatThreadPayloadSchema),
   read('ReadChatChanges', ReadChatChangesPayloadSchema),
   read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
+  read('CheckProviderClient', CheckProviderClientPayloadSchema),
   read('ReadChatAnalytics', ReadChatAnalyticsPayloadSchema),
   read('CompleteChatMention', CompleteChatMentionPayloadSchema),
   read('ReadChatInstructions', ReadChatInstructionsPayloadSchema),

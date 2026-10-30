@@ -35,3 +35,11 @@ export const ClientVersionStatusSchema = z.strictObject({
   message: z.string().min(1).max(1024),
 });
 export type ClientVersionStatus = z.infer<typeof ClientVersionStatusSchema>;
+
+/**
+ * Check again on a provider card: forget what CrewKite read about the family's client and find it
+ * afresh. It changes no task or authority, so it carries no expected revision.
+ */
+export const CheckProviderClientPayloadSchema = z.strictObject({
+  family: z.enum(['openai', 'anthropic', 'google']),
+});
