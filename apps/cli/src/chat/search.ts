@@ -1,5 +1,5 @@
 import { parseArgs } from 'node:util';
-import { CLI_EXIT, MAX_CHAT_SEARCH_THREADS } from '@crewkite/contracts';
+import { CLI_EXIT, CLI_JSON_LINE_VERSION, MAX_CHAT_SEARCH_THREADS } from '@crewkite/contracts';
 import { crewkiteHome } from '../settings.ts';
 import { type Connect, type Io, jsonLine, notDone, terminalText, UsageError } from './scripting.ts';
 
@@ -55,7 +55,7 @@ export async function runSearchCommand(args: string[], io: Io, connect: Connect)
       for (const group of result.groups)
         await io.out(
           jsonLine({
-            v: 2,
+            v: CLI_JSON_LINE_VERSION,
             kind: 'result',
             command: 'SearchChatHistory',
             outcome: 'applied',
@@ -67,7 +67,7 @@ export async function runSearchCommand(args: string[], io: Io, connect: Connect)
         );
       await io.out(
         jsonLine({
-          v: 2,
+          v: CLI_JSON_LINE_VERSION,
           kind: 'result',
           command: 'SearchChatHistory',
           outcome: 'applied',
@@ -101,7 +101,10 @@ export async function runSearchCommand(args: string[], io: Io, connect: Connect)
   } catch (error) {
     const message =
       error instanceof Error && error.message ? error.message : 'The command could not run.';
-    if (json) void io.out(jsonLine({ v: 2, kind: 'error', message: message.slice(0, 4096) }));
+    if (json)
+      void io.out(
+        jsonLine({ v: CLI_JSON_LINE_VERSION, kind: 'error', message: message.slice(0, 4096) }),
+      );
     else io.err(`${terminalText(message)}\n`);
     return notDone(error) ? CLI_EXIT.notDone : CLI_EXIT.failed;
   } finally {

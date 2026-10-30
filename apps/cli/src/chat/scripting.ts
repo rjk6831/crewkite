@@ -12,6 +12,7 @@ import {
   type ChatThreadRead,
   type ChatTurn,
   CLI_EXIT,
+  CLI_JSON_LINE_VERSION,
   type CliJsonLine,
   CliJsonLineSchema,
   type CliThreadEvent,
@@ -76,7 +77,7 @@ const resultLine = (
   result: CommandResult,
   taskId: string | null,
 ): CliJsonLine => ({
-  v: 2,
+  v: CLI_JSON_LINE_VERSION,
   kind: 'result',
   command,
   outcome: result.outcome,
@@ -229,7 +230,9 @@ export function followThread(
     if (!turnId || finishedTurns.has(turnId)) return;
     finishedTurns.add(turnId);
     if (follow.json)
-      void io.out(jsonLine({ v: 2, kind: 'turn-end', taskId, turnId, status, failure }));
+      void io.out(
+        jsonLine({ v: CLI_JSON_LINE_VERSION, kind: 'turn-end', taskId, turnId, status, failure }),
+      );
     else if (failure)
       io.err(
         `\n${terminalText(failure.message)}${failure.providerMessage ? `\n${terminalText(failure.providerMessage)}` : ''}\n${terminalText(failure.nextAction)}\n`,
@@ -302,7 +305,8 @@ export function followThread(
       (event) => {
         const line = threadEvent(event, taskId);
         if (!line) return;
-        if (follow.json) void io.out(jsonLine({ v: 2, kind: 'event', taskId, event: line }));
+        if (follow.json)
+          void io.out(jsonLine({ v: CLI_JSON_LINE_VERSION, kind: 'event', taskId, event: line }));
         if (line.type === 'message' && follow.text !== null && !messageId) {
           const message = line.payload;
           if (
@@ -629,7 +633,7 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
       case 'watch': {
         const read = await client.readThread(need(first, 'thread ID'));
         if (!read.thread.activeTurnId && !values.follow) {
-          if (json) await io.out(jsonLine({ v: 2, kind: 'thread', read }));
+          if (json) await io.out(jsonLine({ v: CLI_JSON_LINE_VERSION, kind: 'thread', read }));
           else io.err('Nothing is running in this thread.\n');
           return 0;
         }
@@ -721,7 +725,7 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
         if (json)
           await io.out(
             jsonLine({
-              v: 2,
+              v: CLI_JSON_LINE_VERSION,
               kind: 'threads',
               threads: threads.map((task) => ({
                 taskId: task.id,
@@ -741,7 +745,11 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
       }
       case 'show': {
         const read = await client.readThread(need(first, 'thread ID'));
-        await io.out(json ? jsonLine({ v: 2, kind: 'thread', read }) : threadSummaryText(read));
+        await io.out(
+          json
+            ? jsonLine({ v: CLI_JSON_LINE_VERSION, kind: 'thread', read })
+            : threadSummaryText(read),
+        );
         return 0;
       }
       case 'changes': {
@@ -795,7 +803,10 @@ export const notDone = (error: unknown) =>
 function failure(error: unknown, io: Io, json: boolean): number {
   const message =
     error instanceof Error && error.message ? error.message : 'The command could not run.';
-  if (json) void io.out(jsonLine({ v: 2, kind: 'error', message: message.slice(0, 4096) }));
+  if (json)
+    void io.out(
+      jsonLine({ v: CLI_JSON_LINE_VERSION, kind: 'error', message: message.slice(0, 4096) }),
+    );
   else io.err(`${terminalText(message)}\n`);
   return notDone(error) ? CLI_EXIT.notDone : CLI_EXIT.failed;
 }

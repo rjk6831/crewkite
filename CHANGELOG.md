@@ -57,3 +57,6 @@ Sprint 2
 - I made the Anthropic turn refuse a pre-placed `mcp.json` or link.
 - I kept a gauge row for every provider, put the Google terms checkbox inline with its label, and showed Ctrl K for search off macOS.
 - I skipped the welcome for anyone who already has a project.
+- I let chat accept a range of client builds within the tested major version, and named the found version on each provider card.
+- I added a Linux preview from source for OpenAI, Anthropic and Local, with Linux CI.
+- I moved the `--json` lines to `v: 3`, because this sprint added fields to the thread, turn and event shapes they embed.
