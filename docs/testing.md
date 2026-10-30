@@ -268,3 +268,17 @@ Mac steps for the reference Mac:
 - Scroll through the whole thread with the trackpad and the scrollbar, and check that nothing flashes or jumps. Press Load earlier at the top and check that the view stays on the same message.
 - In a long thread, open a tool card, focus a button inside a row, and leave a permission request unanswered. Scroll far away and back, and check that the card is still open, focus has not dropped to the page, and the request is still there.
 - Search for a word that appears deep in an old turn, open the result, and check that the thread scrolls to that turn with the row and the word marked. Repeat with the arrow keys and Enter only.
+
+## Project notes
+
+Project notes are short facts the controller stores for a project and sends with every turn. Four claims protect them.
+
+The size rule lives in a pure function, so one table in `packages/contracts/src/notes.test.ts` pins it. It covers no notes, a note at the cap, one byte over, multibyte text counted in bytes, and the 200-note count limit. The same file checks that note text refuses control characters and lone surrogates, that Save as note offers the selection or else the first paragraph, and that the Markdown export lists notes oldest first.
+
+The store claims run on real SQLite in `apps/controller/src/chat/project-notes.test.ts`. A restart keeps the list, ordering is created time then id, an edit keeps its note in place, and the cap and count limits hold per project with a refusal reason for each case.
+
+The packet claims share one table in the same file. Notes reach all four families. A new session reads them in its system context, and a resumed session gets them in front of its message. The notes and the instruction files share 64 KiB, with the notes capped at 16 KiB, so the instruction files keep at least 48 KiB. The adapter tests already prove each family sends its system context on a new session, so this table stops at the request the controller builds.
+
+The command line claim in `apps/cli/src/chat/notes.test.ts` drives list, add and remove through a real controller socket and checks each refusal sentence and exit status.
+
+The migration in this lane applies in file order on a gap-free copy in these tests, so a renumber at integration changes nothing in them.
