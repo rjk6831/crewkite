@@ -2409,20 +2409,22 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       name: 'a conflict blocks the slice and the orchestrator merges it in one turn',
       slices: [slice(1, 'medium'), slice(2, 'easy')],
       openai: [[write('net.mjs', 'one\n')], [write('net.mjs', 'one\ntwo\n'), reply('Merged.')]],
-      local: [[write('net.mjs', 'two\n')]],
+      // The clean c.txt merges only after the resolve turn ends done.
+      local: [[write('net.mjs', 'two\n'), write('c.txt', 'clean\n')]],
       line: 'Crew finished: 2 slices, 0 reviews, 1 fix.',
       card: ['finished', 'done', 'done'],
-      files: { 'net.mjs': 'one\ntwo\n' },
+      files: { 'net.mjs': 'one\ntwo\n', 'c.txt': 'clean\n' },
       conflict: true,
     },
     {
+      // No part of the blocked slice reaches the thread copy, its clean c.txt included.
       name: 'a conflict the orchestrator cannot resolve stops the plan with the slice blocked',
       slices: [slice(1, 'medium'), slice(2, 'easy')],
       openai: [[write('net.mjs', 'one\n')], [failed]],
-      local: [[write('net.mjs', 'two\n')]],
+      local: [[write('net.mjs', 'two\n'), write('c.txt', 'clean\n')]],
       line: 'Plan stopped: the orchestrator could not resolve slice 2.',
       card: ['stopped', 'done', 'blocked'],
-      files: { 'net.mjs': 'one\n' },
+      files: { 'net.mjs': 'one\n', 'c.txt': null },
       conflict: true,
     },
     {
@@ -2584,8 +2586,13 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       row.name,
     );
     const scratch = join(dirname(thread.root), 'chat', taskId, 'scratch');
-    for (const [path, content] of Object.entries(row.files))
-      assert.equal(readFileSync(join(scratch, path), 'utf8'), content, `${row.name}: ${path}`);
+    // A null file is absent from the thread copy.
+    for (const [path, content] of Object.entries(row.files as Record<string, string | null>))
+      assert.equal(
+        existsSync(join(scratch, path)) ? readFileSync(join(scratch, path), 'utf8') : null,
+        content,
+        `${row.name}: ${path}`,
+      );
     // Every slice turn worked in its own copy, never in the thread's or another slice's.
     const requests = [...openai.requests, ...local.requests];
     const copies = requests.flatMap((request) => {

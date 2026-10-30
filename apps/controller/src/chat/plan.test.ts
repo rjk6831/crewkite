@@ -344,7 +344,8 @@ test('a slice replays only its own changes, and a blocked slice writes nothing u
   writeFileSync(join(threadScratch, 'a.txt'), 'slice one\n');
   const at = (path: string) =>
     existsSync(join(threadScratch, path)) ? readFileSync(join(threadScratch, path), 'utf8') : null;
-  type Replayed = { applied: string[]; conflicts: string[]; dropped: string[] };
+  type Replayed = { applied: string[]; conflicts: string[]; dropped: string[]; skipped: string[] };
+  const none = { conflicts: [], dropped: [], skipped: [] };
   type Step = { step: 'build' | 'review' | 'fix'; writes: Record<string, string> };
   const rows: {
     name: string;
@@ -360,7 +361,19 @@ test('a slice replays only its own changes, and a blocked slice writes nothing u
     {
       name: 'a builder with no review chain replays everything it changed',
       steps: [{ step: 'build', writes: { 'b.txt': 'two\n' } }],
-      want: { applied: ['b.txt'], conflicts: [], dropped: [] },
+      want: { ...none, applied: ['b.txt'] },
+      files: { 'a.txt': 'slice one\n', 'b.txt': 'two\n' },
+    },
+    {
+      // The fixer put a.txt back where the slice started, so a.txt is no longer the slice's own.
+      name: 'a path a fixer reverts stops being its own, and a later review edit there stays out',
+      steps: [
+        { step: 'build', writes: { 'b.txt': 'two\n' } },
+        { step: 'review', writes: { 'a.txt': 'reviewer\n' } },
+        { step: 'fix', writes: { 'a.txt': 'slice one\n' } },
+        { step: 'review', writes: { 'a.txt': 'reviewer again\n' } },
+      ],
+      want: { ...none, applied: ['b.txt'], dropped: ['a.txt'] },
       files: { 'a.txt': 'slice one\n', 'b.txt': 'two\n' },
     },
     {
@@ -373,7 +386,7 @@ test('a slice replays only its own changes, and a blocked slice writes nothing u
           writes: { 'a.txt': 'reviewer\n', 'b.txt': 'reviewed\n', 'e.txt': 'extra\n' },
         },
       ],
-      want: { applied: ['b.txt'], conflicts: [], dropped: ['a.txt', 'e.txt'] },
+      want: { ...none, applied: ['b.txt'], dropped: ['a.txt', 'e.txt'] },
       files: { 'a.txt': 'slice one\n', 'b.txt': 'reviewed\n', 'e.txt': null },
     },
     {
@@ -383,7 +396,7 @@ test('a slice replays only its own changes, and a blocked slice writes nothing u
         { step: 'review', writes: { 'a.txt': 'reviewer\n' } },
         { step: 'fix', writes: { 'b.txt': 'two fixed\n' } },
       ],
-      want: { applied: ['b.txt'], conflicts: [], dropped: ['a.txt'] },
+      want: { ...none, applied: ['b.txt'], dropped: ['a.txt'] },
       files: { 'a.txt': 'slice one\n', 'b.txt': 'two fixed\n' },
     },
     {
@@ -391,15 +404,15 @@ test('a slice replays only its own changes, and a blocked slice writes nothing u
       steps: [{ step: 'build', writes: { 'net.mjs': 'slice\n', 'c.txt': 'clean\n' } }],
       thread: { 'net.mjs': 'thread\n' },
       resolve: { 'net.mjs': 'merged\n' },
-      want: { applied: [], conflicts: ['net.mjs'], dropped: [] },
-      after: { applied: ['c.txt'], conflicts: [], dropped: [] },
+      want: { ...none, applied: [], conflicts: ['net.mjs'] },
+      after: { ...none, applied: ['c.txt'] },
       files: { 'net.mjs': 'merged\n', 'c.txt': 'clean\n' },
     },
     {
       name: 'a resolve that never ends done leaves the thread copy without the clean paths',
       steps: [{ step: 'build', writes: { 'net.mjs': 'slice\n', 'c.txt': 'clean\n' } }],
       thread: { 'net.mjs': 'thread\n' },
-      want: { applied: [], conflicts: ['net.mjs'], dropped: [] },
+      want: { ...none, applied: [], conflicts: ['net.mjs'] },
       files: { 'net.mjs': 'thread\n', 'c.txt': null },
     },
   ];

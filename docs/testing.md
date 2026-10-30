@@ -353,9 +353,10 @@ The acceptance claim and the ACP scratch permission claim skip when the Node run
 
 ## Plan slice review leftovers
 
-Two rows extend the parallel plan slice claims.
+These rows extend the parallel plan slice claims.
 
-- The replay table in the plan tests runs on a synthetic repository with a real thread copy and real slice copies. A builder with no review chain replays every path it changed. A review that edits another slice's merged file and adds a file has both left out, while its edit to a path the builder changed stays. A fix after a review counts as the slice's own change. A slice with a conflict writes none of its clean paths, and the replay after a resolve turn ends done writes them and keeps the orchestrator's merge. Without that second replay the thread copy holds neither.
+- The replay table in the plan tests runs on a synthetic repository with a real thread copy and real slice copies. A builder with no review chain replays every path it changed. A review that edits another slice's merged file and adds a file has both left out, while its edit to a path the builder changed stays. A fix after a review counts as the slice's own change, and a fix that puts a path back where the slice started gives it up, so a later review edit there stays out. A slice with a conflict writes none of its clean paths, and the replay after a resolve turn ends done writes them and keeps the orchestrator's merge. Without that second replay the thread copy holds neither.
+- In the service lane test, the blocked slice of both conflict rows also writes a clean file. It reaches the thread copy after a resolve turn that ends done and is absent after one that fails.
 - The read-only row in the service lane test replaces a base link in the thread copy before the slice starts. The slice's ask packet lists no changed files, since the slice copy never holds that change.
 
 These rows use scripted adapters. They do not cover a live reviewer that edits outside its slice.

@@ -132,13 +132,27 @@ export function recordStep(input: {
   const moved = [...new Set([...changed, ...Object.keys(owned.seen)])].filter(
     (path) => !same(stateOf(lane.get(path)), was(path)),
   );
-  const own = input.writer ? [...new Set([...owned.own, ...moved])].sort() : owned.own;
+  // A writer that puts a path back where the slice started gives it up, so a later review edit
+  // there stays out of the replay.
+  const differs = new Set(changed);
+  const own = input.writer
+    ? [...new Set([...owned.own, ...moved])].filter((path) => differs.has(path)).sort()
+    : owned.own;
   const seen = Object.fromEntries(changed.map((path) => [path, stateOf(lane.get(path))]));
   writeFileSync(ownFile(folder), JSON.stringify({ own, seen } satisfies Owned), { mode: 0o600 });
 }
 
-/** `dropped` holds the paths only a review changed, outside the slice's own changes. */
-export type Replay = { applied: string[]; conflicts: string[]; dropped: string[] };
+/**
+ * `dropped` holds the paths only a review changed, outside the slice's own changes. `skipped`
+ * holds the paths the replay after a resolve turn left out because they lead out of the thread
+ * copy through a link.
+ */
+export type Replay = {
+  applied: string[];
+  conflicts: string[];
+  dropped: string[];
+  skipped: string[];
+};
 
 /**
  * Put a slice's changes on the thread copy. A path the slice changed is written when the thread
@@ -166,6 +180,7 @@ export function replayLane(input: {
   const clean: string[] = [];
   const conflicts: string[] = [];
   const dropped: string[] = [];
+  const skipped: string[] = [];
   for (const path of changed) {
     const mine = stateOf(lane.get(path));
     const theirs = stateOf(thread.get(path));
@@ -174,19 +189,22 @@ export function replayLane(input: {
       dropped.push(path);
       continue;
     }
-    if (!same(theirs, startOf(path)) || !inside(threadScratch, path)) {
+    const linked = !inside(threadScratch, path);
+    if (!same(theirs, startOf(path)) || linked) {
+      // After the resolve turn, a path the thread copy changed stays as the orchestrator left it.
       if (!input.resolved) conflicts.push(path);
+      else if (linked) skipped.push(path);
       continue;
     }
     clean.push(path);
   }
-  if (conflicts.length) return { applied: [], conflicts, dropped };
+  if (conflicts.length) return { applied: [], conflicts, dropped, skipped };
   const copy = laneCopy(folder);
   for (const path of clean) {
     const mine = lane.get(path);
     put(threadScratch, path, mine ? join(copy, path) : null, mine?.mode);
   }
-  return { applied: clean, conflicts, dropped };
+  return { applied: clean, conflicts, dropped, skipped };
 }
 
 /** The lane copy by path, where it started, and the paths it changed since, sorted. */

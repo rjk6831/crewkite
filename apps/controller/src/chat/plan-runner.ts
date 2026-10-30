@@ -647,7 +647,7 @@ export class PlanRunner {
     try {
       if (!root || !thread.base) throw Error('The project is no longer registered.');
       replay = slice.readOnly
-        ? { applied: [], conflicts: [], dropped: [] }
+        ? { applied: [], conflicts: [], dropped: [], skipped: [] }
         : replayLane({
             root,
             base: thread.base,
@@ -662,14 +662,21 @@ export class PlanRunner {
       this.halt(task, `slice ${id} could not merge.${why}`.replace(/\.$/, ''), true);
       return this.host.thread(task.id);
     }
-    const { applied, conflicts, dropped } = replay;
+    const { applied, conflicts, dropped, skipped } = replay;
     if (!conflicts.length) {
       const saved = this.put(task, thread, plan, {
         [id]: { status: 'done', turnId: lane.build, lane: undefined, conflicts: undefined },
       });
-      const left = dropped.length
-        ? ` Left out ${plural(dropped.length, 'path', 'paths')} the review chain changed outside the slice's own changes: ${listedConflicts(dropped).join(', ')}${dropped.length > listedConflicts(dropped).length ? ' and more' : ''}.`
-        : '';
+      const named = (paths: readonly string[]) =>
+        `${listedConflicts(paths).join(', ')}${paths.length > listedConflicts(paths).length ? ' and more' : ''}`;
+      const left = [
+        dropped.length
+          ? ` Left out ${plural(dropped.length, 'path', 'paths')} the review chain changed outside the slice's own changes: ${named(dropped)}.`
+          : '',
+        skipped.length
+          ? ` Left out ${plural(skipped.length, 'path', 'paths')} that lead out of the thread copy through a link: ${named(skipped)}.`
+          : '',
+      ].join('');
       this.host.line(
         task,
         slice.readOnly
