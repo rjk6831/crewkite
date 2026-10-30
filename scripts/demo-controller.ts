@@ -187,7 +187,9 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     process.once('SIGINT', () => void close());
     process.once('SIGTERM', () => void close());
   } catch {
-    console.error('The demo controller could not start. Its home may have another owner.');
+    console.error(
+      'The demo controller needs CREWKITE_HOME set to a private directory you own, inside the repository internal folder.',
+    );
     process.exitCode = 1;
   }
 }
