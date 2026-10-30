@@ -59,6 +59,7 @@ import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
 import { ExtensionHost } from '../extensions/host.ts';
 import type { GitIdentity } from '../host/publication.ts';
 import { inspectSourceDetails, projectRoot } from '../host/source.ts';
+import { type GitState, gitProblem, gitState } from '../host/vcs-probe.ts';
 import { groupAbsent, type OwnedCommand, type OwnedWorker, type Schedule } from '../host/worker.ts';
 import { anthropicChatAdapter } from '../providers/anthropic/chat.ts';
 import { type AnthropicLiveModel, readAnthropicModels } from '../providers/anthropic/models.ts';
@@ -180,6 +181,8 @@ export type ControllerOptions = {
   localDiscovery?: Omit<Parameters<typeof startLocalDiscovery>[2], 'lifecycle'>;
   localWriter?: Omit<Parameters<typeof startLocalReplacement>[2], 'lifecycle' | 'onSubmitted'>;
   prepareVerification?: typeof prepareToolchain;
+  /** Whether the tool runs. Tests pass their own. The controller asks the computer once. */
+  gitState?: () => GitState;
   /** Chat adapters by family. A family without one refuses new chat turns. */
   chatAdapters?: ReadonlyMap<ChatFamily, ChatAdapter>;
 };
@@ -1674,6 +1677,13 @@ export class Controller {
         try {
           path = projectRoot(command.payload.path);
         } catch {
+          const problem = gitProblem((this.options.gitState ?? gitState)());
+          if (problem)
+            return {
+              outcome: 'blocked',
+              reason: 'git-unavailable',
+              next: `${problem}. Install it and put it on your PATH. No new project was registered.`,
+            };
           return {
             outcome: 'blocked',
             reason: 'project-folder-unavailable',
@@ -1938,16 +1948,18 @@ export class Controller {
           outcome: 'applied',
           data: { kind: 'usage', windows: this.workspaceState().usage },
         };
-      case 'GetHealth':
+      case 'GetHealth': {
+        const problem = gitProblem((this.options.gitState ?? gitState)());
         return {
           outcome: 'applied',
           data: {
             kind: 'health',
-            status: 'ready',
+            status: problem ? 'degraded' : 'ready',
             version: CREWKITE_VERSION,
-            blockers: [],
+            blockers: problem ? [problem] : [],
           },
         };
+      }
       default:
         return {
           outcome: 'unsupported',
