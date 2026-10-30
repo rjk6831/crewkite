@@ -186,10 +186,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     };
     process.once('SIGINT', () => void close());
     process.once('SIGTERM', () => void close());
-  } catch {
+  } catch (error) {
     console.error(
-      'The demo controller needs CREWKITE_HOME set to a private directory you own, inside the repository internal folder.',
+      'The demo controller needs CREWKITE_HOME set to a directory you own, with mode 0700, inside the repository internal folder.',
     );
+    console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   }
 }
