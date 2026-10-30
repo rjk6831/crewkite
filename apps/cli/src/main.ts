@@ -53,8 +53,8 @@ import {
 } from '@crewkite/contracts';
 import { runUsageAnalytics } from './chat/analytics.ts';
 import { connectChat } from './chat/connect.ts';
-import { runNotesCommand } from './chat/notes.ts';
 import { runExportCommand } from './chat/export.ts';
+import { runNotesCommand } from './chat/notes.ts';
 import { type Connect, notDone, runPrint, runThreadCommand } from './chat/scripting.ts';
 import { runSearchCommand } from './chat/search.ts';
 import { runDiagnosticsCommand } from './diagnostics.ts';
