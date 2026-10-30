@@ -292,7 +292,7 @@ export function Onboarding({
       <div className="onb-column">
         <header className="onb-head">
           <div>
-            <p className="onb-eyebrow">WELCOME</p>
+            <p className="onb-eyebrow">Welcome</p>
             <h1 id="onb-title">Welcome to CrewKite</h1>
             <p className="onb-sub">
               {'Three short steps to your first thread. Settings > General brings this back.'}

@@ -18,7 +18,6 @@ const setup = (
   })),
   googleTermsAcknowledged: false,
   projectCount: 0,
-  projectsWithThreads: 0,
   ...over,
 });
 
@@ -71,13 +70,18 @@ test('the welcome shows the step the setup allows and ends for anyone who alread
       { step: 'provider', canContinue: true, skip: 'Skip' },
     ],
     [
-      'threads exist and the sign-in has lapsed',
-      { setup: setup([], { projectCount: 1, projectsWithThreads: 1 }) },
+      'a project and no ready family, as after an upgrade with Local held in memory only',
+      { setup: setup([], { projectCount: 1 }) },
       { visible: false, reason: 'existing-user' },
     ],
     [
-      'a project with no ready family',
-      { setup: setup([], { projectCount: 1 }) },
+      'a project and a Google family whose acknowledgement no longer matches',
+      { setup: setup(['google'], { projectCount: 1 }) },
+      { visible: false, reason: 'existing-user' },
+    ],
+    [
+      'a project and no ready family, asked for again from Settings',
+      { setup: setup([], { projectCount: 1 }), engaged: true },
       { step: 'provider', canContinue: false, skip: 'Skip for now' },
     ],
     [

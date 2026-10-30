@@ -51,7 +51,6 @@ export function useOnboarding(workspace: Workspace) {
             families: catalog.families.map(({ family, connected }) => ({ family, connected })),
             googleTermsAcknowledged: googleTermsCurrent(header.googleAcpSetup?.googleTerms),
             projectCount: projects.length,
-            projectsWithThreads: projects.filter(({ taskCount }) => taskCount > 0).length,
           }
         : null,
     [header, catalog, projectPage, projects],

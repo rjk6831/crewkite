@@ -74,7 +74,7 @@ A first launch opens a three step welcome in place of the empty workspace. It co
 2. Add a project. Add project opens the folder picker and registers the repository. With projects already added, a menu picks one and Add another project adds more.
 3. Open the composer. The last step shows a suggested first message, "Give me a short tour of this repository and suggest one small first change." Open the composer starts a new thread in the project with that text in the box. CrewKite never sends it for you.
 
-Skip is on every step and ends the welcome for good. The desktop keeps that flag in its profile, so the welcome does not come back after a restart. It does not show for anyone who already has a project and a connected provider, or who already has threads. Settings > General has Show the welcome again. Each step moves focus to its heading, and every control is a button, a menu or a checkbox that the keyboard reaches.
+Skip is on every step and ends the welcome for good. The desktop keeps that flag in its profile, so the welcome does not come back after a restart. It does not show for anyone who already has a project. After Skip, focus moves to New thread in the left rail. Settings > General has Show the welcome again. Each step moves focus to its heading, and every control is a button, a menu or a checkbox that the keyboard reaches.
 
 ## Keyboard
 

@@ -552,6 +552,7 @@ export function App() {
   const [palette, setPalette] = useState(false);
   const paletteOpener = useRef<HTMLElement | null>(null);
   const searchButton = useRef<HTMLButtonElement>(null);
+  const newThreadButton = useRef<HTMLButtonElement>(null);
   const [about, setAbout] = useState(false);
   const task = newThread === null ? snapshot?.tasks.find(({ id }) => id === selected) : undefined;
   const selectedProjectId = task?.projectId;
@@ -741,6 +742,7 @@ export function App() {
           </button>
         </div>
         <button
+          ref={newThreadButton}
           type="button"
           className="nav-item"
           onClick={() => startThread()}
@@ -1009,7 +1011,11 @@ export function App() {
             view={onboarding.view}
             onContinue={onboarding.next}
             onBack={onboarding.back}
-            onSkip={onboarding.finish}
+            onSkip={() => {
+              onboarding.finish();
+              // The welcome unmounts with the button that was pressed, so focus goes to the rail.
+              requestAnimationFrame(() => newThreadButton.current?.focus());
+            }}
             onFinish={finishWelcome}
           />
         ) : !threadSource ? (

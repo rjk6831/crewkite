@@ -18,8 +18,6 @@ export type SetupState = {
   /** Whether the stored Google acknowledgement covers the terms text this build shows. */
   googleTermsAcknowledged: boolean;
   projectCount: number;
-  /** Projects that already hold at least one thread. */
-  projectsWithThreads: number;
 };
 
 /**
@@ -64,8 +62,9 @@ export function onboardingView(input: OnboardingInput): OnboardingView {
   if (flag === 'finished') return { visible: false, reason: 'finished' };
   const ready = readyFamilies(setup);
   // A person who already works here does not need a welcome.
-  const existing = setup.projectsWithThreads > 0 || (setup.projectCount > 0 && ready.length > 0);
-  if (existing && !engaged) return { visible: false, reason: 'existing-user' };
+  // A project is enough. Local is held in memory only, a sign-in can lapse and the Google
+  // acknowledgement can go stale, so a ready family says nothing about who is new.
+  if (setup.projectCount > 0 && !engaged) return { visible: false, reason: 'existing-user' };
   // A step is only shown while what it needs still holds. A family that disconnects sends the
   // person back to the first step, and a missing project back to the second.
   const wanted = ONBOARDING_STEPS.indexOf(input.reached);
