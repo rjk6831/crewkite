@@ -8,7 +8,15 @@ import {
   statSync,
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { ChatAttachment, ChatFamily, ChatRole } from '@crewkite/contracts';
+import {
+  type ChatAttachment,
+  type ChatFamily,
+  type ChatRole,
+  PROJECT_NOTES_BYTES,
+  PROJECT_NOTES_MAX,
+  projectNotesBytes,
+  renderProjectNotes,
+} from '@crewkite/contracts';
 import { anthropicInstructionFile } from '../providers/anthropic/instructions.ts';
 import { googleInstructionFile } from '../providers/google/instructions.ts';
 import type { ChatHistoryEntry } from './adapter.ts';
@@ -38,18 +46,55 @@ export function handoffReason(reason: HandoffReason): string {
 /**
  * The framing for an assistant or fixer turn. The Anthropic client launches with no setting
  * sources and Local has no instruction loader, so those two get the project's instruction files
- * here. The OpenAI and Google clients read their own files from the working folder.
+ * here. The OpenAI and Google clients read their own files from the working folder. Every family
+ * gets the project's notes. The notes and the instruction files share 64 KiB: the notes come first
+ * with at most 16 KiB, and the instruction files keep the rest.
  */
-export function systemContext(projectName: string, directory: string, family: ChatFamily): string {
+export function systemContext(
+  projectName: string,
+  directory: string,
+  family: ChatFamily,
+  notes: readonly string[] = [],
+): string {
   const framing = [
     `You are working on the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     'Read and edit files only inside that copy. The person reviews every change in Changes before it reaches their repository.',
     'When you change files, say which files you changed and why.',
     'The scratch copy has no `.git` folder and no installed dependencies, so git commands and tests may fail there.',
   ].join('\n');
+  const section = notesSection(notes);
   const instructions =
-    family === 'anthropic' || family === 'local' ? projectInstructions(directory) : [];
-  return [framing, ...instructions].join('\n\n');
+    family === 'anthropic' || family === 'local'
+      ? projectInstructions(directory, INSTRUCTION_BYTES - Buffer.byteLength(section))
+      : [];
+  return [framing, ...(section ? [section] : []), ...instructions].join('\n\n');
+}
+
+/**
+ * The project's notes as a section, or an empty string. The controller holds a project to 16 KiB
+ * and 200 notes. A longer list is cut at a whole note, so the section never outgrows its share.
+ */
+export function notesSection(notes: readonly string[]): string {
+  let kept = notes.slice(0, PROJECT_NOTES_MAX);
+  while (kept.length > 0 && projectNotesBytes(kept) > PROJECT_NOTES_BYTES) kept = kept.slice(0, -1);
+  return renderProjectNotes(kept);
+}
+
+/** A brief for a role that reads only, followed by the project's notes. */
+export function withNotes(brief: string, notes: readonly string[]): string {
+  const section = notesSection(notes);
+  return section ? `${brief}\n\n${section}` : brief;
+}
+
+/**
+ * A resumed session skips the system context, so its message carries the current notes in front
+ * of it. A session without notes sees no change.
+ */
+export function withTurnNotes(message: string, notes: readonly string[]): string {
+  const section = notesSection(notes);
+  return section
+    ? `CrewKite attaches the current notes for this project to the message below.\n\n${section}\n\n${message}`
+    : message;
 }
 
 /** Instruction files at the scratch root, in the order systemContext reads them. */
@@ -65,15 +110,15 @@ export function presentInstructions(directory: string): string[] {
     }
   });
 }
-const INSTRUCTION_BYTES = 64 * 1024;
+export const INSTRUCTION_BYTES = 64 * 1024;
 const INSTRUCTIONS_CUT = '[The project instructions stop here at the 64 KiB limit.]';
 
 /**
  * One section per instruction file at the scratch root, in a fixed order. A link that resolves to a
  * file inside the copy counts once, under the first name that reaches it. Headers and text share
- * 64 KiB, and a cut ends on a whole line.
+ * `budget` bytes, 64 KiB less what the notes take, and a cut ends on a whole line.
  */
-function projectInstructions(directory: string): string[] {
+function projectInstructions(directory: string, budget: number): string[] {
   let root: string;
   try {
     root = realpathSync.native(directory);
@@ -93,7 +138,7 @@ function projectInstructions(directory: string): string[] {
     if (!file.startsWith(`${root}${sep}`) || read.has(file)) continue;
     read.add(file);
     const header = `Project instructions from ${name}:\n\n`;
-    const room = INSTRUCTION_BYTES - used - Buffer.byteLength(header);
+    const room = budget - used - Buffer.byteLength(header);
     const bytes = readFileStart(file, Math.max(room, 0) + 1);
     if (bytes === null || bytes.length === 0) continue;
     if (bytes.length <= room) {

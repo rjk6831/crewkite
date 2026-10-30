@@ -136,6 +136,8 @@ import {
   spokenText,
   systemContext,
   withAttachments,
+  withNotes,
+  withTurnNotes,
 } from './prompt.ts';
 import { copyScratch } from './scratch-copy.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
@@ -159,6 +161,8 @@ export type ChatServiceDeps = {
   /** True when the person acknowledged the current Google terms text (ADR 0002). */
   googleTermsAcknowledged: () => boolean;
   projectPath: (projectId: string) => string | undefined;
+  /** The project's notes, oldest first. Every turn carries them. Absent means no notes. */
+  projectNotes?: (projectId: string) => readonly string[];
   /**
    * Check an explicit selection against the catalog, or pick the default when none is given.
    * Null means nothing usable: the service blocks the send and asks for a pick.
@@ -1765,26 +1769,31 @@ export class ChatService {
     const balanced = writer && thread.flightMode === 'balanced';
     const permissionPolicy = writer && !balanced ? thread.permissionPolicy : 'ask';
     const permissionGrants = writer && !balanced ? (thread.permissionGrants ?? []) : [];
+    // A new session reads the notes in its system context. A resumed session skips that context,
+    // so its message carries them. shortcut: a resumed turn repeats the notes every time. Upgrade:
+    // send them only when they changed since the session last ran.
+    const notes = this.deps.projectNotes?.(task.projectId) ?? [];
+    const body = carries
+      ? this.packet(turn, {
+          from: turn.handoffFrom ?? (asked ? (this.answeredOn(task.id) ?? family) : family),
+          reason,
+          root,
+          base: thread.base,
+          history,
+          prompt,
+          files,
+          threadTools,
+        })
+      : (caught?.prompt ?? prompt);
     return {
       turnId: turn.id,
       taskId: task.id,
       role: turn.role,
       selection: turn.selection,
-      prompt: carries
-        ? this.packet(turn, {
-            from: turn.handoffFrom ?? (asked ? (this.answeredOn(task.id) ?? family) : family),
-            reason,
-            root,
-            base: thread.base,
-            history,
-            prompt,
-            files,
-            threadTools,
-          })
-        : (caught?.prompt ?? prompt),
+      prompt: session ? withTurnNotes(body, notes) : body,
       files,
       threadTools,
-      systemContext: this.context(turn, project.name, directory, root, thread, history),
+      systemContext: this.context(turn, project.name, directory, root, thread, history, notes),
       // The packet carries the transcript, so a turn with a packet sends no separate history. With a
       // delta, the history stops where the delta starts, for an adapter that has to start over.
       history: carries ? [] : (caught?.history ?? history),
@@ -2911,6 +2920,7 @@ export class ChatService {
     root: string,
     thread: ChatThread,
     history: readonly ChatHistoryEntry[],
+    notes: readonly string[],
   ): string {
     const { role } = turn;
     const crew = crewRole(thread) === role || turn.slice !== undefined;
@@ -2918,15 +2928,18 @@ export class ChatService {
       (crew && role === 'challenger'
         ? this.lastWrite(turn.taskId)
         : history.findLast((entry) => entry.role === 'assistant')?.text) ?? null;
-    if (role === 'advisor') return adviceContext(name, directory, answer);
-    if (role === 'ask') return askContext(name, directory);
-    if (role === 'challenger') return challengeContext(name, directory, answer);
-    if (role === 'orchestrator') return orchestratorContext(name, directory);
-    if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family);
+    if (role === 'advisor') return withNotes(adviceContext(name, directory, answer), notes);
+    if (role === 'ask') return withNotes(askContext(name, directory), notes);
+    if (role === 'challenger') return withNotes(challengeContext(name, directory, answer), notes);
+    if (role === 'orchestrator') return withNotes(orchestratorContext(name, directory), notes);
+    if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family, notes);
     const base = thread.base ?? '';
     // The brief says why the changes could not be read, and the model works from the files.
     const files = this.scratchDiff(turn.taskId, root, base, directory);
-    return reviewContext(name, directory, base, files, crew, this.unreadable.get(turn.taskId));
+    return withNotes(
+      reviewContext(name, directory, base, files, crew, this.unreadable.get(turn.taskId)),
+      notes,
+    );
   }
 
   /** The newest reply from a turn that wrote to the scratch copy. */

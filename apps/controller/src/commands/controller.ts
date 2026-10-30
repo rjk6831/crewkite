@@ -42,6 +42,7 @@ import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
 import { McpRegistry } from '../chat/mcp-servers.ts';
+import { NotesRefused, ProjectNotes } from '../chat/project-notes.ts';
 import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
@@ -408,6 +409,43 @@ export class Controller {
     }
   }
 
+  private notesRuntime?: ProjectNotes;
+  private projectNotes(): ProjectNotes {
+    // shortcut: notes borrow a message ID's time-ordered suffix, like turns do. Upgrade: add
+    // 'not' to IdPrefix and to the testkit ID helper.
+    this.notesRuntime ??= new ProjectNotes(
+      this.store.db,
+      this.now,
+      () => `not_${this.id('msg').slice(4)}`,
+    );
+    return this.notesRuntime;
+  }
+
+  private notesCommand(
+    command: Extract<
+      Command,
+      { command: 'ReadProjectNotes' | 'AddProjectNote' | 'EditProjectNote' | 'RemoveProjectNote' }
+    >,
+  ): CommandResult {
+    try {
+      const notes = this.projectNotes();
+      const { projectId } = command.payload;
+      const read =
+        command.command === 'AddProjectNote'
+          ? notes.add(projectId, command.payload.text)
+          : command.command === 'EditProjectNote'
+            ? notes.edit(projectId, command.payload.noteId, command.payload.text)
+            : command.command === 'RemoveProjectNote'
+              ? notes.remove(projectId, command.payload.noteId)
+              : notes.read(projectId);
+      return { outcome: 'applied', data: { kind: 'project-notes', ...read } };
+    } catch (failure) {
+      if (failure instanceof NotesRefused)
+        return { outcome: 'blocked', reason: failure.reason, next: failure.next };
+      throw failure;
+    }
+  }
+
   private chatRuntime?: ChatService;
   private chat(): ChatService {
     this.chatRuntime ??= new ChatService({
@@ -423,6 +461,7 @@ export class Controller {
       resolveEnvironment: (family) => this.chatEnvironment(family),
       googleTermsAcknowledged: () => googleTermsCurrent(this.store.googleAcpSetup().googleTerms),
       projectPath: (projectId) => this.projectPath(projectId),
+      projectNotes: (projectId) => this.projectNotes().texts(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
       catalog: () => this.chatCatalog(),
       localContext: () => this.localContext(),
@@ -1346,6 +1385,14 @@ export class Controller {
     // Saved prompts have no task. Their receipts come from the normal journal, so a replayed key
     // answers from its receipt and an old save cannot overwrite a newer body.
     if (command.command === 'SaveChatPrompt' || command.command === 'DeleteChatPrompt') return;
+    // Notes belong to a project, not a task. The controller checks the project and the size cap
+    // when it applies the command, and a replayed key answers from its receipt.
+    if (
+      command.command === 'AddProjectNote' ||
+      command.command === 'EditProjectNote' ||
+      command.command === 'RemoveProjectNote'
+    )
+      return;
     if (
       [
         'SendChatMessage',
@@ -1582,6 +1629,11 @@ export class Controller {
           { home: this.home, store: this.store, profiles: () => this.resolveProfiles() },
           command.payload,
         );
+      case 'ReadProjectNotes':
+      case 'AddProjectNote':
+      case 'EditProjectNote':
+      case 'RemoveProjectNote':
+        return this.notesCommand(command);
       case 'ReadChatCatalog':
         this.refreshStaleChatModels();
         return {
