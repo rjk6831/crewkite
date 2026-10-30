@@ -2,6 +2,15 @@
 
 CrewKite reaches each provider through that provider's own client, signed in on your machine with your own subscription. The chat thread runs one adapter per family: OpenAI, Anthropic, Google and Local. This page names the transport of each, what you have to set up first and how far I have run it live. The file and repository writers that came before the chat thread keep their dated qualification notes under [Writers](#writers).
 
+## Plans per family
+
+CrewKite puts no plan gate of its own. Each family works on whatever plan its provider allows, and the provider's limits apply. I read each fact below on the provider's own pages on 31 October 2026.
+
+- OpenAI: as of 31 October 2026, OpenAI's help center says Codex is included across the ChatGPT Free, Go, Plus, Pro, Business, Edu and Enterprise plans. Its pricing page lists the Codex CLI under Plus, and I could not confirm the CLI plan by plan. Limits depend on the model, the size of the task and whether it runs locally or in the cloud. The pricing page gives five-hour estimates for Plus and Business and says weekly limits may also apply. The client can sign in with ChatGPT for subscription access or with an API key at standard API rates. The OpenAI route needs the ChatGPT sign-in and stops with a message on an API key, because that would bill per token.
+- Anthropic: as of 31 October 2026, Anthropic's pricing page lists Claude Code in the Pro, Max, Team and Enterprise plans and marks it unavailable on Free. Its help center says Pro and Max have a five-hour limit and a weekly limit, and that Claude and Claude Code share them. It also says an `ANTHROPIC_API_KEY` in the environment makes the client bill API usage. CrewKite sets no API key and keeps ambient keys out of the client's environment.
+- Google: as of 31 October 2026, the Antigravity plans page says every plan has the Gemini models and the product features. It gives accounts without Google AI Pro or Ultra a quota that refreshes weekly. Pro refreshes every five hours until its weekly limit, Ultra has the highest quota, and limits follow available capacity. The route signs in with a personal Google account, as the editor guide documents. The terms for third-party access are under [Google and your account](#google-and-your-account).
+- Local: as of 31 October 2026, LM Studio's own post of 8 July 2025 says it is free to use at home and at work. The model runs on your hardware, so speed and context follow your machine.
+
 ## Chat adapters
 
 Every adapter implements `ChatAdapter` and turns its client's native events into the same `AgentEvent` stream. It parses only the fields CrewKite uses. Anything it does not recognize shows once per turn as a notice and never ends the turn. A failure carries its stage, the cause, the provider's own message and a next action. Each turn runs the client in its own process group, and Stop interrupts through the client's protocol before it signals the group.

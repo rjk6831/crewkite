@@ -145,6 +145,7 @@ function ProviderStep({
     <>
       <p className="onb-lead">
         CrewKite runs threads on OpenAI, Anthropic, Google or Local models. Connect one to continue.
+        CrewKite adds no plan requirement, so each family works on the plan its provider allows.
         Each setup below is the one Settings has.
       </p>
       <ul className="onb-families" aria-label="Providers">
