@@ -384,3 +384,7 @@ These claims come from the CLI QA pass. Each row lives in an existing table or t
 - The state guard in `scripts/desktop-state.test.ts` checks that `pnpm desktop` refuses a home or profile inside the checkout's internal folder, including the folder a link in it points to, a folder that holds or sits inside the checkout, a state root that is not the home folder, a path outside the root, or a shared folder. The row in `apps/desktop/src/main/runtime.test.ts` checks that the source desktop in that mode starts `apps/controller/src/main.ts` and never the demo controller.
 
 The reconnect line says about a minute, which is the existing retry schedule of the client (69 seconds in all). The desktop window opened by `pnpm desktop`, and the probe on a computer whose git is missing, need a Mac to confirm.
+
+## Controller safety and queue
+
+- The backup test in `store/backup.test.ts` upgrades one database file through several migration steps. A fresh database takes no copy. Each later upgrade leaves a copy named for the version it started from, holding that version's rows, with mode 0600. Only the newest two copies stay. A database already at the newest version takes none, and a file that already has a copy's name is never overwritten.

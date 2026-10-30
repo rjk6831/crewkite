@@ -1,6 +1,15 @@
 import { randomBytes } from 'node:crypto';
-import { chmodSync, lstatSync, mkdirSync, readdirSync, readFileSync } from 'node:fs';
-import { dirname, join } from 'node:path';
+import {
+  chmodSync,
+  closeSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readdirSync,
+  readFileSync,
+  unlinkSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
   type Attempt,
@@ -176,8 +185,10 @@ export class Store {
   private workspaceRevision = 0n;
   private workspaceDirty = false;
   private readonly listeners = new Set<(event: Event) => void>();
+  private readonly path: string;
 
   constructor(path: string) {
+    this.path = path;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     try {
       if (lstatSync(path).isSymbolicLink()) throw new Error('The database cannot be a symlink.');
@@ -195,6 +206,7 @@ export class Store {
       .sort();
     const current = this.db.prepare('PRAGMA user_version').get()?.user_version as number;
     if (current > files.length) throw new Error('The database needs a newer controller.');
+    if (current > 0 && current < files.length) this.backUpBeforeMigrating(current);
     for (let index = current; index < files.length; index++) {
       if (Number(files[index].slice(0, 3)) !== index + 1)
         throw new Error('Migration sequence has a gap.');
@@ -208,6 +220,49 @@ export class Store {
         } catch {}
         throw error;
       }
+    }
+  }
+
+  // An existing database gets a consistent copy beside it before any migration runs, and the
+  // newest two copies stay. A fresh database has nothing to lose and takes none.
+  private backUpBeforeMigrating(version: number) {
+    if (this.path === ':memory:' || this.path === '') return;
+    const folder = dirname(this.path);
+    const stem = `${basename(this.path)}.before-v${version}`;
+    let target = '';
+    for (let attempt = 1; ; attempt++) {
+      target = join(folder, attempt === 1 ? `${stem}.sqlite` : `${stem}-${attempt}.sqlite`);
+      try {
+        // The exclusive create refuses an existing file or a planted link, and fixes the mode
+        // before any content is written. SQLite accepts an empty file as the target.
+        closeSync(openSync(target, 'wx', 0o600));
+        break;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+      }
+    }
+    try {
+      this.db.prepare('VACUUM INTO ?').run(target);
+      chmodSync(target, 0o600);
+    } catch (error) {
+      try {
+        unlinkSync(target);
+      } catch {}
+      throw error;
+    }
+    const prefix = `${basename(this.path)}.before-v`;
+    const kept = readdirSync(folder)
+      .flatMap((name) => {
+        const match = name.startsWith(prefix)
+          ? /^(\d+)(?:-(\d+))?\.sqlite$/.exec(name.slice(prefix.length))
+          : null;
+        return match ? [{ name, rank: Number(match[1]) * 1e6 + Number(match[2] ?? 1) }] : [];
+      })
+      .sort((a, b) => b.rank - a.rank);
+    for (const old of kept.slice(2)) {
+      try {
+        unlinkSync(join(folder, old.name));
+      } catch {}
     }
   }
 
