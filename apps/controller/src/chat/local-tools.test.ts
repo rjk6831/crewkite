@@ -180,6 +180,13 @@ test('thread tools read through the reader, are cut to the Local room and fail w
     const cut = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 1024);
     assert.match(cut.output, /\[cut to fit the Local context/);
     assert(Buffer.byteLength(cut.output) <= 1024);
+    // No room left gives an empty read, and a room smaller than the notice gets the text alone.
+    const none = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 0);
+    assert.equal(none.status, 'ok');
+    assert.equal(none.output, '');
+    const tiny = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 20);
+    assert.equal(Buffer.byteLength(tiny.output), 20);
+    assert.doesNotMatch(tiny.output, /cut to fit/);
     assert.match((await run('thread_diff', {})).output, /cursor "c1"/);
     assert.match((await run('thread_checks', {})).output, /lint ok/);
     assert.equal((await run('thread_live', {})).output, 'No turn is running.');

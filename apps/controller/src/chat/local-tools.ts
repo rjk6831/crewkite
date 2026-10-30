@@ -640,10 +640,14 @@ function describe(name: string, args: Record<string, unknown>) {
 }
 
 /** A result cut to the room the Local prompt has left. The notice says so, so the model asks again. */
-const cutToRoom = (text: string, bytes: number) =>
-  Buffer.byteLength(text) <= bytes
-    ? text
-    : `${fitBytes(text, bytes - 64)}\n[cut to fit the Local context; ask for less]`;
+const CUT_NOTICE = '\n[cut to fit the Local context; ask for less]';
+const cutToRoom = (text: string, bytes: number) => {
+  if (Buffer.byteLength(text) <= bytes) return text;
+  // Room too small for the notice gets the text alone, and none gets nothing.
+  return bytes > Buffer.byteLength(CUT_NOTICE)
+    ? `${fitBytes(text, bytes - Buffer.byteLength(CUT_NOTICE))}${CUT_NOTICE}`
+    : fitBytes(text, bytes);
+};
 
 const oneLine = (text: string) => text.replace(/\s+/g, ' ').trim();
 
@@ -856,7 +860,7 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
       case 'thread_live': {
         const threads = context.threads;
         if (!threads) return failed('Thread tools are not available in this turn.');
-        const limit = Math.max(512, context.threadBytes ?? OUTPUT_BYTES);
+        const limit = context.threadBytes ?? OUTPUT_BYTES;
         return ready(null, async () => ({
           status: 'ok',
           output: cutToRoom(await readThread(name, threadArguments(args), threads), limit),

@@ -214,3 +214,10 @@ One claim covers the Google gate in `apps/controller/src/commands/google-terms.t
 - The controller refuses a Google connection step until the person acknowledged the current terms text. A first connection with no acknowledgement is refused, an acknowledgement of an old text version is refused and stores nothing, an acknowledgement of the current version is stored with the controller time and the version, the same step then reaches setup, and a stored acknowledgement of an older version is refused again. The renderer flow test keeps the setup sequence with a current acknowledgement in place. A chat turn, ask, plan slice, handoff or crew turn that lands on Google is refused with a pointer to Settings > Google until the current text is acknowledged; the chat service test covers that row. The interactive CLI asks the same question and sends the acknowledgement only on an explicit yes, and its app test covers both answers.
 
 This runs against a real controller and real SQLite with no network.
+
+## Local thread read room
+
+One table in `apps/controller/src/providers/local/budget.test.ts` covers the room a Local thread read gets.
+
+- A thread read gets the prompt room that the built prompt leaves, at three bytes a token, within the 64 KiB bound every tool result has. A small prompt leaves most of the room, large attachments leave less, a prompt that fills or passes the room leaves nothing, and a context too small for any prompt leaves nothing. A second test sweeps six context sizes and checks that the read never passes the room and never grows as the prompt grows.
+- The tool test in `apps/controller/src/chat/local-tools.test.ts` checks that no room gives an empty result and that a room smaller than the cut notice gets the text alone.
