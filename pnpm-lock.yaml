@@ -271,6 +271,24 @@ importers:
         specifier: 8.3.4
         version: 8.3.4(@types/node@24.19.2)(jiti@2.7.0)
 
+  packages/bench:
+    dependencies:
+      '@crewkite/client':
+        specifier: workspace:*
+        version: link:../client
+      '@crewkite/contracts':
+        specifier: workspace:*
+        version: link:../contracts
+      '@crewkite/controller':
+        specifier: workspace:*
+        version: link:../../apps/controller
+      '@crewkite/testkit':
+        specifier: workspace:*
+        version: link:../testkit
+      zod:
+        specifier: 4.6.7
+        version: 4.6.7
+
   packages/client:
     dependencies:
       '@crewkite/contracts':
