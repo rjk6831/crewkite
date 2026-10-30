@@ -161,7 +161,6 @@ else if(mode==='oversized')process.stdout.write('x'.repeat(1048577));
 else {
  process.stdout.write(JSON.stringify(start)+'\n');
  process.stdout.write(JSON.stringify(result)+(mode==='truncated'?'':'\n'));
- if(mode==='descendant') { spawn(process.execPath,['-e','setInterval(()=>{},1000)'],{stdio:'inherit'});process.exit(0); }
 }
 `;
   writeFileSync(executable, fixture, { mode: 0o700 });
@@ -755,6 +754,70 @@ else {
       });
       assert.deepEqual(signals, ['SIGTERM', 'SIGKILL']);
     }
+    {
+      // The leader writes a valid result and exits, and a descendant keeps the output open. A
+      // real descendant outlives its leader and only the system's init reaps it, so this row
+      // scripts the child, the clock and the group probe.
+      let absent = false,
+        settled = false;
+      const timers: Array<{ delay: number; work: () => void; active: boolean }> = [];
+      const signals: NodeJS.Signals[] = [];
+      const child = new EventEmitter() as ReturnType<typeof spawn>;
+      const stdout = new PassThrough();
+      Object.assign(child, { pid: 12346, stdout, stderr: new PassThrough(), unref: () => child });
+      const handle = startGoogleWriter({
+        client,
+        environment,
+        admission,
+        attemptId,
+        repositoryRoot: resolve('.'),
+        directory,
+        temporaryDirectory: runtime,
+        file,
+        task: 'descendant',
+        timeoutMs: 3000,
+        deadline: 3000,
+        now: () => 0,
+        onSubmitted: () => {},
+        spawn: () => child,
+        groupAbsent: () => absent,
+        signalGroup: (_, signal) => {
+          signals.push(signal);
+        },
+        schedule: (work, delay) => {
+          const timer = { delay, work, active: true };
+          timers.push(timer);
+          return () => {
+            timer.active = false;
+          };
+        },
+      });
+      void handle.result.then(() => {
+        settled = true;
+      });
+      const turn = () => new Promise((resolve) => setImmediate(resolve));
+      stdout.write(wire(start));
+      stdout.write(wire(end));
+      await turn();
+      child.emit('exit', 0, null);
+      const check = timers.find((value) => value.active && value.delay === 250);
+      assert(check, 'the exit schedules a closure check');
+      check.active = false;
+      check.work();
+      assert.deepEqual(signals, ['SIGTERM'], 'the held group is stopped');
+      await turn();
+      assert.equal(settled, false, 'no result while the descendant holds the group');
+      absent = true;
+      child.emit('close', 0, null);
+      assert.deepEqual(await handle.result, {
+        reason: 'not-quiescent',
+        quiescent: true,
+        exitCode: 0,
+        signal: null,
+        metadata: null,
+        diagnostic: null,
+      });
+    }
     for (const content of ['text\0tail', '\ud800'])
       await assert.rejects(
         runGoogleWriter({
@@ -784,7 +847,6 @@ else {
       'invalid-utf8',
       'startup-notice',
       'oversized',
-      'descendant',
       'old-build',
       'missing-evidence',
       'billing-unknown',
