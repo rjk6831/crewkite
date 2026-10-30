@@ -301,6 +301,10 @@ test('Local connect stops its command chain when component ownership changes', a
     'Connected. The loaded model is eligible for chat.',
   );
   assert.equal(line({ setup: reading }), 'The controller is reading model metadata.');
+  // A controller notice replaces the generic line for the reason and yields to an action message.
+  const noticed = { reason: 'capability-unavailable' as const, notice: 'Use no authentication.' };
+  assert.equal(line({ setup: noticed }), 'Use no authentication.');
+  assert.equal(line({ setup: noticed, message: 'Retrying.' }), 'Retrying.');
   assert.equal(line({ confirmed: true }), 'Model selection confirmed');
   assert.equal(
     line({ confirmed: true, message: 'Taking longer than expected.' }),
