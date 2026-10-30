@@ -675,6 +675,11 @@ export const AcceptChatChangesPayloadSchema = z.strictObject({
     .regex(/^(?!.*\/\/)[a-z0-9][a-z0-9/-]*[a-z0-9]$/),
   /** The commit message. The controller writes its own when the person leaves it out. */
   message: z.string().min(1).max(4096).optional(),
+  /** The Changes listing the person reviewed. A different current list refuses the Accept. */
+  listing: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
 });
 const branchName = AcceptChatChangesPayloadSchema.shape.branch;
 /**
@@ -900,16 +905,6 @@ export const ChatTurnEventsReadSchema = z
   });
 export type ChatTurnEventsRead = z.infer<typeof ChatTurnEventsReadSchema>;
 
-export const ChatChangesReadSchema = z.strictObject({
-  taskId: id('tsk'),
-  base: z
-    .string()
-    .regex(/^[a-f0-9]{40}$/)
-    .nullable(),
-  files: z.array(ChatFileDiffSchema).max(2000),
-});
-export type ChatChangesRead = z.infer<typeof ChatChangesReadSchema>;
-
 // Results of the read-only thread tools. A cloud client reaches them through the controller's
 // one MCP server; Local calls the same reads as native functions. Every result is bounded here so
 // a large thread cannot flood a model's context.
@@ -1074,7 +1069,6 @@ export const ReadChatTurnEventsPayloadSchema = z.strictObject({
     .regex(/^(0|[1-9][0-9]{0,19})$/)
     .optional(),
 });
-export const ReadChatChangesPayloadSchema = z.strictObject({ taskId: id('tsk') });
 export const ReadChatCatalogPayloadSchema = z.strictObject({ taskId: id('tsk').optional() });
 
 export type ChatCatalogEntry = z.infer<typeof ChatCatalogEntrySchema>;

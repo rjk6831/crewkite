@@ -1,6 +1,13 @@
 import { z } from 'zod';
 import { ChatAnalyticsReadSchema, ReadChatAnalyticsPayloadSchema } from './analytics.ts';
 import {
+  ChatChangesReadSchema,
+  CommentChatChangePayloadSchema,
+  DecideChatHunkPayloadSchema,
+  DiscardChatHunkPayloadSchema,
+  ReadChatChangesPayloadSchema,
+} from './changes.ts';
+import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
   AskChatFamilyPayloadSchema,
@@ -9,7 +16,6 @@ import {
   ChatBranchStatusSchema,
   ChatCatalogChangeSchema,
   ChatCatalogReadSchema,
-  ChatChangesReadSchema,
   ChatEffortSchema,
   ChatFamilySchema,
   ChatPullRequestResultSchema,
@@ -30,7 +36,6 @@ import {
   PushChatBranchPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
-  ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
   ReadChatTurnEventsPayloadSchema,
   RefreshChatModelsPayloadSchema,
@@ -2542,6 +2547,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('RetryChatTurn', RetryChatTurnPayloadSchema),
   read('ReadChatTurnEvents', ReadChatTurnEventsPayloadSchema),
   mutate('DiscardChatChange', DiscardChatChangePayloadSchema),
+  mutate('DecideChatHunk', DecideChatHunkPayloadSchema),
+  mutate('DiscardChatHunk', DiscardChatHunkPayloadSchema),
+  mutate('CommentChatChange', CommentChatChangePayloadSchema),
   mutate('RenameChatThread', RenameChatThreadPayloadSchema),
   mutate('DeleteChatThread', DeleteChatThreadPayloadSchema),
   mutate('AskChatFamily', AskChatFamilyPayloadSchema),
@@ -3882,6 +3890,7 @@ export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
 export * from './analytics.ts';
 export { canonicalJson } from './canonical.ts';
+export * from './changes.ts';
 export * from './chat.ts';
 export * from './checks.ts';
 export * from './cli.ts';
