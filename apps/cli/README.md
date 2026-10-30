@@ -125,6 +125,17 @@ Every command, the task commands included, uses one table.
 
 With `--json` every line is one object that `CliJsonLineSchema` in `packages/contracts/src/cli.ts` accepts. `kind` says which: `event` for a thread event (agent events, turn and thread records, stored messages), `result` for the controller's answer to a command with its reason and next step, `turn-end` with the status of the followed turn, `thread` for a thread read, `threads` for the list and `error`. Every line carries `v: 2`. That number names one fixed shape, the embedded thread, turn, message and event shapes included: the CLI's schema test pins a hash of the whole shape, so a change to any of them moves `v`.
 
+### Usage analytics
+
+```sh
+pnpm crewkite usage thread <task-id> [--csv new-file] [--json]
+pnpm crewkite usage project <project-id> [--csv new-file] [--json]
+```
+
+These two commands print what the controller derives for one thread or for every thread of a project: turns, tokens, allowance used, wall time, handoffs between families, checks run and passed, and accepted branches. The controller reads its own rows, so a thread that ran before this command existed has numbers too. A value the client did not report reads as unknown and never as zero, and a token sum says how many turns it covers. Allowance is charged to a turn only when gauge readings within 15 minutes before and after it show the drop and no other turn on that family overlapped it. Use outside CrewKite between the two readings counts too.
+
+`--csv` writes a new file, one row for each turn of a thread or for each thread of a project, and refuses a file that exists. An empty cell means the value is unknown. Text that a spreadsheet would run as a formula gets a leading single quote. `--json` prints one line, the controller's read with `kind` set to `chat-analytics`. Nothing leaves the machine except the file you name.
+
 ## Task commands
 
 These commands predate the chat thread and keep working as they did. They take `--home path` like every other command.

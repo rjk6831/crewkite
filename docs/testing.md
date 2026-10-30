@@ -284,3 +284,15 @@ When a resume fails and a new session starts, the notes block is taken out of th
 The command line claim in `apps/cli/src/chat/notes.test.ts` drives list, add and remove through a real controller socket and checks each refusal sentence and exit status. A change answers with the project and its byte count, and the command line reads the list again.
 
 The migration for notes is number 019, which follows 018 without a gap. The tests in `project-notes.test.ts` and the command line test apply the real migration folder.
+
+## Usage analytics
+
+Three files cover the usage numbers of a thread and a project. All of them use real SQLite or pure functions, with no network and no sleeps.
+
+- The aggregation table in `apps/controller/src/chat/analytics.test.ts` builds one fixture thread on two families with a handoff, a passed and a failed check, two accepted branches, a turn that reported tokens in and not out, turns that reported none and a turn still running. It checks that sums count only what a client reported, that a family with no reported tokens stays null, and that checks and branches that the thread record no longer holds are counted from the journal.
+- The same table checks the allowance rule. A turn is charged to a gauge window only when a reading before it and a reading after it, each within 15 minutes, agree on the reset and do not rise, and no other turn of the family in any thread overlaps them. A later reading that rises or resets leaves the turn unmeasured.
+- The project table adds two threads, lists them by title and reads a missing thread and project as not found.
+- The CSV table in `packages/client/src/analytics-csv.test.ts` checks quotes, commas, line breaks, formula starts, Thai text, emoji and a lone surrogate, and reads a whole file back with a small parser. Unknown values are empty cells and zero stays zero.
+- The CLI test in `apps/cli/src/chat/analytics.test.ts` runs both commands against a real controller with the scripted chat adapter. It checks the printed numbers, the new CSV file, the refusal to replace it and the exit status of bad arguments.
+
+The save dialog in the desktop main process and the two views need a manual check on a Mac. Gauge readings in the tests are synthetic, so no test shows that a live client reports the same windows.
