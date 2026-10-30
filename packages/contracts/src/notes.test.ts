@@ -124,6 +124,18 @@ test('Save as note offers the selection, else the first paragraph, within the li
   assert.equal(noteFromReply('\n\n  \n\nlate start'), 'late start');
   assert.equal(noteFromReply(''), '');
   assert.equal(noteFromReply('a'.repeat(1500)).length, PROJECT_NOTE_CHARACTERS);
+  // Rows: a cut between the two halves of a surrogate pair drops the whole character.
+  const cuts: { name: string; reply: string; length: number }[] = [
+    { name: 'the pair straddles the limit', reply: `${'a'.repeat(999)}😀bbb`, length: 999 },
+    { name: 'the pair ends at the limit', reply: `${'a'.repeat(998)}😀bbb`, length: 1000 },
+    { name: 'pairs all the way through', reply: '😀'.repeat(600), length: 1000 },
+  ];
+  for (const row of cuts) {
+    const note = noteFromReply(row.reply);
+    assert.equal(note.length, row.length, row.name);
+    assert.equal(note.isWellFormed(), true, row.name);
+    assert.equal(AddProjectNotePayloadSchema.safeParse({ projectId, text: note }).success, true);
+  }
   assert.equal(
     AddProjectNotePayloadSchema.safeParse({ projectId, text: noteFromReply('a\tb ') }).success,
     true,
@@ -140,6 +152,13 @@ test('the Markdown export lists each note with its time, oldest first', () => {
       { text: 'Use pnpm.', createdAt: '2026-10-31T10:00:00.000Z' },
       { text: 'Two\nlines.', createdAt: '2026-11-01T10:00:00.000Z' },
     ]),
-    '# Notes for demo shop\n\n## 2026-10-31T10:00:00.000Z\n\nUse pnpm.\n\n## 2026-11-01T10:00:00.000Z\n\nTwo\nlines.\n',
+    '# Notes for demo shop\n\n## 2026-10-31T10:00:00.000Z\n\n> Use pnpm.\n\n## 2026-11-01T10:00:00.000Z\n\n> Two\n> lines.\n',
   );
+  // A note cannot forge a section: every one of its lines stays inside a block quote.
+  const forged = projectNotesMarkdown('demo', [
+    { text: 'Real.\n\n## 2000-01-01T00:00:00.000Z\n\n# Notes for other', createdAt: 'T1' },
+  ]);
+  const lines = forged.split('\n').filter((line) => line.startsWith('#'));
+  assert.deepEqual(lines, ['# Notes for demo', '## T1']);
+  assert.ok(forged.includes('> ## 2000-01-01T00:00:00.000Z\n>\n> # Notes for other'));
 });

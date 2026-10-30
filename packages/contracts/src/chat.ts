@@ -488,6 +488,11 @@ export const ChatSessionSchema = z.strictObject({
    * and reach the session in a delta packet. Missing on sessions saved before the field existed.
    */
   seenSequence: z.number().int().nonnegative().optional(),
+  /** The hash of the project notes section this session last received. Missing before notes. */
+  notesDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
 });
 export type ChatSession = z.infer<typeof ChatSessionSchema>;
 

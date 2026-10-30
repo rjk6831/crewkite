@@ -66,6 +66,16 @@ export const ProjectNotesReadSchema = z.strictObject({
 });
 export type ProjectNotesRead = z.infer<typeof ProjectNotesReadSchema>;
 
+/**
+ * What a change to the notes answers. The receipt of a change keeps this small record, so a client
+ * reads the list again to see it.
+ */
+export const ProjectNotesChangedSchema = z.strictObject({
+  projectId,
+  bytes: z.number().int().nonnegative().max(PROJECT_NOTES_BYTES),
+});
+export type ProjectNotesChanged = z.infer<typeof ProjectNotesChangedSchema>;
+
 export const ReadProjectNotesPayloadSchema = z.strictObject({ projectId });
 export const AddProjectNotePayloadSchema = z.strictObject({
   projectId,
@@ -104,14 +114,33 @@ export function projectNotesFit(texts: readonly string[]): NotesFit {
   return bytes > PROJECT_NOTES_BYTES ? { fits: false, reason: 'size' } : { fits: true, bytes };
 }
 
-/** The file Settings exports: one section per note, oldest first, with the day it was saved. */
+/**
+ * The file Settings exports: one section per note, oldest first, with the time it was saved. Each
+ * line of a note sits in a block quote, so a note that holds a heading line never opens a section
+ * of its own.
+ */
 export function projectNotesMarkdown(
   projectName: string,
   notes: readonly Pick<ProjectNote, 'text' | 'createdAt'>[],
 ): string {
   const title = `# Notes for ${projectName.replaceAll(/\s+/g, ' ').trim()}`;
   if (notes.length === 0) return `${title}\n\nThis project has no notes.\n`;
-  return `${[title, ...notes.map((note) => `## ${note.createdAt}\n\n${note.text}`)].join('\n\n')}\n`;
+  const quoted = (text: string) =>
+    text
+      .split('\n')
+      .map((line) => (line === '' ? '>' : `> ${line}`))
+      .join('\n');
+  return `${[title, ...notes.map((note) => `## ${note.createdAt}\n\n${quoted(note.text)}`)].join('\n\n')}\n`;
+}
+
+/** The first characters of a text that fit `limit` UTF-16 units, cut between whole code points. */
+function cutAtCodePoint(text: string, limit: number): string {
+  let kept = '';
+  for (const point of text) {
+    if (kept.length + point.length > limit) break;
+    kept += point;
+  }
+  return kept;
 }
 
 /** The text "Save as note" offers for a reply: its selected text, or else its first paragraph. */
@@ -120,6 +149,6 @@ export function noteFromReply(reply: string, selected?: string): string {
     (selected ?? '').trim() || (reply.split(/\n[ \t]*\n/).find((part) => part.trim()) ?? '');
   const text = normalizeNoteText(pick);
   return text.length > PROJECT_NOTE_CHARACTERS
-    ? normalizeNoteText(text.slice(0, PROJECT_NOTE_CHARACTERS))
+    ? normalizeNoteText(cutAtCodePoint(text, PROJECT_NOTE_CHARACTERS))
     : text;
 }

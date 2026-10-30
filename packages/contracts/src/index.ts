@@ -66,6 +66,7 @@ import { McpSupplySchema } from './mcp.ts';
 import {
   AddProjectNotePayloadSchema,
   EditProjectNotePayloadSchema,
+  ProjectNotesChangedSchema,
   ProjectNotesReadSchema,
   ReadProjectNotesPayloadSchema,
   RemoveProjectNotePayloadSchema,
@@ -3604,6 +3605,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   // The byte check on the page stays with the kind tag.
   ChatSearchResultSchema.safeExtend({ kind: z.literal('chat-search') }),
   ProjectNotesReadSchema.extend({ kind: z.literal('project-notes') }),
+  ProjectNotesChangedSchema.extend({ kind: z.literal('project-notes-changed') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
