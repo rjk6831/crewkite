@@ -149,3 +149,61 @@ test('the interactive app sends a typed message, answers a permission by digit a
   assert.equal(sent.length, 1);
   assert.equal(saved, 0);
 });
+
+test('the interactive app lets /provider and /model set the first turn before any message is sent', {
+  timeout: 60_000,
+}, async (t) => {
+  const { home, repository } = await startScriptedController(t, [
+    [{ kind: 'text', itemId: 'done', chunks: ['Done.'] }],
+  ]);
+  const client = await connectChat(home);
+  t.after(() => client.transport.close());
+  await client.send('RegisterProject', { path: repository });
+  const screen = terminal();
+  const app = render(
+    h(App, {
+      client,
+      settings: defaultSettings(),
+      settingsProblem: null,
+      saveSettings: (next) => next,
+      animation: 'off',
+      env: { NO_COLOR: '1', PATH: process.env.PATH, INIT_CWD: repository },
+    }),
+    {
+      stdin: screen.stdin as never,
+      stdout: screen.stdout as never,
+      debug: true,
+      exitOnCtrlC: false,
+      patchConsole: false,
+    },
+  );
+  // The gauge row waits for the catalog, and it names every provider, Google included.
+  await screen.shows('G connect');
+  await screen.shows('project shop');
+  screen.type('/provider anthropic');
+  await screen.shows('/provider anthropic');
+  screen.type('\r');
+  await screen.shows('First message: Anthropic');
+  const firstDefault = /First message: Anthropic (\S+)\./.exec(screen.stdout.screen)?.[1];
+  assert.equal((await client.listThreads()).threads.length, 0);
+  // An unknown model lists the choices, and naming one of them sets the first turn.
+  screen.type('/model none');
+  await screen.shows('/model none');
+  screen.type('\r');
+  await screen.shows('Models: ');
+  const listed = /Models: ([^\n]+)/.exec(screen.stdout.screen)?.[1]?.split(', ') ?? [];
+  const chosen = listed.find((model) => model !== firstDefault);
+  assert.ok(chosen);
+  screen.type(`/model ${chosen}`);
+  await screen.shows(`/model ${chosen}`);
+  screen.type('\r');
+  await screen.shows(`First message: Anthropic ${chosen}.`);
+  screen.type('Hello there');
+  await screen.shows('Hello there');
+  screen.type('\r');
+  await screen.shows('Done.');
+  const [thread] = (await client.listThreads()).threads;
+  assert.equal((await client.readThread(thread.id)).thread.selection?.model, chosen);
+  screen.type('\u0003');
+  await app.waitUntilExit();
+});

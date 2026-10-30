@@ -167,6 +167,9 @@ export function App(props: AppProps) {
   const [projectIndex, setProjectIndex] = useState<number | null>(null);
   const [promptFocus, setPromptFocus] = useState(false);
   const [taskId, setTaskId] = useState<string | null>(null);
+  // The family and model picked with /provider or /model before the first message. The first
+  // turn uses it, and the thread's own selection takes over from there.
+  const [firstChoice, setFirstChoice] = useState<ChatModelSelection | null>(null);
   const taskRef = useRef<string | null>(null);
   taskRef.current = taskId;
   const [state, dispatch] = useReducer(threadReducer, initialThreadState(''));
@@ -249,6 +252,7 @@ export function App(props: AppProps) {
   const openThread = useCallback(
     async (id: string) => {
       setTaskId(id);
+      setFirstChoice(null);
       taskRef.current = id;
       setReady(false);
       setView('thread');
@@ -313,7 +317,11 @@ export function App(props: AppProps) {
       if (!model) throw new Error(`${familyNames[family]} lists no model.`);
       return { family, model: model.model, effort: model.defaultEffort };
     }
-    return thread?.selection ?? chooseSelection(catalog, undefined, settings.selection, now());
+    return (
+      thread?.selection ??
+      (taskId ? null : firstChoice) ??
+      chooseSelection(catalog, undefined, settings.selection, now())
+    );
   };
 
   async function send(raw: string) {
@@ -371,6 +379,7 @@ export function App(props: AppProps) {
     switch (name) {
       case 'new':
         setTaskId(null);
+        setFirstChoice(null);
         setReady(false);
         setView('thread');
         setNotice(
@@ -400,7 +409,6 @@ export function App(props: AppProps) {
         break;
       case 'model':
       case 'provider': {
-        const id = needThread();
         const current = selectionFor();
         let selection: ChatModelSelection;
         if (name === 'provider') {
@@ -430,8 +438,12 @@ export function App(props: AppProps) {
             effort: picked.efforts.find((value) => value === effort) ?? picked.defaultEffort,
           };
         }
-        await client.configure({ taskId: id, selection });
-        setNotice(`Next message: ${familyNames[selection.family]} ${selection.model}.`);
+        // With no thread yet the choice rides on the first message, which creates the thread.
+        if (taskId) await client.configure({ taskId, selection });
+        else setFirstChoice(selection);
+        setNotice(
+          `${taskId ? 'Next message' : 'First message'}: ${familyNames[selection.family]} ${selection.model}.`,
+        );
         break;
       }
       case 'handoff': {
