@@ -76,7 +76,12 @@ export function ReplyMenu({ source }: { source: string }) {
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
         onMouseDown={remember}
-        onClick={() => setOpen(!open)}
+        onClick={(event) => {
+          // A click from the keyboard has no mouse down, so the selection is read here. A pointer
+          // click already read it, before the click could move it.
+          if (event.detail === 0 && !open) remember();
+          setOpen(!open);
+        }}
       >
         <Ellipsis size={14} aria-hidden="true" />
       </button>

@@ -4,7 +4,7 @@ import {
   PROJECT_NOTE_CHARACTERS,
   type ProjectNotesRead,
 } from '@crewkite/contracts';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { addNote, editNote, readNotes, removeNote, type ThreadSource } from '../thread/commands.ts';
 
 /**
@@ -39,13 +39,21 @@ export function NotesCard({
     };
   }, [source, projectId]);
 
+  // The project on screen now. An answer that arrives for another project is dropped, so the list
+  // and the sentence below it always belong to the project the person is looking at.
+  const shown = useRef(projectId);
+  shown.current = projectId;
   async function change(run: () => Promise<ProjectNotesRead>, done: string) {
+    const target = projectId;
     try {
-      setRead(await run());
+      const next = await run();
+      if (shown.current !== target) return false;
+      setRead(next);
       setNote(done);
       return true;
     } catch (failure) {
-      setNote(failure instanceof Error ? failure.message : 'The change was not saved.');
+      if (shown.current === target)
+        setNote(failure instanceof Error ? failure.message : 'The change was not saved.');
       return false;
     }
   }
@@ -55,10 +63,13 @@ export function NotesCard({
       setNote('Export needs the desktop app.');
       return;
     }
+    const target = projectId;
     try {
-      setNote((await source.saveNotes(projectId)) === 'saved' ? 'Saved.' : null);
+      const saved = (await source.saveNotes(target)) === 'saved' ? 'Saved.' : null;
+      if (shown.current === target) setNote(saved);
     } catch (failure) {
-      setNote(failure instanceof Error ? failure.message : 'The file was not saved.');
+      if (shown.current === target)
+        setNote(failure instanceof Error ? failure.message : 'The file was not saved.');
     }
   }
   const clean = normalizeNoteText(text);
