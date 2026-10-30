@@ -58,6 +58,10 @@ The family and the kind in each line come from the catalog, so the examples show
 
 ### OpenAI
 
+#### OpenAI and your account
+
+The OpenAI client signs in with your own OpenAI account, and your use of it follows your plan and OpenAI's terms for that account. OpenAI's authentication page says Sign in with ChatGPT gives subscription access and a sign-in with an API key bills at standard API rates. CrewKite starts the client you installed and signed in, collects no credential and sets no API key. None of the OpenAI pages I read on 31 October 2026 names CrewKite. Your plan's limits and OpenAI's rules stay with your account.
+
 The transport is the OpenAI client's app-server over stdio. CrewKite starts the installed client as `app-server --stdio` for each turn and speaks JSON-RPC to it. The first turn opens a persistent thread with `thread/start` and `ephemeral: false`, rooted at the scratch copy. Later turns call `thread/resume` with the saved thread ID, so the client's own history carries the conversation. The sandbox is `workspace-write`, approvals come to the person, and web search, plugins, apps, hooks and multi-agent features are off for the turn. The launch sets `approval_policy` to `on-request`, because current client builds refuse `untrusted` in configuration and exit before they answer `initialize`. The thread calls carry the policy for the turn: `untrusted` under Ask each time and Allow edits, `on-request` under Allow all. The composer offers the effort levels the client lists for each model, up to `xhigh` or `ultra` where a model has them. The selected level goes on `turn/start`, which sets it for that turn and the ones after it.
 
 Agent message and reasoning deltas, command and file-change items with their output, and `thread/tokenUsage/updated` map to events. Command and file-change approval requests become permission requests in the thread. A network access request names the host and protocol and always goes to the person; no policy or grant answers it. Stop sends `turn/interrupt`, waits up to two seconds for the turn to complete as interrupted so the client records it, then SIGTERM, then SIGKILL. A usage-limit refusal ends the turn with its reset time. When the client exits early or refuses a setup request, the failure keeps the last lines it wrote to stderr and its last eight frames, one line each with the method or ID and any error. Prompts and results stay out of it.
@@ -71,6 +75,10 @@ Attachments: an image other than SVG goes as `localImage` and audio as `localAud
 I ran this adapter live against the real client during development. The dated qualification record is written for the release build, after its final check on macOS.
 
 ### Anthropic
+
+#### Anthropic and your account
+
+The Anthropic client runs under your own account. Anthropic's legal page for the client says its Consumer Terms of Service cover Free, Pro and Max accounts, and its Commercial Terms of Service cover Team, Enterprise and API use. The page says a Claude account sign-in is for the person who bought the plan, that a third party may not route requests through Free, Pro or Max credentials for its users, and that nobody may collect, store or pass on those credentials. It also says the advertised Pro and Max limits assume ordinary individual use, and it does not stop a person from signing in to the unmodified client with their own subscription. CrewKite starts the client you installed and signed in, does not modify it and collects no credential. I checked that page on 31 October 2026. It does not name CrewKite. Reading your own account's terms stays with you.
 
 The transport is the Anthropic client in print mode with stream-json in and out. CrewKite starts it for each turn with `--print --output-format stream-json --input-format stream-json --verbose --include-partial-messages --permission-prompt-tool stdio`, the model and effort the person picked, and hooks disabled for the turn. The same settings turn the client's commit and pull request attribution off, so a model with git access writes no trailer or generated-with line. The user message goes in on stdin as one JSON line. Text, thinking and tool-use blocks stream out and map to events. Permission asks arrive as control requests on stdout, and CrewKite's answers go back on stdin while the turn runs.
 
