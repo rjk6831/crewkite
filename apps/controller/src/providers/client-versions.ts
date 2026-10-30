@@ -1,4 +1,8 @@
-import { type SpawnSyncOptionsWithStringEncoding, spawnSync } from 'node:child_process';
+import {
+  type SpawnSyncOptionsWithStringEncoding,
+  type SpawnSyncReturns,
+  spawnSync,
+} from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { lstatSync, readFileSync, realpathSync, type Stats } from 'node:fs';
 import { userInfo } from 'node:os';
@@ -48,14 +52,23 @@ type Row = (typeof CLIENT_VERSIONS)[ClientFamily];
 
 type Version = { core: [number, number, number]; prerelease: string | null; text: string };
 
+// A client can print a notice about a newer release next to its own version. Those lines name
+// someone else's version, so they never count.
+const NOTICE = /update|available|latest/i;
+
 /**
  * The first version in a client's own version output: `codex-cli 0.170.2`, `2.1.302 (Claude
- * Code)`, `v1.4.2`. A prerelease suffix stays with it; build metadata is dropped.
+ * Code)`, `v1.4.2`. Lines that announce an update are skipped. A prerelease suffix stays with
+ * the version; build metadata is dropped.
  */
 export function parseClientVersion(output: string): Version | null {
+  const own = output
+    .split(/\r?\n/)
+    .filter((line) => !NOTICE.test(line))
+    .join('\n');
   const match =
     /(?:^|[\s(@/])v?(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})(-[0-9A-Za-z.-]{1,64})?(?:\+[0-9A-Za-z.-]{1,64})?(?=$|[\s),;])/m.exec(
-      output,
+      own,
     );
   if (!match) return null;
   const core = [Number(match[1]), Number(match[2]), Number(match[3])] as [number, number, number];
@@ -63,20 +76,36 @@ export function parseClientVersion(output: string): Version | null {
   return { core, prerelease, text: `${core.join('.')}${prerelease ? `-${prerelease}` : ''}` };
 }
 
-/** Negative when left is older. A prerelease ranks below its own release. */
+/**
+ * Negative when left is older, by semantic versioning: a prerelease ranks below its own release,
+ * and prerelease identifiers compare one by one, numbers by value and below any word, words in
+ * ASCII order, a shorter list first when the rest are equal.
+ */
 function compare(left: Version, right: Version): number {
   for (let index = 0; index < 3; index++)
     if (left.core[index] !== right.core[index]) return left.core[index] - right.core[index];
   if (left.prerelease === right.prerelease) return 0;
   if (left.prerelease === null) return 1;
   if (right.prerelease === null) return -1;
-  return left.prerelease < right.prerelease ? -1 : 1;
+  const a = left.prerelease.split('.');
+  const b = right.prerelease.split('.');
+  for (let index = 0; index < Math.min(a.length, b.length); index++) {
+    const x = /^\d+$/.test(a[index]) ? Number(a[index]) : null;
+    const y = /^\d+$/.test(b[index]) ? Number(b[index]) : null;
+    if (x !== null && y !== null) {
+      if (x !== y) return x - y;
+    } else if (x !== null) return -1;
+    else if (y !== null) return 1;
+    else if (a[index] !== b[index]) return a[index] < b[index] ? -1 : 1;
+  }
+  return a.length - b.length;
 }
 
 /**
  * Where a reported version stands against the family's tested build and minimum. A later major
  * version is refused: the adapters parse each client's native frames, and a major release is
- * where those change without notice.
+ * where those change without notice. Under major 0 a newer minor is still accepted as newer,
+ * because one client ships a new 0.minor about every week.
  */
 export function clientVersionState(
   reported: string | null,
@@ -98,12 +127,33 @@ export function clientVersionState(
 
 const ACCEPTED = new Set<ClientVersionState>(['tested', 'newer', 'supported']);
 
+/** The reader reason code for a client CrewKite does not run. */
+export function clientStatusReason(
+  status: ClientVersionStatus,
+):
+  | 'client-unavailable'
+  | 'client-untrusted'
+  | 'client-version-unreadable'
+  | 'client-version-unsupported' {
+  switch (status.state) {
+    case 'untrusted':
+      return 'client-untrusted';
+    case 'unreadable':
+      return 'client-version-unreadable';
+    case 'older':
+    case 'new-major':
+      return 'client-version-unsupported';
+    default:
+      return 'client-unavailable';
+  }
+}
+
 /** The line Settings and the CLI show for a found client, in plain words. */
 export function clientVersionStatus(
   family: ClientFamily,
   found:
     | { state: 'missing' | 'unavailable'; detail?: string }
-    | { state: 'untrusted'; path: string; why: 'shared-write' | 'foreign-owner' }
+    | { state: 'untrusted'; path: string; why: 'shared-write' | 'shared-folder' | 'foreign-owner' }
     | { state: 'version'; path: string; version: string | null }
     | { state: 'pinned'; version: string },
 ): ClientVersionStatus {
@@ -135,10 +185,15 @@ export function clientVersionStatus(
         return `${row.name} ${version} found. CrewKite is tested with ${row.tested} and does not run a new major version yet. Install a ${tested}.x build, or update CrewKite.`;
       case 'unreadable':
         return `CrewKite could not read the version of ${row.name} at ${found.state === 'version' ? found.path : row.command}. Run ${row.command} --version in a terminal to see why, then check again.`;
-      case 'untrusted':
-        return found.state === 'untrusted' && found.why === 'foreign-owner'
-          ? `${row.name} at ${found.path} belongs to another account, so CrewKite will not run it.`
-          : `${row.name} at ${found.state === 'untrusted' ? found.path : row.command} can be changed by other users, so CrewKite will not run it.`;
+      case 'untrusted': {
+        const path = found.state === 'untrusted' ? found.path : row.command;
+        const why = found.state === 'untrusted' ? found.why : 'shared-write';
+        return why === 'foreign-owner'
+          ? `${row.name} at ${path} belongs to another account, so CrewKite will not run it.`
+          : why === 'shared-folder'
+            ? `${row.name} at ${path} is in a folder other users can change, so CrewKite will not run it.`
+            : `${row.name} at ${path} can be changed by other users, so CrewKite will not run it.`;
+      }
       case 'missing':
         return `${row.name} was not found. Install it and sign in, then check again.`;
       default:
@@ -158,26 +213,48 @@ export function clientVersionStatus(
 }
 
 /**
- * The file is a bounded regular file that the current user or the system owns, and nobody else
- * can write. A link counts by the file it resolves to.
+ * The file is a bounded regular file that the current user or the system owns, that neither its
+ * group nor other users can write, in a folder other users cannot write. A link counts by the
+ * file it resolves to.
  */
 export function clientFileTrust(
   stat: Pick<Stats, 'isFile' | 'size' | 'uid' | 'mode'>,
   maximumBytes: number,
   uid = process.getuid?.(),
-): 'trusted' | 'not-a-client' | 'shared-write' | 'foreign-owner' {
+  folder?: Pick<Stats, 'mode'>,
+): 'trusted' | 'not-a-client' | 'shared-write' | 'shared-folder' | 'foreign-owner' {
   if (!stat.isFile() || stat.size > maximumBytes) return 'not-a-client';
   if (stat.uid !== uid && stat.uid !== 0) return 'foreign-owner';
-  if (stat.mode & 0o002) return 'shared-write';
+  if (stat.mode & 0o022) return 'shared-write';
+  if (folder && folder.mode & 0o002) return 'shared-folder';
   return 'trusted';
 }
 
-type Read = { key: string; version: string | null; sha256: string; at: number };
+type Read = {
+  key: string;
+  version: string | null;
+  sha256: string;
+  at: number;
+  /** Unreadable reads in a row of this same file. */
+  failures: number;
+};
+export type ClientReads = Map<string, Read>;
 const identity = (stat: Stats) =>
   `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeMs}:${stat.ctimeMs}`;
-const reads = new Map<string, Read>();
-// An unreadable version is read again after a minute, so a slow first start does not stick.
+const reads: ClientReads = new Map();
+// An unreadable version is read again after a minute, then after twice as long each time up to
+// fifteen minutes, so a client that hangs on --version costs its timeout rarely. A changed file
+// or Check again reads at once.
 const UNREADABLE_RETRY_MS = 60_000;
+const UNREADABLE_RETRY_MAX_MS = 15 * 60_000;
+export function unreadableRetryMs(failures: number) {
+  return Math.min(UNREADABLE_RETRY_MAX_MS, UNREADABLE_RETRY_MS * 2 ** Math.max(0, failures - 1));
+}
+
+/** Check again: the next resolution of this family reads every file afresh. */
+export function forgetClientReads(family: ClientFamily, cache: ClientReads = reads) {
+  for (const key of [...cache.keys()]) if (key.startsWith(`${family}\0`)) cache.delete(key);
+}
 
 export type FoundClient = {
   status: ClientVersionStatus;
@@ -191,9 +268,16 @@ export type FindOptions = {
   path?: string;
   /** Extra candidates beside a found entry, as the OpenAI package keeps its native binary. */
   siblings?: (entry: string) => string[];
-  cache?: Map<string, Read>;
+  cache?: ClientReads;
   now?: () => number;
   timeoutMs?: number;
+  /** Reads the file for its digest. Tests pass one that fails. */
+  hash?: (path: string) => string;
+  /**
+   * Use only versions already read. A file that needs a fresh read counts as unreadable and is
+   * not run, for callers inside a database transaction.
+   */
+  cachedOnly?: boolean;
 };
 
 /**
@@ -216,60 +300,99 @@ export function findClient(family: ClientFamily, options: FindOptions): FoundCli
       continue;
     }
     for (const candidate of [...(options.siblings?.(entry) ?? []), entry]) {
-      let executable: string;
-      let stat: Stats;
+      let found: FoundClient | null;
       try {
-        executable = realpathSync(candidate);
-        stat = lstatSync(executable);
+        found = inspect(family, candidate, seen, options, cache, now);
       } catch {
-        continue;
+        // Nothing about one candidate may stop the search or the caller.
+        found = null;
       }
-      if (seen.has(executable)) continue;
-      seen.add(executable);
-      const trust = clientFileTrust(stat, row.maximumBytes);
-      if (trust === 'not-a-client') continue;
-      if (trust !== 'trusted') {
-        first ??= {
-          status: clientVersionStatus(family, { state: 'untrusted', path: executable, why: trust }),
-        };
-        continue;
-      }
-      const key = identity(stat);
-      let read = cache.get(executable);
-      if (
-        !read ||
-        read.key !== key ||
-        (read.version === null && now() - read.at >= UNREADABLE_RETRY_MS)
-      ) {
-        // The digest is taken before the client runs, and a file that changed while it ran keeps
-        // no version, so the version and the digest describe the same bytes.
-        const sha256 = createHash('sha256').update(readFileSync(executable)).digest('hex');
-        let version = readVersion(executable, row, options);
-        try {
-          if (identity(lstatSync(executable)) !== key) version = null;
-        } catch {
-          version = null;
-        }
-        read = { key, version, sha256, at: now() };
-        cache.set(executable, read);
-      }
-      const status = clientVersionStatus(family, {
-        state: 'version',
-        path: executable,
-        version: read.version,
-      });
-      const found: FoundClient = status.accepted
-        ? {
-            status,
-            client: { executable, sha256: read.sha256, version: status.version ?? row.tested },
-          }
-        : { status };
-      if (status.accepted) return found;
+      if (!found) continue;
+      if (found.client) return found;
       first ??= found;
     }
   }
   return first ?? { status: clientVersionStatus(family, { state: 'missing' }) };
 }
+
+/** One candidate: null to skip it, a status that refuses it, or an accepted client. */
+function inspect(
+  family: ClientFamily,
+  candidate: string,
+  seen: Set<string>,
+  options: FindOptions,
+  cache: ClientReads,
+  now: () => number,
+): FoundClient | null {
+  const row = CLIENT_VERSIONS[family];
+  let executable: string;
+  let stat: Stats;
+  let folder: Stats;
+  try {
+    executable = realpathSync(candidate);
+    stat = lstatSync(executable);
+    folder = lstatSync(dirname(executable));
+  } catch {
+    return null;
+  }
+  if (seen.has(executable)) return null;
+  seen.add(executable);
+  const trust = clientFileTrust(stat, row.maximumBytes, process.getuid?.(), folder);
+  if (trust === 'not-a-client') return null;
+  if (trust !== 'trusted')
+    return {
+      status: clientVersionStatus(family, { state: 'untrusted', path: executable, why: trust }),
+    };
+  const key = identity(stat);
+  const slot = `${family}\0${executable}`;
+  let read = cache.get(slot);
+  if (
+    !read ||
+    read.key !== key ||
+    (read.version === null && now() - read.at >= unreadableRetryMs(read.failures))
+  ) {
+    if (options.cachedOnly)
+      return {
+        status: clientVersionStatus(family, { state: 'version', path: executable, version: null }),
+      };
+    const failures = read?.key === key ? read.failures : 0;
+    // The digest is taken before the client runs. A file CrewKite cannot read, such as one that
+    // is execute-only or that an update removed a moment ago, has no version.
+    let sha256: string | null = null;
+    try {
+      sha256 = (options.hash ?? digest)(executable);
+    } catch {}
+    let version = sha256 === null ? null : readVersion(executable, row, options);
+    // A file that changed while it ran keeps no version, so the version and the digest describe
+    // the same bytes. A swap that lands after this check is caught when the launch hashes again.
+    try {
+      if (identity(lstatSync(executable)) !== key) version = null;
+    } catch {
+      version = null;
+    }
+    read = {
+      key,
+      version,
+      sha256: sha256 ?? '',
+      at: now(),
+      failures: version === null ? failures + 1 : 0,
+    };
+    cache.set(slot, read);
+  }
+  const status = clientVersionStatus(family, {
+    state: 'version',
+    path: executable,
+    version: read.version,
+  });
+  return status.accepted && read.sha256
+    ? {
+        status,
+        client: { executable, sha256: read.sha256, version: status.version ?? row.tested },
+      }
+    : { status };
+}
+
+const digest = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
 
 // shortcut: the read is synchronous, so a client that ignores the bound blocks the controller for
 // up to the timeout once per changed build. The result is cached by the file's identity. An
@@ -293,8 +416,15 @@ function readVersion(executable: string, row: Row, options: FindOptions): string
     maxBuffer: 4096,
     encoding: 'utf8',
   };
-  const result = spawnSync(executable, ['--version'], spawnOptions);
-  // The client ran in its own group. Anything it left behind goes with it.
+  let result: SpawnSyncReturns<string>;
+  try {
+    result = spawnSync(executable, ['--version'], spawnOptions);
+  } catch {
+    return null;
+  }
+  // The client ran in its own group. Anything it left behind goes with it. A child that calls
+  // setsid leaves the group and escapes this kill; --version has no reason to, and every later
+  // launch of the client runs under the adapters' own ownership checks.
   if (result.pid > 0)
     try {
       process.kill(-result.pid, 'SIGKILL');

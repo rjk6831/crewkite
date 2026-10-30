@@ -259,7 +259,7 @@ test('the google quota read maps zero-turn account buckets to window observation
       }
     }
 
-    // Client discovery never executes the client or reads account files.
+    // Discovery runs only the client's --version flag and never reads account files.
     assert.equal(googleUsageDescriptor.clientVersion, '1.4.2');
     if (process.platform !== 'darwin' || process.arch !== 'arm64') {
       assert.deepEqual(resolveGoogleUsageClient(environment), {

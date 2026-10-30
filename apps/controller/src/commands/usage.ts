@@ -9,6 +9,7 @@ import {
   CommandResultSchema,
   CommandSchema,
   canonicalJson,
+  NativeProfileSchema,
   type Observation,
   ObservationSchema,
   type Route,
@@ -19,6 +20,7 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import type { z } from 'zod';
 import { AnthropicUsageRefresh } from '../providers/anthropic/usage-refresh.ts';
+import { type ClientFamily, forgetClientReads } from '../providers/client-versions.ts';
 import {
   GoogleWriterError,
   googleUsageObservations,
@@ -44,6 +46,13 @@ import {
   ProviderUsageDraftSchema,
 } from './schemas.ts';
 
+// The OpenAI reader's client, resolved before an ObserveUsage command opens its transaction. A
+// version read can take seconds, and it never runs while the database is locked.
+const preparedUsage = new WeakMap<
+  Controller,
+  { key: string; openai?: ReturnType<UsageCommands['openAiUsageInputs']> }
+>();
+
 // Usage readers and the provider usage observations that admission reads.
 export class UsageCommands {
   anthropicUsage(this: Controller) {
@@ -54,6 +63,8 @@ export class UsageCommands {
       now: this.now,
       artifactId: () => this.id('art'),
       resolve: () => this.anthropicChatProfile(),
+      client: () =>
+        this.options.chatClients?.anthropic ? this.chatClientFor('anthropic').status : undefined,
       blocked: () => {
         const connection = this.nativeConnections().status();
         if (connection.state === 'unknown') return 'anthropic-connection-ownership-unknown';
@@ -68,10 +79,11 @@ export class UsageCommands {
         )
           return 'anthropic-task-active';
       },
-      changed: () =>
-        this.store.transaction(() =>
-          this.event('usage.reader-updated', null, 0, this.anthropicUsage().status()),
-        ),
+      // The status resolves the client, so it is read before the event's transaction opens.
+      changed: () => {
+        const status = this.anthropicUsage().status();
+        this.store.transaction(() => this.event('usage.reader-updated', null, 0, status));
+      },
       schedule: this.options.schedule,
       reader: this.options.anthropicUsageReader,
     });
@@ -80,13 +92,21 @@ export class UsageCommands {
 
   /**
    * The Anthropic client the quota reader and the sign-in check run: the chat client found by
-   * version range, or the pinned profile when the controller has no chat resolver.
+   * version range, or the pinned profile when the controller has no chat resolver. A build the
+   * range refuses stays refused here too.
    */
   anthropicChatProfile(this: Controller): NativeProfileResolution {
-    const found = this.options.chatClients?.anthropic
-      ? this.chatClientFor('anthropic').profile
-      : undefined;
-    return found ?? this.profileFor('anthropic-file-v1');
+    const pinned = this.profileFor('anthropic-file-v1');
+    if (!this.options.chatClients?.anthropic) return pinned;
+    return (
+      this.chatClientFor('anthropic').profile ?? {
+        facts: NativeProfileSchema.parse({
+          ...pinned.facts,
+          available: false,
+          reason: 'client-unavailable',
+        }),
+      }
+    );
   }
 
   googleUsageReader(this: Controller) {
@@ -103,9 +123,41 @@ export class UsageCommands {
     });
   }
 
-  openAiUsageReader(this: Controller) {
-    const resolved = this.options.openAiUsageClient?.();
-    const profile = resolved?.facts.family === 'openai' ? resolved : unavailableNativeProfile();
+  /**
+   * Check again on a provider card: forget what was read about the family's client files and
+   * resolve them afresh. Nothing launches beyond each client's own version flag.
+   */
+  checkProviderClient(this: Controller, family: ClientFamily): CommandResult {
+    forgetClientReads(family);
+    try {
+      if (family === 'google') {
+        this.usageResolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
+        const status = this.usageResolution.status;
+        return status
+          ? { outcome: 'applied', next: status.message }
+          : { outcome: 'applied', reason: this.usageResolution.reason };
+      }
+      if (family === 'openai') this.options.openAiUsageClient?.();
+      return { outcome: 'applied', next: this.chatClientFor(family).status.message };
+    } catch {
+      return { outcome: 'blocked', reason: 'client-check-failed' };
+    }
+  }
+
+  /** The OpenAI reader's profile and client status. This is the part that resolves. */
+  openAiUsageInputs(this: Controller) {
+    let resolved: NativeProfileResolution | undefined;
+    try {
+      resolved = this.options.openAiUsageClient?.();
+    } catch {}
+    return {
+      profile: resolved?.facts.family === 'openai' ? resolved : unavailableNativeProfile(),
+      client: this.options.chatClients?.openai ? this.chatClientFor('openai').status : undefined,
+    };
+  }
+
+  openAiUsageReader(this: Controller, inputs = this.openAiUsageInputs()) {
+    const profile = inputs.profile;
     const facts = profile.facts;
     if (facts.family !== 'openai') throw Error('The usage reader requires an OpenAI profile.');
     const state = this.openAiUsageState();
@@ -115,7 +167,7 @@ export class UsageCommands {
       clientVersion: facts.clientVersion,
       available: profile.facts.available,
       reason: profile.facts.available ? 'available' : profile.facts.reason,
-      ...(this.options.chatClients?.openai ? { client: this.chatClientFor('openai').status } : {}),
+      ...(inputs.client ? { client: inputs.client } : {}),
       readState: state?.state ?? 'idle',
       readReason: state?.reason ?? null,
       lastRequest: state?.lastRequest ?? null,
@@ -476,6 +528,15 @@ export class UsageCommands {
         reason: 'google-terms-not-acknowledged',
         next: 'Acknowledge the Google terms in Settings > Google before reading Google usage.',
       });
+    // Resolve the client now. observeUsage runs inside the command's transaction.
+    if (command.payload.family === 'openai')
+      preparedUsage.set(this, { key: command.key, openai: this.openAiUsageInputs() });
+    else
+      try {
+        this.usageResolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
+      } catch {
+        this.usageResolution = { available: false, reason: 'client-unavailable' };
+      }
     const pendingReason =
       command.payload.family === 'openai' ? 'openai-usage-read-pending' : 'usage-read-pending';
     const prior = this.usageRead;
@@ -529,7 +590,10 @@ export class UsageCommands {
     if (this.usageRead && this.usageRead.key !== command.key)
       return { outcome: 'blocked', reason: 'usage-reader-busy' };
     if (command.payload.family === 'openai') {
-      const reader = this.openAiUsageReader();
+      const prepared = preparedUsage.get(this);
+      if (prepared?.key !== command.key || !prepared.openai)
+        return { outcome: 'blocked', reason: 'client-unavailable' };
+      const reader = this.openAiUsageReader(prepared.openai);
       if (!reader.available) return { outcome: 'blocked', reason: reader.reason };
       if (this.openAiUsageRead)
         return { outcome: 'blocked', reason: 'openai-metadata-ownership-pending' };
@@ -565,13 +629,13 @@ export class UsageCommands {
     const blocker = this.store.googleOperationBlocker();
     if (blocker) return { outcome: 'blocked', reason: blocker };
     this.store.recordGoogleUsageAttempt(now);
-    try {
-      this.usageResolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
-    } catch {
-      this.usageResolution = { available: false, reason: 'client-unavailable' };
-    }
+    // observeUsageCommand resolved the client before this transaction opened.
     if (!this.usageResolution.available)
-      return { outcome: 'blocked', reason: this.usageResolution.reason };
+      return {
+        outcome: 'blocked',
+        reason: this.usageResolution.reason,
+        ...(this.usageResolution.status ? { next: this.usageResolution.status.message } : {}),
+      };
     this.store.beginGoogleMetadata(command.key, 'usage', reader.authority_revision, now);
     const resolution = this.usageResolution;
     effects.push(
@@ -815,7 +879,10 @@ export class UsageCommands {
     if (!report || this.store.googleOperationBlocker()) return;
     let observations: Observation[];
     try {
-      const resolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
+      // This runs inside a preparation transaction, so it takes only a version already read.
+      const resolution =
+        this.options.googleUsageClient?.() ??
+        resolveGoogleUsageClient(process.env, undefined, { cachedOnly: true });
       const reader = this.store.googleUsageReader();
       const operation = this.store
         .googleMetadataOperations()

@@ -35,6 +35,8 @@ export type AnthropicUsageReaderContext = Readonly<{
   operationId: string;
   executable: string;
   executableSha256: string;
+  /** The version the client reported for these bytes. */
+  clientVersion: string;
   sessionId: string;
   directory: string;
   home: string;
@@ -67,6 +69,7 @@ function detail(reply: string, errors: Buffer) {
 export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
   const plan = anthropicUsageReaderPlan({
     clientSha256: input.executableSha256,
+    clientVersion: input.clientVersion,
     sessionId: input.sessionId,
   });
   if (
@@ -85,6 +88,7 @@ export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
           operationId: input.operationId,
           executable: input.executable,
           executableSha256: plan.clientSha256,
+          clientVersion: plan.clientVersion,
           sessionId: plan.sessionId,
           directory: input.directory,
           home: input.home,
@@ -113,6 +117,7 @@ export function startAnthropicUsageReader(
     operationId: input.operationId,
     executable: input.executable,
     executableSha256: input.executableSha256,
+    clientVersion: input.clientVersion,
     sessionId: input.sessionId,
     directory: input.directory,
     home: input.home,
@@ -125,6 +130,7 @@ export function startAnthropicUsageReader(
     throw new UsageReaderError('native-trust-required');
   const plan = anthropicUsageReaderPlan({
     clientSha256: context.executableSha256,
+    clientVersion: context.clientVersion,
     sessionId: context.sessionId,
   });
   const now = options.now ?? (() => performance.now());

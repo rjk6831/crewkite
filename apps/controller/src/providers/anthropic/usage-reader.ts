@@ -1,6 +1,6 @@
 import { z } from 'zod';
+import { CLIENT_VERSIONS, clientVersionState } from '../client-versions.ts';
 
-const clientSha256 = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37';
 const maximumStdoutBytes = 131_072;
 const name = z
   .string()
@@ -49,13 +49,27 @@ export class UsageReaderError extends Error {
   }
 }
 
-/** This exact build has a local non-interactive /usage command and skips the startup model probe. */
-export function anthropicUsageReaderPlan(input: { clientSha256: string; sessionId: string }) {
-  if (input.clientSha256 !== clientSha256 || !z.uuid().safeParse(input.sessionId).success)
+/**
+ * Builds in the accepted range have a local non-interactive /usage command and skip the startup
+ * model probe (ADR 0009, amendment of 2026-10-31). The digest binds the launch to the bytes whose
+ * version was read.
+ */
+export function anthropicUsageReaderPlan(input: {
+  clientSha256: string;
+  clientVersion: string;
+  sessionId: string;
+}) {
+  const state = clientVersionState(input.clientVersion, CLIENT_VERSIONS.anthropic);
+  if (
+    !/^[a-f0-9]{64}$/.test(input.clientSha256) ||
+    !['tested', 'newer', 'supported'].includes(state) ||
+    !z.uuid().safeParse(input.sessionId).success
+  )
     throw new UsageReaderError('client');
   return {
     sessionId: input.sessionId,
-    clientSha256,
+    clientSha256: input.clientSha256,
+    clientVersion: input.clientVersion,
     timeoutMs: 30_000,
     maximumStdoutBytes,
     maximumStderrBytes: 16_384,

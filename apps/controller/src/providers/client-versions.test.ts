@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import {
   chmodSync,
   existsSync,
@@ -14,11 +15,14 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import {
   CLIENT_VERSIONS,
+  type ClientReads,
   clientFileTrust,
   clientVersionState,
   clientVersionStatus,
   findClient,
+  forgetClientReads,
   parseClientVersion,
+  unreadableRetryMs,
 } from './client-versions.ts';
 
 const row = { tested: '0.163.0', minimum: '0.150.0' };
@@ -48,9 +52,41 @@ test('the chat path accepts a client at or above the minimum within the tested m
     ['codex-cli unknown', 'unreadable'],
     ['0.163', 'unreadable'],
     ['00.163.0', 'unreadable'],
+    // Under major 0 a newer minor is accepted as newer: one client ships a new 0.minor weekly.
+    ['0.200.0', 'newer'],
+    // A line announcing an update names another version and is skipped.
+    ['Update available: 0.180.0 -> run npm install\ncodex-cli 0.163.0', 'tested'],
+    ['codex-cli 0.164.0\nThe latest version is 1.0.0', 'newer'],
+    ['A new version 9.9.9 is available', 'unreadable'],
+    ['UPDATE 0.170.0', 'unreadable'],
   ] as const)
     assert.equal(clientVersionState(output, row), state, output);
   assert.equal(clientVersionState(null, row), 'unreadable');
+});
+
+test('prerelease builds order by semantic versioning, numbers by value', () => {
+  const rows = [
+    ['0.164.0-alpha', '0.164.0-alpha.1'],
+    ['0.164.0-alpha.1', '0.164.0-alpha.beta'],
+    ['0.164.0-alpha.2', '0.164.0-alpha.10'],
+    ['0.164.0-beta.2', '0.164.0-beta.11'],
+    ['0.164.0-rc.1', '0.164.0'],
+    ['0.164.0-9', '0.164.0-10'],
+    ['0.164.0-10', '0.164.0-alpha'],
+  ] as const;
+  for (const [lower, higher] of rows) {
+    // With the lower build as the tested one the higher reads as newer, and never the reverse.
+    assert.equal(
+      clientVersionState(higher, { tested: lower, minimum: '0.1.0' }),
+      'newer',
+      `${higher} > ${lower}`,
+    );
+    assert.equal(
+      clientVersionState(lower, { tested: higher, minimum: '0.1.0' }),
+      'supported',
+      `${lower} < ${higher}`,
+    );
+  }
 });
 
 test('each family names its own tested build, minimum and update command, with the minimum in the tested major', () => {
@@ -124,7 +160,7 @@ test('Settings and the CLI name the found version and the state in plain words',
   }
 });
 
-test('the chat path still refuses a client file that other users can write or another account owns', () => {
+test('the chat path still refuses a client file its group or other users can write, in a shared folder or owned by another account', () => {
   const uid = process.getuid?.() ?? 0;
   const other = uid + 1;
   const file = (mode: number, owner = uid, size = 10, regular = true) => ({
@@ -133,48 +169,63 @@ test('the chat path still refuses a client file that other users can write or an
     uid: owner,
     mode: 0o100000 | mode,
   });
-  for (const [stat, verdict] of [
-    [file(0o755), 'trusted'],
-    [file(0o700), 'trusted'],
-    [file(0o775), 'trusted'],
-    [file(0o755, 0), 'trusted'],
-    [file(0o757), 'shared-write'],
-    [file(0o777), 'shared-write'],
-    [file(0o755, other), 'foreign-owner'],
-    [file(0o777, other), 'foreign-owner'],
-    [file(0o755, uid, 2048), 'not-a-client'],
-    [file(0o755, uid, 10, false), 'not-a-client'],
+  const folder = (mode: number) => ({ mode: 0o040000 | mode });
+  for (const [stat, parent, verdict] of [
+    [file(0o755), folder(0o755), 'trusted'],
+    [file(0o700), folder(0o700), 'trusted'],
+    [file(0o555), folder(0o775), 'trusted'],
+    [file(0o755, 0), folder(0o755), 'trusted'],
+    [file(0o775), folder(0o755), 'shared-write'],
+    [file(0o757), folder(0o755), 'shared-write'],
+    [file(0o777), folder(0o755), 'shared-write'],
+    [file(0o755), folder(0o757), 'shared-folder'],
+    [file(0o755), folder(0o1777), 'shared-folder'],
+    [file(0o755, other), folder(0o755), 'foreign-owner'],
+    [file(0o777, other), folder(0o777), 'foreign-owner'],
+    [file(0o755, uid, 2048), folder(0o755), 'not-a-client'],
+    [file(0o755, uid, 10, false), folder(0o755), 'not-a-client'],
   ] as const)
-    assert.equal(clientFileTrust(stat, 1024, uid), verdict, JSON.stringify(stat));
+    assert.equal(
+      clientFileTrust(stat, 1024, uid, parent),
+      verdict,
+      `${stat.mode.toString(8)} in ${parent.mode.toString(8)}`,
+    );
 });
 
-test('finding a client runs its version flag once per build and refuses a world-writable file before it runs', () => {
+function scratch() {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-client-versions-'));
+  const bin = join(root, 'bin');
+  const store = join(root, 'store');
+  mkdirSync(bin);
+  mkdirSync(store);
+  chmodSync(store, 0o755);
+  const log = join(root, 'runs.log');
+  // A script stands in for the client. It records each run, then runs the body it is given.
+  const client = (name: string, body: string, mode = 0o755) => {
+    const path = join(store, name);
+    writeFileSync(path, `#!/bin/sh\necho "$0 $1" >> '${log}'\n${body}\n`);
+    chmodSync(path, mode);
+    return path;
+  };
+  const runs = () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').length : 0);
+  const link = (path: string) => {
+    rmSync(join(bin, 'codex'), { force: true });
+    symlinkSync(path, join(bin, 'codex'));
+  };
+  return { root, bin, store, client, runs, link };
+}
+
+test('finding a client runs its version flag once per build and refuses an unsafe file before it runs', () => {
+  const { root, bin, store, client, runs, link } = scratch();
   try {
-    const bin = join(root, 'bin');
-    const store = join(root, 'store');
-    mkdirSync(bin);
-    mkdirSync(store);
-    const log = join(root, 'runs.log');
-    // A script stands in for the client. It records each run and prints the version it is given.
-    const client = (name: string, output: string, mode = 0o755) => {
-      const path = join(store, name);
-      writeFileSync(
-        path,
-        `#!/bin/sh\necho "$0 $1" >> '${log}'\n[ "$1" = --version ] || exit 2\necho '${output}'\n`,
-      );
-      chmodSync(path, mode);
-      return path;
-    };
-    const runs = () => (existsSync(log) ? readFileSync(log, 'utf8').trim().split('\n').length : 0);
-    const cache = new Map();
+    const cache: ClientReads = new Map();
     const find = () =>
       findClient('openai', { directories: [bin], home: userInfo().homedir, cache, now: () => 0 });
 
     assert.equal(find().status.state, 'missing');
 
-    const newer = client('codex-newer', 'codex-cli 0.170.2');
-    symlinkSync(newer, join(bin, 'codex'));
+    const newer = client('codex-newer', "echo 'codex-cli 0.170.2'");
+    link(newer);
     const found = find();
     assert.equal(found.status.state, 'newer');
     assert.equal(found.status.version, '0.170.2');
@@ -184,22 +235,169 @@ test('finding a client runs its version flag once per build and refuses a world-
     find();
     assert.equal(runs(), 1, 'an unchanged build is not run again');
 
-    chmodSync(newer, 0o757);
-    const shared = find();
-    assert.equal(shared.status.state, 'untrusted');
-    assert.equal(shared.client, undefined);
-    assert.equal(runs(), 1, 'a world-writable client never runs');
+    for (const [mode, folder, message] of [
+      [0o757, 0o755, 'can be changed by other users'],
+      [0o775, 0o755, 'can be changed by other users'],
+      [0o755, 0o757, 'is in a folder other users can change'],
+    ] as const) {
+      chmodSync(newer, mode);
+      chmodSync(store, folder);
+      const refused = find();
+      assert.equal(refused.status.state, 'untrusted', mode.toString(8));
+      assert.match(refused.status.message, new RegExp(message));
+      assert.equal(refused.client, undefined);
+      assert.equal(runs(), 1, 'an unsafe client never runs');
+    }
+    chmodSync(store, 0o755);
 
-    rmSync(join(bin, 'codex'));
-    symlinkSync(client('codex-old', '0.120.0'), join(bin, 'codex'));
+    link(client('codex-old', "echo '0.120.0'"));
     const old = find();
     assert.equal(old.status.state, 'older');
     assert.equal(old.client, undefined);
 
-    rmSync(join(bin, 'codex'));
-    symlinkSync(client('codex-silent', 'no version here'), join(bin, 'codex'));
+    link(client('codex-silent', "echo 'no version here'"));
     assert.equal(find().status.state, 'unreadable');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('a client file CrewKite cannot read is unreadable and never stops the search or its caller', () => {
+  const { root, bin, client, runs, link } = scratch();
+  try {
+    link(client('codex', "echo '0.170.2'"));
+    for (const code of ['EACCES', 'ENOENT']) {
+      const found = findClient('openai', {
+        directories: [bin],
+        home: userInfo().homedir,
+        cache: new Map(),
+        hash: () => {
+          throw Object.assign(new Error(code), { code });
+        },
+      });
+      assert.equal(found.status.state, 'unreadable', code);
+      assert.equal(found.client, undefined, code);
+      assert.equal(runs(), 0, `${code}: a file that cannot be hashed is not run`);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('an unreadable version is read again after a backoff, at once when the file changes or on Check again, and never inside a transaction', () => {
+  const { root, bin, client, runs, link } = scratch();
+  try {
+    assert.deepEqual(
+      [1, 2, 3, 4, 5, 6].map(unreadableRetryMs),
+      [60_000, 120_000, 240_000, 480_000, 900_000, 900_000],
+    );
+    const silent = client('codex', "echo 'no version'");
+    link(silent);
+    const cache: ClientReads = new Map();
+    let now = 0;
+    const find = (cachedOnly = false) =>
+      findClient('openai', {
+        directories: [bin],
+        home: userInfo().homedir,
+        cache,
+        now: () => now,
+        cachedOnly,
+      }).status.state;
+
+    assert.equal(find(true), 'unreadable');
+    assert.equal(runs(), 0, 'a cached-only resolution runs nothing');
+    assert.equal(find(), 'unreadable');
+    assert.equal(runs(), 1);
+    for (const [at, expected] of [
+      [59_999, 1],
+      [60_000, 2],
+      [179_999, 2],
+      [180_000, 3],
+    ] as const) {
+      now = at;
+      find();
+      assert.equal(runs(), expected, `at ${at}`);
+    }
+    forgetClientReads('openai', cache);
+    find();
+    assert.equal(runs(), 4, 'Check again reads at once');
+    forgetClientReads('anthropic', cache);
+    find();
+    assert.equal(runs(), 4, 'another family keeps its reads');
+    writeFileSync(silent, `${readFileSync(silent, 'utf8')}\n# changed\n`);
+    find();
+    assert.equal(runs(), 5, 'a changed file reads at once');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the version read is bounded, kills its whole process group and passes a minimal environment', () => {
+  const { root, bin, store, client, link } = scratch();
+  try {
+    const pids = join(root, 'pids');
+    link(client('codex', `sleep 30 &\necho $! > '${pids}'\nsleep 30`));
+    const started = Date.now();
+    const hung = findClient('openai', {
+      directories: [bin],
+      home: userInfo().homedir,
+      cache: new Map(),
+      timeoutMs: 300,
+    });
+    assert.equal(hung.status.state, 'unreadable');
+    assert(Date.now() - started < 5000, 'the read stops at its bound');
+    const left = Number(readFileSync(pids, 'utf8').trim());
+    assert(left > 0);
+    assert(gone(left), 'a process the client left in its group is killed');
+
+    // A client that reports its own environment. Nothing of the controller's reaches it.
+    const seen = join(root, 'env.json');
+    const script = join(store, 'codex-env');
+    writeFileSync(
+      script,
+      `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(seen)}, JSON.stringify(Object.keys(process.env).sort()));\nconsole.log('0.170.2');\n`,
+    );
+    chmodSync(script, 0o755);
+    link(script);
+    process.env.CREWKITE_FIXTURE_SECRET = 'canary';
+    try {
+      const found = findClient('openai', {
+        directories: [bin],
+        home: userInfo().homedir,
+        path: '/usr/bin:/bin',
+        cache: new Map(),
+      });
+      assert.equal(found.status.state, 'newer');
+    } finally {
+      delete process.env.CREWKITE_FIXTURE_SECRET;
+    }
+    assert.deepEqual(JSON.parse(readFileSync(seen, 'utf8')), ['HOME', 'LANG', 'NO_COLOR', 'PATH']);
+
+    // A file that changes while its version runs keeps no version.
+    link(client('codex-changing', `echo '# touched' >> "$0"\necho '0.170.2'`));
+    const swapped = findClient('openai', {
+      directories: [bin],
+      home: userInfo().homedir,
+      cache: new Map(),
+    });
+    assert.equal(swapped.status.state, 'unreadable');
+    assert.equal(swapped.client, undefined);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+/** The process is gone or only waits to be reaped. Checked a bounded number of times, no sleep. */
+function gone(pid: number) {
+  for (let attempt = 0; attempt < 50; attempt++) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return true;
+    }
+    const state = spawnSync('ps', ['-o', 'stat=', '-p', String(pid)], { encoding: 'utf8' });
+    const stat = state.stdout.trim();
+    if (!stat || stat.startsWith('Z')) return true;
+  }
+  return false;
+}

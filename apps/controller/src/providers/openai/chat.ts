@@ -40,6 +40,7 @@ import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { CLIENT_VERSIONS, clientVersionState } from '../client-versions.ts';
 import {
   type OpenAiUsageHook,
   type OpenAiUsageWindow,
@@ -65,7 +66,8 @@ type Spawn = (
 ) => ChildProcessWithoutNullStreams;
 
 export type OpenAiChatDeps = Readonly<{
-  launch: (request: ChatTurnRequest) => NativeLaunch;
+  /** The client to run. Its version, when known, names the build in a failure. */
+  launch: (request: ChatTurnRequest) => NativeLaunch & { version?: string };
   onUsage?: OpenAiUsageHook;
   /** Tests replace the client with a scripted peer. */
   spawn?: Spawn;
@@ -397,6 +399,10 @@ class OpenAiChatTurn {
   private readonly roots: string[];
   private child: ChildProcessWithoutNullStreams | null = null;
   private group = 0;
+  /** The version of the client this turn runs, when the launch named one. */
+  private version: string | undefined;
+  /** True once the client answered initialize, so it accepted the settings it was started with. */
+  private initialized = false;
   private nextId = 1;
   private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
   private threadId: string | null = null;
@@ -494,6 +500,7 @@ class OpenAiChatTurn {
     let step: 'client' | 'storage' | 'spawn' = 'client';
     try {
       const launch = deps.launch(this.request);
+      this.version = launch.version;
       const executable = verifiedClient(launch);
       step = 'storage';
       const directory = privateStorage(launch);
@@ -563,6 +570,7 @@ class OpenAiChatTurn {
       (reply) => {
         if ('error' in reply)
           return this.fail(this.providerFailure('session', 'initialize', reply.error));
+        this.initialized = true;
         this.write({ method: 'initialized' });
         this.call('account/read', { refreshToken: false }, (reply) => {
           if ('error' in reply)
@@ -1441,13 +1449,23 @@ class OpenAiChatTurn {
   private exited(code: number | null, signal: NodeJS.Signals | null) {
     this.closed = true;
     if (this.terminal !== undefined) this.fail(this.providerFailure('stream', null, this.terminal));
+    // A build newer than the tested one that closes before it answers initialize most often
+    // refused a setting passed under --strict-config. Its own words stay in the detail.
+    const tested = CLIENT_VERSIONS.openai.tested;
+    const refusedSettings =
+      !this.initialized &&
+      !signal &&
+      this.version !== undefined &&
+      clientVersionState(this.version, CLIENT_VERSIONS.openai) === 'newer';
     this.fail(
       chatFailure({
         stage: this.threadId ? 'stream' : 'session',
         kind: 'client-exit',
-        message: signal
-          ? `Codex stopped on ${signal} before the turn finished.`
-          : `Codex exited with code ${code} before the turn finished.`,
+        message: refusedSettings
+          ? `Codex ${this.version} closed before it started, and CrewKite was tested with ${tested}. A newer build can refuse a setting CrewKite passes; install ${tested} or update CrewKite.`
+          : signal
+            ? `Codex stopped on ${signal} before the turn finished.`
+            : `Codex exited with code ${code} before the turn finished.`,
       }),
     );
     if (this.group === 0 || groupAbsent(this.group)) this.settle();

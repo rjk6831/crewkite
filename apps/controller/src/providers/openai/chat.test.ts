@@ -258,7 +258,7 @@ function turn(
     prepare?: (scratch: string) => void;
     schedule?: Schedule;
     /** The client the turn launches, when a test resolved its own. */
-    client?: { executable: string; sha256: string };
+    client?: { executable: string; sha256: string; version?: string };
   } = {},
 ) {
   const home = mkdtempSync(join(root, `${scenario}-`));
@@ -955,6 +955,21 @@ test('a client that fails before its turn runs leaves its error output and last 
     assert.equal(stopReason, 'error', row.scenario);
     const { nextAction: _nextAction, resetsAt: _resetsAt, ...kept } = failure ?? {};
     assert.deepEqual(kept, row.failure, row.scenario);
+  }
+  // A newer build that closes before it starts names its version and the tested one. The tested
+  // build and an older one keep the plain exit line.
+  for (const [version, message] of [
+    [
+      '0.170.2',
+      'Codex 0.170.2 closed before it started, and CrewKite was tested with 0.163.0. A newer build can refuse a setting CrewKite passes; install 0.163.0 or update CrewKite.',
+    ],
+    ['0.163.0', 'Codex exited with code 1 before the turn finished.'],
+  ] as const) {
+    const { failure } = await turn('crash', {
+      client: { executable, sha256, version },
+    }).settled();
+    assert.equal(failure?.message, message, version);
+    assert.equal(failure?.providerMessage, 'Error: invalid configuration', version);
   }
 });
 

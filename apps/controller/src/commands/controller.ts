@@ -983,6 +983,9 @@ export class Controller {
         this.googleAcpPreparation = this.prepareGoogleAcp().catch(() => {});
       return acknowledged;
     }
+    // Reading a client's version changes nothing, so it comes before the Google terms gate.
+    if (command.command === 'CheckProviderClient')
+      return this.checkProviderClient(command.payload.family);
     const termsRefusal = googleTermsGate(this.store, command, (runId) => this.isPreparedAcp(runId));
     if (termsRefusal) return termsRefusal;
     if (

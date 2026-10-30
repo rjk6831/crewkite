@@ -56,12 +56,7 @@ export class ProjectCommands {
       usageReaders: [
         this.googleUsageReader(),
         this.openAiUsageReader(),
-        {
-          ...this.anthropicUsage().status(),
-          ...(this.options.chatClients?.anthropic
-            ? { client: this.chatClientFor('anthropic').status }
-            : {}),
-        },
+        this.anthropicUsage().status(),
       ],
       routes: this.store.list('route'),
       usage: this.store

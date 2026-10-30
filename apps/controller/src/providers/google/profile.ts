@@ -1,6 +1,11 @@
 import { userInfo } from 'node:os';
 import { type ClientVersionStatus, GoogleNativeProfileSchema } from '@crewkite/contracts';
-import { CLIENT_VERSIONS, clientDirectories, findClient } from '../client-versions.ts';
+import {
+  CLIENT_VERSIONS,
+  clientDirectories,
+  clientStatusReason,
+  findClient,
+} from '../client-versions.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
 import type { GoogleClientIdentity } from './native-writer.ts';
 
@@ -70,6 +75,7 @@ export type GoogleUsageClientResolution =
 export function resolveGoogleUsageClient(
   environment = process.env,
   searchDirectories?: readonly string[],
+  options: { cachedOnly?: boolean } = {},
 ): GoogleUsageClientResolution {
   if (process.platform !== 'darwin' || process.arch !== 'arm64')
     return { available: false, reason: 'unsupported-platform' };
@@ -79,21 +85,10 @@ export function resolveGoogleUsageClient(
     directories: searchDirectories ?? clientDirectories('google', environment),
     home: environment.HOME,
     path: environment.PATH,
+    cachedOnly: options.cachedOnly,
   });
   const status = found.status;
-  if (!found.client)
-    return {
-      available: false,
-      reason:
-        status.state === 'untrusted'
-          ? 'client-untrusted'
-          : status.state === 'unreadable'
-            ? 'client-version-unreadable'
-            : status.state === 'missing'
-              ? 'client-unavailable'
-              : 'client-version-unsupported',
-      status,
-    };
+  if (!found.client) return { available: false, reason: clientStatusReason(status), status };
   return {
     available: true,
     reason: 'available',
