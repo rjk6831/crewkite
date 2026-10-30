@@ -6,6 +6,8 @@ CrewKite is early. I review every change myself, and these rules keep the codeba
 
 Use Node 24 (see `.nvmrc`) and pnpm. `pnpm install` points git at the hooks in `.githooks`, which check branch names, commit messages and staged paths before anything leaves your machine.
 
+Run `pnpm desktop` to build and open the desktop from source on the real controller and your own CrewKite home, `~/.crewkite` unless `CREWKITE_HOME` names another folder under your home folder; it refuses any state path inside `internal/`. Run `pnpm demo` to open the same build on a synthetic project with scripted providers and state under `internal/`.
+
 Run `pnpm install` inside every git worktree you add. A worktree that borrows the main checkout's `node_modules` resolves `@crewkite/*` to the main checkout, so its own edits to `packages/contracts` never reach its type check or its tests.
 
 ## Branches and pull requests

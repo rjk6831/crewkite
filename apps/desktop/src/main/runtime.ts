@@ -15,6 +15,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { ControllerClient, readControllerEndpoint } from '@crewkite/client/node';
 import { type RuntimeManifest, RuntimeManifestSchema } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
+import { sourceDesktopState } from '../../../../scripts/desktop-state.ts';
 import {
   checkEnvironment,
   checkOwner,
@@ -95,15 +96,23 @@ export function resolveRuntime(
     arch = manifest.node.arch;
   } else {
     root = realpathSync(resolve(appRoot, '../..'));
-    const internal = join(root, 'internal');
-    if (!existsSync(internal)) mkdirSync(internal, { mode: 0o700 });
-    if (lstatSync(internal).isSymbolicLink())
-      throw new Error('The source internal directory cannot be a symlink.');
-    stateRoots = [realpathSync(internal)];
-    const check = checkOwner();
-    if (check) stateRoots.push(check.stateRoot);
-    if (existsSync(join(internal, 'tools')))
-      stateRoots.push(dirname(realpathSync(join(internal, 'tools'))));
+    // `pnpm desktop` names the state root of the person's own CrewKite home and runs the real
+    // controller. Its state never sits in this checkout's internal folder, which the demo uses.
+    const ownState = environment.CREWKITE_SOURCE_STATE_ROOT;
+    if (ownState !== undefined) {
+      mode = 'workspace';
+      stateRoots = [sourceDesktopState(root, ownState, home, profile).root];
+    } else {
+      const internal = join(root, 'internal');
+      if (!existsSync(internal)) mkdirSync(internal, { mode: 0o700 });
+      if (lstatSync(internal).isSymbolicLink())
+        throw new Error('The source internal directory cannot be a symlink.');
+      stateRoots = [realpathSync(internal)];
+      const check = checkOwner();
+      if (check) stateRoots.push(check.stateRoot);
+      if (existsSync(join(internal, 'tools')))
+        stateRoots.push(dirname(realpathSync(join(internal, 'tools'))));
+    }
     if (
       appRoot !== join(root, 'apps/desktop') ||
       !environment.CREWKITE_SOURCE_NODE ||

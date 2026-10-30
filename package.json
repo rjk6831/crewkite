@@ -20,6 +20,7 @@
     "crewkite": "node apps/cli/src/main.ts",
     "controller": "node apps/controller/src/main.ts",
     "desktop:install": "pnpm --filter @crewkite/desktop exec install-electron",
+    "desktop": "pnpm build && node scripts/desktop.ts",
     "demo": "pnpm build && node scripts/demo.ts",
     "demo:controller": "node scripts/demo-controller.ts",
     "test:desktop": "playwright test e2e/thread.spec.ts --workers=1 --reporter=line --output=internal/test-results",
