@@ -13,7 +13,7 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
       family="google"
       entry={entry}
       client={header.usageReaders.find((reader) => reader.family === 'google')?.client}
-      onCheck={() => void workspace.refresh().catch(() => {})}
+      onCheck={() => void actions.checkClient('google')}
       main={
         <>
           <p className="st-note">The quota read runs by default. Chat needs Connect.</p>

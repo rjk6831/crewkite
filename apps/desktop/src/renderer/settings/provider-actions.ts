@@ -69,6 +69,21 @@ export function useProviderActions(workspace: Pick<Workspace, 'metadataCommand'>
       work('anthropic', false);
     }
   }
+  /** Check again: the controller forgets what it read about the client and finds it afresh. */
+  async function checkClient(family: Family) {
+    work(family, true);
+    try {
+      const result = await workspace.metadataCommand({
+        command: 'CheckProviderClient',
+        payload: { family },
+      });
+      if (!applied(result.outcome)) say(family, refusal(result));
+    } catch (failure) {
+      say(family, failure instanceof Error ? failure.message : 'The client could not be checked.');
+    } finally {
+      work(family, false);
+    }
+  }
   async function observeUsage(family: 'google' | 'openai') {
     work(family, true);
     say(family, 'Quota read in progress.');
@@ -91,6 +106,7 @@ export function useProviderActions(workspace: Pick<Workspace, 'metadataCommand'>
     refreshAnthropic,
     stopAnthropicUsage,
     checkAnthropic,
+    checkClient,
     observeUsage,
   };
 }

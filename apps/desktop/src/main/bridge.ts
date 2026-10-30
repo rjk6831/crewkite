@@ -322,6 +322,7 @@ export async function installBridge(
         'RefreshAnthropicUsage',
         'StopAnthropicUsage',
         'CheckNativeConnection',
+        'CheckProviderClient',
         'RefreshTaskModelCatalog',
         'InstallGoogleAcp',
         'StopGoogleAcpInstall',

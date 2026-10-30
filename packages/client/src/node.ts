@@ -479,6 +479,7 @@ export class ControllerClient {
                                 : [
                                       'ObserveUsage',
                                       'RefreshChatModels',
+                                      'CheckProviderClient',
                                       'DiscoverGoogleAcp',
                                       'StopGoogleAcpSetup',
                                     ].includes(command.command)
