@@ -3,6 +3,8 @@ import { GitBranch, PanelRight } from 'lucide-react';
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { ExtensionThreadActions } from '../extension-slots.tsx';
+import { provide } from '../palette/actions.ts';
+import { ShareDialog } from '../palette/share-dialog.tsx';
 import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
 import { ChecksCard } from './checks-card.tsx';
 import {
@@ -134,6 +136,7 @@ function ThreadBody({
     focus: string | null;
   }>({ open: false, tab: 'changes', focus: null });
   const [notice, setNotice] = useState<string | null>(null);
+  const [sharing, setSharing] = useState(false);
   const counter = useRef(0);
   const composer = useRef<ComposerHandle>(null);
   const toggle = useRef<HTMLButtonElement>(null);
@@ -155,6 +158,29 @@ function ThreadBody({
       setSaid((previous) => ({ count: previous.count + 1, text: lines.join(' ') }));
   }, [state.loaded, signals]);
   const lastMessage = useMemo(() => lastUserMessage(state), [state]);
+  // Export and share are offered to the command palette while this thread is open. Main renders
+  // the file through the controller and the person picks where it goes.
+  const exportMarkdown = useCallback(async () => {
+    if (!source.saveExport) {
+      setNotice('Export needs the desktop app.');
+      return;
+    }
+    try {
+      const done = await source.saveExport({ taskId: task.id, format: 'markdown' });
+      if (done === 'saved')
+        setSaid((previous) => ({
+          count: previous.count + 1,
+          text: 'Saved the thread as Markdown.',
+        }));
+    } catch (failure) {
+      setNotice(failure instanceof Error ? failure.message : 'The file was not saved.');
+    }
+  }, [source, task.id]);
+  useEffect(
+    () =>
+      provide('exporter', { markdown: () => void exportMarkdown(), share: () => setSharing(true) }),
+    [exportMarkdown],
+  );
 
   const queued = thread?.queued;
   // The controller queues a message while the thread is busy. The queued list shows that one, so
@@ -486,6 +512,9 @@ function ThreadBody({
           {said.count % 2 === 0 ? '' : '\u200b'}
         </p>
       </section>
+      {sharing && (
+        <ShareDialog source={source} taskId={task.id} onClose={() => setSharing(false)} />
+      )}
       {inspector.open && (
         <Inspector
           source={source}

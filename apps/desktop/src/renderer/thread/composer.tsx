@@ -35,6 +35,7 @@ import {
 import { familyName } from '../components.tsx';
 import { ContextGauge } from '../context-gauge.tsx';
 import { lastSeen, observeOpenConnection } from '../local-setup-flow.ts';
+import { provide } from '../palette/actions.ts';
 import { flightModes, preferredSelection } from '../settings/preferences.ts';
 import { type ChipFile, chipOf, FileChips, keepThumbnail } from './attach.tsx';
 import {
@@ -187,6 +188,13 @@ export function Composer({
       );
   }, [source, taskId]);
   useEffect(loadCatalog, [loadCatalog]);
+  // The command palette reaches the slash commands through this one function.
+  const paletteSlash = useRef(runSlash);
+  paletteSlash.current = runSlash;
+  useEffect(
+    () => provide('slash', (name, argument) => void paletteSlash.current(name, argument, true)),
+    [],
+  );
   useEffect(() => {
     if (catalog) onCatalog?.(catalog);
   }, [catalog, onCatalog]);
@@ -331,7 +339,13 @@ export function Composer({
   }
   // A slash command moves around the app or fills the box. It never sends a message, and accept,
   // push and pull request stay behind their own confirmation in Changes.
-  async function runSlash(name: Parameters<typeof slashEffect>[0], argument: string) {
+  // The command palette runs the same function. It leaves the draft in the box, since the person
+  // did not type the command into it.
+  async function runSlash(
+    name: Parameters<typeof slashEffect>[0],
+    argument: string,
+    keepDraft = false,
+  ) {
     const { action, note: said } = slashEffect(name, {
       thread: taskId !== null,
       newThread: !!onNewThread,
@@ -363,7 +377,7 @@ export function Composer({
       return;
     }
     if (action === 'ask') {
-      clearBox();
+      if (!keepDraft) clearBox();
       if (argument) fillBox(argument);
       const why = roles.why('ask');
       if (why) setNote(why);
@@ -372,7 +386,7 @@ export function Composer({
     }
     // A command the view cannot run, and /help, leave the box as it is.
     if (action === 'none') return;
-    clearBox();
+    if (!keepDraft) clearBox();
     if (action === 'new-thread') onNewThread?.();
     else if (action === 'open-settings') onOpenSettings?.();
     else if (action === 'open-crew') onOpenCrew?.();
