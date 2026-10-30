@@ -811,6 +811,13 @@ export function SettingsView({
             entry.connected ? 'Connected' : reasonText(entry.reason),
           ),
         ),
+        entry.client
+          ? h(
+              Text,
+              { color: entry.client.accepted ? colors.muted : colors.amber, wrap: 'wrap' },
+              safeText(entry.client.message),
+            )
+          : null,
         UsageLine({ catalog, nowMs, colors, only: entry.family }),
         groups.live.length + groups.known.length > 0
           ? h(

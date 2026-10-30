@@ -1,4 +1,9 @@
-import type { ChatCatalogRead, ChatFamily, WorkspaceState } from '@crewkite/contracts';
+import type {
+  ChatCatalogRead,
+  ChatFamily,
+  ClientVersionStatus,
+  WorkspaceState,
+} from '@crewkite/contracts';
 import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import type { Workspace } from '../source.ts';
@@ -154,6 +159,8 @@ export function ProviderCard({
   main,
   side,
   models,
+  client,
+  onCheck,
 }: {
   family: ChatFamily;
   entry: CatalogEntry | undefined;
@@ -163,7 +170,12 @@ export function ProviderCard({
   side: ReactNode;
   /** Shown under the model list, such as a way to read it again. */
   models?: ReactNode;
+  /** The installed client against its tested build. The catalog entry's own when left out. */
+  client?: ClientVersionStatus;
+  /** Reads the client again, after the person updates or installs it. */
+  onCheck?: () => void;
 }) {
+  const found = client ?? entry?.client;
   const titleId = useId();
   const card = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -183,6 +195,16 @@ export function ProviderCard({
           {entry && !entry.connected && entry.reason ? reasonText(entry.reason) : detail}
         </span>
       </header>
+      {found && (
+        <div className={found.accepted ? 'st-client' : 'st-client is-refused'}>
+          <p role="status">{found.message}</p>
+          {onCheck && (
+            <button type="button" className="button secondary" onClick={onCheck}>
+              Check again
+            </button>
+          )}
+        </div>
+      )}
       <div className="st-body">
         <div className="st-col">{main}</div>
         <div className="st-col">

@@ -1078,7 +1078,7 @@ export async function runCli(
             [
               ...workspace.usageReaders.map(
                 (reader) =>
-                  `${reader.family} quota reader  ${reader.reason}${reader.readState ? `  ${reader.readState}, ${reader.readReason ?? 'no result'}${reader.lastRequest ? `, last request ${reader.lastRequest}` : ''}` : ''}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
+                  `${reader.family} quota reader  ${reader.reason}${reader.readState ? `  ${reader.readState}, ${reader.readReason ?? 'no result'}${reader.lastRequest ? `, last request ${reader.lastRequest}` : ''}` : ''}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}${reader.client ? `\n  ${reader.client.message}` : ''}`,
               ),
               ...workspace.usageReaders
                 .filter((reader) => reader.family === 'anthropic')

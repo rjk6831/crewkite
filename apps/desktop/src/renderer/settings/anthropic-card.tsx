@@ -27,6 +27,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
     <ProviderCard
       family="anthropic"
       entry={entry}
+      onCheck={() => void workspace.refresh().catch(() => {})}
       detail={connection?.state === 'signed-in' ? 'Signed in with a subscription' : undefined}
       main={
         <ClientStatus family="anthropic" header={header} now={now}>
