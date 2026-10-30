@@ -49,6 +49,7 @@ import {
 import { McpVault, supplyMcp } from './mcp-vault.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
+import { saveTextFile } from './save-file.ts';
 import { assertSender, openExternalLink } from './security.ts';
 
 const verifications = new WeakMap<BrowserWindow, { requestId: string; abort: AbortController }>();
@@ -720,17 +721,7 @@ export async function installBridge(
     assertSender(event, window);
     if (choice.canceled || !choice.filePath) return 'cancelled';
     try {
-      const file = openSync(
-        choice.filePath,
-        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
-        0o600,
-      );
-      try {
-        writeFileSync(file, analyticsToCsv(analytics));
-        fsyncSync(file);
-      } finally {
-        closeSync(file);
-      }
+      saveTextFile(choice.filePath, analyticsToCsv(analytics));
     } catch {
       throw new Error('The file could not be written there. Choose another place.');
     }
