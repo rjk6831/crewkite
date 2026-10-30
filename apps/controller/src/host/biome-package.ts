@@ -7,15 +7,25 @@ const PACKAGES: Record<string, Record<string, string>> = {
   linux: { x64: '@biomejs/cli-linux-x64', arm64: '@biomejs/cli-linux-arm64' },
 };
 
-/** True when the running Node reports a glibc runtime, which a musl system does not. */
+/**
+ * True when the running Node reports a glibc runtime, which a musl system does not. The report
+ * leaves out network interfaces, so it reads no address of this computer.
+ */
 export function hostUsesGlibc(): boolean {
+  // The Node types leave out excludeNetwork, which the runtime has had since Node 16.
+  const report = process.report as
+    | (typeof process.report & { excludeNetwork?: boolean })
+    | undefined;
+  if (!report) return false;
+  const previous = report.excludeNetwork;
   try {
-    const report = process.report?.getReport() as
-      | { header?: { glibcVersionRuntime?: unknown } }
-      | undefined;
-    return typeof report?.header?.glibcVersionRuntime === 'string';
+    report.excludeNetwork = true;
+    const header = (report.getReport() as { header?: { glibcVersionRuntime?: unknown } }).header;
+    return typeof header?.glibcVersionRuntime === 'string';
   } catch {
     return false;
+  } finally {
+    report.excludeNetwork = previous;
   }
 }
 
