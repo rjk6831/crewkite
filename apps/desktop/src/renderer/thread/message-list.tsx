@@ -20,7 +20,7 @@ import { markMatches } from './reveal-dom.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 import { replySource, roleLabels, viewBlocks } from './turn-fold.ts';
 import { TurnStats } from './turn-stats.tsx';
-import { layoutRows, ROW_GAP, rowTop, rowWindow } from './virtual-window.ts';
+import { layoutRows, mountPlan, rowTop, rowWindow } from './virtual-window.ts';
 
 /**
  * `OpenAI · large-1 · Ultra`, after the family mark. A default effort is left out: the client
@@ -182,6 +182,15 @@ function Row({
   }
 }
 
+/** What marks a card the person opened or one that shows an error. */
+const OPEN_CARD = '[aria-expanded="true"], details[open], .th-error[role="alert"]';
+
+/** A permission request nobody has answered yet. Its row stays mounted so the answer is not lost. */
+const awaitsAnswer = (item: ThreadItem) =>
+  item.kind === 'turn' &&
+  !item.turn.ended &&
+  item.turn.blocks.some((block) => block.kind === 'permission' && block.choice === null);
+
 /** A search hit to show: the row to scroll to and the words to mark in it. `nonce` makes the same hit show again. */
 export type Reveal = { key: string; terms: readonly string[]; nonce: number };
 
@@ -246,8 +255,31 @@ export function MessageList({
   layoutNow.current = layout;
   const view = useRef({ top: 0, height: 800 });
   const span = rowWindow(layout, view.current.top, view.current.height);
-  const shown = useRef(span);
-  shown.current = span;
+  // Rows that stay mounted wherever the view is, because unmounting them would lose something the
+  // person is using: the row that holds focus, a card they opened or that shows an error, and a
+  // permission still waiting for an answer. The first two are read from the page as the view
+  // moves, since a card keeps its open state to itself.
+  const focused = useRef<string | null>(null);
+  const opened = useRef<ReadonlySet<string>>(new Set());
+  const keyIndex = useMemo(() => new Map(keys.map((key, index) => [key, index])), [keys]);
+  const waiting = useMemo(
+    () => items.flatMap((item, index) => (awaitsAnswer(item) ? [index] : [])),
+    [items],
+  );
+  const pinsNow = () => {
+    const pins = new Set(waiting);
+    for (const key of [focused.current, ...opened.current]) {
+      const index = key === null ? undefined : keyIndex.get(key);
+      if (index !== undefined) pins.add(index);
+    }
+    return [...pins].sort((a, b) => a - b);
+  };
+  const pins = pinsNow();
+  const plan = mountPlan(layout, span, pins);
+  const pinsRef = useRef(pinsNow);
+  pinsRef.current = pinsNow;
+  const shown = useRef('');
+  shown.current = `${span.start}:${span.end}:${pins.join(',')}`;
   // Reads the scroll position. A render follows only when the mounted rows would change.
   const syncView = useCallback(() => {
     const element = scroller.current;
@@ -257,10 +289,34 @@ export function MessageList({
       top: element.scrollTop - rowsTop(element, block),
       height: element.clientHeight,
     };
+    const found = new Set<string>();
+    for (const slot of block.querySelectorAll<HTMLElement>('[data-slot]'))
+      if (slot.dataset.slot && slot.querySelector(OPEN_CARD)) found.add(slot.dataset.slot);
+    opened.current = found;
     const next = rowWindow(layoutNow.current, view.current.top, view.current.height);
-    if (next.start !== shown.current.start || next.end !== shown.current.end)
+    if (`${next.start}:${next.end}:${pinsRef.current().join(',')}` !== shown.current)
       setTick((tick) => tick + 1);
   }, []);
+  // The row that holds focus stays mounted. Focus that moves to another row is set by that row's
+  // own focusin, which follows the focusout.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the rows block exists once the thread has rows
+  useEffect(() => {
+    const block = rows.current;
+    if (!block) return;
+    const into = (event: FocusEvent) => {
+      focused.current =
+        (event.target as HTMLElement).closest<HTMLElement>('[data-slot]')?.dataset.slot ?? null;
+    };
+    const out = (event: FocusEvent) => {
+      if (!block.contains(event.relatedTarget as Node | null)) focused.current = null;
+    };
+    block.addEventListener('focusin', into);
+    block.addEventListener('focusout', out);
+    return () => {
+      block.removeEventListener('focusin', into);
+      block.removeEventListener('focusout', out);
+    };
+  }, [populated]);
   const observer = useRef<ResizeObserver | null>(null);
   const watched = useRef(new Set<Element>());
   useLayoutEffect(() => {
@@ -423,7 +479,6 @@ export function MessageList({
     setAway(!stick.current);
     syncView();
   }
-  const mounted = items.slice(span.start, span.end);
   return (
     <div className="th-scroll-frame">
       {populated ? (
@@ -443,37 +498,36 @@ export function MessageList({
               </div>
             )}
             <div className="th-rows" ref={rows}>
-              {span.before > 0 && (
-                <div
-                  className="th-pad"
-                  style={{ height: span.before - ROW_GAP }}
-                  aria-hidden="true"
-                />
-              )}
-              {mounted.map((item) => (
-                // One wrapper for every row, so a control that appears below it keeps the row
-                // mounted, and the row and its controls are measured as one.
-                <div
-                  key={item.key}
-                  className={item.key === hit ? 'th-slot is-hit' : 'th-slot'}
-                  data-slot={item.key}
-                >
-                  <Row
-                    item={item}
-                    taskId={taskId}
-                    onResolve={onResolve}
-                    onOpenChanges={onOpenChanges}
-                  />
-                  {actions?.(item)}
-                </div>
-              ))}
-              {span.after > 0 && (
-                <div
-                  className="th-pad"
-                  style={{ height: span.after - ROW_GAP }}
-                  aria-hidden="true"
-                />
-              )}
+              {plan.map((entry, at) => {
+                if (entry.kind === 'pad')
+                  return (
+                    <div
+                      // biome-ignore lint/suspicious/noArrayIndexKey: padding blocks have no identity
+                      key={`pad-${at}`}
+                      className="th-pad"
+                      style={{ height: entry.height }}
+                      aria-hidden="true"
+                    />
+                  );
+                const item = items[entry.index];
+                return (
+                  // One wrapper for every row, so a control that appears below it keeps the row
+                  // mounted, and the row and its controls are measured as one.
+                  <div
+                    key={item.key}
+                    className={item.key === hit ? 'th-slot is-hit' : 'th-slot'}
+                    data-slot={item.key}
+                  >
+                    <Row
+                      item={item}
+                      taskId={taskId}
+                      onResolve={onResolve}
+                      onOpenChanges={onOpenChanges}
+                    />
+                    {actions?.(item)}
+                  </div>
+                );
+              })}
             </div>
             {footer}
           </div>

@@ -3,6 +3,7 @@ import { test } from 'node:test';
 import {
   ESTIMATED_ROW_HEIGHT,
   layoutRows,
+  mountPlan,
   ROW_GAP,
   rowTop,
   rowWindow,
@@ -67,6 +68,58 @@ test('rows that overlap the view are always mounted, with the overscan on both s
       if (start >= top + viewport + overscan + ROW_GAP + 1000) assert.ok(!mounted, `row ${index}`);
     }
   }
+});
+
+test('a pinned row stays mounted far outside the window, and the padding still adds up', () => {
+  const heights = new Map(keys(2000).map((key, index) => [key, 60 + (index % 5) * 30] as const));
+  const layout = layoutRows(keys(2000), heights);
+  const window = rowWindow(layout, 1000 * 200, 800);
+  const rows: [string, number[]][] = [
+    ['no pins', []],
+    ['one row far above', [3]],
+    ['one row far below', [1900]],
+    ['rows on both sides and one inside the window', [0, window.start + 2, 1999]],
+    ['a pin outside the thread is ignored', [-4, 5000]],
+  ];
+  for (const [claim, pinned] of rows) {
+    const plan = mountPlan(layout, window, pinned);
+    const drawn = plan.flatMap((item) => (item.kind === 'row' ? [item.index] : []));
+    for (const index of pinned)
+      if (index >= 0 && index < 2000) assert.ok(drawn.includes(index), claim);
+    for (let index = window.start; index < window.end; index++) assert.ok(drawn.includes(index));
+    assert.deepEqual(
+      drawn,
+      [...drawn].sort((a, b) => a - b),
+      `${claim}: rows stay in order`,
+    );
+    assert.equal(new Set(drawn).size, drawn.length, `${claim}: a row is drawn once`);
+    assert.ok(drawn.length < window.end - window.start + 4, `${claim}: only the pins are added`);
+    assert.ok(
+      plan.every((item, at) => item.kind !== 'pad' || plan[at - 1]?.kind !== 'pad'),
+      `${claim}: no two blocks of padding in a row`,
+    );
+    // With a gap beside every item, the plan stands for the thread's whole height.
+    const height = plan.reduce(
+      (sum, item) =>
+        sum +
+        (item.kind === 'pad'
+          ? item.height
+          : (heights.get(`row-${item.index}`) ?? ESTIMATED_ROW_HEIGHT)),
+      ROW_GAP * (plan.length - 1),
+    );
+    assert.equal(height, layout.total - ROW_GAP, claim);
+  }
+  // The rows in the window and nothing else is what the window alone gives.
+  assert.deepEqual(
+    mountPlan(layout, window).filter((item) => item.kind === 'row').length,
+    window.end - window.start,
+  );
+  // A short thread has nothing to pad.
+  const short = layoutRows(keys(10), new Map());
+  assert.deepEqual(
+    mountPlan(short, rowWindow(short, 0, 800), [4]).map((item) => item.kind),
+    Array(10).fill('row'),
+  );
 });
 
 test('rowTop gives the scroll position of a row and clamps an index outside the thread', () => {

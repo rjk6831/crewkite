@@ -15,6 +15,9 @@ import './rail-search.css';
 // the results are reached with the arrow keys, as in the command palette.
 
 const DEBOUNCE_MS = 220;
+// Counts the results opened in this window. It lives here and not in the component, so a rail that
+// remounts, as it does when the sidebar collapses, never reuses a number the open thread has seen.
+let nonce = 0;
 const kindLabels: Record<ChatSearchHit['kind'], string> = {
   title: 'Title',
   message: 'Message',
@@ -42,7 +45,6 @@ export function RailSearch({
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
   const [active, setActive] = useState(0);
   const generation = useRef(0);
-  const opened = useRef(0);
   const field = useRef<HTMLInputElement>(null);
   const listId = useId();
   const query = text.trim();
@@ -96,8 +98,8 @@ export function RailSearch({
   }, [current]);
 
   function open(row: Row) {
-    opened.current += 1;
-    onOpen({ taskId: row.group.taskId, hit: row.hit, query, nonce: opened.current });
+    nonce += 1;
+    onOpen({ taskId: row.group.taskId, hit: row.hit, query, nonce });
   }
   function onKeyDown(event: KeyboardEvent<HTMLInputElement>) {
     if (event.key === 'Escape') {

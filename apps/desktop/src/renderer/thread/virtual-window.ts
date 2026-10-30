@@ -92,3 +92,38 @@ export function rowWindow(
 export function rowTop(layout: RowLayout, index: number): number {
   return layout.offsets[Math.max(0, Math.min(index, layout.offsets.length - 1))];
 }
+
+export type MountItem = { kind: 'row'; index: number } | { kind: 'pad'; height: number };
+
+/**
+ * What to draw, top to bottom: the rows of the window and the pinned rows outside it, with a block
+ * of padding for each stretch of rows left out. A pinned row is one that has to stay mounted
+ * wherever the view is, such as the row holding focus, a card the person opened or a permission
+ * waiting for an answer. Drawn with `ROW_GAP` between items, the items stand for the full height.
+ */
+export function mountPlan(
+  layout: RowLayout,
+  window: RowWindow,
+  pinned: Iterable<number> = [],
+): MountItem[] {
+  const count = layout.offsets.length - 1;
+  const wanted = new Set<number>();
+  for (let index = window.start; index < window.end; index++) wanted.add(index);
+  for (const index of pinned) if (index >= 0 && index < count) wanted.add(index);
+  const items: MountItem[] = [];
+  let previous = -1;
+  for (const index of [...wanted].sort((a, b) => a - b)) {
+    // The padding stands for the rows left out between two drawn ones. The gaps around it are
+    // counted with it, since the column draws a gap beside every item.
+    const from = previous < 0 ? 0 : layout.offsets[previous + 1];
+    const height = layout.offsets[index] - from - ROW_GAP;
+    if (index > previous + 1 && height > 0) items.push({ kind: 'pad', height });
+    items.push({ kind: 'row', index });
+    previous = index;
+  }
+  if (previous >= 0 && previous < count - 1) {
+    const height = layout.total - layout.offsets[previous + 1] - ROW_GAP;
+    if (height > 0) items.push({ kind: 'pad', height });
+  }
+  return items;
+}
