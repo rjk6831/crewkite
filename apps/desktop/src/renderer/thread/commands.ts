@@ -12,6 +12,8 @@ import {
   ChatInstructionsReadSchema,
   type ChatMentionsRead,
   ChatMentionsReadSchema,
+  type ChatSearchResult,
+  ChatSearchResultSchema,
   type ChatThreadRead,
   ChatThreadReadSchema,
   type ChatTurnEventsRead,
@@ -40,6 +42,7 @@ import {
   SaveChatPromptPayloadSchema,
   type SavedPrompts,
   SavedPromptsSchema,
+  SearchChatHistoryPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -60,7 +63,9 @@ const dispatch = (source: ThreadSource, command: string, payload: unknown) =>
   source.command({
     command,
     payload,
-    ...(command.startsWith('Read') || command === 'CompleteChatMention'
+    ...(command.startsWith('Read') ||
+    command === 'CompleteChatMention' ||
+    command === 'SearchChatHistory'
       ? {}
       : { expectedRevision: CHAT_REVISION }),
   } as unknown as DesktopCommand);
@@ -101,6 +106,14 @@ export const readThread = (
     'ReadChatThread',
     ReadChatThreadPayloadSchema.parse({ taskId, limit: THREAD_PAGE_SIZE, beforeCursor }),
     ChatThreadReadSchema,
+  );
+/** Search over every thread's titles, messages, tool cards and file paths. */
+export const searchHistory = (source: ThreadSource, query: string): Promise<ChatSearchResult> =>
+  read(
+    source,
+    'SearchChatHistory',
+    SearchChatHistoryPayloadSchema.parse({ query }),
+    ChatSearchResultSchema,
   );
 /** One page of a finished turn's stored events. Pass `nextAfterCursor` back to read on. */
 export const readTurnEvents = (

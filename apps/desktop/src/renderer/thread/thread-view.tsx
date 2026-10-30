@@ -23,6 +23,7 @@ import { FamilyMark } from './family-mark.tsx';
 import { tryWithChoices } from './file-fit.ts';
 import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
+import type { HistoryFind } from './history-reveal.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { outputLimitLine } from './output-limit.ts';
@@ -44,6 +45,7 @@ import {
 } from './thread-state.ts';
 import { ThreadTitle } from './thread-title.tsx';
 import type { TurnView } from './turn-fold.ts';
+import { useReveal } from './use-reveal.ts';
 import { useThread } from './use-thread.ts';
 import './thread.css';
 
@@ -80,6 +82,7 @@ export function ThreadView({
   preview,
   connection,
   refresh,
+  find,
   onNewThread,
   onOpenSettings,
 }: {
@@ -90,10 +93,13 @@ export function ThreadView({
   preview: boolean;
   connection: string;
   refresh?: () => Promise<WorkspaceState>;
+  /** A history search result to open at, scrolled to its turn with the match marked. */
+  find?: HistoryFind | null;
   onNewThread?: () => void;
   onOpenSettings?: () => void;
 }) {
   const {
+    reach,
     state,
     items,
     dispatch,
@@ -107,6 +113,7 @@ export function ThreadView({
     reload,
     retry,
   } = useThread(source, task.id, connection);
+  const reveal = useReveal(find, items, state.loaded, reach);
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const [inspector, setInspector] = useState<{
     open: boolean;
@@ -425,6 +432,7 @@ export function ThreadView({
           wantsHistory={wantsHistory}
           onTurnVisible={loadHistory}
           taskId={task.id}
+          reveal={reveal}
           earlier={hasEarlier ? { onLoad: loadEarlier, note: earlierNote } : null}
           onResolve={resolve}
           onOpenChanges={openChanges}

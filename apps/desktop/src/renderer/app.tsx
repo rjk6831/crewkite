@@ -37,10 +37,12 @@ import { SUGGESTED_FIRST_MESSAGE } from './onboarding/flow.ts';
 import { Onboarding } from './onboarding/onboarding.tsx';
 import { useOnboarding } from './onboarding/use-onboarding.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
+import { RailSearch } from './rail-search.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { adjacentThread, isMacPlatform, shortcutFor } from './thread/composer-rules.ts';
+import type { HistoryFind } from './thread/history-reveal.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { OpeningThread, ThreadView } from './thread/thread-view.tsx';
@@ -586,12 +588,19 @@ export function App() {
     setAddedProject(projectId);
     startThread(projectId);
   }
+  // A history search result the open thread scrolls to. Opening a thread any other way clears it.
+  const [find, setFind] = useState<HistoryFind | null>(null);
   function openThread(id: string) {
     // A thread in view means the person is under way, so the welcome ends.
     if (onboarding.view.visible) onboarding.finish();
+    setFind(null);
     setNewThread(null);
     setSelected(id);
     setPage('tasks');
+  }
+  function openFind(next: HistoryFind) {
+    openThread(next.taskId);
+    setFind(next);
   }
   const titles = new Map(
     Object.values(taskPages).flatMap((page) => page.tasks.map((row) => [row.id, row.title])),
@@ -767,6 +776,7 @@ export function App() {
           <span className="nav-text">Search</span>
           <kbd>⌘ K</kbd>
         </button>
+        {threadSource && !collapsed && <RailSearch source={threadSource} onOpen={openFind} />}
         {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
         <div className="nav-scroll" hidden={collapsed}>
           <div className="nav-label">PROJECTS</div>
@@ -1054,6 +1064,7 @@ export function App() {
             preview={preview}
             connection={connection}
             refresh={workspace.refresh}
+            find={find?.taskId === task.id ? find : null}
             onNewThread={() => startThread()}
             onOpenSettings={() => setPage('settings')}
           />
