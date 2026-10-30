@@ -14,11 +14,13 @@ import {
   TaskSchema,
 } from '@crewkite/contracts';
 import { startController } from '@crewkite/controller';
-import { runChecks } from './checks.ts';
+import { checkEnvironment, runChecks } from './checks.ts';
 import { isVerified, type Task } from './manifest.ts';
 import type { Exclusion, RunReport, TaskResult } from './report.ts';
 import { type ScriptedPlan, scriptedAdapter } from './scripted.ts';
 import {
+  assertWorkOutsideRepositories,
+  ceilingOf,
   copyTree,
   createProject,
   hasCommit,
@@ -37,8 +39,18 @@ export const REVIEW_TEXT =
 export type RunOptions = {
   /** The checkout the harness runs from. Tasks with repository `self` read commits here. */
   self: string;
-  /** Work files and the controller home live under this folder for the length of the run. */
+  /**
+   * Work files and the controller home live under this folder for the length of the run. It must
+   * be outside every repository, and the run refuses a folder inside the checkout. The caller
+   * makes it with createWorkDirectory.
+   */
   workDirectory: string;
+  /**
+   * What a work turn may do without asking. The default allows edits in the scratch copy and
+   * leaves commands to ask, and nobody answers a question during a run. allow-all lets the client
+   * run any command with the person's own permissions, so it is an explicit choice.
+   */
+  permissionPolicy?: 'allow-edits' | 'allow-all';
   selection: ChatModelSelection;
   tasks: readonly Task[];
   /** Exclusions found before the run, for example tasks that were not verified. */
@@ -171,6 +183,8 @@ export function selectTasks(
 
 /** Runs the selected tasks one after another through the controller's chat thread path. */
 export async function runBench(options: RunOptions): Promise<RunReport> {
+  assertWorkOutsideRepositories(options.workDirectory, options.self);
+  const permissionPolicy = options.permissionPolicy ?? 'allow-edits';
   const started = new Date(options.now()).toISOString();
   const report: RunReport = {
     version: 1,
@@ -180,6 +194,7 @@ export async function runBench(options: RunOptions): Promise<RunReport> {
     mode: options.scripted ? 'scripted' : 'live',
     selection: options.selection,
     reviewStep: options.review === true,
+    permissionPolicy,
     host: { node: process.version, platform: process.platform, arch: process.arch },
     results: [],
     exclusions: [...(options.exclusions ?? [])],
@@ -187,6 +202,13 @@ export async function runBench(options: RunOptions): Promise<RunReport> {
   const home = join(options.workDirectory, 'home');
   mkdirSync(home, { recursive: true, mode: 0o700 });
   chmodSync(home, 0o700);
+
+  // Git run from inside a scratch copy stops at the work folder's parent. The variable also goes
+  // to every check. The clients build their own environment, so the folder outside any repository
+  // is what keeps a turn away from the person's checkout.
+  const ceiling = ceilingOf(options.workDirectory);
+  const priorCeiling = process.env.GIT_CEILING_DIRECTORIES;
+  const environment = checkEnvironment(options.workDirectory, ceiling);
 
   let current: Task | null = null;
   const { family } = options.selection;
@@ -205,6 +227,7 @@ export async function runBench(options: RunOptions): Promise<RunReport> {
       : {}),
   });
   const transport = await connectController({ ...readControllerEndpoint(home), actor });
+  process.env.GIT_CEILING_DIRECTORIES = ceiling;
   try {
     const api = connect(transport);
     const watch = await watchTurns(transport);
@@ -223,7 +246,9 @@ export async function runBench(options: RunOptions): Promise<RunReport> {
         continue;
       }
       current = task;
-      report.results.push(await runTask(task, options, api, watch, home));
+      report.results.push(
+        await runTask(task, options, api, watch, home, permissionPolicy, environment),
+      );
       current = null;
       options.onProgress?.(report);
     }
@@ -231,6 +256,8 @@ export async function runBench(options: RunOptions): Promise<RunReport> {
   } finally {
     transport.close();
     await runtime.close();
+    if (priorCeiling === undefined) delete process.env.GIT_CEILING_DIRECTORIES;
+    else process.env.GIT_CEILING_DIRECTORIES = priorCeiling;
     if (!options.keepWork) rmSync(options.workDirectory, { recursive: true, force: true });
   }
   report.finishedAt = new Date(options.now()).toISOString();
@@ -260,11 +287,14 @@ async function runTask(
   api: Api,
   watch: Watch,
   home: string,
+  permissionPolicy: 'allow-edits' | 'allow-all',
+  environment: NodeJS.ProcessEnv,
 ): Promise<TaskResult> {
   const result: TaskResult = {
     taskId: task.id,
     difficulty: task.difficulty,
     verified: isVerified(task),
+    baseFailure: task.verification?.baseFailure ?? null,
     outcome: 'errored',
     turn: { state: 'not-started', failure: null },
     wallMs: 0,
@@ -292,8 +322,9 @@ async function runTask(
         })
       ).entity,
     );
-    // Edits and commands run in the scratch copy only, and nobody is there to answer a question.
-    await api.run('ConfigureChatThread', { taskId: created.id, permissionPolicy: 'allow-all' });
+    // Nobody is there to answer a question, so a command the policy does not allow waits for the
+    // limit and the turn is recorded as timed out.
+    await api.run('ConfigureChatThread', { taskId: created.id, permissionPolicy });
 
     const turn = await sendAndWait(api, watch, created.id, task.text, 'assistant', options);
     result.wallMs = turn.wallMs;
@@ -325,7 +356,7 @@ async function runTask(
     copyTree(scratch, checkDirectory);
     if (task.solution) placeHidden(repository, task.solution, task.hidden, checkDirectory);
     linkDependencies(repository, checkDirectory);
-    result.checks = await runChecks(checkDirectory, task.checks, options.now);
+    result.checks = await runChecks(checkDirectory, task.checks, options.now, environment);
     result.outcome = result.checks.every((check) => check.passed) ? 'passed' : 'failed';
   } catch (error) {
     result.outcome = 'errored';
@@ -365,14 +396,17 @@ async function sendAndWait(
     };
   let turn = await watch.next(taskId, before, options.timeoutMs);
   let timedOut = false;
+  // The wall time of a turn that hit the limit is the limit, not the wait for it to stop.
+  let limitWallMs = 0;
   if (!turn) {
     timedOut = true;
+    limitWallMs = Math.max(0, Math.round(options.now() - began));
     const open = (await api.thread(taskId)).thread.activeTurnId;
     if (open) await api.send('StopChatTurn', { taskId, turnId: open });
     // A stopped turn settles quickly. If it does not, the record keeps the timeout without it.
     turn = await watch.next(taskId, before, 60_000);
   }
-  const wallMs = Math.max(0, Math.round(options.now() - began));
+  const wallMs = timedOut ? limitWallMs : Math.max(0, Math.round(options.now() - began));
   const read = await api.thread(taskId);
   const settled = turn ? read.turns.find((value) => value.id === turn.id) : undefined;
   const message = settled

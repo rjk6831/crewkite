@@ -1,4 +1,4 @@
-import { readFileSync, writeFileSync } from 'node:fs';
+import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
@@ -8,6 +8,7 @@ import { type RunReport, RunReportSchema, renderMarkdown, summarize, writeRun } 
 import { runBench, selectTasks } from './runner.ts';
 import { oraclePlan } from './scripted.ts';
 import { verificationRecord, verifyTask } from './verify.ts';
+import { createWorkDirectory } from './workspace.ts';
 
 const SELF = resolve(import.meta.dirname, '../../..');
 const DEFAULT_TASKS = resolve(import.meta.dirname, '../tasks');
@@ -22,6 +23,7 @@ Run options:
   --timeout-minutes <n>    limit for one work turn, default 30
   --out <folder>           where run files go, default internal/bench
   --keep                   keep the work folder, with each task's scratch copy and check copy
+  --allow-all              let the client run any command during a task (default: edits only)
 Every command takes --tasks-dir <folder> more than once to add task folders. The default folder is
 packages/bench/tasks. A live run uses the clients installed on this machine through the normal
 adapters. Task files, run files and the table are described in docs/bench.md.
@@ -77,6 +79,7 @@ export async function main(
         scripted: { type: 'boolean' },
         write: { type: 'boolean' },
         keep: { type: 'boolean' },
+        'allow-all': { type: 'boolean' },
         out: { type: 'string' },
         'tasks-dir': { type: 'string', multiple: true },
         'timeout-minutes': { type: 'string' },
@@ -156,21 +159,45 @@ export async function main(
     const startedAt = Date.now();
     const runId = `${stamp(startedAt)}-${family.data}-${slug(model)}-${effort.data}`;
     const write = (report: RunReport) => void writeRun(out, report);
-    const report = await runBench({
-      self: SELF,
-      workDirectory: join(out, 'work', runId),
-      selection: { family: family.data, model, effort: effort.data },
-      tasks: picked.tasks,
-      exclusions: picked.exclusions,
-      review: values.review === true,
-      ...(values.scripted ? { scripted: oraclePlan(SELF) } : {}),
-      timeoutMs: minutes * 60_000,
-      runId,
-      now: Date.now,
-      keepWork: values.keep === true,
-      onProgress: write,
-    });
+    // The work folder holds each task's scratch copy, so it goes under the system temporary
+    // directory, outside this checkout and every other repository. Only run files go in `out`.
+    const workDirectory = createWorkDirectory();
+    const keep = values.keep === true;
+    const allowAll = values['allow-all'] === true;
+    if (allowAll)
+      log(
+        'Warning: --allow-all lets the client run any command in each task with your own permissions.',
+      );
+    const interrupt = () => {
+      if (!keep) rmSync(workDirectory, { recursive: true, force: true });
+      process.exit(130);
+    };
+    process.once('SIGINT', interrupt);
+    process.once('SIGTERM', interrupt);
+    let report: RunReport;
+    try {
+      report = await runBench({
+        self: SELF,
+        workDirectory,
+        permissionPolicy: allowAll ? 'allow-all' : 'allow-edits',
+        selection: { family: family.data, model, effort: effort.data },
+        tasks: picked.tasks,
+        exclusions: picked.exclusions,
+        review: values.review === true,
+        ...(values.scripted ? { scripted: oraclePlan(SELF) } : {}),
+        timeoutMs: minutes * 60_000,
+        runId,
+        now: Date.now,
+        keepWork: keep,
+        onProgress: write,
+      });
+    } finally {
+      process.off('SIGINT', interrupt);
+      process.off('SIGTERM', interrupt);
+      if (!keep) rmSync(workDirectory, { recursive: true, force: true });
+    }
     write(report);
+    if (keep) log(`Work folder kept at ${workDirectory}.`);
     const total = summarize(report);
     log(
       `${runId}: ran ${total.ran} of ${total.requested}, passed ${total.passed}, excluded ${total.excluded}. Files are in ${out}.`,

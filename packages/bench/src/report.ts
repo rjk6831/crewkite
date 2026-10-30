@@ -23,6 +23,8 @@ export const TaskResultSchema = z.strictObject({
   difficulty: z.enum(['easy', 'medium', 'hard']),
   /** False when the task carries no verification record and was named by id. */
   verified: z.boolean(),
+  /** How the checks failed on the base when the task was verified. Null with no record. */
+  baseFailure: z.enum(['assertion', 'missing-module']).nullable(),
   outcome: z.enum(['passed', 'failed', 'errored', 'timed-out']),
   turn: z.strictObject({
     state: z.enum(['done', 'stopped', 'failed', 'timed-out', 'not-started']),
@@ -62,6 +64,8 @@ export const RunReportSchema = z.strictObject({
   mode: z.enum(['scripted', 'live']),
   selection: z.strictObject({ family: z.string(), model: z.string(), effort: z.string() }),
   reviewStep: z.boolean(),
+  /** The thread permission policy every turn of the run used. */
+  permissionPolicy: z.enum(['allow-edits', 'allow-all']),
   host: z.strictObject({ node: z.string(), platform: z.string(), arch: z.string() }),
   results: z.array(TaskResultSchema),
   exclusions: z.array(ExclusionSchema),
@@ -91,6 +95,12 @@ export function summarize(report: RunReport) {
     wallMs: report.results.reduce((total, result) => total + result.wallMs, 0),
     tokensIn: sum(report.results.map((result) => result.tokensIn)),
     tokensOut: sum(report.results.map((result) => result.tokensOut)),
+    reviewTokensIn: sum(report.results.map((result) => result.review?.tokensIn ?? null)),
+    reviewTokensOut: sum(report.results.map((result) => result.review?.tokensOut ?? null)),
+    assertionBase: report.results.filter((result) => result.baseFailure === 'assertion').length,
+    missingModuleBase: report.results.filter((result) => result.baseFailure === 'missing-module')
+      .length,
+    unrecordedBase: report.results.filter((result) => result.baseFailure === null).length,
   };
 }
 
@@ -101,24 +111,44 @@ const seconds = (ms: number) => (ms / 1000).toFixed(1);
 export function renderMarkdown(report: RunReport): string {
   const { family, model, effort } = report.selection;
   const total = summarize(report);
+  const columns = [
+    'Task',
+    'Difficulty',
+    'Base failure',
+    'Outcome',
+    'Checks passed',
+    'Wall s',
+    'Tokens in',
+    'Tokens out',
+    'Review findings',
+    ...(report.reviewStep ? ['Review tokens in', 'Review tokens out'] : []),
+    'Bugs found after',
+  ];
   const lines = [
     `# Bench run ${report.runId}`,
     '',
-    `Family ${family}, model ${model}, effort ${effort}. Mode ${report.mode}. Started ${report.startedAt}${report.finishedAt ? '' : ', still running'}. Review step ${report.reviewStep ? 'on' : 'off'}.`,
+    `Family ${family}, model ${model}, effort ${effort}. Mode ${report.mode}. Started ${report.startedAt}${report.finishedAt ? '' : ', still running'}. Review step ${report.reviewStep ? 'on' : 'off'}. Permission policy ${report.permissionPolicy}.`,
     '',
-    '| Task | Difficulty | Outcome | Checks passed | Wall s | Tokens in | Tokens out | Review findings | Bugs found after |',
-    '| --- | --- | --- | --- | --- | --- | --- | --- | --- |',
+    `| ${columns.join(' | ')} |`,
+    `| ${columns.map(() => '---').join(' | ')} |`,
     ...report.results
       .map((result) =>
         [
           result.verified ? result.taskId : `${result.taskId} (unverified)`,
           result.difficulty,
+          cell(result.baseFailure, 'not recorded'),
           result.outcome,
           `${result.checks.filter((check) => check.passed).length}/${result.checks.length}`,
           seconds(result.wallMs),
           cell(result.tokensIn),
           cell(result.tokensOut),
           result.review ? cell(result.review.findings) : 'no review',
+          ...(report.reviewStep
+            ? [
+                result.review ? cell(result.review.tokensIn) : 'no review',
+                result.review ? cell(result.review.tokensOut) : 'no review',
+              ]
+            : []),
           cell(result.bugsFoundAfter, 'not checked'),
         ].join(' | '),
       )
@@ -126,6 +156,12 @@ export function renderMarkdown(report: RunReport): string {
     '',
     `Requested ${total.requested}, ran ${total.ran}, passed ${total.passed}, failed ${total.failed}, errored ${total.errored}, timed out ${total.timedOut}, excluded ${total.excluded}.`,
     `Tokens in ${total.tokensIn.total} known and ${total.tokensIn.unknown} unknown. Tokens out ${total.tokensOut.total} known and ${total.tokensOut.unknown} unknown. Wall time ${seconds(total.wallMs)} s.`,
+    ...(report.reviewStep
+      ? [
+          `Review tokens in ${total.reviewTokensIn.total} known and ${total.reviewTokensIn.unknown} unknown. Review tokens out ${total.reviewTokensOut.total} known and ${total.reviewTokensOut.unknown} unknown.`,
+        ]
+      : []),
+    `Base failure of the tasks that ran: ${total.assertionBase} assertion, ${total.missingModuleBase} missing module, ${total.unrecordedBase} not recorded. A missing module means the hidden test needs a module or an export the change adds, so the base could not load it.`,
   ];
   const failures = report.results.filter((result) => result.turn.failure);
   if (failures.length > 0)

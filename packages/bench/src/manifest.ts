@@ -41,6 +41,12 @@ export const VerificationSchema = z.strictObject({
   node: z.string().min(1).max(40),
   /** Checks that failed on the base commit with the hidden files in place. */
   failedOnBase: z.array(z.string().min(1).max(80)).min(1).max(8),
+  /**
+   * Why the checks failed on the base. A missing module means the hidden test imports a module or
+   * an export that the change adds, so the base fails to load it and no assertion about behavior
+   * ran. An assertion means the test ran and its claim did not hold.
+   */
+  baseFailure: z.enum(['assertion', 'missing-module']),
   /** Checks that passed on the solution commit. */
   passedOnSolution: z.array(z.string().min(1).max(80)).min(1).max(8),
 });

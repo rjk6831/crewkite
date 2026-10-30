@@ -20,10 +20,11 @@
   "difficulty": "easy",
   "tags": ["packaging", "scripts", "pure-function"],
   "verification": {
-    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
-    "verifiedAt": "2026-10-30T18:58:27.544Z",
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:21.447Z",
     "node": "v24.22.0",
     "failedOnBase": ["package-seal"],
+    "baseFailure": "missing-module",
     "passedOnSolution": ["package-seal"]
   }
 }

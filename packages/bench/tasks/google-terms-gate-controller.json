@@ -16,10 +16,11 @@
   "difficulty": "medium",
   "tags": ["controller", "google", "gate", "commands"],
   "verification": {
-    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
-    "verifiedAt": "2026-10-30T18:58:13.657Z",
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:07.777Z",
     "node": "v24.22.0",
     "failedOnBase": ["google-terms"],
+    "baseFailure": "missing-module",
     "passedOnSolution": ["google-terms"]
   }
 }

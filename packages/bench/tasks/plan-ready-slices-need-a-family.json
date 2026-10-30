@@ -20,10 +20,11 @@
   "difficulty": "easy",
   "tags": ["plan", "pure-function"],
   "verification": {
-    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
-    "verifiedAt": "2026-10-30T18:58:32.021Z",
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:25.903Z",
     "node": "v24.22.0",
     "failedOnBase": ["plan"],
+    "baseFailure": "assertion",
     "passedOnSolution": ["plan"]
   }
 }

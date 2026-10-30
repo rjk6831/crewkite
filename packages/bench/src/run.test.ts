@@ -1,8 +1,17 @@
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import { type TestContext, test } from 'node:test';
 import type { Task } from './manifest.ts';
 import { TaskSchema } from './manifest.ts';
@@ -10,6 +19,12 @@ import { RunReportSchema, writeRun } from './report.ts';
 import { runBench, selectTasks } from './runner.ts';
 import type { ScriptedPlan } from './scripted.ts';
 import { verificationRecord, verifyTask } from './verify.ts';
+import {
+  assertWorkOutsideRepositories,
+  ceilingOf,
+  createWorkDirectory,
+  repositoryAround,
+} from './workspace.ts';
 
 // A small repository on disk stands in for any project: a base commit where two files are wrong
 // and a solution commit that fixes them and adds one checking script.
@@ -51,6 +66,8 @@ function sandbox(t: TestContext) {
   write('a.txt', 'right\n');
   write('b.txt', 'right\n');
   write('check-b.mjs', script('b.txt'));
+  write('helper.mjs', 'export const ready = true;\n');
+  write('check-c.mjs', "import './helper.mjs';\n");
   run('add', '-A');
   run('commit', '-q', '-m', 'solution');
   const solution = run('rev-parse', 'HEAD');
@@ -79,12 +96,21 @@ test('a task verifies only when its checks fail on the base commit and pass on t
       task: task('visible', { checks: [nodeCheck('a', 'check-a.mjs')] }),
       ok: true,
       failedOnBase: ['a'],
+      baseFailure: 'assertion',
     },
     {
       name: 'a hidden check taken from the solution commit',
       task: task('hidden', { hidden: ['check-b.mjs'], checks: [nodeCheck('b', 'check-b.mjs')] }),
       ok: true,
       failedOnBase: ['b'],
+      baseFailure: 'assertion',
+    },
+    {
+      name: 'a hidden check that imports a file only the solution adds fails by a missing module',
+      task: task('missing', { hidden: ['check-c.mjs'], checks: [nodeCheck('c', 'check-c.mjs')] }),
+      ok: true,
+      failedOnBase: ['c'],
+      baseFailure: 'missing-module',
     },
     {
       name: 'a check that already passes on base proves nothing',
@@ -93,6 +119,7 @@ test('a task verifies only when its checks fail on the base commit and pass on t
       }),
       ok: false,
       failedOnBase: [],
+      baseFailure: null,
     },
     {
       name: 'a check that still fails on the solution commit',
@@ -101,18 +128,21 @@ test('a task verifies only when its checks fail on the base commit and pass on t
       }),
       ok: false,
       failedOnBase: ['never'],
+      baseFailure: 'assertion',
     },
     {
       name: 'a task with no solution commit',
       task: task('no-solution', { solution: undefined, checks: [nodeCheck('a', 'check-a.mjs')] }),
       ok: false,
       failedOnBase: [],
+      baseFailure: null,
     },
   ];
   for (const item of cases) {
     const outcome = await verifyTask(item.task, { self: directory });
     assert.equal(outcome.ok, item.ok, item.name);
     assert.deepEqual(outcome.failedOnBase, item.failedOnBase, item.name);
+    assert.equal(outcome.baseFailure, item.baseFailure, item.name);
     assert.equal(outcome.reason === null, item.ok, item.name);
   }
 });
@@ -135,7 +165,11 @@ test('a scripted run of two tasks writes one JSON file and a table that disclose
   // The first task gets its fix and reports tokens. The second gets nothing, and reports none.
   const plan: ScriptedPlan = (item, role) => {
     if (role === 'reviewer')
-      return { steps: [{ kind: 'text', itemId: 'review', chunks: ['One thing.\nFindings: 1'] }] };
+      return {
+        steps: [{ kind: 'text', itemId: 'review', chunks: ['One thing.\nFindings: 1'] }],
+        // Only the first task's review reports tokens.
+        ...(item.id === 'fixed' ? { tokens: { in: 50, out: 9 } } : {}),
+      };
     return item.id === 'fixed'
       ? {
           steps: [
@@ -156,9 +190,11 @@ test('a scripted run of two tasks writes one JSON file and a table that disclose
   let tick = 0;
   const picked = selectTasks([fixed, missed, loose], 'all');
   const out = join(directory, 'out');
+  const work = createWorkDirectory();
+  t.after(() => rmSync(work, { recursive: true, force: true }));
   const report = await runBench({
     self: directory,
-    workDirectory: join(directory, 'work'),
+    workDirectory: work,
     selection: { family: 'openai', model: 'model-a', effort: 'default' },
     tasks: picked.tasks,
     exclusions: picked.exclusions,
@@ -193,14 +229,76 @@ test('a scripted run of two tasks writes one JSON file and a table that disclose
     [['loose', 'unverified']],
   );
   assert.equal(saved.finishedAt !== null, true);
+  assert.equal(saved.permissionPolicy, 'allow-edits', 'a run does not allow commands unless asked');
+  assert.equal(fixedResult?.baseFailure, 'assertion');
+  assert.equal(fixedResult?.review?.tokensIn, 50);
+  assert.equal(missedResult?.review?.tokensIn, null);
 
   const table = readFileSync(files.markdown, 'utf8');
-  assert.match(table, /\| fixed \| easy \| passed \| 1\/1 \|/);
-  assert.match(table, /\| missed \| easy \| failed \| 0\/1 \|/);
-  assert.match(table, /unknown/);
+  // Each pattern covers a whole row: base failure, outcome, checks, wall time, tokens, review
+  // findings, review tokens and the manual field. Unknown must sit in the cells that are unknown.
+  assert.match(
+    table,
+    /\| fixed \| easy \| assertion \| passed \| 1\/1 \| [\d.]+ \| 120 \| 30 \| 1 \| 50 \| 9 \| not checked \|/,
+  );
+  assert.match(
+    table,
+    /\| missed \| easy \| assertion \| failed \| 0\/1 \| [\d.]+ \| unknown \| unknown \| 1 \| unknown \| unknown \| not checked \|/,
+  );
+  assert.match(table, /Permission policy allow-edits\./);
+  assert.match(table, /Review tokens in 50 known and 1 unknown\./);
+  assert.match(
+    table,
+    /Base failure of the tasks that ran: 2 assertion, 0 missing module, 0 not recorded\./,
+  );
   assert.match(
     table,
     /Requested 3, ran 2, passed 1, failed 1, errored 0, timed out 0, excluded 1\./,
   );
   assert.match(table, /\| loose \| unverified \|/);
+});
+
+test('the work folder sits outside the checkout and a repository lookup in a scratch copy finds none', async (t) => {
+  const { task, directory, repository } = sandbox(t);
+  const work = createWorkDirectory();
+  t.after(() => rmSync(work, { recursive: true, force: true }));
+  // A folder under the checkout, the old location, is refused. So is one inside any repository.
+  assert.throws(
+    () => assertWorkOutsideRepositories(join(repository, 'internal/bench/work'), repository),
+    /inside the checkout/,
+  );
+  assert.throws(
+    () => assertWorkOutsideRepositories(join(repository, 'elsewhere'), work),
+    /inside the repository/,
+  );
+  assert.equal(relative(realpathSync(directory), work).startsWith('..'), true);
+  assert.equal(repositoryAround(work), null);
+
+  const plan: ScriptedPlan = () => ({
+    steps: [{ kind: 'text', itemId: 'reply', chunks: ['I changed nothing.'] }],
+  });
+  await runBench({
+    self: repository,
+    workDirectory: work,
+    selection: { family: 'openai', model: 'model-a', effort: 'default' },
+    tasks: [task('probe', { checks: [nodeCheck('a', 'check-a.mjs')] })],
+    scripted: plan,
+    timeoutMs: 120_000,
+    runId: 'probe-run',
+    now: Date.now,
+    keepWork: true,
+  });
+  const chats = join(work, 'home', 'chat');
+  const [thread] = readdirSync(chats);
+  const scratch = join(chats, thread ?? '', 'scratch');
+  assert.equal(existsSync(scratch), true, 'the run kept a scratch copy to inspect');
+  // The scratch copy has no repository of its own. A lookup from there, with the run's ceiling,
+  // finds none, so it cannot reach the checkout the tasks were read from.
+  assert.throws(() =>
+    execFileSync('git', ['-C', scratch, 'rev-parse', '--show-toplevel'], {
+      env: { PATH: process.env.PATH, GIT_CEILING_DIRECTORIES: ceilingOf(work) },
+      stdio: 'pipe',
+    }),
+  );
+  assert.equal(repositoryAround(scratch), null);
 });

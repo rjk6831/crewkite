@@ -18,6 +18,15 @@ const valid = {
   tags: ['chat'],
 };
 
+const record = {
+  method: 'by hand',
+  verifiedAt: '2026-01-01T00:00:00.000Z',
+  node: 'v24.0.0',
+  failedOnBase: ['queue'],
+  baseFailure: 'assertion',
+  passedOnSolution: ['queue'],
+};
+
 test('the task format accepts a complete task and refuses each malformed one', () => {
   const cases: [string, object, boolean][] = [
     ['a complete task', valid, true],
@@ -42,6 +51,21 @@ test('the task format accepts a complete task and refuses each malformed one', (
       false,
     ],
     [
+      'a verification record that names how the base failed',
+      { ...valid, verification: { ...record, baseFailure: 'missing-module' } },
+      true,
+    ],
+    [
+      'a verification record that omits how the base failed',
+      { ...valid, verification: { ...record, baseFailure: undefined } },
+      false,
+    ],
+    [
+      'a verification record with an unknown kind of base failure',
+      { ...valid, verification: { ...record, baseFailure: 'crash' } },
+      false,
+    ],
+    [
       'a verification record with no solution commit',
       {
         ...valid,
@@ -51,6 +75,7 @@ test('the task format accepts a complete task and refuses each malformed one', (
           verifiedAt: '2026-01-01T00:00:00.000Z',
           node: 'v24.0.0',
           failedOnBase: ['queue'],
+          baseFailure: 'assertion',
           passedOnSolution: ['queue'],
         },
       },
@@ -96,5 +121,6 @@ test('every task shipped with the harness carries a verification record and a so
     assert.equal(isVerified(task), true, `${task.id} is not verified`);
     assert.ok(task.solution, `${task.id} names no solution`);
     assert.ok(task.verification?.failedOnBase.length, `${task.id} records no failing check`);
+    assert.ok(task.verification?.baseFailure, `${task.id} records no base failure kind`);
   }
 });

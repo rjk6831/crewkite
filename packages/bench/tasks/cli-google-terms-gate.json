@@ -16,10 +16,11 @@
   "difficulty": "medium",
   "tags": ["cli", "google", "gate"],
   "verification": {
-    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout.",
-    "verifiedAt": "2026-10-30T18:56:43.582Z",
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:24:37.308Z",
     "node": "v24.22.0",
     "failedOnBase": ["interactive-app"],
+    "baseFailure": "assertion",
     "passedOnSolution": ["interactive-app"]
   }
 }

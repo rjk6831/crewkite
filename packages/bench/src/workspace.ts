@@ -12,7 +12,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join, relative, resolve, sep } from 'node:path';
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { Task } from './manifest.ts';
 
 // Everything here works on local files and local git objects. Nothing reaches the network.
@@ -168,3 +168,45 @@ function mirror(folder: string, place: string, root: string, directory: string) 
 
 /** Where a link in a mirrored folder points, for tests that read the layout. */
 export const linkTarget = (path: string) => readlinkSync(path);
+
+/** A new private folder under the system temporary directory, outside any repository. */
+export function createWorkDirectory(): string {
+  return realpathSync(mkdtempSync(join(realpathSync(tmpdir()), 'crewkite-bench-')));
+}
+
+/** The folder git must not climb above while it looks for a repository from inside `work`. */
+export const ceilingOf = (work: string) => dirname(work);
+
+/**
+ * The repository that holds `directory`, or null. The lookup runs with no ceiling, so it answers
+ * what a command run there would find.
+ */
+export function repositoryAround(directory: string): string | null {
+  const env: NodeJS.ProcessEnv = { ...GIT_ENV };
+  delete env.GIT_CEILING_DIRECTORIES;
+  delete env.GIT_DIR;
+  try {
+    return execFileSync('git', ['-C', directory, 'rev-parse', '--show-toplevel'], {
+      env,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
+      .toString()
+      .trim();
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Refuses a work folder inside the checkout the run reads from or inside any repository. A model
+ * working in a scratch copy there could run commands against the person's real repository.
+ */
+export function assertWorkOutsideRepositories(work: string, self: string) {
+  const resolved = resolve(work);
+  mkdirSync(resolved, { recursive: true, mode: 0o700 });
+  const inside = relative(realpathSync(self), realpathSync(resolved));
+  if (inside === '' || (!inside.startsWith('..') && !isAbsolute(inside)))
+    throw new Error(`The work folder ${work} is inside the checkout ${self}.`);
+  const found = repositoryAround(resolved);
+  if (found) throw new Error(`The work folder ${work} is inside the repository at ${found}.`);
+}
