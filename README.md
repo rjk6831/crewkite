@@ -23,7 +23,7 @@ A crew can work a large request in slices. In the Full crew preset an orchestrat
 2. Run `pnpm install`, then `pnpm desktop:install` to download the Electron binary.
 3. Run `pnpm demo` to open the desktop on a synthetic project with scripted providers. To use your own clients on Apple silicon, stage a package with `node scripts/package.mjs --id my-build` and open `bin/desktop` in the folder it prints. The script expects the pinned Node binary under `internal/tools` and a committed working tree.
 
-To try a published build without the source, follow the [preview guide](docs/preview.md). Each provider needs its own client, signed in on your machine. [Provider routes](docs/providers.md) lists the setup for each.
+To try a published build without the source, follow the [preview guide](docs/preview.md). Each provider needs its own client, signed in on your machine. Chat accepts a range of client builds within the major version I tested: OpenAI from 0.163.0 (tested with 0.163.0), Anthropic from 2.1.0 (tested with 2.1.302) and the Google quota reader from 1.4.0 (tested with 1.4.2). Settings names the version it found. [Provider routes](docs/providers.md#client-versions) lists the update command for each and the setup.
 
 ## Plans per family
 

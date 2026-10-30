@@ -21,3 +21,12 @@ The custom sandbox delayed the workflow I need most. Stating the trust boundary 
 - CrewKite claims no containment of a compromised client or of malware running as the same user.
 - Six pilot checks gate the first live route: write boundaries, synthetic secret canaries, approval correlation, retention without a summary, account and billing identity, and recovery from the installed app.
 - Stronger containment returns when a requirement needs it, with its own evidence.
+
+## Amendment, 2026-10-31
+
+The chat path accepts a range of client builds. For OpenAI, Anthropic and the Google quota reader, CrewKite finds the installed client the way the profiles do, runs its own `--version` flag in an owned process group with a five-second bound, and accepts a build at or above a minimum for the family and within the major version I tested. A later major version is refused until I test it, because a major release is where the native frames the adapters parse change without notice. An older build or a version CrewKite cannot read is refused with one line that names the minimum or the command to run. The trust checks stay: the resolved real path, a regular file, an owner that is the person or the system, and no write access for other users. Only the exact digest equality is gone from this path. The digest still binds each launch to the bytes CrewKite read the version from.
+
+The single-file and repository writer profiles keep their exact pins and their D1 and D2 qualification evidence. The Google ACP agent keeps its fixed archive and digests, because CrewKite installs that bundle itself.
+
+I made this change because the clients ship several builds a week. An exact pin meant that a person who installed the current client got a build mismatch and could not connect, and that I would ship a release for every client update. The writer profiles are different: their evidence is about one build, and a new build there is a new qualification. The [provider notes](../providers.md#client-versions) name the tested builds and minimums.
+

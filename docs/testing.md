@@ -408,3 +408,16 @@ These claims run against real git and real SQLite on temporary folders, through 
 - `hunks.test.ts` composes a file from a chosen set of hunks for every subset that matters, keeps a hunk key when another hunk of the file is reverted, and keeps a missing final newline. `hunk-lines.test.ts` checks the base and copy line numbers the desktop gives each patch line and the range a pick names. `packages/contracts/src/changes.test.ts` keeps the page, decision and comment bounds and checks the three commands are mutations.
 
 I check the Changes tab itself by hand on the Mac. I expand a file, accept one of two hunks, accept to a branch and check that `git show` holds only that hunk. I discard a hunk and see the other keep its mark. I pick two lines, comment, and see the message appear in the thread, or in the queue while a reply runs.
+
+
+## Client version ranges
+
+Five claims cover the chat path's version range and the trust checks it keeps. They run at the lowest layer that sees each one, with scripted clients on temp folders and no network.
+
+- The version table in `apps/controller/src/providers/client-versions.test.ts` sorts a reported version into tested, newer within the tested major, supported between the minimum and the tested build, older, a new major version and unreadable. Its rows cover a leading `v`, prerelease suffixes that rank below their own release, build metadata and output with no version at all. A new major version is refused, because the adapters parse native frames that a major release can change.
+- The same file holds each family's tested build, minimum and update command in one table, and checks the plain lines Settings and the CLI show, with no en or em dash.
+- The trust table refuses a client file that other users can write or another account owns, and skips one that is too large or not a regular file. A scripted client on a temp folder shows that a world-writable file never runs, that an unchanged build runs its `--version` flag once, and that an older or silent build is refused.
+- The OpenAI chat table launches a turn on a scripted client that reports a build newer than the tested one, found through the same resolution the controller uses.
+- The catalog claim in `apps/controller/src/chat/catalog.test.ts` connects chat on a build the chat client accepts while the writer profile reports a build mismatch, refuses an older build with its reason, and keeps the profiles in charge for a controller with no chat resolver. The profile claim in `apps/controller/src/providers/anthropic/profile.test.ts` keeps the writer profiles on their exact pinned builds.
+
+A live client on the Mac confirms what the scripted clients cannot: each client's real `--version` output, its time to answer, and a chat turn on a build other than the tested one.
