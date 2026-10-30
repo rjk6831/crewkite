@@ -106,7 +106,15 @@ test('each interactive view draws a scripted thread in colour and without it und
   await settled.promise;
   const done = threadItems(state);
   const changes = await client.readChanges(task.id);
-  assert.equal((await client.accept(task.id, 'cli/clamp')).outcome, 'applied');
+  // The CLI publishes only the list it read. A listing that no longer matches is refused.
+  assert.equal(
+    (await client.accept(task.id, 'cli/clamp', undefined, 'f'.repeat(64))).reason,
+    'listing-changed',
+  );
+  assert.equal(
+    (await client.accept(task.id, 'cli/clamp', undefined, changes.listing)).outcome,
+    'applied',
+  );
   const accepted = (await client.readThread(task.id)).thread;
   const crew = {
     name: 'Pair',

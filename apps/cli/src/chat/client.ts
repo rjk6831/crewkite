@@ -227,16 +227,24 @@ export function chatClient(
     }) => run('RunChatPlan', input),
     cancelPlan: (taskId: string, planId: string) => run('CancelChatPlan', { taskId, planId }),
     discard: (taskId: string, path: string) => send('DiscardChatChange', { taskId, path }),
-    /** A refusal comes back as the result, so a view can show each reason on its own line. */
-    accept: (taskId: string, branch: string, message?: string) => {
+    /**
+     * A refusal comes back as the result, so a view can show each reason on its own line. Accept
+     * names the listing of the Changes list the person saw, or reads every page first when the
+     * caller has none, so the controller publishes only that list.
+     */
+    async accept(taskId: string, branch: string, message?: string, listing?: string | null) {
       const payload = AcceptChatChangesPayloadSchema.safeParse({ taskId, branch, message });
       if (!payload.success)
-        return Promise.resolve<CommandResult>({
+        return {
           outcome: 'denied',
           reason: 'branch-name-unsupported',
           next: 'Use lower case letters, digits, / and - for the branch name.',
-        });
-      return send('AcceptChatChanges', payload.data);
+        } satisfies CommandResult as CommandResult;
+      const reviewed = listing === undefined ? (await this.readChanges(taskId)).listing : listing;
+      return send('AcceptChatChanges', {
+        ...payload.data,
+        ...(reviewed ? { listing: reviewed } : {}),
+      });
     },
     /**
      * `confirmed` is true only after the person answered the push question, in the view or with

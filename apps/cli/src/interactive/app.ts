@@ -510,7 +510,8 @@ export function App(props: AppProps) {
     if (!id) throw new Error('Start a thread first.');
     const title = threads.list.find((task) => task.id === id)?.title ?? 'changes';
     const accept = async (name: string) => {
-      const result = await client.accept(id, name.trim());
+      // The Changes view the person read names the list Accept may publish.
+      const result = await client.accept(id, name.trim(), undefined, changes?.listing);
       setNotice(
         applied(result)
           ? (result.next ?? `Accepted on ${name}.`)
