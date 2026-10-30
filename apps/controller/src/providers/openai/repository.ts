@@ -8,6 +8,7 @@ import {
   NativeTargetPathSchema,
 } from '@crewkite/contracts';
 import { z } from 'zod';
+import { withGitCeiling } from '../../host/git-ceiling.ts';
 import {
   authorityNotice,
   type DiscoveryMetadata,
@@ -706,7 +707,8 @@ export function startRepository(
   let reader: RepositoryTranscript | undefined;
   const now = options.now ?? (() => performance.now());
   const handle = startNativeTask(
-    launch,
+    // The writer works in the scratch copy, which has no .git of its own.
+    { ...launch, environment: withGitCeiling(launch.environment, trusted.scratchPath) },
     { ...options, now, disableMcpServers: true, maximumTaskMs: 600_000 },
     (remaining) => {
       reader = new RepositoryTranscript(trusted, {

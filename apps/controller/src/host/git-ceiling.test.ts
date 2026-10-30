@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { gitCeiling, withGitCeiling } from './git-ceiling.ts';
+import { OwnedCommand } from './worker.ts';
 
 const temporary = (t: test.TestContext) => {
   const root = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-ceiling-')));
@@ -89,4 +90,20 @@ test('a parent folder with a colon in its name is refused with a plain line', (t
         !error.message.includes('\n'),
       target,
     );
+});
+
+test('a node check process of an evaluated copy starts with the ceiling above that copy', async (t) => {
+  const root = temporary(t);
+  const copy = join(root, 'candidate', 'copy');
+  mkdirSync(copy, { recursive: true });
+  const job = new OwnedCommand({
+    argv: ['-e', 'process.stdout.write(process.env.GIT_CEILING_DIRECTORIES ?? "none")'],
+    directory: copy,
+    environmentHome: join(root, 'environment'),
+    onSpawn: () => {},
+  });
+  const chunks: Buffer[] = [];
+  job.child.stdout.on('data', (chunk: Buffer) => chunks.push(chunk));
+  await job.closed;
+  assert.equal(Buffer.concat(chunks).toString('utf8'), join(root, 'candidate'));
 });

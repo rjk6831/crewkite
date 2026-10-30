@@ -5,6 +5,7 @@ import fs, {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -1011,9 +1012,21 @@ test('the acp writer binds an imported client and observed configuration before 
 test('fresh acp writers keep broad editors disabled without an mcp server', async () => {
   const f = fixture('fresh-no-mcp');
   try {
-    const completion = await writer(f, { mcpServer: undefined }).result;
+    const launched: NodeJS.ProcessEnv[] = [];
+    const completion = await writer(f, {
+      mcpServer: undefined,
+      spawn: (program, args, options) => {
+        launched.push(options.env);
+        return spawnCheckChild(program, args, options);
+      },
+    }).result;
     assert.equal(completion.reason, null);
     assert.equal(completion.metadata?.stopReason, 'end_turn');
+    // The writer works in the scratch copy, which has no .git of its own.
+    assert.deepEqual(
+      launched.map((env) => env.GIT_CEILING_DIRECTORIES),
+      [realpathSync.native(dirname(f.scratch))],
+    );
   } finally {
     f.dispose();
   }

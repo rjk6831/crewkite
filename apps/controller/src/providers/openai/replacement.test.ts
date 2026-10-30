@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
 import { resolve } from 'node:path';
 import test from 'node:test';
 import { hashCanonical, sealHandoff } from '@crewkite/contracts/hash';
@@ -2241,6 +2241,7 @@ test('native task submission and interruption share one deadline through owned c
     let repositorySubmissions = 0;
     const ownedActivities: RepositoryActivity[] = [];
     const repositoryUsages: OpenAiUsage[] = [];
+    const repositoryCeilings: (string | undefined)[] = [];
     const repository = startRepository(
       {
         executable: process.execPath,
@@ -2272,6 +2273,7 @@ test('native task submission and interruption share one deadline through owned c
           repositoryUsages.push(usage);
         },
         spawn: (executable, args, options) => {
+          repositoryCeilings.push(options.env?.GIT_CEILING_DIRECTORIES);
           const phase =
             args.at(-1) === 'list' ? 'features' : ++repositoryPhases === 1 ? 'prepare' : 'task';
           const child = spawn(
@@ -2298,6 +2300,9 @@ test('native task submission and interruption share one deadline through owned c
       },
     );
     const captured = await repository.result;
+    // Every process of the writer starts with Git held to the folder above the scratch copy.
+    assert(repositoryCeilings.length > 0);
+    assert(repositoryCeilings.every((value) => value === realpathSync.native(root)));
     assert.equal(captured.reason, null, JSON.stringify(captured));
     assert.equal(captured.quiescent, true);
     assert.deepEqual(captured.ignoredNotifications, {

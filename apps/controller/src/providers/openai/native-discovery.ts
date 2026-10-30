@@ -164,7 +164,16 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
     LANG: 'C',
     CODEX_INTERNAL_APP_SERVER_REMOTE_CONTROL_DISABLED: '1',
   };
-  for (const key of ['HOME', 'CODEX_HOME', 'PATH', 'TMPDIR', 'USER', 'LOGNAME', 'SHELL'])
+  for (const key of [
+    'HOME',
+    'CODEX_HOME',
+    'PATH',
+    'TMPDIR',
+    'USER',
+    'LOGNAME',
+    'SHELL',
+    'GIT_CEILING_DIRECTORIES',
+  ])
     if (source[key] !== undefined) environment[key] = source[key];
   if (!environment.HOME || !isAbsolute(environment.HOME))
     throw new Error('Discovery requires the existing absolute native home.');
