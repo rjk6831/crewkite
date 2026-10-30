@@ -4,12 +4,14 @@ import {
   closeSync,
   constants,
   fstatSync,
+  lstatSync,
   openSync,
+  realpathSync,
   renameSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
-import { basename, dirname, join } from 'node:path';
+import { basename, dirname, join, resolve, sep } from 'node:path';
 import type { DatabaseSync } from 'node:sqlite';
 import type {
   ChatChangesRead,
@@ -192,7 +194,17 @@ export function writeScratchFile(
   content: Buffer,
   expected: CandidateHash,
 ) {
-  const target = join(scratch, path);
+  const root = realpathSync.native(scratch);
+  const target = resolve(root, path);
+  if (!target.startsWith(`${root}${sep}`)) throw new Error('scratch path leaves the copy');
+  // Every write goes through real directories only. A link the copy added on the way could send
+  // the rename anywhere.
+  const parts = path.split('/');
+  for (let end = 1; end < parts.length; end++) {
+    const state = lstatSync(join(root, ...parts.slice(0, end)), { throwIfNoEntry: false });
+    if (!state?.isDirectory() || state.isSymbolicLink())
+      throw new Error('scratch path is not a real folder');
+  }
   const fd = openSync(target, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   let mode: number;
   try {
@@ -269,6 +281,9 @@ export function acceptedTree(
     const accepted = decisions.get(entry.path);
     if (!accepted?.size || !entry.old || !entry.next || entry.link) continue;
     const sides = readSides(repository, scratch, entry);
+    // The hunks come from the bytes read now. They must be the bytes the listing hashed.
+    if (!sides.next || blobOid(sides.next.content, entry.next.oid.length === 64) !== entry.next.oid)
+      throw new Error('A scratch file changed while it was read.');
     const diff = fileHunks(entry.path, sides.old, sides.next);
     if (!diff?.controls) continue;
     const chosen = new Set(
@@ -344,7 +359,12 @@ export function commentMessage(
       line.length > QUOTED_LINE_CHARACTERS ? `${line.slice(0, QUOTED_LINE_CHARACTERS)}...` : line,
     );
   if (quoted.length > QUOTED_LINES) shown.push(`... ${quoted.length - QUOTED_LINES} more lines`);
-  const fence = shown.some((line) => line.includes('```')) ? '~~~~' : '```';
+  // A fence longer than any backtick run in the quote, so no quoted line can close it.
+  const longest = Math.max(
+    0,
+    ...shown.map((line) => Math.max(0, ...(line.match(/`+/g) ?? []).map((run) => run.length))),
+  );
+  const fence = '`'.repeat(Math.max(3, longest + 1));
   return [
     `Review comment on ${entry.path}, ${where}:`,
     '',
