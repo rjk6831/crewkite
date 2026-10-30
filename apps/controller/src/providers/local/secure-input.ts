@@ -14,6 +14,7 @@ import { Readable, type Writable } from 'node:stream';
 import { CommandIdSchema, HashSchema, RevisionSchema } from '@crewkite/contracts';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
+import { localTokenRefusal } from '../platform.ts';
 import {
   LocalEndpointSchema,
   localConfiguredConnectionHash,
@@ -220,10 +221,11 @@ export function startLocalSecretInput(
   const descriptor = helperSchema.safeParse(helper);
   if (!parsed.success || !descriptor.success)
     throw Error('Local input configuration is unavailable.');
-  if (
-    (options.platform ?? process.platform) !== 'darwin' ||
-    (options.arch ?? process.arch) !== 'arm64'
-  )
+  // The helper is a macOS keychain prompt built for Apple silicon. Linux takes the loopback mode
+  // with no authentication and never reaches this call.
+  const refusal = localTokenRefusal(options.platform ?? process.platform);
+  if (refusal) throw Error(refusal);
+  if ((options.arch ?? process.arch) !== 'arm64')
     throw Error('Local input requires macOS on Apple Silicon.');
   const prompt = { ...parsed.data, binding: Object.freeze(parsed.data.binding) };
   const now = options.now ?? (() => performance.now());

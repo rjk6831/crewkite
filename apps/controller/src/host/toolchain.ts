@@ -5,6 +5,7 @@ import { createRequire } from 'node:module';
 import { basename, dirname, isAbsolute, join, relative, sep } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { isDeepStrictEqual } from 'node:util';
+import { biomePackageName } from './biome-package.ts';
 
 export type CopyBudget = {
   deadline: number;
@@ -225,7 +226,9 @@ async function scan(
 export function trustedBiome(root: string): { entrypoint: string; version: string } {
   const real = realpathSync(root);
   const manifest = createRequire(join(real, 'package.json')).resolve('@biomejs/biome/package.json');
-  const binary = createRequire(manifest).resolve('@biomejs/cli-darwin-arm64/package.json');
+  const platformPackage = biomePackageName();
+  if (!platformPackage) throw new Error('No trusted Biome build exists for this computer.');
+  const binary = createRequire(manifest).resolve(`${platformPackage}/package.json`);
   const version = JSON.parse(readFileSync(manifest, 'utf8')).version;
   if (typeof version !== 'string' || JSON.parse(readFileSync(binary, 'utf8')).version !== version)
     throw new Error('Installed Biome packages disagree.');

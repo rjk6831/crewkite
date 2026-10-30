@@ -6,6 +6,7 @@ import {
   resolveOpenAiChatClient,
   resolveRepositoryProfile,
 } from '../openai/profile.ts';
+import { platformGate } from '../platform.ts';
 import {
   resolveAnthropicChatClient,
   resolveAnthropicCompactNativeProfile,
@@ -34,12 +35,16 @@ test('the writer profiles keep their exact pinned builds while chat takes a vers
   assert.equal(anthropic.family === 'anthropic' && anthropic.clientVersion, '2.1.302');
   assert.equal(CLIENT_VERSIONS.openai.tested, '0.163.0');
   assert.equal(CLIENT_VERSIONS.anthropic.tested, '2.1.302');
-  // Off the supported Mac, the chat path refuses before it searches and says why in words.
-  if (process.platform !== 'darwin' || process.arch !== 'arm64')
-    for (const chat of [resolveAnthropicChatClient({}), resolveOpenAiChatClient({})]) {
-      assert.equal(chat.profile, undefined);
-      assert.equal(chat.reason, 'unsupported-platform');
-      assert.equal(chat.status.state, 'unavailable');
-      assert.match(chat.status.message, /macOS with Apple silicon/);
-    }
+  // With no HOME, the chat path refuses before it searches and says why in words. A computer
+  // the preview does not run on gets the platform line; the others get the home line.
+  const allowed = platformGate('openai').allowed;
+  for (const chat of [resolveAnthropicChatClient({}), resolveOpenAiChatClient({})]) {
+    assert.equal(chat.profile, undefined);
+    assert.equal(chat.reason, allowed ? 'native-home-unavailable' : 'unsupported-platform');
+    assert.equal(chat.status.state, 'unavailable');
+    assert.match(
+      chat.status.message,
+      allowed ? /needs HOME/ : /does not run on Windows|Apple silicon/,
+    );
+  }
 });

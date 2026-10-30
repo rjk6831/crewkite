@@ -21,6 +21,7 @@ import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { biomePackageName } from '../apps/controller/src/host/biome-package.ts';
 import {
   copyInstalledDependencies,
   inspectInstalledDependencies,
@@ -505,8 +506,12 @@ export async function packageDesktop() {
   const rootPackages = createRequire(join(checkout, 'package.json'));
   const biome = dirname(rootPackages.resolve('@biomejs/biome/package.json'));
   const biomeManifest = json(join(biome, 'package.json'));
+  // The package is for macOS arm64 today. The Biome platform package comes from the same table as
+  // the controller's trusted build, so a later Linux package needs no second list.
+  const biomePlatformPackage = biomePackageName();
+  if (!biomePlatformPackage) throw new Error('No Biome build exists for this computer.');
   const biomeBinary = dirname(
-    createRequire(join(biome, 'package.json')).resolve('@biomejs/cli-darwin-arm64/package.json'),
+    createRequire(join(biome, 'package.json')).resolve(`${biomePlatformPackage}/package.json`),
   );
   const biomeBinaryManifest = json(join(biomeBinary, 'package.json'));
   if (
@@ -517,7 +522,7 @@ export async function packageDesktop() {
     throw new Error('The installed Biome payload differs from the frozen root manifest.');
   mkdirSync(join(runtime, 'node_modules/@biomejs'), { recursive: true });
   copyPackagePayload(biome, join(runtime, 'node_modules/@biomejs/biome'), ['node_modules']);
-  copyPackagePayload(biomeBinary, join(runtime, 'node_modules/@biomejs/cli-darwin-arm64'));
+  copyPackagePayload(biomeBinary, join(runtime, 'node_modules', biomePlatformPackage));
   const runtimePackages = await copyRuntimePackages({
     source: checkout,
     from: 'apps/controller/package.json',

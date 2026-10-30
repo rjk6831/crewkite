@@ -8,6 +8,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
+import { platformGate } from '../platform.ts';
 import { localProposalBudget } from './budget.ts';
 
 export const LocalEndpointSchema = z
@@ -69,8 +70,7 @@ export function resolveLocalConnection(
     }),
     connection: null,
   });
-  if (capability.platform !== 'darwin' || capability.arch !== 'arm64')
-    return unavailable('unsupported-platform');
+  if (!platformGate('local', capability).allowed) return unavailable('unsupported-platform');
   if (input === null || input === undefined) return unavailable('not-configured');
   const configuration = configurationSchema.safeParse(input);
   if (!configuration.success) return unavailable('model-setup-unavailable');

@@ -262,10 +262,14 @@ test('the google quota read maps zero-turn account buckets to window observation
     // Discovery runs only the client's --version flag and never reads account files.
     assert.equal(googleUsageDescriptor.clientVersion, '1.4.2');
     if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-      assert.deepEqual(resolveGoogleUsageClient(environment), {
-        available: false,
-        reason: 'unsupported-platform',
-      });
+      const refused = resolveGoogleUsageClient(environment);
+      assert.equal(refused.available, false);
+      assert.equal(refused.reason, 'unsupported-platform');
+      assert.equal(refused.status?.state, 'unavailable');
+      assert.match(
+        refused.status?.message ?? '',
+        /Google is not available on Linux|Apple silicon|Windows/,
+      );
     } else {
       assert.equal(
         resolveGoogleUsageClient({ ...environment, HOME: home }).reason,

@@ -45,7 +45,12 @@ export function unavailableNativeProfile(
   };
 }
 
-/** Resolve the supported installation without executing it or reading authentication files. */
+/**
+ * Resolve the supported installation without executing it or reading authentication files. The
+ * digest pin names the macOS arm64 build, so this writer profile stays on that computer. The
+ * Linux preview takes the chat path below; a Linux writer needs its own pin and qualification
+ * (ADR 0013, amendment of 2026-10-31).
+ */
 export function resolveNativeProfile(environment = process.env): NativeProfileResolution {
   if (process.platform !== 'darwin' || process.arch !== 'arm64')
     return unavailableNativeProfile('unsupported-platform');

@@ -4,9 +4,11 @@ import {
   CLIENT_VERSIONS,
   clientDirectories,
   clientStatusReason,
+  clientVersionStatus,
   findClient,
 } from '../client-versions.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
+import { platformGate } from '../platform.ts';
 import type { GoogleClientIdentity } from './native-writer.ts';
 
 const descriptor = {
@@ -77,8 +79,14 @@ export function resolveGoogleUsageClient(
   searchDirectories?: readonly string[],
   options: { cachedOnly?: boolean } = {},
 ): GoogleUsageClientResolution {
-  if (process.platform !== 'darwin' || process.arch !== 'arm64')
-    return { available: false, reason: 'unsupported-platform' };
+  // Google stays on macOS arm64. On Linux the status line says so in one sentence.
+  const platform = platformGate('google');
+  if (!platform.allowed)
+    return {
+      available: false,
+      reason: 'unsupported-platform',
+      status: clientVersionStatus('google', { state: 'unavailable', detail: platform.line }),
+    };
   if (!environment.HOME || environment.HOME !== userInfo().homedir)
     return { available: false, reason: 'native-home-unavailable' };
   const found = findClient('google', {

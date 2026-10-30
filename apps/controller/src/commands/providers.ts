@@ -45,6 +45,7 @@ import {
   type NativeProfileResolution,
   unavailableNativeProfile,
 } from '../providers/openai/profile.ts';
+import { localTokenRefusal } from '../providers/platform.ts';
 import type { Controller } from './controller.ts';
 import { googleTermsAcknowledged } from './google-terms.ts';
 import {
@@ -775,6 +776,15 @@ export class ProviderCommands {
     );
   }
 
+  /**
+   * The line that refuses Local token mode, or null. The token window and the remembered token
+   * both need the macOS keychain, so any other computer takes the no-authentication loopback mode
+   * only (ADR 0013, amendment of 2026-10-31).
+   */
+  localTokenRefusal(this: Controller) {
+    return localTokenRefusal(this.options.localInput?.platform ?? process.platform);
+  }
+
   localSetup(this: Controller): LocalSetup {
     const control = this.localControl();
     const generation = this.store.localGenerationBlocker();
@@ -795,7 +805,8 @@ export class ProviderCommands {
             : 'discovery-active'
         : !control.endpoint
           ? 'unconfigured'
-          : control.authMode === 'token' && !this.options.localInputHelper
+          : control.authMode === 'token' &&
+              (!this.options.localInputHelper || this.localTokenRefusal())
             ? 'capability-unavailable'
             : control.connectionFailed
               ? 'connection-unavailable'
@@ -874,6 +885,8 @@ export class ProviderCommands {
       };
     const { endpoint } = control;
     if (!endpoint) return { outcome: 'blocked', reason: 'local-not-configured' };
+    const refusal = this.localTokenRefusal();
+    if (refusal) return { outcome: 'blocked', reason: 'local-token-needs-macos', next: refusal };
     return this.store.transaction((): CommandResult => {
       const blocker = this.store.localStartBlocker();
       if (blocker || control.operation)
@@ -977,6 +990,8 @@ export class ProviderCommands {
     if (blocker) return { outcome: 'blocked', reason: blocker };
     if (command.command === 'ConfigureLocal') {
       const authMode = command.payload.authMode ?? 'token';
+      const refusal = authMode === 'token' ? this.localTokenRefusal() : null;
+      if (refusal) return { outcome: 'blocked', reason: 'local-token-needs-macos', next: refusal };
       if (control.endpoint === command.payload.endpoint && control.authMode === authMode)
         return applied();
       this.revokeLocalSecret();
@@ -1025,8 +1040,14 @@ export class ProviderCommands {
       });
       return applied();
     }
-    if (control.authMode === 'token' && !this.options.localInputHelper)
-      return { outcome: 'blocked', reason: 'local-input-unavailable' };
+    if (control.authMode === 'token' && !this.options.localInputHelper) {
+      const refusal = this.localTokenRefusal();
+      return {
+        outcome: 'blocked',
+        reason: refusal ? 'local-token-needs-macos' : 'local-input-unavailable',
+        ...(refusal ? { next: refusal } : {}),
+      };
+    }
     if (command.command === 'RefreshLocalModels' && !this.localConnected(control))
       return { outcome: 'blocked', reason: 'local-connection-required' };
     const kind = command.command === 'BeginLocalConnectionInput' ? 'input' : 'discovery';

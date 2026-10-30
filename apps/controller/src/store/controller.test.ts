@@ -71,6 +71,7 @@ import {
   verificationStages,
 } from '../evidence/toolchain-definition.ts';
 import { type VerificationExecution, verificationCommand } from '../evidence/toolchain-verify.ts';
+import { biomePackageName } from '../host/biome-package.ts';
 import {
   checkOwner,
   enrollCheckRoot,
@@ -158,10 +159,12 @@ const runtimeOwnedByAnotherUser =
 
 function installedBiome() {
   const manifest = createRequire(resolve('package.json')).resolve('@biomejs/biome/package.json');
+  const platformPackage = biomePackageName();
+  if (!platformPackage) throw new Error('No Biome build exists for this computer.');
   return {
     version: JSON.parse(readFileSync(manifest, 'utf8')).version as string,
     binary: join(
-      dirname(createRequire(manifest).resolve('@biomejs/cli-darwin-arm64/package.json')),
+      dirname(createRequire(manifest).resolve(`${platformPackage}/package.json`)),
       'biome',
     ),
   };

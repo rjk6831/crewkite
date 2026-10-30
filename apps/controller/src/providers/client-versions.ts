@@ -8,6 +8,7 @@ import { lstatSync, readFileSync, realpathSync, type Stats } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { ClientVersionState, ClientVersionStatus } from '@crewkite/contracts';
+import { platformGate } from './platform.ts';
 
 // The chat path and the Google quota reader accept a range of client builds (ADR 0009, amendment
 // of 2026-10-31). The writer profiles keep their exact digest pins. Each row names the build I
@@ -466,27 +467,39 @@ function readVersion(executable: string, row: Row, options: FindOptions): string
   return parseClientVersion(result.stdout)?.text ?? null;
 }
 
-/** The directories the profiles search for a family, in their order. */
-export function clientDirectories(family: ClientFamily, environment: NodeJS.ProcessEnv): string[] {
+/**
+ * The directories the profiles search for a family, in their order: the person's PATH, then fixed
+ * install locations. macOS keeps Homebrew and /usr/local. Linux adds ~/.local/bin for the native
+ * installers and a user-prefix npm install, /usr/local/bin for a global npm install and /usr/bin
+ * for a distribution package. No other directory is searched.
+ */
+export function clientDirectories(
+  family: ClientFamily,
+  environment: NodeJS.ProcessEnv,
+  host: { platform: string } = process,
+): string[] {
   const path = (environment.PATH ?? '').split(':').filter(isAbsolute);
+  const local = environment.HOME ? [join(environment.HOME, '.local/bin')] : [];
+  if (host.platform === 'linux') return [...path, ...local, '/usr/local/bin', '/usr/bin'];
   return family === 'openai'
     ? [...path, '/opt/homebrew/bin', '/usr/local/bin']
-    : [
-        ...path,
-        ...(environment.HOME ? [join(environment.HOME, '.local/bin')] : []),
-        '/opt/homebrew/bin',
-        '/usr/local/bin',
-      ];
+    : [...path, ...local, '/opt/homebrew/bin', '/usr/local/bin'];
 }
 
 /** The npm package keeps the native binary beside its script entry. */
-export function openAiNativeSibling(entry: string): string[] {
-  return [
-    join(
-      dirname(dirname(entry)),
-      'node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex',
-    ),
-  ];
+export function openAiNativeSibling(
+  entry: string,
+  host: { platform: string; arch: string } = process,
+): string[] {
+  const native =
+    host.platform !== 'linux'
+      ? '@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex'
+      : host.arch === 'x64'
+        ? '@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex'
+        : host.arch === 'arm64'
+          ? '@openai/codex-linux-arm64/vendor/aarch64-unknown-linux-musl/bin/codex'
+          : null;
+  return native ? [join(dirname(dirname(entry)), 'node_modules', native)] : [];
 }
 
 /** The gates every resolution shares with the profiles: platform and the person's own home. */
@@ -496,11 +509,8 @@ export function clientHostGate(
   host: { platform: string; arch: string } = process,
 ): { reason: 'unsupported-platform' | 'native-home-unavailable'; detail: string } | null {
   const name = CLIENT_VERSIONS[family].name;
-  if (host.platform !== 'darwin' || host.arch !== 'arm64')
-    return {
-      reason: 'unsupported-platform',
-      detail: `${name} runs from CrewKite on macOS with Apple silicon only.`,
-    };
+  const platform = platformGate(family, host);
+  if (!platform.allowed) return { reason: 'unsupported-platform', detail: platform.line };
   if (!environment.HOME || environment.HOME !== userInfo().homedir)
     return {
       reason: 'native-home-unavailable',

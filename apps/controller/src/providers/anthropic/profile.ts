@@ -48,7 +48,11 @@ export function subscriptionAuth(metadata: unknown): boolean {
   return subscriptionMetadata.safeParse(metadata).success;
 }
 
-/** Resolve a known build without executing it or reading authentication files. */
+/**
+ * Resolve a known build without executing it or reading authentication files. The digest pin
+ * names the macOS arm64 build, so this writer profile stays on that computer. The Linux preview
+ * takes the chat path below (ADR 0013, amendment of 2026-10-31).
+ */
 function resolve(
   selected: typeof descriptor | typeof compactDescriptor,
   environment: NodeJS.ProcessEnv,
