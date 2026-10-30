@@ -6,6 +6,7 @@ import {
   readFileSync,
   rmSync,
   statSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -108,4 +109,90 @@ test('a copy never overwrites an existing file', (t) => {
     'state.sqlite.before-v5.sqlite',
   ]);
   assert.equal(contents(join(directory, 'state.sqlite.before-v5-2.sqlite')).version, 5);
+});
+
+// Sets the age of a copy, so the order of two copies never depends on the clock's granularity.
+const setTime = (directory: string, name: string, seconds: number) =>
+  utimesSync(join(directory, name), seconds, seconds);
+const removeDatabase = (database: string) => {
+  for (const suffix of ['', '-wal', '-shm']) rmSync(`${database}${suffix}`, { force: true });
+};
+
+test('a restored older database keeps the copy it just wrote and the newest copy of another version', (t) => {
+  const directory = temp(t, 'ck-backup-');
+  const database = join(directory, 'state.sqlite');
+  upgrade(database, 5, t).close();
+  upgrade(database, 10, t).close();
+  upgrade(database, 15, t).close();
+  assert.deepEqual(backups(directory), [
+    'state.sqlite.before-v10.sqlite',
+    'state.sqlite.before-v5.sqlite',
+  ]);
+  setTime(directory, 'state.sqlite.before-v5.sqlite', 1000);
+  setTime(directory, 'state.sqlite.before-v10.sqlite', 2000);
+  // The person restores a database from before all of this and upgrades it again.
+  removeDatabase(database);
+  upgrade(database, 3, t).close();
+  upgrade(database, newest, t).close();
+  assert.deepEqual(backups(directory), [
+    'state.sqlite.before-v10.sqlite',
+    'state.sqlite.before-v3.sqlite',
+  ]);
+  assert.equal(contents(join(directory, 'state.sqlite.before-v3.sqlite')).version, 3);
+});
+
+test('repeated failed upgrades keep the one copy of another version and drop their own older copies', (t) => {
+  const directory = temp(t, 'ck-backup-');
+  const database = join(directory, 'state.sqlite');
+  upgrade(database, 4, t).close();
+  upgrade(database, 5, t).close();
+  assert.deepEqual(backups(directory), ['state.sqlite.before-v4.sqlite']);
+  setTime(directory, 'state.sqlite.before-v4.sqlite', 1000);
+  const broken = upTo(t, 5);
+  writeFileSync(join(broken, '006-broken.sql'), 'SELECT * FROM table_that_does_not_exist;');
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const store = new Store(database);
+    try {
+      assert.throws(() => store.applyMigrations(broken), /table_that_does_not_exist/);
+      assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 5);
+    } finally {
+      store.close();
+    }
+    const names = backups(directory);
+    assert.equal(names.length, 2, `after failure ${attempt}`);
+    assert(names.includes('state.sqlite.before-v4.sqlite'), `after failure ${attempt}`);
+    // Each failure writes one copy of its own and removes the one the failure before it wrote.
+    assert.equal(
+      names.filter((name) => name.includes('-v5')).length,
+      1,
+      `after failure ${attempt}`,
+    );
+    for (const name of names) if (name.includes('-v5')) setTime(directory, name, 1000 + attempt);
+  }
+  assert.equal(contents(join(directory, 'state.sqlite.before-v4.sqlite')).version, 4);
+});
+
+test('a backup that cannot be written stops the upgrade with a plain line and the cause', (t) => {
+  const directory = temp(t, 'ck-backup-');
+  // The copy's name adds 18 characters, which takes this one past the 255 a name may hold.
+  const database = join(directory, `${'d'.repeat(240)}.sqlite`);
+  upgrade(database, 5, t).close();
+  const store = new Store(database);
+  try {
+    assert.throws(
+      () => store.applyMigrations(upTo(t, 10)),
+      (error: Error) => {
+        const [first, second] = error.message.split('\n');
+        assert.equal(
+          first,
+          `Could not back up the database before upgrading it. Free space in ${directory} and start again.`,
+        );
+        assert.match(second ?? '', /ENAMETOOLONG|name too long/i);
+        return true;
+      },
+    );
+    assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 5);
+  } finally {
+    store.close();
+  }
 });
