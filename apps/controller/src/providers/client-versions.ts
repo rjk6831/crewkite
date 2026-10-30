@@ -58,14 +58,16 @@ const NOTICE = /update|available|latest/i;
 
 /**
  * The first version in a client's own version output: `codex-cli 0.170.2`, `2.1.302 (Claude
- * Code)`, `v1.4.2`. Lines that announce an update are skipped. A prerelease suffix stays with
- * the version; build metadata is dropped.
+ * Code)`, `v1.4.2`. Lines that announce an update are skipped, unless every line does; then the
+ * first version on the first line counts. A prerelease suffix stays with the version; build
+ * metadata is dropped.
  */
 export function parseClientVersion(output: string): Version | null {
-  const own = output
-    .split(/\r?\n/)
-    .filter((line) => !NOTICE.test(line))
-    .join('\n');
+  const lines = output.split(/\r?\n/).filter((line) => line.trim());
+  const kept = lines.filter((line) => !NOTICE.test(line));
+  // A client that prints its version and the notice on one line leaves only notices. Its own
+  // version then comes first on the first line.
+  const own = (kept.length ? kept : lines.slice(0, 1)).join('\n');
   const match =
     /(?:^|[\s(@/])v?(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})\.(0|[1-9]\d{0,8})(-[0-9A-Za-z.-]{1,64})?(?:\+[0-9A-Za-z.-]{1,64})?(?=$|[\s),;])/m.exec(
       own,
@@ -230,6 +232,21 @@ export function clientFileTrust(
   return 'trusted';
 }
 
+/**
+ * The folder a client was found in, before any link is followed. Other users must not be able to
+ * write it, unless it has the sticky bit and the entry belongs to the person or the system, as in
+ * a shared temporary folder where nobody can replace another user's file.
+ */
+export function foundLocationTrust(
+  folder: Pick<Stats, 'mode'>,
+  entry: Pick<Stats, 'uid'>,
+  uid = process.getuid?.(),
+): 'trusted' | 'shared-folder' {
+  if (!(folder.mode & 0o002)) return 'trusted';
+  if (folder.mode & 0o1000 && (entry.uid === uid || entry.uid === 0)) return 'trusted';
+  return 'shared-folder';
+}
+
 type Read = {
   key: string;
   version: string | null;
@@ -293,9 +310,25 @@ export function findClient(family: ClientFamily, options: FindOptions): FoundCli
   let first: FoundClient | null = null;
   const seen = new Set<string>();
   for (const directory of new Set(options.directories.filter(isAbsolute))) {
+    const location = join(directory, row.command);
     let entry: string;
     try {
-      entry = realpathSync(join(directory, row.command));
+      // Where the client was found counts too: anyone who can write that folder can place a link
+      // there to any trusted binary, and CrewKite would then run it.
+      if (
+        foundLocationTrust(lstatSync(directory), lstatSync(location), process.getuid?.()) !==
+        'trusted'
+      ) {
+        first ??= {
+          status: clientVersionStatus(family, {
+            state: 'untrusted',
+            path: location,
+            why: 'shared-folder',
+          }),
+        };
+        continue;
+      }
+      entry = realpathSync(location);
     } catch {
       continue;
     }

@@ -133,8 +133,14 @@ export type ChatClientResolution = {
 };
 
 /** The quota reader's profile: the accepted chat client, or an unavailable one that says why. */
-export function resolveOpenAiUsageClient(environment = process.env): NativeProfileResolution {
-  const chat = resolveOpenAiChatClient(environment, { id: 'openai-file-v1' });
+export function resolveOpenAiUsageClient(
+  environment = process.env,
+  options: { cachedOnly?: boolean } = {},
+): NativeProfileResolution {
+  const chat = resolveOpenAiChatClient(environment, {
+    id: 'openai-file-v1',
+    cachedOnly: options.cachedOnly,
+  });
   if (chat.profile) return chat.profile;
   const reason =
     chat.status.state === 'missing'
@@ -155,7 +161,12 @@ export function resolveOpenAiUsageClient(environment = process.env): NativeProfi
  */
 export function resolveOpenAiChatClient(
   environment = process.env,
-  options: { id?: 'openai-file-v1' | 'openai-repository-v1'; directories?: string[] } = {},
+  options: {
+    id?: 'openai-file-v1' | 'openai-repository-v1';
+    directories?: string[];
+    /** Use only versions already read, for callers inside a database transaction. */
+    cachedOnly?: boolean;
+  } = {},
 ): ChatClientResolution {
   const gate =
     clientHostGate('openai', environment) ??
@@ -176,6 +187,7 @@ export function resolveOpenAiChatClient(
     home: environment.HOME as string,
     path: environment.PATH,
     siblings: openAiNativeSibling,
+    cachedOnly: options.cachedOnly,
   });
   if (!found.client) return { status: found.status };
   const located = {

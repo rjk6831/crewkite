@@ -165,7 +165,7 @@ export type ControllerOptions = {
   anthropicUsageReader?: Parameters<
     typeof import('../providers/anthropic/native-usage-reader.ts').startAnthropicUsageReader
   >[1];
-  openAiUsageClient?: () => NativeProfileResolution;
+  openAiUsageClient?: (options?: { cachedOnly?: boolean }) => NativeProfileResolution;
   openAiUsageSpawn?: Parameters<typeof startNativeSession>[1]['spawn'];
   googleUsageClient?: () => GoogleUsageClientResolution;
   googleUsageSpawn?: Parameters<typeof startGoogleUsage>[0]['spawn'];

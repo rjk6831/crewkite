@@ -1,7 +1,16 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
 import { createTestClock, createTestIds } from '@crewkite/testkit';
@@ -417,6 +426,55 @@ test('the usage owner bounds output and refuses metadata before physical closure
       assert(stopped.length > 0);
     }
     assert(scheduled.some((item) => item.milliseconds === 30000 && item.cancelled));
+  }
+});
+
+test('a client installed as a node script reads usage with the person PATH and fails without it', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'ck-usage-script-'));
+  try {
+    const directory = join(root, 'run');
+    const home = join(root, 'home');
+    mkdirSync(directory, { mode: 0o700 });
+    mkdirSync(home, { mode: 0o700 });
+    // The npm global install and ~/.claude/local both start the client this way.
+    const client = join(root, 'cli.js');
+    writeFileSync(
+      client,
+      `#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(${JSON.stringify(
+        new URL('./usage-fixture.jsonl', import.meta.url).pathname,
+      )}));\n`,
+    );
+    chmodSync(client, 0o755);
+    const digest = createHash('sha256').update(readFileSync(client)).digest('hex');
+    const read = async (path: string | undefined) => {
+      const context = {
+        operationId: 'usage_script',
+        executable: client,
+        executableSha256: digest,
+        clientVersion,
+        ...(path ? { path } : {}),
+        sessionId,
+        directory,
+        home,
+        temporary: directory,
+      };
+      const scope = anthropicUsageReaderScope(context);
+      const handle = startAnthropicUsageReader({
+        ...context,
+        trust: { nativeTrust: 'accepted', scopeHash: scope.scopeHash },
+        lifecycle: { intent() {}, owned() {}, quiescent() {} },
+      });
+      return handle.result;
+    };
+    const withPath = await read(`${dirname(process.execPath)}:/usr/bin:/bin`);
+    assert.equal(withPath.reason, null, withPath.detail ?? undefined);
+    assert.equal(withPath.reading?.status, 'reported');
+    // The same client under the fixed system PATH cannot find node, which the old launch did.
+    const without = await read(undefined);
+    assert.equal(without.reading, null);
+    assert.notEqual(without.reason, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
   }
 });
 

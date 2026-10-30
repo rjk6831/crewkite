@@ -194,6 +194,7 @@ export class AnthropicUsageRefresh {
       executable: profile.client.executable,
       executableSha256: profile.client.sha256,
       clientVersion: profile.client.version,
+      ...(profile.environment.PATH ? { path: profile.environment.PATH } : {}),
       sessionId: '00000000-0000-4000-8000-000000000000',
       directory,
       home: profile.environment.HOME,

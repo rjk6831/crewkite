@@ -21,6 +21,7 @@ import {
   clientVersionStatus,
   findClient,
   forgetClientReads,
+  foundLocationTrust,
   parseClientVersion,
   unreadableRetryMs,
 } from './client-versions.ts';
@@ -57,8 +58,10 @@ test('the chat path accepts a client at or above the minimum within the tested m
     // A line announcing an update names another version and is skipped.
     ['Update available: 0.180.0 -> run npm install\ncodex-cli 0.163.0', 'tested'],
     ['codex-cli 0.164.0\nThe latest version is 1.0.0', 'newer'],
-    ['A new version 9.9.9 is available', 'unreadable'],
-    ['UPDATE 0.170.0', 'unreadable'],
+    // When every line is a notice, the first version on the first line is the client's own.
+    ['0.163.0 (x) update available 0.170.0', 'tested'],
+    ['codex-cli 0.164.0, latest is 0.171.0\nRun the update to get it', 'newer'],
+    ['An update is available', 'unreadable'],
   ] as const)
     assert.equal(clientVersionState(output, row), state, output);
   assert.equal(clientVersionState(null, row), 'unreadable');
@@ -215,6 +218,48 @@ function scratch() {
   return { root, bin, store, client, runs, link };
 }
 
+test('a client found through a folder other users can write is refused unless the folder is sticky and the entry is mine', () => {
+  const uid = process.getuid?.() ?? 0;
+  const other = uid + 1;
+  const folder = (mode: number) => ({ mode: 0o040000 | mode });
+  for (const [parent, owner, verdict] of [
+    [folder(0o755), uid, 'trusted'],
+    [folder(0o775), other, 'trusted'],
+    [folder(0o777), uid, 'shared-folder'],
+    [folder(0o757), 0, 'shared-folder'],
+    [folder(0o1777), uid, 'trusted'],
+    [folder(0o1777), 0, 'trusted'],
+    [folder(0o1777), other, 'shared-folder'],
+  ] as const)
+    assert.equal(
+      foundLocationTrust(parent, { uid: owner }, uid),
+      verdict,
+      `${parent.mode.toString(8)} owner ${owner === uid ? 'me' : owner}`,
+    );
+
+  // A world-writable folder on PATH holds a link to a trusted client. The client never runs.
+  const { root, bin, client, runs, link } = scratch();
+  try {
+    link(client('codex', "echo '0.170.2'"));
+    const find = () =>
+      findClient('openai', { directories: [bin], home: userInfo().homedir, cache: new Map() });
+    chmodSync(bin, 0o777);
+    const refused = find();
+    assert.equal(refused.status.state, 'untrusted');
+    assert.equal(
+      refused.status.message,
+      `Codex at ${join(bin, 'codex')} is in a folder other users can change, so CrewKite will not run it.`,
+    );
+    assert.equal(runs(), 0);
+    // The same folder with the sticky bit and a link I own is safe to search.
+    chmodSync(bin, 0o1777);
+    assert.equal(find().status.state, 'newer');
+    assert.equal(runs(), 1);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('finding a client runs its version flag once per build and refuses an unsafe file before it runs', () => {
   const { root, bin, store, client, runs, link } = scratch();
   try {
@@ -306,6 +351,15 @@ test('an unreadable version is read again after a backoff, at once when the file
 
     assert.equal(find(true), 'unreadable');
     assert.equal(runs(), 0, 'a cached-only resolution runs nothing');
+    // An accepted build that changes reads as unreadable to a cached-only caller, without a run.
+    const good = client('codex-good', "echo '0.170.2'");
+    link(good);
+    assert.equal(find(), 'newer');
+    writeFileSync(good, `${readFileSync(good, 'utf8')}\n# changed\n`);
+    assert.equal(find(true), 'unreadable');
+    assert.equal(runs(), 1);
+    link(silent);
+    rmSync(join(root, 'runs.log'));
     assert.equal(find(), 'unreadable');
     assert.equal(runs(), 1);
     for (const [at, expected] of [

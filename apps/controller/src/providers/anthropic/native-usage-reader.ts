@@ -37,6 +37,11 @@ export type AnthropicUsageReaderContext = Readonly<{
   executableSha256: string;
   /** The version the client reported for these bytes. */
   clientVersion: string;
+  /**
+   * The person's PATH. A client installed as a script starts with `#!/usr/bin/env node` and finds
+   * node on it. The digest binds the client file, so PATH stays out of the scope hash.
+   */
+  path?: string;
   sessionId: string;
   directory: string;
   home: string;
@@ -118,6 +123,7 @@ export function startAnthropicUsageReader(
     executable: input.executable,
     executableSha256: input.executableSha256,
     clientVersion: input.clientVersion,
+    ...(input.path ? { path: input.path } : {}),
     sessionId: input.sessionId,
     directory: input.directory,
     home: input.home,
@@ -152,7 +158,7 @@ export function startAnthropicUsageReader(
       USER: userInfo().username,
       LOGNAME: userInfo().username,
       TMPDIR: context.temporary,
-      PATH: '/usr/bin:/bin',
+      PATH: context.path || '/usr/bin:/bin',
       LANG: 'C',
       NO_COLOR: '1',
     },

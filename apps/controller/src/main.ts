@@ -103,7 +103,8 @@ export async function startController(options: ControllerOptions) {
   const configuration = {
     openAiUsageClient:
       !options.nativeProfile && !options.nativeProfiles
-        ? () => resolveOpenAiUsageClient()
+        ? (resolution?: { cachedOnly?: boolean }) =>
+            resolveOpenAiUsageClient(process.env, resolution)
         : undefined,
     // Chat finds each client by version range. The writer profiles below keep their exact pins.
     chatClients:

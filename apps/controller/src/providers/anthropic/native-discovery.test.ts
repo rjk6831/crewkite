@@ -73,6 +73,8 @@ test('authentication metadata waits for bounded owned child and descendant clean
     GH_TOKEN: secret,
     DEBUG: '1',
     CLAUDE_CODE_ENTRYPOINT: secret,
+    // A client installed as a script finds node on the person's own PATH.
+    PATH: '/opt/person/bin:/usr/bin:/bin',
   };
   try {
     for (const mode of [
@@ -160,7 +162,7 @@ test('authentication metadata waits for bounded owned child and descendant clean
             assert.deepEqual(options.env, {
               HOME: root,
               USER: userInfo().username,
-              PATH: '/usr/bin:/bin',
+              PATH: '/opt/person/bin:/usr/bin:/bin',
               LANG: 'C',
               TMPDIR: join(directory, 'tmp'),
               DISABLE_UPDATES: '1',

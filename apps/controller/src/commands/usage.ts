@@ -327,7 +327,9 @@ export class UsageCommands {
         let reportBytes = 0;
         const current = () => {
           const saved = this.openAiUsageState();
-          const currentProfile = this.options.openAiUsageClient?.();
+          // This runs inside transactions too, so it takes only a version already read. A client
+          // file that changed since then reads as unreadable and revokes the read.
+          const currentProfile = this.options.openAiUsageClient?.({ cachedOnly: true });
           if (
             this.closed ||
             runtime.stopped ||
@@ -816,7 +818,16 @@ export class UsageCommands {
             };
           result = {
             outcome: 'applied',
-            data: { kind: 'usage', windows: this.workspaceState().usage },
+            // Inside this transaction: the windows come from the store alone. The workspace read
+            // would resolve every family's client.
+            data: {
+              kind: 'usage',
+              windows: this.store
+                .list<Observation>('window')
+                .map((observation) =>
+                  deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
+                ),
+            },
           };
         }
         this.finishMetadataReceipt(commandId, result);
