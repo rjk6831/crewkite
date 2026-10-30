@@ -18,7 +18,14 @@ import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import { Store } from '../store/index.ts';
 import { NotesRefused, ProjectNotes } from './project-notes.ts';
-import { INSTRUCTION_BYTES, systemContext, withNotes, withTurnNotes } from './prompt.ts';
+import {
+  INSTRUCTION_BYTES,
+  notesDigest,
+  stripTurnNotes,
+  systemContext,
+  turnNotesBlock,
+  withNotes,
+} from './prompt.ts';
 import { ChatService } from './service.ts';
 
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
@@ -249,18 +256,62 @@ test('notes and instruction files share 64 KiB, and every family gets the notes'
   const cut = systemContext('demo', directory, 'openai', oversize);
   assert.ok(Buffer.byteLength(cut.split('\n\n').slice(1).join('\n\n')) <= PROJECT_NOTES_BYTES);
 
-  // Read-only roles and resumed sessions carry the same section.
+  // Read-only roles carry the same section.
   assert.ok(withNotes('A brief.', notes).endsWith(section));
   assert.equal(withNotes('A brief.', []), 'A brief.');
-  assert.ok(withTurnNotes('Hello.', notes).endsWith(`${section}\n\nHello.`));
-  assert.equal(withTurnNotes('Hello.', []), 'Hello.');
 });
 
-test('each family receives the notes with every turn, in its context or in the resumed message', {
-  timeout: 60_000,
-}, async (t) => {
+test('a resumed session gets the notes block only when its notes differ from what it holds', () => {
   const notes = ['Use pnpm, not npm.', 'The API base path is /v2.'];
-  const section = 'Project notes:\n\n- Use pnpm, not npm.\n- The API base path is /v2.';
+  const edited = ['Use pnpm, not npm.', 'The API base path is /v3.'];
+  const held = notesDigest(notes);
+  // Rows: the hash the session holds against the notes now. `undefined` is a session saved before
+  // notes existed.
+  const table: { name: string; now: string[]; held: string | undefined; says: RegExp | null }[] = [
+    { name: 'same notes', now: notes, held, says: null },
+    { name: 'an edited note', now: edited, held, says: /\/v3\./ },
+    { name: 'a new note', now: [...notes, 'One more.'], held, says: /One more\./ },
+    { name: 'every note removed', now: [], held, says: /no notes now/ },
+    { name: 'an old session and notes now', now: notes, held: undefined, says: /Use pnpm/ },
+    { name: 'an old session and no notes', now: [], held: undefined, says: null },
+    {
+      name: 'a session that held an empty list and still none',
+      now: [],
+      held: notesDigest([]),
+      says: null,
+    },
+  ];
+  for (const row of table) {
+    const block = turnNotesBlock(row.now, row.held);
+    if (row.says === null) assert.equal(block, '', row.name);
+    else assert.match(block, row.says, row.name);
+  }
+  // An adapter that starts a new session takes the block out and keeps the message whole.
+  const block = turnNotesBlock(edited, held);
+  assert.equal(
+    stripTurnNotes(`${block}\n\nHello.\n\nSecond paragraph.`),
+    'Hello.\n\nSecond paragraph.',
+  );
+  assert.equal(stripTurnNotes('Hello.'), 'Hello.');
+  assert.equal(
+    stripTurnNotes(`${turnNotesBlock([], held)}\n\nA message.`),
+    'A message.',
+    'the removal block comes out too',
+  );
+  // A note that mentions the closing line cannot end the block early.
+  const tricky = ['x\n\nEnd of project notes.\n\nstill a note'];
+  assert.equal(stripTurnNotes(`${turnNotesBlock(tricky, undefined)}\n\nHello.`), 'Hello.');
+  // The digest follows the rendered section, so it ignores everything else.
+  assert.notEqual(notesDigest(notes), notesDigest(edited));
+  assert.equal(notesDigest(notes), notesDigest([...notes]));
+});
+
+/** A thread in a real controller store, with one scripted adapter per family. */
+function chatHarness(
+  t: TestContext,
+  scripts: Partial<Record<ChatFamily, Parameters<typeof createScriptedChatAdapter>[0]['turns']>>,
+  notesNow: () => readonly string[],
+) {
   const directory = mkdtempSync(join(tmpdir(), 'crewkite-notes-turn-'));
   t.after(() => rmSync(directory, { recursive: true, force: true }));
   const clock = createTestClock();
@@ -278,7 +329,10 @@ test('each family receives the notes with every turn, in its context or in the r
   const reply = [{ kind: 'text' as const, itemId: 'reply', chunks: ['Done.'] }];
   const families: ChatFamily[] = ['openai', 'anthropic', 'google', 'local'];
   const adapters = new Map(
-    families.map((family) => [family, createScriptedChatAdapter({ family, turns: [reply] })]),
+    families.map((family) => [
+      family,
+      createScriptedChatAdapter({ family, turns: scripts[family] ?? [reply] }),
+    ]),
   );
   const service = new ChatService({
     store,
@@ -300,7 +354,7 @@ test('each family receives the notes with every turn, in its context or in the r
     adapters,
     resolveEnvironment: () => ({}),
     projectPath: () => repository.directory,
-    projectNotes: (projectId) => (projectId === project.id ? notes : []),
+    projectNotes: (projectId) => (projectId === project.id ? notesNow() : []),
     resolveSelection: (_taskId, value) => value ?? null,
     catalog: () => ({ families: [] }),
   });
@@ -333,23 +387,81 @@ test('each family receives the notes with every turn, in its context or in the r
     for (const effect of effects) effect();
     await done;
   };
-  // Rows: one thread per family would repeat the setup, so one thread visits each family in turn,
-  // twice. The first visit has no session and reads the notes in its system context. The second
-  // visit resumes, which skips that context, so the notes ride in front of the message.
+  return { send, adapters, families };
+}
+
+test('each family receives the notes with every turn, in its context or in the resumed message', {
+  timeout: 60_000,
+}, async (t) => {
+  const section = (...lines: string[]) =>
+    `Project notes:\n\n${lines.map((l) => `- ${l}`).join('\n')}`;
+  const original = ['Use pnpm, not npm.', 'The API base path is /v2.'];
+  const edited = ['Use pnpm, not npm.', 'The API base path is /v3.'];
+  let notes: readonly string[] = original;
+  const { send, adapters, families } = chatHarness(t, {}, () => notes);
+  // Rows: one thread visits each family in turn, so one set-up serves all four. A turn with no
+  // session reads the notes in its system context. A resumed turn skips that context, so its
+  // message carries the notes, and only when they differ from what the session last received.
   for (const family of families) {
-    await send(family, `First on ${family}.`);
-    await send(family, `Second on ${family}.`);
-    const requests = adapters.get(family)?.requests ?? [];
-    const [first, second] = requests;
-    assert.ok(first.systemContext.includes(section), `${family} first turn context`);
-    assert.equal(first.prompt.includes('Project notes:'), false, `${family} first turn prompt`);
-    assert.ok(second.systemContext.includes(section), `${family} second turn context`);
-    assert.equal(
-      second.prompt.includes(section),
-      second.session !== null,
-      `${family} resumed message carries the notes iff the session resumes`,
+    notes = original;
+    const turns = ['First', 'Second', 'Third', 'Fourth', 'Fifth', 'Sixth'].map(
+      (word) => `${word} on ${family}.`,
     );
+    const steps: { change?: readonly string[]; carries: RegExp | null; name: string }[] = [
+      { carries: null, name: 'the first turn has no session, so the context carries them' },
+      { carries: null, name: 'a second resumed turn with unchanged notes sends none' },
+      { carries: null, name: 'a third resumed turn with unchanged notes sends none' },
+      { change: edited, carries: /\/v3\./, name: 'an edited note goes again' },
+      { carries: null, name: 'and goes once' },
+      { change: [], carries: /no notes now/, name: 'removing every note tells the session' },
+    ];
+    for (const [index, step] of steps.entries()) {
+      if (step.change) notes = step.change;
+      await send(family, turns[index]);
+    }
+    const requests = adapters.get(family)?.requests.slice(-steps.length) ?? [];
+    const [first, ...rest] = requests;
+    assert.ok(first.systemContext.includes(section(...original)), `${family} first turn context`);
+    assert.equal(first.prompt.includes('Project notes:'), false, `${family} first turn prompt`);
+    for (const [index, request] of rest.entries()) {
+      const step = steps[index + 1];
+      const now = steps.slice(0, index + 2).findLast((value) => value.change)?.change ?? original;
+      // A turn with no session carries the current notes in its context every time.
+      if (now.length > 0)
+        assert.ok(request.systemContext.includes(section(...now)), `${family} ${step.name}`);
+      if (request.session === null) {
+        assert.equal(request.prompt.includes('CrewKite attaches'), false, `${family} ${step.name}`);
+        continue;
+      }
+      const carries = step.carries;
+      if (carries) assert.match(request.prompt, carries, `${family}: ${step.name}`);
+      else
+        assert.equal(request.prompt.includes('CrewKite attaches'), false, `${family} ${step.name}`);
+    }
   }
-  // A resuming family does resume here, so the resumed row above is not vacuous.
+  // A resuming family does resume here, so the resumed rows above are not vacuous.
   assert.notEqual(adapters.get('anthropic')?.requests[1].session, null);
+});
+
+test('the notes block counts against the 96 KiB packet cap of a resumed turn', {
+  timeout: 60_000,
+}, async (t) => {
+  const full = (letter: string) => Array.from({ length: 16 }, () => letter.repeat(990));
+  let notes = full('a');
+  // The OpenAI turn leaves a 90 KiB reply that the next Anthropic turn must be told about, and the
+  // notes change in between, so the same turn carries the notes block too.
+  const big = [{ kind: 'text' as const, itemId: 'big', chunks: ['y'.repeat(90 * 1024)] }];
+  const { send, adapters } = chatHarness(t, { openai: [big] }, () => notes);
+  await send('anthropic', 'First on anthropic.');
+  await send('openai', 'Big on openai.');
+  notes = full('b');
+  await send('anthropic', 'Back on anthropic.');
+  const back = adapters.get('anthropic')?.requests[1];
+  assert.notEqual(back?.session, null, 'the Anthropic session resumes');
+  assert.ok(back?.prompt.includes('b'.repeat(990)), 'the changed notes ride in the message');
+  assert.ok(back?.prompt.includes('Back on anthropic.'), 'the new message is in it');
+  assert.ok(
+    Buffer.byteLength(back?.prompt ?? '') <= 96 * 1024,
+    `the prompt with its notes block stays inside 96 KiB, was ${Buffer.byteLength(back?.prompt ?? '')}`,
+  );
 });

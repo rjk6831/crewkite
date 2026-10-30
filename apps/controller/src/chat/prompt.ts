@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
@@ -86,15 +87,38 @@ export function withNotes(brief: string, notes: readonly string[]): string {
   return section ? `${brief}\n\n${section}` : brief;
 }
 
+/** The hash of the notes section a session receives. The session keeps it to see a change. */
+export function notesDigest(notes: readonly string[]): string {
+  return createHash('sha256').update(notesSection(notes)).digest('hex');
+}
+
+const TURN_NOTES_LEAD =
+  'CrewKite attaches the current notes for this project to the message below.';
+const TURN_NOTES_END = 'End of project notes.';
+const NO_NOTES = 'This project has no notes now.';
+
 /**
- * A resumed session skips the system context, so its message carries the current notes in front
- * of it. A session without notes sees no change.
+ * A resumed session skips the system context, so the notes reach it in front of its message. They
+ * go only when they differ from what the session last received, which `held` is the hash of. A
+ * session that never received notes needs nothing while the project has none. A session that held
+ * notes the project has since dropped is told so. The block is empty when nothing has to be said.
+ * It starts and ends on fixed lines, so an adapter that starts a new session can take it out.
  */
-export function withTurnNotes(message: string, notes: readonly string[]): string {
+export function turnNotesBlock(notes: readonly string[], held: string | undefined): string {
   const section = notesSection(notes);
-  return section
-    ? `CrewKite attaches the current notes for this project to the message below.\n\n${section}\n\n${message}`
-    : message;
+  if (held === notesDigest(notes) || (held === undefined && !section)) return '';
+  return `${TURN_NOTES_LEAD}\n\n${section || NO_NOTES}\n\n${TURN_NOTES_END}`;
+}
+
+/**
+ * The prompt without the block `turnNotesBlock` put in front of it. An adapter calls it when a
+ * resume fails and a new session starts, because that session reads the notes in its system
+ * context and would otherwise see them twice.
+ */
+export function stripTurnNotes(prompt: string): string {
+  if (!prompt.startsWith(`${TURN_NOTES_LEAD}\n\n`)) return prompt;
+  const end = prompt.indexOf(`\n\n${TURN_NOTES_END}\n\n`);
+  return end < 0 ? prompt : prompt.slice(end + TURN_NOTES_END.length + 4);
 }
 
 /** Instruction files at the scratch root, in the order systemContext reads them. */

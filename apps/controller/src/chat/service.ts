@@ -130,14 +130,15 @@ import {
   type HandoffReason,
   handoffPacket,
   handoffReason,
+  notesDigest,
   orchestratorContext,
   presentInstructions,
   reviewContext,
   spokenText,
   systemContext,
+  turnNotesBlock,
   withAttachments,
   withNotes,
-  withTurnNotes,
 } from './prompt.ts';
 import { copyScratch } from './scratch-copy.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
@@ -393,6 +394,8 @@ const stoppedResult: ChatTurnResult = {
 export class ChatService {
   private readonly deps: ChatServiceDeps;
   private readonly live = new Map<string, LiveTurn>();
+  /** The hash of the notes each open turn started with, for the session the turn leaves. */
+  private readonly notesSent = new Map<string, string>();
   /** Plan slice turns stopped before their launch ran. Each starts as stopped. */
   private readonly stoppedEarly = new Set<string>();
   /** Orchestrator plans: proposal, assignment and the slice chain (ADR 0045). */
@@ -1722,6 +1725,12 @@ export class ChatService {
       carries = true;
       reason = 'session';
     }
+    // A new session reads the notes in its system context. A resumed session skips that context,
+    // so its message carries them, only when they differ from what the session last received. The
+    // block counts against the packet cap below.
+    const notes = this.deps.projectNotes?.(task.projectId) ?? [];
+    this.notesSent.set(turn.id, notesDigest(notes));
+    let turnNotes = session ? turnNotesBlock(notes, session.notesDigest) : '';
     // The thread is the source of truth. A resumed session hears what happened since it last ran,
     // and a session that fell too far behind gives way to a new one with the full packet. Send now
     // keeps its full packet, which tells the model what the stopped reply left behind.
@@ -1736,10 +1745,12 @@ export class ChatService {
             prompt,
             turn.handoffFrom ? reason : null,
             threadTools,
+            turnNotes ? Buffer.byteLength(turnNotes) + 2 : 0,
           )
         : null;
     if (delta === 'over') {
       session = null;
+      turnNotes = '';
       carries = true;
       if (!turn.handoffFrom) reason = 'session';
       // The saved session goes now, so a turn that fails here cannot bring the decision and its
@@ -1769,10 +1780,6 @@ export class ChatService {
     const balanced = writer && thread.flightMode === 'balanced';
     const permissionPolicy = writer && !balanced ? thread.permissionPolicy : 'ask';
     const permissionGrants = writer && !balanced ? (thread.permissionGrants ?? []) : [];
-    // A new session reads the notes in its system context. A resumed session skips that context,
-    // so its message carries them. shortcut: a resumed turn repeats the notes every time. Upgrade:
-    // send them only when they changed since the session last ran.
-    const notes = this.deps.projectNotes?.(task.projectId) ?? [];
     const body = carries
       ? this.packet(turn, {
           from: turn.handoffFrom ?? (asked ? (this.answeredOn(task.id) ?? family) : family),
@@ -1790,7 +1797,7 @@ export class ChatService {
       taskId: task.id,
       role: turn.role,
       selection: turn.selection,
-      prompt: session ? withTurnNotes(body, notes) : body,
+      prompt: turnNotes ? `${turnNotes}\n\n${body}` : body,
       files,
       threadTools,
       systemContext: this.context(turn, project.name, directory, root, thread, history, notes),
@@ -2080,6 +2087,8 @@ export class ChatService {
   }
 
   private settle(turnId: string, end: Ending) {
+    const notesSent = this.notesSent.get(turnId);
+    this.notesSent.delete(turnId);
     const turn = this.turn(turnId);
     if (!turn || !OPEN_STATES.has(turn.state)) return;
     const task = this.task(turn.taskId) as Task;
@@ -2120,7 +2129,13 @@ export class ChatService {
       writesScratch(turn.role) &&
       turn.slice === undefined &&
       end.session?.family === turn.selection.family
-        ? { ...end.session, seenSequence: turn.sequence }
+        ? {
+            ...end.session,
+            seenSequence: turn.sequence,
+            // The notes this turn started with. A restart between the start and the end leaves none,
+            // and the next turn then sends them again.
+            ...(notesSent ? { notesDigest: notesSent } : {}),
+          }
         : null;
     // Plan slices run side by side. The thread stays busy while any of its turns is open.
     const other = this.deps.store.db
@@ -3194,6 +3209,8 @@ export class ChatService {
     prompt: string,
     reason: HandoffReason | null,
     threadTools: boolean,
+    /** Bytes the turn's notes block takes in front of the packet. */
+    reserve: number,
   ):
     | { prompt: string; files: NonNullable<ChatTurnRequest['files']>; history: ChatHistoryEntry[] }
     | 'over'
@@ -3275,15 +3292,16 @@ export class ChatService {
         clip,
         threadTools,
       });
+    const cap = PACKET_BYTES - reserve;
     for (const clip of [undefined, PACKET_ENTRY_CHARACTERS]) {
-      const room = PACKET_BYTES - Buffer.byteLength(build(clip, []));
+      const room = cap - Buffer.byteLength(build(clip, []));
       // Patches take what is left up to their share. With too little room the list stands alone.
       const patches =
         changes.changed.length && room > 4096
           ? patchSections(changes.changed, Math.min(PACKET_PATCH_BYTES, room))
           : [];
       const text = build(clip, patches);
-      if (Buffer.byteLength(text) <= PACKET_BYTES)
+      if (Buffer.byteLength(text) <= cap)
         return { prompt: text, files, history: this.history(taskId, first.toString()) };
     }
     return 'over';
