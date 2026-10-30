@@ -26,6 +26,9 @@ import type { z } from 'zod';
 import { ScratchTooLarge } from '../host/source.ts';
 import type { Store } from '../store/index.ts';
 import { scratchChanges } from './changes.ts';
+import { redact } from './redact.ts';
+
+export { redact };
 
 // The five read-only thread tools of ADR 0044, over the thread store. Cloud clients reach them
 // through the controller's MCP server and Local through native functions; both call the reader
@@ -65,20 +68,6 @@ const CHECK_LINES = 64;
 const RUN_OUTPUT_LINES = 6;
 const TRUNCATED = '\n[truncated]';
 const OPEN = new Set<ChatTurn['state']>(['queued', 'running', 'waiting-permission']);
-
-/**
- * Pattern redaction, a second guard for text a model or a command printed. It misses shapes it
- * does not know, and ADR 0044 says so.
- */
-export function redact(text: string): string {
-  return text
-    .replace(/\bsk-[A-Za-z0-9_-]{6,}/g, '[redacted]')
-    .replace(/\bBearer\s+[^\s"'`]+/gi, 'Bearer [redacted]')
-    .replace(
-      /\b([A-Za-z_][A-Za-z0-9_.-]*(?:TOKEN|SECRET|KEY)[A-Za-z0-9_]*)(["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s,;}]+)/gi,
-      '$1$2[redacted]',
-    );
-}
 
 /** The newest run of each check as lines: a summary, then the last lines of its output. */
 function runLines(runs: readonly ChatCheckRun[]): { at: string; lines: string[] }[] {

@@ -13,6 +13,8 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { RuntimeManifestSchema } from '@crewkite/contracts';
 import { Controller, type ControllerOptions } from './commands/controller.ts';
+import { installCrashCapture } from './diagnostics/crash.ts';
+import { appendControllerLog } from './diagnostics/log.ts';
 import { configuredIdentity } from './host/publication.ts';
 import {
   resolveAnthropicCompactNativeProfile,
@@ -145,6 +147,7 @@ export async function startController(options: ControllerOptions) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const home = process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite');
+  installCrashCapture(home);
   try {
     // The GPU report takes a moment, so it starts with the process and the first workspace read
     // after it lands carries the core count.
@@ -153,10 +156,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     void refreshAvailableMemory();
     const runtime = await startController({ home, identity: () => configuredIdentity(home) });
     console.log(`Controller ready at ${runtime.socketPath}`);
+    appendControllerLog(home, 'controller ready');
     let closing = false;
     const close = async () => {
       if (closing) return;
       closing = true;
+      appendControllerLog(home, 'controller stopping');
       await runtime.close();
       process.exit(0);
     };
@@ -167,6 +172,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       void close();
     });
   } catch {
+    appendControllerLog(home, 'controller could not start');
     console.error('Controller could not start. Check its private home and existing owner.');
     process.exitCode = 1;
   }

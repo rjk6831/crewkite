@@ -665,4 +665,5 @@ export async function connectController(options: Options): Promise<ControllerCli
   return client;
 }
 
+export { writeDiagnosticsFolder } from './diagnostics.ts';
 export { transferArtifact } from './output.ts';

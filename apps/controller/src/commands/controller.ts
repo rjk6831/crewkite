@@ -46,6 +46,7 @@ import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/s
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
+import { readDiagnostics } from '../diagnostics/read.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
 import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
 import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
@@ -1571,6 +1572,11 @@ export class Controller {
       case 'SaveChatPrompt':
       case 'DeleteChatPrompt':
         return this.savedPrompts(command);
+      case 'ReadDiagnostics':
+        return readDiagnostics(
+          { home: this.home, store: this.store, profiles: () => this.resolveProfiles() },
+          command.payload,
+        );
       case 'ReadChatCatalog':
         this.refreshStaleChatModels();
         return {

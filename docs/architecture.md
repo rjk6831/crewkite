@@ -176,6 +176,7 @@ The command set for the first release:
 | `DiscardChatChange` | Restore one path of the scratch copy to the thread's base; Accept then carries only what is left |
 | `ReadChatThread`, `ReadChatChanges`, `ReadChatCatalog` | Bounded reads of the thread, of the scratch diff against its base, and of the providers and models the composer can offer |
 | `ReadChatInstructions`, `ReadChatPrompts`, `SaveChatPrompt`, `DeleteChatPrompt` | Read the instruction files at the copy root and the saved prompts that the desktop and the CLI share, and save or delete one prompt |
+| `ReadDiagnostics` | Build the diagnostics bundle from the controller's home and store: versions, pinned client digests, saved settings, the end of the controller log, the last 200 events of one thread and system facts, all redacted. The desktop and the CLI write it to a new folder; the older `ExportDiagnostics` stays unsupported |
 | `SupplyMcpServers` | Give the controller the person's MCP server set from the desktop. It is a read with no receipt, and the controller keeps the set in memory |
 | `ReadExtensions`, `ConfigureExtension`, `RunExtensionCommand` | List extension folders and their slots, turn one on or off after its hash check, and run one declared command with an idempotency receipt |
 | `RefreshChatModels` | Read the OpenAI model list through the client with no thread and no model turn. One read runs at a time, and a process group it leaves behind blocks the next one |

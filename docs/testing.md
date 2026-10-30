@@ -237,3 +237,14 @@ One table in `apps/desktop/src/renderer/onboarding/flow.test.ts` covers which we
 A second file, `apps/desktop/src/main/onboarding-store.test.ts`, covers the flag file on a temp directory. A missing, corrupt, oversized, linked or false file reads as not finished, a true file reads as finished, and a write round trips even when a stale temporary file is left behind.
 
 The flow test is a pure function test with no controller, no window and no network. What a Mac can show is the layout in both themes, the focus move at each step and the folder picker.
+
+## Diagnostics bundle and crash records
+
+Three claims cover the diagnostics export and crash capture. Each runs at the lowest layer that can see it, in `apps/controller/src/diagnostics`, with temporary folders, no network and no waits.
+
+- The redaction table runs the controller's existing key, bearer token and secret assignment rules together with the two additions: my home folder becomes `~` and email addresses go. It includes a pretty-printed JSON value whose key and value sit on different lines, a path that only starts with the home folder's name, and structured data where a key that ends in token, secret, password or key loses its value.
+- The crash record claim writes a record with multi-byte text far over its limits and checks the file stays under 8 KiB with the secret and the home path gone, keeps the newest five of eight records, reports the newest one as unseen until the person dismisses it, shows a later crash again, and refuses a dismiss name that leaves the crashes folder.
+- The bundle claim builds from a fixture home with a log larger than its tail, a settings file with a secret, 250 events and one pinned client. It lists exactly the six parts in order and parses against the contract. No secret, email address or home path survives in any part. The log tail starts at a whole line, the thread holds the newest 200 events, the client path is shortened to `~` and keeps its digest, and a call with no desktop and no thread still returns every part. The same claim writes the parts through the folder writer the desktop and the CLI share and checks that it refuses to replace a folder.
+
+The controller log, the crash handlers and the save dialog are not exercised here. A manual check on the Mac covers the native message box that lists the parts, the save dialog that names the new folder, and the line after a forced renderer crash.
+
