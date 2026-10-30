@@ -5,7 +5,7 @@ import { z } from 'zod';
 // the acknowledgement with its time and the text version it covered. A new version asks again.
 
 /** Change this when the summary or the checkbox text changes. */
-export const GOOGLE_TERMS_VERSION = '2026-10-28';
+export const GOOGLE_TERMS_VERSION = '2026-10-31';
 
 export const GOOGLE_TERMS_SUMMARY = [
   'Google says in its third-party access FAQ that third-party access through its coding client login violates its terms. Its headless FAQ also excludes consumer CLI wrappers.',
