@@ -41,7 +41,7 @@ import { RailSearch } from './rail-search.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
-import { adjacentThread, isMacPlatform, shortcutFor } from './thread/composer-rules.ts';
+import { adjacentThread, isMacPlatform, searchHint, shortcutFor } from './thread/composer-rules.ts';
 import type { HistoryFind } from './thread/history-reveal.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
@@ -761,7 +761,7 @@ export function App() {
         >
           <Search size={14} aria-hidden="true" />
           <span className="nav-text">Search</span>
-          <kbd>⌘ K</kbd>
+          <kbd>{searchHint(isMacPlatform())}</kbd>
         </button>
         {threadSource && !collapsed && <RailSearch source={threadSource} onOpen={openFind} />}
         {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
@@ -1071,7 +1071,7 @@ export function App() {
             {connectionLabel}
           </span>
           <span>
-            Search<kbd>⌘ K</kbd>
+            Search<kbd>{searchHint(isMacPlatform())}</kbd>
           </span>
         </footer>
       </div>
