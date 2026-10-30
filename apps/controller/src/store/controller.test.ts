@@ -17,6 +17,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -147,6 +148,12 @@ const macosToolchainOnly =
 const linuxOwnershipUnqualified =
   process.platform !== 'darwin' &&
   'Linux process ownership is unqualified: a group is not yet gone when its streams close, and an orphan that init never reaps keeps the group present';
+
+// The native client check refuses an executable owned by another user, and these fixtures use the
+// test runtime as the client.
+const runtimeOwnedByAnotherUser =
+  process.getuid?.() !== statSync(process.execPath).uid &&
+  'the native client check requires a runtime owned by the user running the tests';
 
 function installedBiome() {
   const manifest = createRequire(resolve('package.json')).resolve('@biomejs/biome/package.json');
@@ -2656,7 +2663,9 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
   );
 });
 
-test('acceptance creates one checked branch and preserves the original source', async (t) => {
+test('acceptance creates one checked branch and preserves the original source', {
+  skip: runtimeOwnedByAnotherUser,
+}, async (t) => {
   for (const transfer of ['reserve', 'manual'] as const)
     await acceptsTransferredCandidate(t, transfer);
   await acceptsNativeCandidate(t);
@@ -8879,7 +8888,9 @@ test('a catalog read with no stored model list starts one model read and the pic
   assert.deepEqual(phases, ['features', 'app-server']);
 });
 
-test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
+test('an acp scratch permission binds one live action and crash recovery cannot invent completion', {
+  skip: runtimeOwnedByAnotherUser,
+}, async (t) => {
   for (const row of [
     'approved',
     'hunk-approved',

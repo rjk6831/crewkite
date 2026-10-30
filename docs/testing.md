@@ -348,3 +348,5 @@ CI runs the full suite on macOS 15 arm64, and a Linux container reports the clai
 - The retained descendant claim, the owned command stream claim and the authentication metadata cleanup claim skip outside macOS because Linux process ownership is unqualified. A Linux group can outlive the close of its streams for a few milliseconds, and an orphan that init never reaps stays in its group after SIGKILL, so the group absence proof does not settle. I record this as a Linux product gap.
 
 The project command claim has no platform scope. Its shell row copies a regular file named `sh`, because `/bin/sh` is a link on Linux and the identity check refuses a link before the shell check runs.
+
+The acceptance claim and the ACP scratch permission claim skip when the Node runtime that runs the tests belongs to another user. Both use that runtime as the native client, and the controller refuses a client that the running user does not own. This is the case in a container that runs as root with a Node install owned by a service account. Both pass when the runtime belongs to the user who runs the tests.
