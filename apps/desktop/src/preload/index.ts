@@ -2,6 +2,7 @@ import type { DesktopSource, LocalTokenStatus } from '@crewkite/client';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
+  ChatExportSchema,
   CommandResultSchema,
   DesktopNoticeSchema,
   EventSchema,
@@ -186,8 +187,34 @@ const bridge: DesktopSource = {
       throw plain(failure);
     }
   },
+  previewShare: async (taskId) => {
+    try {
+      const shared = ChatExportSchema.parse(
+        await ipcRenderer.invoke('crewkite:export-preview', String(taskId)),
+      );
+      return {
+        html: shared.content,
+        filename: shared.filename,
+        turns: shared.turns,
+        omitted: shared.omitted,
+      };
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
   dismissCrash: async () => {
     await ipcRenderer.invoke('crewkite:dismiss-crash');
+  },
+  saveExport: async (input) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:export-save', {
+        taskId: String(input.taskId),
+        format: input.format,
+      });
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
   },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {

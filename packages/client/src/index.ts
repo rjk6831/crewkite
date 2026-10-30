@@ -28,6 +28,8 @@ export type ConnectionState = 'connecting' | 'connected' | 'offline';
  * A file main found for the composer. The renderer sends the path on to the controller and never
  * opens it. `thumbnail` is a small PNG data URL, present only for an image main could decode.
  */
+/** The share page main rendered for a preview. */
+export type DesktopShare = { html: string; filename: string; turns: number; omitted: number };
 export type DesktopFile = { path: string; name: string; bytes: number; thumbnail: string | null };
 export type DesktopAttachInput =
   | { from: 'picker' }
@@ -66,6 +68,16 @@ export interface DesktopSource {
   saveNotes?(projectId: string): Promise<'saved' | 'cancelled'>;
   /** Save the usage numbers of a thread or project as CSV. Main reads them and shows the dialog. */
   saveAnalytics?(input: ReadChatAnalyticsPayload): Promise<'saved' | 'cancelled'>;
+  /**
+   * Render the thread's share page for the person to look at. Main keeps the text it returned, and
+   * saveExport writes that text and nothing the page supplies.
+   */
+  previewShare?(taskId: string): Promise<DesktopShare>;
+  /** Save the previewed share page, or the thread as Markdown, through the system save dialog. */
+  saveExport?(input: {
+    taskId: string;
+    format: 'markdown' | 'html';
+  }): Promise<'saved' | 'cancelled'>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;

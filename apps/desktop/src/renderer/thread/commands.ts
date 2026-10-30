@@ -63,7 +63,10 @@ import { THREAD_PAGE_SIZE } from './thread-state.ts';
 
 // The chat commands are listed in CommandSchema. The cast stays in this one file so the thread
 // view never spells a command name anywhere else.
-export type ThreadSource = Pick<DesktopSource, 'command' | 'subscribe' | 'attachFiles'>;
+export type ThreadSource = Pick<
+  DesktopSource,
+  'command' | 'subscribe' | 'attachFiles' | 'previewShare' | 'saveExport'
+>;
 // Mutations carry a revision by contract. The controller does not race chat commands on it, so
 // the thread sends zero and never has to chase the task revision while events stream.
 const CHAT_REVISION = 0;

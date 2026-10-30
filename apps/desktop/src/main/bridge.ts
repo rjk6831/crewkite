@@ -16,6 +16,7 @@ import {
   ArtifactSchema,
   ArtifactVerificationSchema,
   ChatAnalyticsReadSchema,
+  ChatExportSchema,
   type Command,
   type CommandResult,
   CommandResultSchema,
@@ -39,6 +40,7 @@ import { attachRequest } from '../shared/attach.ts';
 import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
 import { installDiagnostics } from './diagnostics.ts';
+import { ExportStage } from './export.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
 import {
   controllerPort,
@@ -200,6 +202,8 @@ export async function installBridge(
     'local-token-forget',
     'export-diagnostics',
     'dismiss-crash',
+    'export-preview',
+    'export-save',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
   const diagnostics = installDiagnostics({
@@ -726,6 +730,40 @@ export async function installBridge(
       throw new Error('The file could not be written there. Choose another place.');
     }
     return 'saved';
+  });
+  // The controller renders an export and main holds the text, so the page never supplies the
+  // bytes of a file. The share page saves as previewed, and the person picks where it goes.
+  const exports = new ExportStage({
+    read: async (taskId, format) => {
+      const read = await send(
+        CommandSchema.parse({
+          protocol: 1,
+          key: createCommandKey(),
+          actor: desktopActor,
+          command: 'ExportChatThread',
+          payload: { taskId, format },
+        }),
+      );
+      if (!applied(read) || read.data?.kind !== 'chat-export')
+        throw new Error(read.next ?? 'The thread could not be exported.');
+      const { kind: _kind, ...rest } = read.data;
+      return ChatExportSchema.parse(rest);
+    },
+    choose: (options) => dialog.showSaveDialog(window, options),
+  });
+  ipcMain.handle('crewkite:export-preview', async (event, taskId: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const shared = await exports.preview(taskId);
+    assertSender(event, window);
+    return shared;
+  });
+  ipcMain.handle('crewkite:export-save', async (event, input: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const saved = await exports.save(input);
+    assertSender(event, window);
+    return saved;
   });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);
