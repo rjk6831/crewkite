@@ -51,6 +51,7 @@ import {
   SaveChatPromptPayloadSchema,
   SavedPromptsSchema,
 } from './composer.ts';
+import { DiagnosticsReadSchema, ReadDiagnosticsPayloadSchema } from './diagnostics.ts';
 import {
   ConfigureExtensionPayloadSchema,
   ExtensionCommandResultSchema,
@@ -1487,6 +1488,8 @@ export const DesktopNoticeSchema = z.discriminatedUnion('kind', [
     artifactId: ArtifactIdSchema,
     outcome: z.enum(['saved', 'cancelled', 'failed']),
   }),
+  /** The time of the crash record the last run left, or null once the person dismissed it. */
+  z.strictObject({ kind: z.literal('crash'), at: TimestampSchema.nullable() }),
 ]);
 export type DesktopNotice = z.infer<typeof DesktopNoticeSchema>;
 export const RuntimeManifestSchema = z.strictObject({
@@ -2509,6 +2512,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('CompleteChatMention', CompleteChatMentionPayloadSchema),
   read('ReadChatInstructions', ReadChatInstructionsPayloadSchema),
   read('ReadChatPrompts', ReadChatPromptsPayloadSchema),
+  read('ReadDiagnostics', ReadDiagnosticsPayloadSchema),
   mutate('SaveChatPrompt', SaveChatPromptPayloadSchema),
   mutate('DeleteChatPrompt', DeleteChatPromptPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
@@ -3583,6 +3587,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatMentionsReadSchema.extend({ kind: z.literal('chat-mentions') }),
   ChatInstructionsReadSchema.extend({ kind: z.literal('chat-instructions') }),
   SavedPromptsSchema.extend({ kind: z.literal('chat-prompts') }),
+  DiagnosticsReadSchema.safeExtend({ kind: z.literal('diagnostic-files') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
@@ -3856,6 +3861,7 @@ export * from './chat.ts';
 export * from './checks.ts';
 export * from './cli.ts';
 export * from './composer.ts';
+export * from './diagnostics.ts';
 export * from './extensions.ts';
 export * from './google-terms.ts';
 export * from './mcp.ts';
