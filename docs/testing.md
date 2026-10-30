@@ -360,3 +360,14 @@ These rows extend the parallel plan slice claims.
 - The read-only row in the service lane test replaces a base link in the thread copy before the slice starts. The slice's ask packet lists no changed files, since the slice copy never holds that change.
 
 These rows use scripted adapters. They do not cover a live reviewer that edits outside its slice.
+
+## First impression polish
+
+Four claims came out of hands-on QA of the desktop and the terminal.
+
+- The scripted chat adapter test in `packages/testkit/src/chat-adapter.test.ts` holds one table for the scripted ask. An ask before a tool step guards that tool: the tool starts, the ask names its call, and Deny leaves the file unwritten and reports the tool as denied. Allow once lets the edit land. The thread policy the controller passes answers without the person: allow-edits answers an edit, allow-all answers any ask, and a kind granted for the thread is allowed for the thread. Ask, and allow-edits on a command, wait for the person. The demo and any recorded video rely on the fake showing the safety model working.
+- The usage presentation table in `apps/desktop/src/renderer/usage-presentation.test.ts` keeps a provider that is not connected and has read nothing on the rail with Connect and no bar, so the rail and the terminal gauge row show one gauge per provider.
+- The interactive terminal claim in `apps/cli/src/interactive/app.test.ts` checks that `/provider` and `/model` before the first message set the family and model of the first turn without creating a thread, and that the thread the first message creates uses them.
+- The search hint test in `apps/desktop/src/renderer/thread/search-hint.test.ts` checks that the search shortcut reads as Command K on a Mac and Ctrl K elsewhere.
+
+The Google card checkbox layout and the Ctrl K hint on Linux are visual, and only a Mac run of the desktop confirms them.
