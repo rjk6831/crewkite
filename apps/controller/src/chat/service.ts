@@ -64,7 +64,6 @@ import {
   blobToFile,
   type CandidateHash,
   git,
-  hashCandidateFiles,
   type PlannedFile,
   readPlannedBlobs,
   type ScratchPlan,
@@ -83,12 +82,15 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from './adapter.ts';
+import type { ChangeCommandHost } from './change-commands.ts';
+import * as changeCommands from './change-commands.ts';
+import * as review from './change-review.ts';
 import {
-  changeCounts,
   type DiscardOutcome,
   deleteThreadBaseRef,
   discardScratchPath,
-  LISTED_FILES,
+  listChanges,
+  listingDigest,
   readDiscardMark,
   scratchChanges,
   writeDiscardMark,
@@ -234,7 +236,7 @@ type Ending = {
   /** The reply used its whole output budget. */
   outputLimit?: ChatOutputLimit;
 };
-type FileDiff = ChatChangesRead['files'][number];
+type FileDiff = ReturnType<typeof scratchChanges>[number];
 type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments' | 'files'>;
 type LiveTurn = {
   taskId: string;
@@ -691,19 +693,27 @@ export class ChatService {
     let fileCount: number;
     let plan: ScratchPlan;
     let candidates: CandidateHash[];
+    let contents: Map<string, Buffer>;
+    let partial: { path: string; accepted: number; hunks: number }[];
     try {
-      plan = scratchPlan(root, base);
-      candidates = hashCandidateFiles(scratch, root, plan);
+      // Every entry reaches a page of the Changes tab, so Accept publishes only listed files. With
+      // the listing the tab read, it publishes exactly the list the person paged through.
+      const listing = listChanges(root, scratch, base);
+      if (payload.listing && payload.listing !== listingDigest(base, listing))
+        return blocked(
+          'listing-changed',
+          'The changes moved since the list was read. Review the list again, then accept.',
+        );
+      plan = listing.plan;
       // The Changes tab count, so the system line matches what the person reviewed. A base link
       // the copy changed is listed there and comes from the base, so it is not counted.
-      const counts = changeCounts(plan, candidates, scratch);
-      fileCount = counts.files;
-      // Changes lists a bounded number of entries. A file the person could not see is not published.
-      if (counts.listed > LISTED_FILES)
-        return blocked(
-          'too-many-changes',
-          `${fileCount.toLocaleString('en-US')} files changed, and Changes lists the first ${LISTED_FILES.toLocaleString('en-US')} entries. Accept only publishes files you can review, so discard changes until the list is complete, then accept again.`,
-        );
+      fileCount = listing.files;
+      ({ candidates, contents, partial } = review.acceptedTree(
+        root,
+        scratch,
+        listing,
+        review.currentDecisions(this.deps.store.db, task.id, base, listing),
+      ));
     } catch (error) {
       if (error instanceof ScratchTooLarge) return blocked('scratch-unreadable', error.message);
       if (/unsupported (symlink|special file|file mode)/.test((error as Error).message))
@@ -733,6 +743,7 @@ export class ChatService {
             scratch,
             plan,
             candidates,
+            contents,
           }),
           identity,
           at,
@@ -768,8 +779,9 @@ export class ChatService {
       rmSync(work, { recursive: true, force: true });
     }
     // The new tree is the copy's files plus the base entries it left out, so the copy matches
-    // the new base and Changes starts empty.
+    // the new base and Changes starts empty, apart from the hunks Accept left in the copy.
     this.pinBase(task, root, commit);
+    review.clearDecisions(this.deps.store.db, task.id);
     this.putThread(task, {
       ...thread,
       base: commit,
@@ -782,7 +794,7 @@ export class ChatService {
     this.appendEntry(task, {
       kind: 'chat-system',
       author: { kind: 'system', turnId: null },
-      text: `Accepted ${fileCount} ${fileCount === 1 ? 'file' : 'files'} to branch ${payload.branch}.${note ? ` ${note}` : ''}`,
+      text: `Accepted ${fileCount} ${fileCount === 1 ? 'file' : 'files'} to branch ${payload.branch}.${review.partialLine(partial)}${note ? ` ${note}` : ''}`,
     });
     return {
       outcome: 'applied',
@@ -1300,24 +1312,31 @@ export class ChatService {
     return searchHistory(this.deps.store.db, payload);
   }
 
-  readChanges(payload: Payload<'ReadChatChanges'>): ChatChangesRead {
+  /** One page of the Changes list. A page read under a listing that has moved on is refused. */
+  readChanges(payload: Payload<'ReadChatChanges'>): ChatChangesRead | CommandResult {
     const thread = this.thread(payload.taskId);
     const task = this.task(payload.taskId);
     const root = task && this.deps.projectPath(task.projectId);
+    const empty = { taskId: payload.taskId, base: thread.base, total: 0, next: null };
     if (!thread.scratchReady || !thread.base || !root)
-      return { taskId: payload.taskId, base: thread.base, files: [] };
+      return { ...empty, files: [], listing: null };
     try {
-      return {
-        taskId: payload.taskId,
+      const page = review.readChangesPage(this.deps.store.db, {
+        repository: root,
+        scratch: this.scratchDirectory(payload.taskId),
         base: thread.base,
-        files: scratchChanges(root, this.scratchDirectory(payload.taskId), thread.base),
-      };
+        payload,
+      });
+      return 'refused' in page
+        ? blocked('listing-changed', 'The changes moved since the first page. Read them again.')
+        : page;
     } catch (error) {
       if (!(error instanceof ScratchTooLarge)) throw error;
       // The read has no field for a cause, so one entry says why the list is empty.
       return {
-        taskId: payload.taskId,
-        base: thread.base,
+        ...empty,
+        total: 1,
+        listing: null,
         files: [
           {
             // A backslash cannot sit in a scratch path, so Discard can never match this note.
@@ -1325,10 +1344,49 @@ export class ChatService {
             additions: 0,
             deletions: 0,
             patch: `${error.message}\n`,
+            hunks: [],
+            hunkControls: false,
+            decided: false,
           },
         ],
       };
     }
+  }
+
+  decideHunk(payload: Payload<'DecideChatHunk'>): CommandResult {
+    return changeCommands.decideHunk(this.changeHost(), payload);
+  }
+
+  discardHunk(payload: Payload<'DiscardChatHunk'>): CommandResult {
+    return changeCommands.discardHunk(this.changeHost(), payload);
+  }
+
+  commentChange(payload: Payload<'CommentChatChange'>, effects: Effects): CommandResult {
+    return changeCommands.commentChange(
+      this.changeHost((message) => this.sendMessage(message, effects)),
+      payload,
+    );
+  }
+
+  private changeHost(
+    send: ChangeCommandHost['send'] = () => blocked('not-sent'),
+  ): ChangeCommandHost {
+    return {
+      db: this.deps.store.db,
+      task: (taskId) => this.task(taskId),
+      checkedThread: (task) => this.checkedThread(task),
+      ownershipUnknown: (left, then) => ownershipUnknown(left, then),
+      projectPath: (projectId) => this.deps.projectPath(projectId),
+      scratchDirectory: (taskId) => this.scratchDirectory(taskId),
+      systemLine: (task, text) => {
+        this.appendEntry(task, {
+          kind: 'chat-system',
+          author: { kind: 'system', turnId: null },
+          text,
+        });
+      },
+      send,
+    };
   }
 
   private readonly mentionIndex = createMentionIndex(() => Date.now());

@@ -134,8 +134,21 @@ export function chatClient(
         { taskId, turnId, afterCursor },
         ChatTurnEventsReadSchema,
       ) as Promise<ChatTurnEventsRead>,
-    readChanges: (taskId: string): Promise<ChatChangesRead> =>
-      read('ReadChatChanges', { taskId }, ChatChangesReadSchema),
+    /** Every page of the Changes list, read under the first page's listing. */
+    async readChanges(taskId: string): Promise<ChatChangesRead> {
+      const first = await read('ReadChatChanges', { taskId }, ChatChangesReadSchema);
+      const files = [...first.files];
+      for (let after = first.next; after && first.listing; ) {
+        const page = await read(
+          'ReadChatChanges',
+          { taskId, after, listing: first.listing },
+          ChatChangesReadSchema,
+        );
+        files.push(...page.files);
+        after = page.next;
+      }
+      return { ...first, files, next: null };
+    },
     readDiagnostics: (taskId?: string): Promise<DiagnosticsRead> =>
       read('ReadDiagnostics', taskId ? { taskId } : {}, DiagnosticsReadSchema),
     searchHistory: (input: {

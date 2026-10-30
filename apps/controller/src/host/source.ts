@@ -1194,6 +1194,8 @@ export function treeFromScratch(input: {
   scratch: string;
   plan: ScratchPlan;
   candidates: readonly CandidateHash[];
+  /** Bytes that replace a scratch file in the tree, by path. Each candidate oid names them. */
+  contents?: ReadonlyMap<string, Buffer>;
 }): string {
   const { plan, candidates } = input;
   if (candidates.length + plan.kept.length > MAX_SCRATCH_FILES)
@@ -1241,17 +1243,22 @@ export function treeFromScratch(input: {
   const entries: Buffer[] = [];
   for (const file of candidates) {
     const base = held.get(file.path);
+    const replaced = input.contents?.get(file.path);
     if (
       !(base && base.oid === file.oid && base.mode === file.mode) &&
       !hasObject(input.repository, file.oid)
     ) {
-      const written = git(input.repository, [
-        'hash-object',
-        '-w',
-        '--no-filters',
-        '--',
-        join(input.scratch, file.path),
-      ])
+      const written = (
+        replaced
+          ? git(input.repository, ['hash-object', '-w', '--no-filters', '--stdin'], replaced)
+          : git(input.repository, [
+              'hash-object',
+              '-w',
+              '--no-filters',
+              '--',
+              join(input.scratch, file.path),
+            ])
+      )
         .toString('utf8')
         .trim();
       if (written !== file.oid) throw Error('A scratch file changed while it was read.');

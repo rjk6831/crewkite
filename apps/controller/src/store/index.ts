@@ -960,6 +960,7 @@ export class Store {
         'DELETE FROM conversation_entries WHERE task_id=?',
         'DELETE FROM task_conversations WHERE task_id=?',
         'DELETE FROM chat_turns WHERE task_id=?',
+        'DELETE FROM chat_hunk_decisions WHERE task_id=?',
         'DELETE FROM chat_threads WHERE task_id=?',
         "DELETE FROM entities WHERE kind='task' AND id=?",
       ])

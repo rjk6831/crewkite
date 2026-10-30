@@ -1511,17 +1511,6 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   const branch = 'refs/heads/crewkite/fix-rounding';
   const accept = () => run('AcceptChatChanges', { branch: 'crewkite/fix-rounding' }, task.revision);
 
-  // More changed files than Changes lists are never published unseen.
-  const crowd = join(scratch, 'crowd');
-  mkdirSync(crowd);
-  for (let index = 0; index < 2001; index++) writeFileSync(join(crowd, `f${index}`), `${index}\n`);
-  const refused = await accept();
-  assert.equal(refused.outcome, 'blocked');
-  assert.equal(refused.reason, 'too-many-changes');
-  assert.match(refused.next ?? '', /^2,002 files changed, and Changes lists the first 2,000 /);
-  assert.equal(repo('branch', '--list', 'crewkite/fix-rounding'), '');
-  rmSync(crowd, { recursive: true, force: true });
-
   const result = await accept();
   assert.equal(result.outcome, 'applied');
   const commit = repo('rev-parse', branch);
@@ -1571,12 +1560,18 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   // Every read loads the thread record from the store, so a restarted controller sees the same base.
   assert.equal(after.thread.base, commit);
   const changes = await run('ReadChatChanges', {});
-  assert.deepEqual(changes.data, {
-    kind: 'chat-changes',
-    taskId: task.id,
-    base: commit,
-    files: [],
-  });
+  assert.deepEqual(
+    { ...(changes.data as object), listing: null },
+    {
+      kind: 'chat-changes',
+      taskId: task.id,
+      base: commit,
+      files: [],
+      total: 0,
+      next: null,
+      listing: null,
+    },
+  );
   // HEAD moves on. Accept still starts from the thread's base and leaves HEAD where it is.
   advance(repo('rev-parse', 'HEAD^{tree}'));
   const moved = checkout();

@@ -19,7 +19,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { basename, dirname, join, resolve, sep } from 'node:path';
-import type { ChatChangesRead } from '@crewkite/contracts';
+import { type ChatChangeEntry, MAX_FILE_HUNKS } from '@crewkite/contracts';
 import {
   blobToFile,
   type CandidateHash,
@@ -33,16 +33,25 @@ import {
   type ScratchPlan,
   scratchPlan,
 } from '../host/source.ts';
+import {
+  decodeText,
+  type HunkRange,
+  hunkRanges,
+  lineDiff,
+  type Op,
+  renderPatch,
+  textLines,
+} from './hunks.ts';
 
-type FileDiff = ChatChangesRead['files'][number];
-type Op = { op: ' ' | '-' | '+'; line: string };
+type FileDiff = Pick<ChatChangeEntry, 'path' | 'additions' | 'deletions' | 'patch'>;
 
 const PATCH_CHARACTERS = 262_144;
-// Counts always return. Patches stop here so one read stays well under the frame limit.
+// Counts always return. Patches and hunks stop here so one read stays well under the frame limit.
 const TOTAL_PATCH_BYTES = 655_360;
-const MAXIMUM_LINES = 50_000;
-const MAXIMUM_EDITS = 2_000;
-const CONTEXT = 3;
+// What one hunk entry adds to a read: a 64 character key, four numbers and the field names.
+const HUNK_BYTES = 180;
+// A file larger than this on either side shows its patch with whole-file controls only.
+const HUNK_FILE_BYTES = 4 * 1024 * 1024;
 
 // The most file bytes one comparison reads for patches. A larger change set still lists every
 // path, and the files past this limit say so in place of a patch.
@@ -71,66 +80,224 @@ function changedLinks(scratch: string, plan: ScratchPlan) {
   return links;
 }
 
-/** The most files a Changes read lists. */
-export const LISTED_FILES = 2000;
+/** One entry of the Changes list: a changed file, or a base link the copy changed. */
+export type ListedChange = {
+  path: string;
+  old?: PlannedFile;
+  next?: CandidateHash;
+  link?: { link: LinkEntry; change: LinkChange };
+};
 
-/**
- * How many files differ from the base, and how many entries Changes would list for them. The two
- * differ by the base links the copy changed, and `listed` stops at what one read holds.
- */
-export function changeCounts(
-  plan: ScratchPlan,
-  candidates: readonly CandidateHash[],
-  scratch: string,
-): { files: number; listed: number } {
-  const files = changedPaths(plan, candidates).length;
-  return { files, listed: files + changedLinks(scratch, plan).size };
+/** Every entry of the Changes list in path order, by blob id. No file bytes are read. */
+export type ChangeListing = {
+  plan: ScratchPlan;
+  candidates: CandidateHash[];
+  entries: ListedChange[];
+  /** How many files differ from the base. Changed links are listed and never published. */
+  files: number;
+};
+
+export function listChanges(repository: string, scratch: string, base: string): ChangeListing {
+  const plan = scratchPlan(repository, base);
+  // Committed ignore rules keep generated files such as installed packages out of the diff.
+  // Skipped entries always come from the base, so they never show as changes.
+  const candidates = hashCandidateFiles(scratch, repository, plan);
+  const changed = changedPaths(plan, candidates);
+  const byPath = new Map<string, ListedChange>(changed.map((entry) => [entry.path, entry]));
+  // Accept takes held links from the base too. One the copy changed shows, so the person sees
+  // that the copy's version stays out.
+  for (const [path, link] of changedLinks(scratch, plan))
+    byPath.set(path, { ...(byPath.get(path) ?? { path }), link });
+  const entries = [...byPath.keys()].sort().map((path) => byPath.get(path) as ListedChange);
+  return { plan, candidates, entries, files: changed.length };
 }
 
-/** Compare the scratch copy with the committed base. One entry per changed path, sorted. */
+/** Hunk keys the person accepted, by path, already checked against the current copy. */
+export type HunkDecisions = ReadonlyMap<string, ReadonlySet<string>>;
+
+/**
+ * A digest of the list by blob id and mode. Pages read under one listing and an Accept that names
+ * it cover exactly the same entries. Hunk decisions stay out: they are the person's own commands,
+ * and any change to a file's bytes drops them.
+ */
+export function listingDigest(base: string, listing: ChangeListing): string {
+  const hash = createHash('sha256').update(`${base}\n`);
+  for (const entry of listing.entries)
+    hash.update(
+      `${JSON.stringify([
+        entry.path,
+        entry.old?.oid ?? null,
+        entry.old?.mode ?? null,
+        entry.next?.oid ?? null,
+        entry.next?.mode ?? null,
+        entry.link?.change ?? null,
+      ])}\n`,
+    );
+  return hash.digest('hex');
+}
+
+/** The diff of one text file, and whether its hunks take per hunk controls. */
+export type FileHunks = {
+  ops: Op[];
+  hunks: HunkRange[];
+  patch: string;
+  additions: number;
+  deletions: number;
+  controls: boolean;
+};
+
+type Side = { content: Buffer; mode: string };
+
+/**
+ * The hunks of one changed file from its two contents. Null for binary text on either side. Only
+ * a text file the base and the copy both hold, with an unchanged mode, sides of at most 4 MiB, a
+ * patch that fits one read and at most `MAX_FILE_HUNKS` hunks, takes per hunk controls.
+ */
+export function fileHunks(path: string, old?: Side, next?: Side): FileHunks | null {
+  const before = old ? decodeText(old.content) : '';
+  const after = next ? decodeText(next.content) : '';
+  if (before === null || after === null) return null;
+  const ops = lineDiff(textLines(before), textLines(after));
+  const hunks = hunkRanges(ops);
+  const patch = renderPatch(path, { old: Boolean(old), next: Boolean(next) }, ops, hunks);
+  const controls =
+    old !== undefined &&
+    next !== undefined &&
+    old.mode === next.mode &&
+    old.content.length <= HUNK_FILE_BYTES &&
+    next.content.length <= HUNK_FILE_BYTES &&
+    hunks.length > 0 &&
+    hunks.length <= MAX_FILE_HUNKS &&
+    patch.length <= PATCH_CHARACTERS &&
+    Buffer.byteLength(patch) + hunks.length * HUNK_BYTES <= TOTAL_PATCH_BYTES;
+  return {
+    ops,
+    hunks,
+    patch,
+    additions: ops.filter((op) => op.op === '+').length,
+    deletions: ops.filter((op) => op.op === '-').length,
+    controls,
+  };
+}
+
+/** The base bytes and the copy bytes of one listed file. */
+export function readSides(
+  repository: string,
+  scratch: string,
+  entry: ListedChange,
+): { old?: Side; next?: Side } {
+  return {
+    old: entry.old
+      ? { content: readPlannedBlobs(repository, [entry.old])[0], mode: entry.old.mode }
+      : undefined,
+    next: entry.next ? readScratchFile(scratch, entry.next.path) : undefined,
+  };
+}
+
+const wholeFile = { hunks: [], hunkControls: false, decided: false };
+
+/**
+ * One page of the Changes list: up to `limit` entries after `after`, in path order. A page ends
+ * early when the next patch would pass the read limits, so that patch starts the next page and
+ * every file whose patch fits one read reaches a page with it. `next` names the page's last entry.
+ */
+export function changesPage(
+  repository: string,
+  scratch: string,
+  listing: ChangeListing,
+  decisions: HunkDecisions,
+  after: string | undefined,
+  limit: number,
+): { files: ChatChangeEntry[]; next: string | null } {
+  const entries = listing.entries.filter((entry) => after === undefined || entry.path > after);
+  const files: ChatChangeEntry[] = [];
+  let budget = TOTAL_PATCH_BYTES;
+  let read = 0;
+  for (const entry of entries) {
+    if (files.length === limit) break;
+    if (entry.link) {
+      files.push({ ...linkDiff(entry.link.link, entry.link.change), ...wholeFile });
+      continue;
+    }
+    const size = (entry.old?.bytes ?? 0) + (entry.next?.bytes ?? 0);
+    if (read + size > DIFF_READ_BYTES) {
+      if (files.length) break;
+      const patch = notCompared(size, read);
+      files.push({ path: entry.path, additions: 0, deletions: 0, patch, ...wholeFile });
+      continue;
+    }
+    const sides = readSides(repository, scratch, entry);
+    const diff = fileHunks(entry.path, sides.old, sides.next);
+    read += size;
+    if (!diff) {
+      files.push({ path: entry.path, additions: 0, deletions: 0, patch: null, ...wholeFile });
+      continue;
+    }
+    const cost =
+      Buffer.byteLength(diff.patch) + (diff.controls ? diff.hunks.length * HUNK_BYTES : 0);
+    const fits = diff.patch.length <= PATCH_CHARACTERS && cost <= budget;
+    if (!fits && files.length && cost <= TOTAL_PATCH_BYTES) break;
+    if (fits) budget -= cost;
+    const accepted = decisions.get(entry.path);
+    const controls = fits && diff.controls;
+    files.push({
+      path: entry.path,
+      additions: diff.additions,
+      deletions: diff.deletions,
+      patch: fits ? diff.patch : null,
+      hunks: controls
+        ? diff.hunks.map((hunk) => ({
+            key: hunk.key,
+            oldStart: hunk.oldStart,
+            oldLines: hunk.oldLines,
+            newStart: hunk.newStart,
+            newLines: hunk.newLines,
+            decision: accepted?.has(hunk.key) ? 'accepted' : 'undecided',
+          }))
+        : [],
+      hunkControls: controls,
+      decided: controls && diff.hunks.some((hunk) => accepted?.has(hunk.key)),
+    });
+  }
+  const last = files.at(-1)?.path;
+  return {
+    files,
+    next: last !== undefined && entries.at(-1)?.path !== last ? last : null,
+  };
+}
+
+/**
+ * The whole list in one read, for the prompts and the thread tools, which keep their own limits.
+ * Patches stop at the read limits; later files keep their counts with no patch.
+ */
 export function scratchChanges(
   repository: string,
   scratch: string,
   base: string,
   patches = true,
 ): FileDiff[] {
-  const plan = scratchPlan(repository, base);
-  // Committed ignore rules keep generated files such as installed packages out of the diff.
-  // Skipped entries always come from the base, so they never show as changes.
-  const changed = new Map(
-    changedPaths(plan, hashCandidateFiles(scratch, repository, plan)).map((entry) => [
-      entry.path,
-      entry,
-    ]),
-  );
-  // Accept takes held links from the base too. One the copy changed shows, so the person sees
-  // that the copy's version stays out.
-  const links = changedLinks(scratch, plan);
-  const paths = [...new Set([...changed.keys(), ...links.keys()])].sort();
+  const listing = listChanges(repository, scratch, base);
   const files: FileDiff[] = [];
   let budget = patches ? TOTAL_PATCH_BYTES : 0;
   let read = 0;
-  for (const path of paths) {
-    const held = links.get(path);
-    const entry = changed.get(path);
-    // shortcut: the read shape holds 2000 files. Upgrade: page changes when a thread needs more.
-    if (files.length === LISTED_FILES) break;
+  for (const entry of listing.entries) {
+    const { path } = entry;
     let diff: FileDiff;
     let notice = false;
-    if (held) diff = linkDiff(held.link, held.change);
+    if (entry.link) diff = linkDiff(entry.link.link, entry.link.change);
     else if (!patches) diff = { path, additions: 0, deletions: 0, patch: null };
     else {
-      const size = (entry?.old?.bytes ?? 0) + (entry?.next?.bytes ?? 0);
+      const size = (entry.old?.bytes ?? 0) + (entry.next?.bytes ?? 0);
       if (read + size > DIFF_READ_BYTES) {
         diff = { path, additions: 0, deletions: 0, patch: notCompared(size, read) };
         notice = true;
       } else {
         read += size;
-        const old = entry?.old
-          ? { ...entry.old, content: readPlannedBlobs(repository, [entry.old])[0] }
-          : undefined;
-        const next = entry?.next ? readScratchFile(scratch, entry.next.path) : undefined;
-        diff = fileDiff(path, old, next);
+        const sides = readSides(repository, scratch, entry);
+        const hunks = fileHunks(path, sides.old, sides.next);
+        diff = hunks
+          ? { path, additions: hunks.additions, deletions: hunks.deletions, patch: hunks.patch }
+          : { path, additions: 0, deletions: 0, patch: null };
       }
     }
     const bytes = diff.patch === null ? 0 : Buffer.byteLength(diff.patch);
@@ -374,132 +541,4 @@ export function deleteThreadBaseRef(repository: string, taskId: string) {
   const current = refCommit(repository, ref);
   if (current === null) return;
   git(repository, ['update-ref', '--no-deref', '-d', ref, current]);
-}
-
-function fileDiff(path: string, old?: FileContent, next?: FileContent): FileDiff {
-  const before = old ? decode(old.content) : '';
-  const after = next ? decode(next.content) : '';
-  if (before === null || after === null) return { path, additions: 0, deletions: 0, patch: null };
-  const ops = lineDiff(lines(before), lines(after));
-  const header = [
-    `--- ${old ? `a/${path}` : '/dev/null'}`,
-    `+++ ${next ? `b/${path}` : '/dev/null'}`,
-  ];
-  return {
-    path,
-    additions: ops.filter((op) => op.op === '+').length,
-    deletions: ops.filter((op) => op.op === '-').length,
-    patch: `${[...header, ...hunks(ops)].join('\n')}\n`,
-  };
-}
-
-function decode(content: Buffer): string | null {
-  if (content.includes(0)) return null;
-  try {
-    return new TextDecoder('utf-8', { fatal: true }).decode(content);
-  } catch {
-    return null;
-  }
-}
-
-function lines(text: string): string[] {
-  const split = text.split('\n');
-  if (split.at(-1) === '') split.pop();
-  return split;
-}
-
-/** Shortest edit script (Myers). Falls back to replace-all when the files barely match. */
-export function lineDiff(a: readonly string[], b: readonly string[]): Op[] {
-  const replaceAll = (): Op[] => [
-    ...a.map((line) => ({ op: '-' as const, line })),
-    ...b.map((line) => ({ op: '+' as const, line })),
-  ];
-  const max = a.length + b.length;
-  if (max > MAXIMUM_LINES) return replaceAll();
-  const offset = max + 1;
-  const v = new Int32Array(2 * max + 3);
-  const trace: Int32Array[] = [];
-  let found = -1;
-  for (let d = 0; d <= Math.min(max, MAXIMUM_EDITS) && found < 0; d++) {
-    // Keep only the diagonals step d reads, so memory grows with d squared.
-    trace.push(v.slice(offset - d, offset + d + 1));
-    for (let k = -d; k <= d; k += 2) {
-      const down = k === -d || (k !== d && v[offset + k - 1] < v[offset + k + 1]);
-      let x = down ? v[offset + k + 1] : v[offset + k - 1] + 1;
-      let y = x - k;
-      while (x < a.length && y < b.length && a[x] === b[y]) {
-        x++;
-        y++;
-      }
-      v[offset + k] = x;
-      if (x >= a.length && y >= b.length) {
-        found = d;
-        break;
-      }
-    }
-  }
-  if (found < 0) return replaceAll();
-  const ops: Op[] = [];
-  let x = a.length;
-  let y = b.length;
-  for (let d = found; d > 0; d--) {
-    const previous = trace[d];
-    const at = (k: number) => previous[k + d];
-    const k = x - y;
-    const down = k === -d || (k !== d && at(k - 1) < at(k + 1));
-    const priorK = down ? k + 1 : k - 1;
-    const priorX = at(priorK);
-    const priorY = priorX - priorK;
-    while (x > priorX && y > priorY) {
-      x--;
-      y--;
-      ops.push({ op: ' ', line: a[x] });
-    }
-    if (down) ops.push({ op: '+', line: b[--y] });
-    else ops.push({ op: '-', line: a[--x] });
-  }
-  while (x > 0) ops.push({ op: ' ', line: a[--x] });
-  return ops.reverse();
-}
-
-function hunks(ops: readonly Op[]): string[] {
-  const oldLine: number[] = [];
-  const newLine: number[] = [];
-  let o = 1;
-  let n = 1;
-  for (const { op } of ops) {
-    oldLine.push(o);
-    newLine.push(n);
-    if (op !== '+') o++;
-    if (op !== '-') n++;
-  }
-  const out: string[] = [];
-  let index = 0;
-  while (index < ops.length) {
-    while (index < ops.length && ops[index].op === ' ') index++;
-    if (index === ops.length) break;
-    let last = index;
-    let cursor = index;
-    while (cursor < ops.length) {
-      if (ops[cursor].op !== ' ') {
-        last = cursor++;
-        continue;
-      }
-      let run = cursor;
-      while (run < ops.length && ops[run].op === ' ') run++;
-      if (run === ops.length || run - cursor > 2 * CONTEXT) break;
-      cursor = run;
-    }
-    const start = Math.max(0, index - CONTEXT);
-    const stop = Math.min(ops.length, last + CONTEXT + 1);
-    const slice = ops.slice(start, stop);
-    const oldCount = slice.filter((value) => value.op !== '+').length;
-    const newCount = slice.filter((value) => value.op !== '-').length;
-    const oldStart = oldCount ? oldLine[start] : oldLine[start] - 1;
-    const newStart = newCount ? newLine[start] : newLine[start] - 1;
-    out.push(`@@ -${oldStart},${oldCount} +${newStart},${newCount} @@`);
-    for (const value of slice) out.push(`${value.op}${value.line}`);
-    index = stop;
-  }
-  return out;
 }

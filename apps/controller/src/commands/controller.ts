@@ -1383,6 +1383,9 @@ export class Controller {
         'ImportChatAttachment',
         'RetryChatTurn',
         'DiscardChatChange',
+        'DecideChatHunk',
+        'DiscardChatHunk',
+        'CommentChatChange',
         'RenameChatThread',
         'DeleteChatThread',
         'AskChatFamily',
@@ -1546,6 +1549,12 @@ export class Controller {
         return this.chat().retryTurn(command.payload, effects);
       case 'DiscardChatChange':
         return this.chat().discardChange(command.payload, command.key);
+      case 'DecideChatHunk':
+        return this.chat().decideHunk(command.payload);
+      case 'DiscardChatHunk':
+        return this.chat().discardHunk(command.payload);
+      case 'CommentChatChange':
+        return this.chat().commentChange(command.payload, effects);
       case 'RenameChatThread':
         return this.chat().renameThread(command.payload);
       case 'DeleteChatThread':
@@ -1572,16 +1581,20 @@ export class Controller {
             : this.options.identity,
         );
       case 'ReadChatThread':
-      case 'ReadChatChanges':
+      case 'ReadChatChanges': {
         if (!this.store.get<Task>('task', command.payload.taskId))
           return { outcome: 'blocked', reason: 'task-not-found' };
+        if (command.command === 'ReadChatChanges') {
+          const page = this.chat().readChanges(command.payload);
+          return 'outcome' in page
+            ? page
+            : { outcome: 'applied', data: { kind: 'chat-changes', ...page } };
+        }
         return {
           outcome: 'applied',
-          data:
-            command.command === 'ReadChatThread'
-              ? { kind: 'chat-thread', ...this.chat().readThread(command.payload) }
-              : { kind: 'chat-changes', ...this.chat().readChanges(command.payload) },
+          data: { kind: 'chat-thread', ...this.chat().readThread(command.payload) },
         };
+      }
       case 'SearchChatHistory':
         return {
           outcome: 'applied',
