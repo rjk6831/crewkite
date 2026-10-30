@@ -53,6 +53,7 @@ import {
   SavedPromptsSchema,
 } from './composer.ts';
 import { DiagnosticsReadSchema, ReadDiagnosticsPayloadSchema } from './diagnostics.ts';
+import { ChatExportSchema, ExportChatThreadPayloadSchema } from './export.ts';
 import {
   ConfigureExtensionPayloadSchema,
   ExtensionCommandResultSchema,
@@ -2525,6 +2526,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatPrompts', ReadChatPromptsPayloadSchema),
   read('ReadDiagnostics', ReadDiagnosticsPayloadSchema),
   read('SearchChatHistory', SearchChatHistoryPayloadSchema),
+  read('ExportChatThread', ExportChatThreadPayloadSchema),
   mutate('SaveChatPrompt', SaveChatPromptPayloadSchema),
   mutate('DeleteChatPrompt', DeleteChatPromptPayloadSchema),
   read('ReadProjectNotes', ReadProjectNotesPayloadSchema),
@@ -3609,6 +3611,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatSearchResultSchema.safeExtend({ kind: z.literal('chat-search') }),
   ProjectNotesReadSchema.extend({ kind: z.literal('project-notes') }),
   ProjectNotesChangedSchema.extend({ kind: z.literal('project-notes-changed') }),
+  ChatExportSchema.extend({ kind: z.literal('chat-export') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
@@ -3884,6 +3887,7 @@ export * from './checks.ts';
 export * from './cli.ts';
 export * from './composer.ts';
 export * from './diagnostics.ts';
+export * from './export.ts';
 export * from './extensions.ts';
 export * from './google-terms.ts';
 export * from './history-search.ts';
