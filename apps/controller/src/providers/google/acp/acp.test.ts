@@ -2262,6 +2262,7 @@ setInterval(() => {}, 1000);
 
 test('a controller that registers the Google client sets it up at launch and leaves the sign-in to the person', async () => {
   const f = fixture('complete');
+  const started: string[] = [];
   const clock = createTestClock();
   const id = createTestIds();
   const client = { HOME: userInfo().homedir, PATH: process.env.PATH };
@@ -2274,7 +2275,10 @@ test('a controller that registers the Google client sets it up at launch and lea
       googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
       googleAcp: {
         reviewMappings: [f.mapping],
-        spawn: spawnCheckChild as AcpSpawn,
+        spawn: ((...args: Parameters<AcpSpawn>) => {
+          started.push('spawn');
+          return spawnCheckChild(...args);
+        }) as AcpSpawn,
         resolve: (proof) => ({
           ...resolveGoogleAcpProfile({ home: f.home, proof, environment: client }),
           client: f.client,
@@ -2286,13 +2290,15 @@ test('a controller that registers the Google client sets it up at launch and lea
     controller.store.googleMetadataOperations().map((row) => `${row.kind} ${row.state}`);
   let controller = open();
   try {
-    // A fresh client initializes on its own and stops before the browser sign-in.
+    // Before the acknowledgement the client does not start at all.
     await controller.googleAcpPreparation;
     let setup = controller.store.googleAcpSetup();
-    assert.equal(setup.state, 'authentication-required');
-    assert.deepEqual(steps(controller), ['acp-initialize quiescent']);
+    assert.equal(setup.state, 'uninitialized');
+    assert.deepEqual(started, []);
+    assert.deepEqual(steps(controller), []);
 
-    // Signing in is the person's choice, made after they acknowledge Google's terms.
+    // Acknowledging Google's terms runs the launch steps at once. A fresh client initializes on
+    // its own and stops before the browser sign-in, which is the person's choice.
     const acknowledged = await controller.execute(
       CommandSchema.parse({
         protocol: 1,
@@ -2305,7 +2311,11 @@ test('a controller that registers the Google client sets it up at launch and lea
       'local-owner',
     );
     assert.equal(acknowledged.outcome, 'applied');
+    await controller.googleAcpPreparation;
     setup = controller.store.googleAcpSetup();
+    assert.equal(setup.state, 'authentication-required');
+    assert.ok(started.length > 0);
+    assert.deepEqual(steps(controller), ['acp-initialize quiescent']);
 
     const signIn = await controller.execute(
       CommandSchema.parse({

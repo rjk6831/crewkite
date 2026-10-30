@@ -46,6 +46,7 @@ import {
   unavailableNativeProfile,
 } from '../providers/openai/profile.ts';
 import type { Controller } from './controller.ts';
+import { googleTermsAcknowledged } from './google-terms.ts';
 import {
   type AcpSetupCommand,
   type LocalControl,
@@ -226,12 +227,14 @@ export class ProviderCommands {
    * prompt and open no browser. Authenticate opens a browser, so it waits for a click. The
    * initialize reply names sign-in methods and no sign-in status, so discover runs only on a
    * proof that already records a finished sign-in. Only a controller that registers the real
-   * client prepares it; a harness that drives each step leaves registration off.
+   * client prepares it; a harness that drives each step leaves registration off. Nothing starts
+   * until the current Google terms text is acknowledged, and the acknowledgement runs this again.
    */
   googleAcpPreparationStep(this: Controller): 'initialize' | 'discover' | null {
     if (
       !this.options.registerGoogleAcp ||
       this.closed ||
+      !googleTermsAcknowledged(this.store) ||
       this.acpSetupRuntime ||
       this.acpStart ||
       this.googleInstallationBlocker() ||

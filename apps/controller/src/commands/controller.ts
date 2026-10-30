@@ -937,10 +937,15 @@ export class Controller {
         this.outputReads.delete(reading);
       }
     }
-    if (command.command === 'AcknowledgeGoogleTerms')
-      return this.store.transaction(() =>
+    if (command.command === 'AcknowledgeGoogleTerms') {
+      const acknowledged = this.store.transaction(() =>
         acknowledgeGoogleTerms(this.store, command.payload.textVersion, this.now()),
       );
+      // The launch-time steps waited for this, so they run now and need no restart.
+      if (acknowledged.outcome === 'applied')
+        this.googleAcpPreparation = this.prepareGoogleAcp().catch(() => {});
+      return acknowledged;
+    }
     const termsRefusal = googleTermsGate(this.store, command, (runId) => this.isPreparedAcp(runId));
     if (termsRefusal) return termsRefusal;
     if (
