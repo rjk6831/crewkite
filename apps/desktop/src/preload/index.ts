@@ -7,6 +7,7 @@ import {
   EventSchema,
   McpStateSchema,
   ProjectPageSchema,
+  ReadChatAnalyticsPayloadSchema,
   SnapshotSchema,
   TaskPageSchema,
   WorkspaceStateSchema,
@@ -170,6 +171,16 @@ const bridge: DesktopSource = {
   saveNotes: async (projectId) => {
     try {
       const value: unknown = await ipcRenderer.invoke('crewkite:save-notes', projectId);
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  saveAnalytics: async (input) => {
+    const payload = ReadChatAnalyticsPayloadSchema.safeParse(input);
+    if (!payload.success) throw new Error('The usage request is invalid.');
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-analytics', payload.data);
       return value === 'cancelled' ? 'cancelled' : 'saved';
     } catch (failure) {
       throw plain(failure);

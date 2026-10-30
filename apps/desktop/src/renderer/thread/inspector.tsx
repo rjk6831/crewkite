@@ -23,6 +23,7 @@ import {
   useRef,
   useState,
 } from 'react';
+import { AnalyticsView } from '../analytics-view.tsx';
 import { familyName } from '../components.tsx';
 import {
   ExtensionInspectorTab,
@@ -55,10 +56,11 @@ import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
 
-export type InspectorTab = 'changes' | 'usage' | 'crew' | 'thread' | `ext:${string}`;
+export type InspectorTab = 'changes' | 'usage' | 'analytics' | 'crew' | 'thread' | `ext:${string}`;
 const tabs: { id: InspectorTab; label: string }[] = [
   { id: 'changes', label: 'Changes' },
   { id: 'usage', label: 'Usage' },
+  { id: 'analytics', label: 'Analytics' },
   { id: 'crew', label: 'Crew' },
   { id: 'thread', label: 'Thread' },
 ];
@@ -815,6 +817,13 @@ export function Inspector({
           />
         )}
         {tab === 'usage' && <UsageTab source={source} header={header} preview={preview} />}
+        {tab === 'analytics' && (
+          <AnalyticsView
+            source={source}
+            input={{ scope: 'thread', taskId }}
+            refreshKey={`${turns.length}:${turns.at(-1)?.state ?? ''}`}
+          />
+        )}
         {tab === 'crew' && <CrewTab source={source} thread={thread} onConfigure={onConfigure} />}
         {tab === 'thread' && (
           <ThreadTab

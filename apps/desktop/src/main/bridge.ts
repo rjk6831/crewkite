@@ -10,11 +10,12 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, extname, relative, sep } from 'node:path';
-import { promptsToJson } from '@crewkite/client';
+import { analyticsToCsv, promptsToJson } from '@crewkite/client';
 import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
+  ChatAnalyticsReadSchema,
   type Command,
   type CommandResult,
   CommandResultSchema,
@@ -29,6 +30,7 @@ import {
   type McpState,
   projectNotesMarkdown,
   ReadProjectNotesPayloadSchema,
+  ReadChatAnalyticsPayloadSchema,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
@@ -291,6 +293,7 @@ export async function installBridge(
         'ReadChatTurnEvents',
         'ReadChatChanges',
         'ReadChatCatalog',
+        'ReadChatAnalytics',
         'ReadExtensions',
         'CompleteChatMention',
         'ReadChatInstructions',
@@ -676,6 +679,54 @@ export async function installBridge(
       );
       try {
         writeFileSync(file, projectNotesMarkdown(projectName, notes));
+        fsyncSync(file);
+      } finally {
+        closeSync(file);
+      }
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return 'saved';
+  });
+  // The usage numbers are the controller's. Main reads them for the thread or project the page
+  // names, so the page never supplies the bytes, and the person picks where the file goes.
+  ipcMain.handle('crewkite:save-analytics', async (event, input: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const payload = ReadChatAnalyticsPayloadSchema.parse(input);
+    const read = await send(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'ReadChatAnalytics',
+        payload,
+      }),
+    );
+    if (!applied(read) || read.data?.kind !== 'chat-analytics')
+      throw new Error('The usage numbers could not be read.');
+    const { kind: _kind, ...rest } = read.data;
+    const analytics = ChatAnalyticsReadSchema.parse(rest);
+    const slug = analytics.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 40);
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Save usage',
+      defaultPath: `crewkite-usage-${slug || analytics.scope}.csv`,
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      const file = openSync(
+        choice.filePath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(file, analyticsToCsv(analytics));
         fsyncSync(file);
       } finally {
         closeSync(file);

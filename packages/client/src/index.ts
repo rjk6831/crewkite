@@ -7,6 +7,7 @@ import type {
   McpBridge,
   ProjectPage,
   ProjectPageRequest,
+  ReadChatAnalyticsPayload,
   Snapshot,
   SnapshotScope,
   TaskPage,
@@ -63,6 +64,8 @@ export interface DesktopSource {
   dismissCrash?(): Promise<void>;
   /** Save one project's notes as a Markdown file. Main reads them and shows the dialog. */
   saveNotes?(projectId: string): Promise<'saved' | 'cancelled'>;
+  /** Save the usage numbers of a thread or project as CSV. Main reads them and shows the dialog. */
+  saveAnalytics?(input: ReadChatAnalyticsPayload): Promise<'saved' | 'cancelled'>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;

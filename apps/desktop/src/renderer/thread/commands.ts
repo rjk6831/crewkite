@@ -1,6 +1,8 @@
 import {
   AcceptChatChangesPayloadSchema,
   AddProjectNotePayloadSchema,
+  type ChatAnalyticsRead,
+  ChatAnalyticsReadSchema,
   type ChatAttachment,
   ChatAttachmentSchema,
   type ChatBranchStatus,
@@ -33,6 +35,8 @@ import {
   type ProjectNotesRead,
   ProjectNotesReadSchema,
   PushChatBranchPayloadSchema,
+  type ReadChatAnalyticsPayload,
+  ReadChatAnalyticsPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
@@ -139,6 +143,17 @@ export const readChanges = (source: ThreadSource, taskId: string): Promise<ChatC
     'ReadChatChanges',
     ReadChatChangesPayloadSchema.parse({ taskId }),
     ChatChangesReadSchema,
+  );
+/** Turns, tokens, allowance, wall time, checks and branches of one thread or one project. */
+export const readAnalytics = (
+  source: ThreadSource,
+  input: ReadChatAnalyticsPayload,
+): Promise<ChatAnalyticsRead> =>
+  read(
+    source,
+    'ReadChatAnalytics',
+    ReadChatAnalyticsPayloadSchema.parse(input),
+    ChatAnalyticsReadSchema,
   );
 export const readCatalog = (source: ThreadSource, taskId?: string): Promise<ChatCatalogRead> =>
   read(
