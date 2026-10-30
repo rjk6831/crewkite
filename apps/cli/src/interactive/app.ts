@@ -340,6 +340,9 @@ export function App(props: AppProps) {
       }
       const created = await client.createThread(projectId, text || paths.join(', '));
       id = created.id;
+      // The thread keeps a pick made before it existed, so a refusal at the Google gate and a
+      // second send still use it.
+      if (firstChoice) await client.configure({ taskId: id, selection: firstChoice });
       if (settings.handoffMode !== 'most-left')
         await client.configure({ taskId: id, handoffMode: settings.handoffMode });
       await openThread(id);
