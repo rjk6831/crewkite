@@ -8,7 +8,10 @@ Run with no subcommand on a terminal, it opens the interactive mode. With a subc
 pnpm crewkite                                   # interactive mode
 pnpm crewkite -p "Why can the total go negative?"   # one reply to stdout
 pnpm crewkite thread list --json                # scripting
+pnpm crewkite notes add prj_... "Use pnpm, not npm."   # a project note
 ```
+
+Project notes are short facts the controller keeps for a project and sends to every provider with each turn. `crewkite notes list <project-id>` shows them, `notes add <project-id> <text>` saves one and `notes remove <project-id> <note-id>` deletes one. A project holds 200 notes and 16 KiB of them.
 
 The CLI adds no authority. Every action it offers is a command the controller checks the same way it checks the desktop's: a permission answer must name an open request and an option it offered, Accept builds one new local branch, and Push needs your confirmation. No setting grants a permission, raises a limit or accepts a result: a thread's permission policy changes only when you name it for that thread, with a flag for one run or by answering the question in the interactive mode.
 

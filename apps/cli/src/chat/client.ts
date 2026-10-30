@@ -25,6 +25,8 @@ import {
   type DiagnosticsRead,
   DiagnosticsReadSchema,
   type Event,
+  type ProjectNotesRead,
+  ProjectNotesReadSchema,
   type ProjectPage,
   type ProjectPageRequest,
   type SavedPrompts,
@@ -141,6 +143,13 @@ export function chatClient(
         ChatSearchResultSchema,
       ),
     readPrompts: (): Promise<SavedPrompts> => read('ReadChatPrompts', {}, SavedPromptsSchema),
+    readNotes: (projectId: string): Promise<ProjectNotesRead> =>
+      read('ReadProjectNotes', { projectId }, ProjectNotesReadSchema),
+    /** Each note change answers with the project's whole list. */
+    addNote: (projectId: string, text: string): Promise<ProjectNotesRead> =>
+      read('AddProjectNote', { projectId, text }, ProjectNotesReadSchema),
+    removeNote: (projectId: string, noteId: string): Promise<ProjectNotesRead> =>
+      read('RemoveProjectNote', { projectId, noteId }, ProjectNotesReadSchema),
     readCatalog: (taskId?: string): Promise<ChatCatalogRead> =>
       read('ReadChatCatalog', taskId ? { taskId } : {}, ChatCatalogReadSchema),
     readBranchStatus: (taskId: string, branch: string): Promise<ChatBranchStatus> =>

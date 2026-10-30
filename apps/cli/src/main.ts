@@ -52,6 +52,7 @@ import {
   type WorkspaceContinuation,
 } from '@crewkite/contracts';
 import { connectChat } from './chat/connect.ts';
+import { runNotesCommand } from './chat/notes.ts';
 import { type Connect, notDone, runPrint, runThreadCommand } from './chat/scripting.ts';
 import { runSearchCommand } from './chat/search.ts';
 import { runDiagnosticsCommand } from './diagnostics.ts';
@@ -64,6 +65,7 @@ const help = `Usage: crewkite                     interactive mode in a terminal
        crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show> ... (crewkite thread --help)
        crewkite diagnostics export <folder> [--thread task-id] [--home path]
        crewkite search <text> [--limit 1..50] [--per-thread 1..5] [--json] [--home path]
+       crewkite notes <list|add|remove> <project-id> [text|note-id] [--json] (crewkite notes --help)
        crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
@@ -142,6 +144,7 @@ export async function runCli(
   if (args[0] === 'thread') return runThreadCommand(args.slice(1), output, connect);
   if (args[0] === 'diagnostics') return runDiagnosticsCommand(args.slice(1), output, connect);
   if (args[0] === 'search') return runSearchCommand(args.slice(1), output, connect);
+  if (args[0] === 'notes') return runNotesCommand(args.slice(1), output, connect);
   if (printRequested(args)) return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
   const streamWrite = async (text: string) => {
