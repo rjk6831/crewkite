@@ -102,6 +102,6 @@ The CLI talks to the same controller as the desktop, so keep the desktop open wh
 4. Open Changes with Ctrl+G. Press A to accept on a new branch, then P to push it once you agree to the question, and O to open a pull request.
 5. Try the slash commands: `/model`, `/provider`, `/crew`, `/ask` and `/help`. Type `@` and part of a file name to mention a file.
 6. Leave with Ctrl+C. While a reply runs, it asks first, and the reply keeps running in the controller. The desktop shows the same thread.
-7. Script it. `pnpm crewkite -p "What does netMinor return for 3000 and 4000?"` prints one reply and exits with the turn's status, and `pnpm crewkite thread list --json` prints the threads as JSON lines.
+7. Script it. `pnpm crewkite -p "What does netMinor return for 3000 and 4000?"` prints one reply and exits with the turn's status, and `pnpm crewkite thread list --json` prints the threads as JSON lines. `pnpm crewkite thread stop <thread-id>` ends the running reply, clears the messages queued behind it and prints how many.
 
 Set `NO_COLOR=1` to check the screens without colour, and pass `--no-animation` to keep the spinner still. Note anything the CLI showed differently from the desktop in your record.

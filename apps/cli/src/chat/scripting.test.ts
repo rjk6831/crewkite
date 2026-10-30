@@ -9,7 +9,7 @@ import { createSyntheticRepository } from '../../../../packages/testkit/src/repo
 import { printRequested, runCli } from '../main.ts';
 import { startScriptedController } from '../scripted-controller.ts';
 import { connectChat } from './connect.ts';
-import { runPrint } from './scripting.ts';
+import { clearedQueueLine, runPrint } from './scripting.ts';
 
 const failure = {
   stage: 'stream' as const,
@@ -122,7 +122,19 @@ test('print mode streams the reply, uses only a registered checkout and exits wi
     plainEnv,
   );
   const taskId = await started.promise;
-  assert.equal(await runCli(['thread', 'stop', taskId, '--home', home], capture().output), 0);
+  // A message queued behind the running reply is cleared by the stop, and the stop says so.
+  const queuing = await connectChat(home);
+  const queued = await queuing.sendMessage({
+    taskId,
+    text: 'Then the totals.',
+    selection: { family: 'anthropic', model: 'fixture-model', effort: 'default' },
+  });
+  assert.equal(queued.outcome, 'applied');
+  assert.equal((await queuing.readThread(taskId)).thread.queued.length, 1);
+  queuing.transport.close();
+  const stopped = capture();
+  assert.equal(await runCli(['thread', 'stop', taskId, '--home', home], stopped.output), 0);
+  assert.equal(stopped.io.out, 'Cleared 1 queued message.\n');
   assert.equal(await printing, 3);
 
   // A checkout the controller does not hold is refused without registering it, and the refusal
@@ -388,4 +400,40 @@ test('a computer without git reports degraded health and names git when it refus
     assert.match(refused.io.out, new RegExp(`^git-unavailable\\n${row.line}\\.`), row.state);
     assert.doesNotMatch(refused.io.out, /Choose a readable/, row.state);
   }
+});
+
+test('thread stop names how many queued messages it cleared and says nothing when it cleared none', () => {
+  const message = {
+    id: 'msg_00000000000000000000000001',
+    at: '2026-10-23T12:00:00.000Z',
+    text: 'Then the totals.',
+    role: 'assistant' as const,
+    attachments: [],
+    files: [],
+  };
+  const rows = [
+    { name: 'no data', result: { outcome: 'applied' as const }, line: null },
+    {
+      name: 'empty queue',
+      result: { outcome: 'applied' as const, data: { kind: 'chat-queue' as const, messages: [] } },
+      line: null,
+    },
+    {
+      name: 'one message',
+      result: {
+        outcome: 'applied' as const,
+        data: { kind: 'chat-queue' as const, messages: [message] },
+      },
+      line: 'Cleared 1 queued message.',
+    },
+    {
+      name: 'three messages',
+      result: {
+        outcome: 'applied' as const,
+        data: { kind: 'chat-queue' as const, messages: [message, message, message] },
+      },
+      line: 'Cleared 3 queued messages.',
+    },
+  ];
+  for (const row of rows) assert.equal(clearedQueueLine(row.result), row.line, row.name);
 });

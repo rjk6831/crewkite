@@ -65,6 +65,12 @@ export function jsonLine(line: CliJsonLine): string {
   return `${JSON.stringify(CliJsonLineSchema.parse(line))}\n`;
 }
 
+/** What `thread stop` says when the stop took messages out of the queue, or null when it took none. */
+export function clearedQueueLine(result: CommandResult): string | null {
+  const count = result.data?.kind === 'chat-queue' ? result.data.messages.length : 0;
+  return count > 0 ? `Cleared ${count} queued ${count === 1 ? 'message' : 'messages'}.` : null;
+}
+
 const resultLine = (
   command: string,
   result: CommandResult,
@@ -664,7 +670,10 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
           taskId,
           turnId: read.thread.activeTurnId,
         });
-        return await report('StopChatTurn', result, taskId);
+        const code = await report('StopChatTurn', result, taskId);
+        const cleared = clearedQueueLine(result);
+        if (!json && code === 0 && cleared) await io.out(`${cleared}\n`);
+        return code;
       }
       case 'accept': {
         const taskId = need(first, 'thread ID');

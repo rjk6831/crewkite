@@ -1406,13 +1406,16 @@ export class ChatService {
         const left = this.stillPresent(turn);
         this.settle(turn.id, {
           state: 'failed',
-          failure: left.length
-            ? processFailure(left)
-            : chatFailure({
-                stage: 'stream',
-                kind: 'internal',
-                message: 'The turn did not finish before the controller restarted.',
-              }),
+          failure: {
+            ...(left.length
+              ? processFailure(left)
+              : chatFailure({
+                  stage: 'stream',
+                  kind: 'internal',
+                  message: 'The turn did not finish before the controller restarted.',
+                })),
+            detail: RESTART_DETAIL,
+          },
           text: streamedText(this.agentEvents(turn.taskId, turn.id)),
           session: null,
           stopReason: 'error',
@@ -2735,7 +2738,9 @@ export class ChatService {
    * the stopped message and the queue moves once that turn settles, and a new send starts the
    * oldest queued message right away. A send that waited on a family busy in another thread
    * came after the failure too, so the queue moves when that family frees. A leftover process
-   * holds the queue until a later check finds it gone.
+   * holds the queue until a later check finds it gone. A turn that startup recovery failed
+   * does not hold it: the reply died with the controller, not on a limit or a sign-in, so the
+   * messages queued before the restart start once the thread is free.
    */
   private continueQueue(taskId: string) {
     const effects: Effects = [];
@@ -2754,7 +2759,13 @@ export class ChatService {
           return;
         const newest = this.newestTurn(taskId);
         const sentAfter = newest?.endedAt && (thread.queued.at(-1)?.at ?? '') > newest.endedAt;
-        if (newest && (newest.state === 'failed' || endedOnLimit(newest)) && !sentAfter) return;
+        if (
+          newest &&
+          (newest.state === 'failed' || endedOnLimit(newest)) &&
+          !endedByRestart(newest) &&
+          !sentAfter
+        )
+          return;
         if (this.waitsOnFamily(task, thread, this.plans.route(thread, thread.queued[0]))) return;
         const started = this.startQueued(task, effects);
         if (started.outcome !== 'applied')
@@ -3877,6 +3888,13 @@ function readOnlyCommand(input: unknown, scratch: string): boolean {
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */
+// Startup recovery writes this as the failure detail, so a turn it failed stays recognizable.
+const RESTART_DETAIL = 'The controller restarted while this turn was open.';
+
+function endedByRestart(turn: ChatTurn): boolean {
+  return turn.state === 'failed' && turn.failure?.detail === RESTART_DETAIL;
+}
+
 function endedOnLimit(turn: ChatTurn): boolean {
   return turn.stopReason
     ? turn.stopReason === 'limit'

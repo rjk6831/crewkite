@@ -3829,3 +3829,72 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
   service.close();
   await assert.rejects(service.runCombinedChecks(taskId, first), /closed/);
 });
+
+test('startup recovery lets a queued message start, and any other failed turn still holds the queue', {
+  timeout: 30000,
+}, async (t) => {
+  const failed = chatFailure({
+    stage: 'stream',
+    kind: 'client-exit',
+    message: 'The client exited.',
+  });
+  const rows = [
+    {
+      name: 'the controller stopped mid-turn',
+      // The first turn never launches: the process ends after the command commits. The only
+      // scripted turn belongs to the queued message.
+      crash: true,
+      turns: [[{ kind: 'text' as const, itemId: 'reply', chunks: ['Done.'] }]],
+      started: true,
+    },
+    {
+      name: 'the client failed on its own',
+      crash: false,
+      turns: [[{ kind: 'fail' as const, stopReason: 'error' as const, failure: failed }]],
+      started: false,
+    },
+  ];
+  for (const row of rows) {
+    const thread = standalone(t, {
+      adapters: new Map([
+        ['openai', createScriptedChatAdapter({ family: 'openai', turns: row.turns })],
+      ]),
+    });
+    const { store, taskId } = thread;
+    const ended = turnReaches(thread, row.crash ? 'done' : 'failed');
+    if (row.crash)
+      store.transaction(() =>
+        thread.service.sendMessage(
+          {
+            taskId,
+            text: 'Start the change.',
+            selection,
+            role: 'assistant',
+            attachments: [],
+            files: [],
+          },
+          [],
+        ),
+      );
+    else thread.send('Start the change.');
+    assert.equal(thread.send('Then the totals.').outcome, 'applied', row.name);
+    assert.deepEqual(
+      thread.read().thread.queued.map((message) => message.text),
+      ['Then the totals.'],
+      row.name,
+    );
+    if (!row.crash) await ended;
+    const restarted = thread.start();
+    restarted.recover();
+    if (row.crash) await ended;
+    const after = thread.read(restarted);
+    assert.equal(after.turns.length, row.started ? 2 : 1, row.name);
+    assert.equal(after.turns[0].state, 'failed', row.name);
+    assert.deepEqual(
+      after.thread.queued.map((message) => message.text),
+      row.started ? [] : ['Then the totals.'],
+      row.name,
+    );
+    if (row.started) assert.equal(after.turns[1].state, 'done', row.name);
+  }
+});
