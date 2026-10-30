@@ -24,7 +24,7 @@ const line = (cells: readonly (string | number | null)[]) => cells.map(csvCell).
 
 const turnColumns = [
   'thread',
-  'turn',
+  'sequence',
   'role',
   'family',
   'model',

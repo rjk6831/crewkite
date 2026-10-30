@@ -51,6 +51,7 @@ import {
   TaskSchema,
   type WorkspaceContinuation,
 } from '@crewkite/contracts';
+import { runUsageAnalytics } from './chat/analytics.ts';
 import { connectChat } from './chat/connect.ts';
 import { runNotesCommand } from './chat/notes.ts';
 import { type Connect, notDone, runPrint, runThreadCommand } from './chat/scripting.ts';
@@ -93,6 +94,7 @@ const help = `Usage: crewkite                     interactive mode in a terminal
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
+       crewkite usage <thread|project> <id> [--csv new-file] [--json] [--home path]
        crewkite usage refresh --family google|openai|anthropic [--native-trust --usage-scope hash] [--json] [--home path]
        crewkite usage stop <operation-id> --family anthropic [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--maximum-task-ms 300000|600000] [--context-lines START:END] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
@@ -145,6 +147,8 @@ export async function runCli(
   if (args[0] === 'diagnostics') return runDiagnosticsCommand(args.slice(1), output, connect);
   if (args[0] === 'search') return runSearchCommand(args.slice(1), output, connect);
   if (args[0] === 'notes') return runNotesCommand(args.slice(1), output, connect);
+  if (args[0] === 'usage' && (args[1] === 'thread' || args[1] === 'project'))
+    return runUsageAnalytics(args.slice(1), output, connect);
   if (printRequested(args)) return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
   const streamWrite = async (text: string) => {

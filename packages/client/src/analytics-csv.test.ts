@@ -96,7 +96,7 @@ test('a thread file has a row for each turn and reads back as written', () => {
     ],
   } as unknown as ChatAnalyticsRead;
   const text = analyticsToCsv(read);
-  assert.ok(text.startsWith('﻿thread,turn,role,'));
+  assert.ok(text.startsWith('﻿thread,sequence,role,'));
   assert.ok(text.endsWith('\r\n'));
   const rows = parse(text);
   assert.equal(rows.length, 4);

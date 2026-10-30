@@ -190,5 +190,6 @@ export class FrameDecoder {
 }
 
 export * from './analytics-csv.ts';
+export * from './analytics-format.ts';
 export * from './mentions.ts';
 export * from './slash-commands.ts';
