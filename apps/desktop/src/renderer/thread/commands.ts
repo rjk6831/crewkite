@@ -193,8 +193,9 @@ async function promptList(source: ThreadSource, command: string, payload: unknow
 }
 
 /**
- * A project's notes. Every change answers with the whole list, so the view never patches its own
- * copy. The text is cleaned the way the CLI cleans it, and the controller checks it again.
+ * A project's notes. A change answers with a small record, so each change reads the list again and
+ * the view never patches its own copy. The text is cleaned the way the CLI cleans it, and the
+ * controller checks it again.
  */
 export const readNotes = (source: ThreadSource, projectId: string): Promise<ProjectNotesRead> =>
   read(
@@ -203,40 +204,43 @@ export const readNotes = (source: ThreadSource, projectId: string): Promise<Proj
     ReadProjectNotesPayloadSchema.parse({ projectId }),
     ProjectNotesReadSchema,
   );
-export const addNote = (
+export const addNote = async (
   source: ThreadSource,
   projectId: string,
   text: string,
-): Promise<ProjectNotesRead> =>
-  read(
+): Promise<ProjectNotesRead> => {
+  await run(
     source,
     'AddProjectNote',
     AddProjectNotePayloadSchema.parse({ projectId, text: normalizeNoteText(text) }),
-    ProjectNotesReadSchema,
   );
-export const editNote = (
+  return readNotes(source, projectId);
+};
+export const editNote = async (
   source: ThreadSource,
   projectId: string,
   noteId: string,
   text: string,
-): Promise<ProjectNotesRead> =>
-  read(
+): Promise<ProjectNotesRead> => {
+  await run(
     source,
     'EditProjectNote',
     EditProjectNotePayloadSchema.parse({ projectId, noteId, text: normalizeNoteText(text) }),
-    ProjectNotesReadSchema,
   );
-export const removeNote = (
+  return readNotes(source, projectId);
+};
+export const removeNote = async (
   source: ThreadSource,
   projectId: string,
   noteId: string,
-): Promise<ProjectNotesRead> =>
-  read(
+): Promise<ProjectNotesRead> => {
+  await run(
     source,
     'RemoveProjectNote',
     RemoveProjectNotePayloadSchema.parse({ projectId, noteId }),
-    ProjectNotesReadSchema,
   );
+  return readNotes(source, projectId);
+};
 
 export const sendMessage = (
   source: ThreadSource,

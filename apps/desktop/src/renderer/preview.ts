@@ -102,7 +102,15 @@ export function createPreviewSource(): DesktopSource {
         rows.filter((row) => row.id !== payload.noteId),
       );
     else notes.set(projectId, rows);
-    return { outcome: 'applied', data: noteList(projectId) } as CommandResult;
+    const now = noteList(projectId);
+    // A read answers with the list. A change answers with the small record the controller sends.
+    return {
+      outcome: 'applied',
+      data:
+        name === 'ReadProjectNotes'
+          ? now
+          : { kind: 'project-notes-changed', projectId, bytes: now.bytes },
+    } as CommandResult;
   }
   function composerCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
     const applied = (data: unknown) => ({ outcome: 'applied', data }) as CommandResult;

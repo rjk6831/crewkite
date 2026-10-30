@@ -145,11 +145,15 @@ export function chatClient(
     readPrompts: (): Promise<SavedPrompts> => read('ReadChatPrompts', {}, SavedPromptsSchema),
     readNotes: (projectId: string): Promise<ProjectNotesRead> =>
       read('ReadProjectNotes', { projectId }, ProjectNotesReadSchema),
-    /** Each note change answers with the project's whole list. */
-    addNote: (projectId: string, text: string): Promise<ProjectNotesRead> =>
-      read('AddProjectNote', { projectId, text }, ProjectNotesReadSchema),
-    removeNote: (projectId: string, noteId: string): Promise<ProjectNotesRead> =>
-      read('RemoveProjectNote', { projectId, noteId }, ProjectNotesReadSchema),
+    /** A note change answers with a small record, so these read the list again. */
+    addNote: async (projectId: string, text: string): Promise<ProjectNotesRead> => {
+      await run('AddProjectNote', { projectId, text });
+      return read('ReadProjectNotes', { projectId }, ProjectNotesReadSchema);
+    },
+    removeNote: async (projectId: string, noteId: string): Promise<ProjectNotesRead> => {
+      await run('RemoveProjectNote', { projectId, noteId });
+      return read('ReadProjectNotes', { projectId }, ProjectNotesReadSchema);
+    },
     readCatalog: (taskId?: string): Promise<ChatCatalogRead> =>
       read('ReadChatCatalog', taskId ? { taskId } : {}, ChatCatalogReadSchema),
     readBranchStatus: (taskId: string, branch: string): Promise<ChatBranchStatus> =>
