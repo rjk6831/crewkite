@@ -1,7 +1,8 @@
 // Names that mark a value as a secret. The word must end the name, so keyboard and tokenizer stay.
 const SECRET_WORDS =
   '(?:token|secret|password|passwd|pwd|key|apikey|authorization|credential|cookie)s?';
-const VALUE = `(?:(?:Bearer|Basic|Token)\\s+)?(?:"[^"\\n]*"|'[^'\\n]*'|[^\\s,;}&"']+)`;
+// A Bearer or Basic credential an earlier rule already replaced stays as it is.
+const VALUE = `(?!(?:Bearer|Basic) \\[redacted\\])(?:Token\\s+)?(?:"[^"\\n]*"|'[^'\\n]*'|[^\\s,;}&"']+)`;
 
 const PATTERNS: Array<[RegExp, string]> = [
   // A private key block, across lines, or to the end of the text when the block is cut off.
