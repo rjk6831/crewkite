@@ -4,8 +4,10 @@ import type { ChatAnalyticsRead } from '@crewkite/contracts';
 // writes a row for each turn and a project writes a row for each thread. An empty cell means the
 // value is unknown. It never stands for zero.
 
-// A spreadsheet runs a cell that starts with one of these as a formula.
-const FORMULA_START = /^[=+\-@\t\r]/;
+// A spreadsheet runs a cell that starts with one of these as a formula, also after white space and
+// when the sign is a full-width form. A cell that starts with a tab, return or line feed can
+// hide the formula the same way.
+const FORMULA_START = /^\s*[=+\-@＝＋－＠]|^[\t\r\n]/;
 
 /**
  * One CSV cell. Null is empty. Text that a spreadsheet would run as a formula gets a leading
@@ -46,16 +48,21 @@ const threadColumns = [
   'wall_ms',
   'tokens_in',
   'tokens_out',
-  'token_turns',
+  'tokens_in_turns',
+  'tokens_out_turns',
   'checks_run',
   'checks_passed',
   'checks_failed',
-  'branches_accepted',
+  'acceptances',
   'slices_total',
   'slices_done',
   'slices_failed',
   'slices_blocked',
 ];
+
+/** A closing row that says what the read left out, padded to the width of the table. */
+const noteLine = (text: string, width: number) =>
+  line([text, ...Array.from({ length: width - 1 }, () => null)]);
 
 /**
  * The file for a read, with a byte order mark so a spreadsheet reads the text as UTF-8 and lines
@@ -101,11 +108,12 @@ export function analyticsToCsv(read: ChatAnalyticsRead): string {
               thread.wallMs,
               thread.tokensIn,
               thread.tokensOut,
-              thread.tokenTurns,
+              thread.tokensInTurns,
+              thread.tokensOutTurns,
               thread.checksRun,
               thread.checksPassed,
               thread.checksFailed,
-              thread.branchesAccepted,
+              thread.acceptances,
               thread.slices?.total ?? null,
               thread.slices?.done ?? null,
               thread.slices?.failed ?? null,
@@ -113,5 +121,28 @@ export function analyticsToCsv(read: ChatAnalyticsRead): string {
             ]),
           ),
         ];
-  return `﻿${rows.join('\r\n')}\r\n`;
+  // A capped read ends with a row that says so, so the file never reads as complete when it is not.
+  const width = read.scope === 'thread' ? turnColumns.length : threadColumns.length;
+  if (read.scope === 'thread' && read.turnRowsOmitted > 0)
+    rows.push(
+      noteLine(
+        `${read.turnRowsOmitted} earlier turns are not in this file. It holds the newest ${read.turnRows.length}.`,
+        width,
+      ),
+    );
+  if (read.scope === 'project' && read.threadCount > read.threads.length)
+    rows.push(
+      noteLine(
+        `${read.threadCount - read.threads.length} threads are not in this file. It holds the first ${read.threads.length} by title.`,
+        width,
+      ),
+    );
+  if (read.gaugeTruncated)
+    rows.push(
+      noteLine(
+        'The gauge read stopped at its row cap, so allowance may be missing for some turns.',
+        width,
+      ),
+    );
+  return `\uFEFF${rows.join('\r\n')}\r\n`;
 }
