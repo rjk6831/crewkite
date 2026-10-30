@@ -12,7 +12,7 @@ import {
   type Task,
 } from '@crewkite/contracts';
 import type { Store } from '../store/index.ts';
-import { redact } from './thread-reader.ts';
+import { redact, withoutHiddenCharacters } from './redact.ts';
 
 // Thread export. The controller renders the thread as Markdown for the person's own notes or as a
 // read-only share page, and the client writes the text where the person chose. The renderer never
@@ -69,21 +69,28 @@ function folderPattern(folder: string): RegExp | null {
   );
 }
 
+// Folders that name a person. A WSL path to the Windows profile comes before the plain Users rule,
+// which a drive letter in front would otherwise hide.
 const OTHER_HOMES = [
+  /(?<![\w.~-])\/mnt\/[a-z]\/Users\/[^/\\\s'"`:;,)\]}>]+/g,
   /(?<![\w.~-])\/(?:Users|home)\/[^/\\\s'"`:;,)\]}>]+/g,
   /(?<![\w.~-])[A-Za-z]:\\Users\\[^\\\s'"`:;,)\]}>]+/g,
   /(?<![\w.~-])\/root(?![\w.-])/g,
 ];
-const EMAIL = /[\p{L}\p{N}._%+-]+@[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+/gu;
-// Control characters other than the line break and the tab, and the bidirectional controls that
-// can reorder text on screen.
-const CONTROL = /[\p{Cc}؜‎‏‪-‮⁦-⁩]/gu;
+// Temporary folders carry a per-user hash on a Mac and often a name elsewhere. The first part
+// after /tmp or the hash folder goes, and the rest of the path stays.
+const TEMP_FOLDERS = [
+  /(?<![\w.~-])(?:\/private)?\/var\/folders\/[A-Za-z0-9_]+\/[A-Za-z0-9_]+\/[A-Za-z0-9](?![\w.-])/g,
+  /(?<![\w.~-])(?:\/private)?\/tmp\/[^/\\\s'"`:;,)\]}>]+/g,
+];
+// The local part starts where its run of characters starts, so a long run is read once.
+const EMAIL = /(?<![\p{L}\p{N}._%+-])[\p{L}\p{N}._%+-]+@[\p{L}\p{N}-]+(?:\.[\p{L}\p{N}-]+)+/gu;
 const KEEP = new Set(['\n', '\t']);
 
 /**
  * Every text field goes through this before it is placed in an export: well-formed Unicode with no
- * control or reordering characters, paths reduced, the controller's pattern redaction for secrets,
- * then email addresses. Redaction matches known shapes and misses others, which ADR 0044 says.
+ * control, format or reordering characters, paths reduced, the controller's pattern redaction for
+ * secrets, then email addresses. Redaction matches known shapes and misses others, which ADR 0044 says.
  */
 export function scrubber(paths: ExportPaths): (text: string) => string {
   const folders = [...new Set(paths.roots)]
@@ -99,12 +106,16 @@ export function scrubber(paths: ExportPaths): (text: string) => string {
       return pattern ? [pattern] : [];
     });
   return (text) => {
-    let next = text.toWellFormed().replace(CONTROL, (found) => (KEEP.has(found) ? found : ''));
+    // Format characters go first, so a path or an address split by one is whole for the rules.
+    let next = withoutHiddenCharacters(text.toWellFormed()).replace(/\p{Cc}/gu, (found) =>
+      KEEP.has(found) ? found : '',
+    );
     for (const { pattern, to } of folders)
       next = next.replace(pattern, (found) => (/[\\/]$/.test(found) ? to : '.'));
     for (const pattern of homes)
       next = next.replace(pattern, (found) => (/[\\/]$/.test(found) ? '~/' : '~'));
     for (const pattern of OTHER_HOMES) next = next.replace(pattern, '~');
+    for (const pattern of TEMP_FOLDERS) next = next.replace(pattern, '$TMPDIR');
     return redact(next).replace(EMAIL, '[redacted]');
   };
 }
@@ -172,34 +183,47 @@ function newest(blocks: readonly string[]): { kept: string[]; dropped: number } 
   return { kept: blocks.slice(start), dropped: start };
 }
 
+const longestRun = (text: string) =>
+  (text.match(/`+/g) ?? []).reduce((most, run) => Math.max(most, run.length), 0);
+/** Inline code one backtick longer than any run inside it, so the text cannot close it early. */
 const fence = (value: string) => {
   const text = value || 'no title';
-  const longest = Math.max(0, ...(text.match(/`+/g) ?? []).map((run) => run.length));
-  const ticks = '`'.repeat(Math.max(1, longest + 1));
+  const ticks = '`'.repeat(longestRun(text) + 1);
   return `${ticks}${text.startsWith('`') || text.endsWith('`') ? ` ${text} ` : text}${ticks}`;
 };
+/**
+ * A code block one backtick longer than any run inside it, so a message cannot end it, start a
+ * heading of its own or open a block that swallows what follows.
+ */
+const block = (text: string) => {
+  const ticks = '`'.repeat(Math.max(3, longestRun(text) + 1));
+  return `${ticks}text\n${text}\n${ticks}`;
+};
+// Characters that start Markdown markup inside a line. Used for the fields that sit outside a code
+// span, which is a heading and nothing else.
+const plain = (value: string) => value.replace(/[\\`*_[\]<>#|~&]/g, '\\$&');
 
 /** The thread as Markdown. A tool call is one line, and attachments are named, not embedded. */
 export function renderMarkdown(model: ExportModel): { text: string; omitted: number } {
   const blocks = model.messages.map((message) => {
-    const lines = [`## ${speaker(message)}`, '', `_${message.at}_`, ''];
+    const lines = [`## ${plain(speaker(message))}`, '', `_${message.at}_`, ''];
     if (message.tools.length > 0) {
       for (const tool of message.tools) lines.push(`- ${toolWord(tool)}: ${fence(tool.title)}`);
       if (message.more) lines.push(`- and ${message.more} more tool calls`);
       lines.push('');
     }
-    if (message.text) lines.push(message.text, '');
+    if (message.text) lines.push(block(message.text), '');
     if (message.files.length > 0)
-      lines.push(`Attachments, not included: ${message.files.join(', ')}`, '');
+      lines.push(`Attachments, not included: ${message.files.map(fence).join(', ')}`, '');
     return `${lines.join('\n')}\n`;
   });
   const { kept, dropped } = newest(blocks);
   const omitted = model.older + dropped;
   const head = [
-    `# ${model.title}`,
+    `# ${plain(model.title)}`,
     '',
     `${model.turns} ${model.turns === 1 ? 'turn' : 'turns'} on ${model.families.join(', ') || 'no provider'}. ${dateRange(model)}.`,
-    'Secrets and email addresses are redacted. Each tool call is one line. Attachments are named and not included.',
+    'Secrets, email addresses and folder paths are redacted. Redaction matches known patterns and can miss others, so read the file before you share it. Each tool call is one line. Attachments are named and not included.',
     ...(omitted > 0
       ? [`${omitted} earlier ${omitted === 1 ? 'message is' : 'messages are'} not in this file.`]
       : []),
@@ -272,7 +296,7 @@ export function renderShare(model: ExportModel): { text: string; omitted: number
 <p>A read-only copy of a CrewKite thread. This page runs no code and loads nothing from the network.</p>
 <dl>
 <dt>Contains</dt><dd>${model.turns} ${model.turns === 1 ? 'turn' : 'turns'} on ${families}, ${escapeHtml(dateRange(model))}. The messages in order, with each tool call as one line.${omitted > 0 ? ` ${omitted} earlier ${omitted === 1 ? 'message is' : 'messages are'} not on this page.` : ''}</dd>
-<dt>Redacted</dt><dd>Secrets and email addresses are replaced with [redacted]. Folder paths inside the project are shown relative to it, and home folders are shown as ~. Redaction matches known patterns and can miss other formats, so read the page before you share it.</dd>
+<dt>Redacted</dt><dd>Secrets and email addresses are replaced with [redacted]. Folder paths inside the project are shown relative to it, home folders as ~ and temporary folders as $TMPDIR. Redaction matches known patterns and can miss other formats, so read the page before you share it.</dd>
 <dt>Left out</dt><dd>Attachments, which are listed by name only, tool output, file contents and diffs, model reasoning, and the thread settings.</dd>
 </dl>
 </header>

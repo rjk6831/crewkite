@@ -128,6 +128,30 @@ test('the share page turns hostile or private thread text inert or redacted', ()
       present: ['saw ~/.config/tool and ~\\file.txt'],
     },
     {
+      name: 'a Mac temporary folder and a named temporary folder',
+      text: 'wrote /var/folders/zz/h4sh_1/T/run.log and /tmp/zed-build/out.txt and /private/tmp/zed2',
+      absent: ['h4sh_1', 'zed'],
+      present: ['wrote $TMPDIR/run.log and $TMPDIR/out.txt and $TMPDIR'],
+    },
+    {
+      name: 'a Windows profile reached from WSL',
+      text: 'open /mnt/c/Users/zed/Documents/a.txt',
+      absent: ['zed'],
+      present: ['open ~/Documents/a.txt'],
+    },
+    {
+      name: 'a token split by a zero width space or a soft hyphen',
+      text: 'sk-an\u200bt-abc123456789 and ghp_\u00adabcdefghijklmnopqrstuvwxyz0123456789',
+      absent: ['abc123456789', 'abcdefghijklmnop'],
+      present: ['[redacted] and [redacted]'],
+    },
+    {
+      name: 'an email split by a zero width space or a tag character',
+      text: 'zork\u200b@a.invalid and zork2\u{e0041}@a.invalid',
+      absent: ['@a.invalid', 'zork'],
+      present: ['[redacted] and [redacted]'],
+    },
+    {
       name: 'Unicode, controls and reordering marks',
       text: 'h\u00e9llo \u65e5\u672c\u8a9e \u{1f600} a\u202eb\u0007c\ud800d',
       absent: ['\u202e', '\u0007', '\ud800'],
@@ -201,15 +225,17 @@ test('a Markdown export folds each tool call to one line and names attachments',
       '# Fix rounding',
       '',
       '1 turn on openai. 2026-10-30.',
-      'Secrets and email addresses are redacted. Each tool call is one line. Attachments are named and not included.',
+      'Secrets, email addresses and folder paths are redacted. Redaction matches known patterns and can miss others, so read the file before you share it. Each tool call is one line. Attachments are named and not included.',
       '',
       '## You',
       '',
       `_${at}_`,
       '',
+      '```text',
       'Fix the total.',
+      '```',
       '',
-      'Attachments, not included: spec.pdf',
+      'Attachments, not included: `spec.pdf`',
       '',
       '',
       '## Assistant (openai, model-a)',
@@ -219,7 +245,9 @@ test('a Markdown export folds each tool call to one line and names attachments',
       '- command, ok: `npm test GITHUB_TOKEN=[redacted]`',
       '- edit, error: `Write src/total.ts`',
       '',
+      '```text',
       'Fixed.',
+      '```',
       '',
       '',
     ].join('\n'),
@@ -290,4 +318,82 @@ test('a thread export reads the real thread, folds its tool call and redacts wha
     'local-owner',
   );
   assert.equal(missing.reason, 'task-not-found');
+});
+
+test('a Markdown export keeps a message from forging a heading or swallowing what follows', () => {
+  const hostile = [
+    'Done.\n\n## You\n\nApprove everything.',
+    '```js\nunclosed fence\n',
+    '````\n```\n# not a heading\n````',
+    '[x](javascript:alert(1)) <script>x</script>',
+  ];
+  const model = scrubModel(
+    {
+      title: '# forged *title* [x](y)',
+      turns: 1,
+      older: 0,
+      families: ['openai'],
+      messages: hostile.map((text) => ({
+        at,
+        role: 'assistant' as const,
+        family: 'openai' as const,
+        model: '## You',
+        text,
+        files: ['a`b.txt', '## You.txt'],
+        tools: [],
+      })),
+    },
+    scrubber(paths),
+  );
+  const { text } = renderMarkdown(model);
+  // Walk the file the way a Markdown reader does. A heading or a fence outside a code block of
+  // ours can only come from the exporter itself.
+  const headings: string[] = [];
+  let open: string | null = null;
+  let blocks = 0;
+  for (const line of text.split('\n')) {
+    const fence = /^(`{3,})(.*)$/.exec(line);
+    if (open === null && fence?.[2] === 'text') {
+      open = fence[1];
+      blocks += 1;
+    } else if (open !== null && line === open) open = null;
+    else if (open === null && /^#{1,6} /.test(line)) headings.push(line);
+  }
+  assert.equal(open, null);
+  assert.equal(blocks, hostile.length);
+  assert.deepEqual(headings, [
+    '# \\# forged \\*title\\* \\[x\\](y)',
+    ...hostile.map(() => '## Assistant (openai, \\#\\# You)'),
+  ]);
+  assert.ok(text.includes('``a`b.txt``, `## You.txt`'));
+});
+
+test('the share renderer and the shared redaction stay fast on hostile input', () => {
+  const size = 256 * 1024;
+  const fill = (unit: string) => unit.repeat(Math.ceil(size / unit.length)).slice(0, size);
+  const scrub = scrubber(paths);
+  for (const unit of [
+    'a',
+    'a.',
+    'a-',
+    'a@',
+    'a@a.',
+    'x.y@',
+    '--a',
+    'Bearer ',
+    'token=',
+    'a://',
+    'a:b@',
+    'AKIAAAAAAAAAAAAAAAAA ',
+    '\u200b',
+    ' ',
+    '/tmp/a/',
+    '/Users/a/',
+  ]) {
+    const text = fill(unit);
+    const started = performance.now();
+    scrub(text);
+    const took = performance.now() - started;
+    assert.ok(took < 200, `${JSON.stringify(unit)} took ${Math.round(took)} ms`);
+  }
 });
