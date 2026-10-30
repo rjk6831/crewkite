@@ -51,6 +51,7 @@ Google's third-party access FAQ says that third-party access through its coding 
 ## Documentation
 
 - [Preview walkthrough](docs/preview.md)
+- [Uninstall](docs/preview.md#uninstall)
 - [Architecture](docs/architecture.md)
 - [Provider routes](docs/providers.md)
 - [Usage and routing](docs/routing.md)

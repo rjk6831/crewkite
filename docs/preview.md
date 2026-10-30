@@ -88,6 +88,22 @@ Skip is on every step and ends the welcome for good. The desktop keeps that flag
 
 On Windows and Linux the window shortcuts use Control in place of Command. The window shortcuts wait while a dialog is open. Control N and Control P move the caret in a Mac text box, so on a Mac only Command counts.
 
+## Uninstall
+
+CrewKite keeps its data in four places. Quit the app with Command-Q first, so the controller stops.
+
+1. The app. A preview package is the folder you extracted, so move that folder to the Trash. A source checkout is the folder you cloned.
+2. The controller data folder. It holds the database, the thread records, the scratch copies and the attached files. A package keeps it at `state/home` inside the package folder, so step 1 already removed it. `pnpm desktop` and the CLI use `.crewkite` in your home folder, or the folder named by `CREWKITE_HOME`.
+3. The desktop profile folder. It holds the window position, the welcome flag, the logs, the crash records, your MCP server list and a remembered Local token, with the list's secrets and the token encrypted. A package keeps it at `state/profile` inside the package folder. `pnpm desktop` uses `.crewkite-desktop` in your home folder, or the folder named by `CREWKITE_PROFILE`.
+4. The scratch copies. Each thread's copy sits at `chat/<thread-id>/scratch` inside the controller data folder, with its attached files at `chat/<thread-id>/files`, so step 2 removes them. To remove one thread, its copy and its files, use Delete in the thread's menu in the left rail. A file pasted into the composer waits in a `crewkite-paste-` folder in the system temp folder, which macOS clears.
+5. The git refs. Each thread pins its base commit in your project's repository at `refs/crewkite/threads/<thread-id>`, so the commit survives garbage collection after you delete an accepted branch. Delete in the thread's menu removes the ref, and removing the data folder does not. To remove every thread ref in a repository, run this inside it:
+
+```sh
+git for-each-ref --format='delete %(refname)' refs/crewkite/threads/ | git update-ref --stdin
+```
+
+Run it once in each project you added. It touches no branch, no working tree and no HEAD. The branches you accepted stay in your repository, and `git for-each-ref refs/crewkite/threads/` prints nothing once the refs are gone. A provider client stays signed in until you sign it out in that client.
+
 ## Send a short record
 
 Keep a short record of what you asked, which provider answered, any refusal or error line, what Changes showed, and whether the next action was clear. A few sentences is enough. The [roadmap](roadmap.md) lists the open evidence gates.
