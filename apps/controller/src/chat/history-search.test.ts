@@ -315,6 +315,57 @@ test('a very large number of matches is cut at the best ones', (t) => {
   assert.equal(result.more, true);
 });
 
+test('one busy thread cannot fill the page, so quieter threads still appear', (t) => {
+  const { store } = openStore(t);
+  const w = world(store);
+  // Thread 1 holds 450 short, strong matches. Threads 2 and 3 each hold one weaker match.
+  w.task(1, 'Busy thread');
+  for (let n = 1; n <= 450; n++) w.message(1, n, 'needle');
+  w.task(2, 'Quiet thread');
+  w.message(2, 1000, `a long message that mentions the needle once ${'filler '.repeat(80)}`);
+  w.task(3, 'Other thread');
+  w.message(3, 1001, `another long message about the needle ${'filler '.repeat(80)}`);
+  const result = search(store, 'needle', { limit: 10, perThread: 3 });
+  assert.deepEqual(
+    result.groups.map((group) => group.taskId).sort(),
+    [taskId(1), taskId(2), taskId(3)],
+    'all three threads are on the page',
+  );
+  const busy = result.groups.find((group) => group.taskId === taskId(1));
+  assert.equal(busy?.hits.length, 3, 'the busy thread keeps only its best few');
+  assert.equal(result.groups[0].taskId, taskId(1), 'the busy thread still ranks first');
+  assert.equal(result.more, true);
+});
+
+test('user messages get their turns from one read per thread', (t) => {
+  const { store } = openStore(t);
+  const w = world(store);
+  w.task(1, 'Turns');
+  for (let n = 1; n <= 4; n++) {
+    w.message(1, n, `question zebra ${n}`);
+    w.turn(1, n, n, n - 1);
+  }
+  const result = search(store, 'zebra', { perThread: 5 });
+  const turns = result.groups[0].hits.map((hit) => hit.turnId).sort();
+  assert.deepEqual(turns, [1, 2, 3, 4].map(turnId));
+});
+
+test('a message that holds the marker characters is shown without marks, not with false ones', (t) => {
+  const { store } = openStore(t);
+  const w = world(store);
+  w.task(1, 'Markers');
+  w.message(1, 1, 'before \u0001 the zebra \u0002 after');
+  w.task(2, 'Plain');
+  w.message(2, 2, 'a plain zebra here');
+  const result = search(store, 'zebra');
+  const byTask = (id: string) => result.groups.find((group) => group.taskId === id)?.hits[0];
+  const odd = byTask(taskId(1));
+  assert.ok(odd);
+  assert.equal(odd.marks.length, 0);
+  assert.ok(!odd.snippet.includes('\u0001') && !odd.snippet.includes('\u0002'));
+  assert.equal(byTask(taskId(2))?.marks.length, 1, 'other messages keep their marks');
+});
+
 const populate = (w: ReturnType<typeof world>) => {
   w.task(1, 'Old thread about rounding');
   w.message(1, 1, 'first question about totals');
@@ -533,8 +584,11 @@ test('a snippet reads its markers into offsets and flattens line breaks', () => 
     ],
     ['line one\nline\u0001 two\u0002', 'line one line two', [[13, 17]]],
     ['a\u0001 stray open', 'a stray open', []],
+    ['a stray close\u0002 and \u0001ab\u0002', 'a stray close and ab', [[18, 20]]],
+    ['\u0001one \u0001two\u0002', 'one two', [[0, 7]]],
     ['no marks at all', 'no marks at all', []],
   ];
+  assert.deepEqual(readSnippet('\u0001ab\u0002 cd', true), { snippet: 'ab cd', marks: [] });
   for (const [raw, text, marks] of rows) {
     const read = readSnippet(raw);
     assert.equal(read.snippet, text, raw);
