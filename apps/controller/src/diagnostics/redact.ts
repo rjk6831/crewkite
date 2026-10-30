@@ -6,7 +6,7 @@ import { redact as redactSecrets } from '../chat/redact.ts';
 // which becomes ~, and email addresses. It misses shapes it does not know, like the redaction it
 // builds on.
 
-const EMAIL = /\b[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b/g;
+const EMAIL = /(?<![A-Za-z0-9._%+-])[A-Za-z0-9._%+-]+@[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+\b/g;
 // A key whose name ends like a secret loses its whole value, whatever its type or shape.
 const SECRET_KEY =
   /(token|secret|password|passwd|pwd|key|apikey|authorization|credential|cookie)s?$/i;

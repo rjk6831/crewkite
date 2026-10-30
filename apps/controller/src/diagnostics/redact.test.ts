@@ -128,6 +128,91 @@ test('shared redaction removes every secret shape and leaves ordinary words, dig
         gone: ['line-split-value'],
         kept: ['apiToken'],
       },
+      {
+        name: 'fine grained token with underscores',
+        input: 'use github_pat_11ABCDEFG0_abcdefghijklmnop_qrstuv now',
+        gone: ['github_pat_11', 'qrstuv'],
+        kept: ['use', 'now'],
+      },
+      {
+        name: 'slack bot and user tokens',
+        input: 'xoxb-123456789012-abcdefABCDEF and xoxp-9876543210-zyxwvuZYXWVU',
+        gone: ['xoxb-1234', 'xoxp-9876', 'abcdefABCDEF'],
+        kept: [' and '],
+      },
+      {
+        name: 'aws key id then secret',
+        input: 'AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY ok',
+        gone: ['AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI'],
+        kept: ['ok'],
+      },
+      {
+        name: 'aws secret then key id',
+        input: 'aws wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY, "AKIAIOSFODNN7EXAMPLE" ok',
+        gone: ['AKIAIOSFODNN7EXAMPLE', 'wJalrXUtnFEMI'],
+        kept: ['aws', 'ok'],
+      },
+      {
+        name: 'aws key id alone',
+        input: 'id ASIAIOSFODNN7EXAMPLE',
+        gone: ['ASIAIOSFODNN7EXAMPLE'],
+      },
+      {
+        name: 'google api key',
+        input: 'key AIzaSyA-abcdefghijklmnopqrstuvwxyz012345 end',
+        gone: ['AIzaSyA'],
+        kept: ['end'],
+      },
+      {
+        name: 'authorization token scheme',
+        input: 'Authorization: token abc123def456\nnext',
+        gone: ['abc123def456'],
+        kept: ['next'],
+      },
+      {
+        name: 'set-cookie line',
+        input: 'Set-Cookie: sid=abc123; Path=/; HttpOnly\nnext line',
+        gone: ['abc123', 'HttpOnly'],
+        kept: ['next line'],
+      },
+      {
+        name: 'cookie inside a curl argument',
+        input: "curl -H 'Cookie: sid=abc123; theme=dark' https://example.com/x",
+        gone: ['abc123', 'theme=dark'],
+        kept: ['https://example.com/x'],
+      },
+      {
+        name: 'value on the next line after an equals sign',
+        input: 'GITHUB_TOKEN=\n  ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+        gone: ['ghp_abcdef'],
+        kept: ['GITHUB_TOKEN='],
+      },
+      {
+        name: 'plain value on the next line',
+        input: 'API_SECRET:\n  plainvalue99',
+        gone: ['plainvalue99'],
+      },
+      {
+        name: 'key split by a zero width space',
+        input: 'sk-an\u200bt-abc123456789',
+        gone: ['abc123456789'],
+      },
+      {
+        name: 'key split by a soft hyphen, a byte order mark, a word joiner and tag characters',
+        input:
+          'sk-\u00adab\ufeffcd\u{e0041}ef1234567890 and ghp_\u2060abcdefghijklmnopqrstuvwxyz0123456789',
+        gone: ['ef1234567890', 'ghp_abcdef'],
+      },
+      {
+        name: 'assignment name split by a zero width space',
+        input: 'pass\u200bword=hunter2',
+        gone: ['hunter2'],
+      },
+      {
+        name: 'emoji joiner kept',
+        input: '\u{1f468}\u200d\u{1f469} and a\u200db',
+        kept: ['\u{1f468}\u200d\u{1f469} and ab'],
+      },
       // Text that must survive.
       {
         name: 'keyboard',
@@ -216,4 +301,41 @@ test('diagnostic redaction adds home paths and emails and redacts any value unde
       count: 3,
     },
   );
+});
+
+test('shared and diagnostic redaction read a 256 KiB adversarial string in well under a second', () => {
+  const size = 256 * 1024;
+  const fill = (unit: string) => unit.repeat(Math.ceil(size / unit.length)).slice(0, size);
+  for (const unit of [
+    'a',
+    'a.',
+    'a-',
+    'a_',
+    '--a',
+    '--key',
+    'Bearer ',
+    'Basic ',
+    'token ',
+    'token=',
+    'key:',
+    'a://',
+    'a.a://',
+    'a:b@',
+    'a.b@',
+    'password=',
+    'Cookie:',
+    'AKIAAAAAAAAAAAAAAAAA ',
+    `${'A'.repeat(40)} `,
+    'eyJaaaa.eyJaaaa.',
+    '-----BEGIN PRIVATE KEY-----',
+    '\u200b',
+    'token=\n',
+    ' ',
+  ]) {
+    const text = fill(unit);
+    const started = performance.now();
+    redactDiagnosticText(text, home);
+    const took = performance.now() - started;
+    assert.ok(took < 200, `${JSON.stringify(unit)} took ${Math.round(took)} ms`);
+  }
 });
