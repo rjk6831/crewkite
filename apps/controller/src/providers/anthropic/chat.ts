@@ -37,7 +37,7 @@ import { attachedLine, attachedSection } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
-import { withGitCeiling } from '../../host/git-ceiling.ts';
+import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
 
@@ -634,12 +634,15 @@ function startTurn(
     const temporary = join(request.work.directory, 'tmp');
     mkdirSync(temporary, { recursive: true, mode: 0o700 });
     environment = withGitCeiling(chatEnvironment(request.environment, temporary), scratch);
-  } catch {
+  } catch (error) {
     return refuse(
       chatFailure({
         stage: 'launch',
         kind: 'internal',
-        message: 'CrewKite could not prepare the working directory for this turn.',
+        message:
+          error instanceof GitCeilingError
+            ? error.message
+            : 'CrewKite could not prepare the working directory for this turn.',
       }),
     );
   }

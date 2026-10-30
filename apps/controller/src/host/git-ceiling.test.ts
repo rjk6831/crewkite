@@ -16,11 +16,24 @@ test('the turn environment names the copy parent and keeps everything else', (t)
   const root = temporary(t);
   mkdirSync(join(root, 'real', 'copy'), { recursive: true });
   symlinkSync(join(root, 'real'), join(root, 'link'));
+  // A copy that is itself a link: Git resolves the working directory to the target.
+  mkdirSync(join(root, 'elsewhere', 'target'), { recursive: true });
+  symlinkSync(join(root, 'elsewhere', 'target'), join(root, 'real', 'linked-copy'));
   const rows = [
     { name: 'plain copy', copy: join(root, 'real', 'copy'), parent: join(root, 'real') },
     {
       name: 'copy reached through a link',
       copy: join(root, 'link', 'copy'),
+      parent: join(root, 'real'),
+    },
+    {
+      name: 'copy that is a link to a folder elsewhere',
+      copy: join(root, 'real', 'linked-copy'),
+      parent: join(root, 'elsewhere'),
+    },
+    {
+      name: 'copy not made yet under a link',
+      copy: join(root, 'link', 'later'),
       parent: join(root, 'real'),
     },
     { name: 'copy not made yet', copy: join(root, 'real', 'later'), parent: join(root, 'real') },
@@ -61,4 +74,19 @@ test('a repository lookup from a scratch copy under a repository finds none with
   // A copy that carries its own repository is still found.
   execFileSync('git', ['init', '--quiet', copy]);
   assert.equal(lookup(withGitCeiling(clean, copy)), copy);
+});
+
+test('a parent folder with a colon in its name is refused with a plain line', (t) => {
+  const root = temporary(t);
+  const copy = join(root, 'home:one', 'copy');
+  mkdirSync(copy, { recursive: true });
+  for (const target of [copy, join(root, 'home:one', 'later')])
+    assert.throws(
+      () => withGitCeiling({}, target),
+      (error: Error) =>
+        error.message.startsWith('CrewKite cannot hold Git to the folder ') &&
+        error.message.includes('home:one') &&
+        !error.message.includes('\n'),
+      target,
+    );
 });

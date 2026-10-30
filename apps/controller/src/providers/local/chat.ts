@@ -867,11 +867,17 @@ function startLocalTurn(
     closeText();
     closeThinking();
     let streamed = 0;
+    let environment: NodeJS.ProcessEnv;
+    try {
+      environment = withGitCeiling(request.environment, request.scratch.directory);
+    } catch (error) {
+      return { refused: error instanceof Error ? error.message : 'The environment is not usable.' };
+    }
     // A per-call context: `permitted` turns true only after the person allows a command.
     const context = {
       ...(threads ? { threads, threadBytes } : {}),
       scratch: request.scratch.directory,
-      environment: withGitCeiling(request.environment, request.scratch.directory),
+      environment,
       signal: abort.signal,
       permitted: false,
       onGroup: (group: number) => groups.push(group),

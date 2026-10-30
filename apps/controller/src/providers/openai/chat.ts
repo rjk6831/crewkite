@@ -37,7 +37,7 @@ import {
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
-import { withGitCeiling } from '../../host/git-ceiling.ts';
+import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import {
   type OpenAiUsageHook,
@@ -528,7 +528,9 @@ class OpenAiChatTurn {
       });
       child.on('close', (code, signal) => this.exited(code, signal));
       return null;
-    } catch {
+    } catch (error) {
+      if (error instanceof GitCeilingError)
+        return chatFailure({ stage: 'launch', kind: 'internal', message: error.message });
       if (step === 'storage')
         return chatFailure({
           stage: 'launch',
