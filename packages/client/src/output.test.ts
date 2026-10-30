@@ -179,7 +179,10 @@ test('native output reads verify large retained bytes with cancellation and expl
 test('a client finds the controller socket through the home record, and refuses a socket it should not trust', async (t) => {
   const uid = process.getuid?.() ?? 0;
   const temporary = process.env.TMPDIR;
-  const base = mkdtempSync(join(tmpdir(), 'ck-record-'));
+  // A macOS temporary directory is long enough that a socket path under it passes the 100 byte
+  // bound, and the controller then binds under /tmp as designed. This claim needs the per-user
+  // folder under the test's own temporary directory, so the folders stay short on every platform.
+  const base = mkdtempSync('/tmp/ck-record-');
   const first = join(base, 'first');
   const second = join(base, 'second');
   const real = join(base, 'real');
@@ -197,6 +200,7 @@ test('a client finds the controller socket through the home record, and refuses 
   });
   mkdirSync(join(first, `crewkite-${uid}`), { mode: 0o755 });
   chmodSync(join(first, `crewkite-${uid}`), 0o755);
+  assert.ok(controllerSocketPath(home).startsWith(`${first}/crewkite-${uid}/`), 'the path fits');
   assert.equal(controllerSocketPath(home), controllerSocketPath(join(real, 'home')));
   const controller = new Controller({
     home,
