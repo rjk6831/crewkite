@@ -175,6 +175,7 @@ The command set for the first release:
 | `AcceptChatChanges` | Commit the scratch copy on the thread's base as one new local branch; the checkout stays untouched |
 | `DiscardChatChange` | Restore one path of the scratch copy to the thread's base; Accept then carries only what is left |
 | `ReadChatThread`, `ReadChatChanges`, `ReadChatCatalog` | Bounded reads of the thread, of the scratch diff against its base, and of the providers and models the composer can offer |
+| `SearchChatHistory` | Search titles, messages, tool card titles and summaries and the file paths they named across every thread, from an index the database keeps with triggers in the same transaction as each write. A read that returns at most 50 threads, five hits under each and 64 KiB, with the turn and message to open and a snippet whose matches are offsets |
 | `ReadChatInstructions`, `ReadChatPrompts`, `SaveChatPrompt`, `DeleteChatPrompt` | Read the instruction files at the copy root and the saved prompts that the desktop and the CLI share, and save or delete one prompt |
 | `ReadDiagnostics` | Build the diagnostics bundle from the controller's home and store: versions, pinned client digests, saved settings, the end of the controller log, the last 200 events of one thread and system facts, all redacted. The desktop and the CLI write it to a new folder; the older `ExportDiagnostics` stays unsupported |
 | `SupplyMcpServers` | Give the controller the person's MCP server set from the desktop. It is a read with no receipt, and the controller keeps the set in memory |

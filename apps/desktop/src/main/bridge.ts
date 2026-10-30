@@ -284,6 +284,7 @@ export async function installBridge(
         'GetArtifactRange',
         'GetTaskOperations',
         'ReadChatThread',
+        'SearchChatHistory',
         'ReadChatTurnEvents',
         'ReadChatChanges',
         'ReadChatCatalog',

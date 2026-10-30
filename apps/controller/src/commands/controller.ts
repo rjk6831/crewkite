@@ -1557,6 +1557,11 @@ export class Controller {
               ? { kind: 'chat-thread', ...this.chat().readThread(command.payload) }
               : { kind: 'chat-changes', ...this.chat().readChanges(command.payload) },
         };
+      case 'SearchChatHistory':
+        return {
+          outcome: 'applied',
+          data: { kind: 'chat-search', ...this.chat().searchHistory(command.payload) },
+        };
       case 'CompleteChatMention':
       case 'ReadChatInstructions':
         if (!this.store.get<Task>('task', command.payload.taskId))

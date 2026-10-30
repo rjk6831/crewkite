@@ -24,6 +24,7 @@ import {
   type ChatPermissionOption,
   type ChatPermissionPolicy,
   type ChatQueuedMessage,
+  type ChatSearchResult,
   type ChatSession,
   ChatSessionSchema,
   type ChatThread,
@@ -110,6 +111,7 @@ import {
   pushChatBranch,
   readChatBranchStatus,
 } from './git.ts';
+import { searchHistory } from './history-search.ts';
 import { scratchPath } from './local-tools.ts';
 import type { McpRegistry } from './mcp-servers.ts';
 import { createMentionIndex, readInstructions as readInstructionFiles } from './mentions.ts';
@@ -1283,6 +1285,11 @@ export class ChatService {
     const oldest = messages[0]?.cursor ?? payload.beforeCursor;
     const more = oldest !== undefined && this.messages(payload.taskId, oldest, 1).length > 0;
     return ChatThreadReadSchema.parse({ thread, turns, messages, liveEvents, cursor, more });
+  }
+
+  /** Threads that match a search, from the index the database keeps. A read; it writes nothing. */
+  searchHistory(payload: Payload<'SearchChatHistory'>): ChatSearchResult {
+    return searchHistory(this.deps.store.db, payload);
   }
 
   readChanges(payload: Payload<'ReadChatChanges'>): ChatChangesRead {
