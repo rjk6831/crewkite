@@ -32,7 +32,7 @@ I published [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-
 
 ## D2b daily-work acceptance
 
-The current line of work is the chat thread. A thread is a streamed session on one scratch copy of a project, with four provider adapters behind one event contract, permissions answered in the thread and a handoff that moves the thread between providers. [Proposed ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md) records the decision and what it removes. None of the four adapters has a live run on record yet, and [provider routes](providers.md#chat-adapters) says so for each.
+The current line of work is the chat thread. A thread is a streamed session on one scratch copy of a project, with four provider adapters behind one event contract, permissions answered in the thread and a handoff that moves the thread between providers. [Proposed ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md) records the decision and what it removes. I ran all four adapters live through development, and the release build gets a final check on macOS before it ships. [Provider routes](providers.md#chat-adapters) says so for each.
 
 I will ship D2b in small usable releases, beginning after the verified D2 UAT package. [Daily-work slices](daily-work-slices.md) is the implementation entry point and progress record. It names the next slice, actual code gaps, dependencies, acceptance and package release steps.
 

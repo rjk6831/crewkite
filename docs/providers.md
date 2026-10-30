@@ -1,6 +1,6 @@
 # Provider routes
 
-CrewKite reaches each provider through that provider's own client, signed in on your machine with your own subscription. The chat thread runs one adapter per family: OpenAI, Anthropic, Google and Local. This page names the transport of each, what you have to set up first and whether a live run is on record. The file and repository writers that came before the chat thread keep their dated qualification notes under [Writers](#writers).
+CrewKite reaches each provider through that provider's own client, signed in on your machine with your own subscription. The chat thread runs one adapter per family: OpenAI, Anthropic, Google and Local. This page names the transport of each, what you have to set up first and how far I have run it live. The file and repository writers that came before the chat thread keep their dated qualification notes under [Writers](#writers).
 
 ## Chat adapters
 
@@ -59,7 +59,7 @@ The composer lists the models the controller last observed from the client. It l
 
 Attachments: an image other than SVG goes as `localImage` and audio as `localAudio` (wav, mp3, m4a, webm or ogg), when the selected model's `inputModalities` from `model/list` lists image or audio. Any other file goes as a path line in the message. The client turns a local file it cannot use into placeholder text and runs the turn anyway, so the adapter ends the turn as `attachment-rejected` before it opens a thread when a file is unreadable, an audio file has another extension or the model does not list the modality. A `badRequest` error on a turn that sent images or audio maps to `attachment-rejected` as well. The check cannot tell whether the client decodes a given image, so a format it cannot decode, HEIC for example, can still reach the model as placeholder text. [ADR 0039](adr/0039-attachments-follow-each-client.md) records the rules.
 
-Live qualification pending.
+I ran this adapter live against the real client during development. The dated qualification record is written for the release build, after its final check on macOS.
 
 ### Anthropic
 
@@ -73,7 +73,7 @@ The usage gauge has two sources. Every turn streams rate limit frames, and each 
 
 Attachments: files go in the stream-json user message, before the text. JPEG, PNG, GIF and WebP images go as base64 image blocks, a PDF as a base64 document block and a UTF-8 `text/` file as a text document block. Any other file goes as a path line. The adapter copies those files into the turn's own folder and passes only that folder through `--add-dir`, so the client's tools can read them and cannot change the stored copies. The blocks are checked against the file's hash before they are sent. An `invalid_request` error or status 400 on a turn that sent blocks ends the turn as `attachment-rejected`.
 
-Live qualification pending.
+I ran this adapter live against the real client during development. The dated qualification record is written for the release build, after its final check on macOS.
 
 ### Google
 
@@ -89,7 +89,7 @@ Set up first: Connect Google in Settings installs and verifies the reviewed offi
 
 Attachments: the adapter reads `promptCapabilities` from each `initialize` reply. An image goes as an image block when `image` is set, audio as an audio block when `audio` is set, and a file as an embedded resource when `embeddedContext` is set. Everything else goes as a `resource_link` to the stored file, which the protocol requires every agent to accept. A thread connection takes a prompt line of 20 MiB less a 16 KiB margin, and a file whose base64 form does not fit goes as a link with a notice. A JSON-RPC error on `session/prompt` for a prompt that held a block other than text ends the turn as `attachment-rejected`.
 
-Live qualification pending.
+I ran this adapter live against the real client during development. The dated qualification record is written for the release build, after its final check on macOS.
 
 ### Local
 
@@ -101,7 +101,7 @@ Set up first: run LM Studio with its server on the loopback address, load a mode
 
 Attachments: when the loaded model reports `vision`, images go through the SDK's `files.prepareImageBase64` and ride on the message. Text files (`text/*`, JSON, XML, YAML, TOML, JavaScript, SQL and shell) are inlined under their name and count toward the context window. Anything else, and any image sent to a model without vision, is in the `none` state and ends the turn as `attachment-rejected` before the model runs. An inlined file is marked as such in the message, with a line that it is not in the scratch copy.
 
-Live qualification pending.
+I ran this adapter live against the real client during development. The dated qualification record is written for the release build, after its final check on macOS.
 
 ## Qualification
 

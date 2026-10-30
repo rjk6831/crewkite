@@ -5,9 +5,13 @@
   <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="107">
 </picture>
 
-CrewKite is a desktop chat for coding on the OpenAI, Anthropic and Google subscriptions you already pay for, and on a local model. A thread can move from one provider to another and keep its messages and its edited files.
+CrewKite is a local workspace for the coding agents you already pay for. It is not a harness and not a wrapper. It runs the OpenAI, Anthropic and Google clients you have signed in, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
+
+## Status
+
+CrewKite is a prerelease, version 0.1.0. I ran all four families, OpenAI, Anthropic, Google and Local, live through development. The release build gets a final check on macOS before it ships.
 
 ![The thread view: a streamed reply, a thinking card, tool cards with a diff and an inline permission prompt.](docs/images/thread.png)
 
@@ -19,7 +23,7 @@ A crew can work a large request in slices. In the Full crew preset an orchestrat
 2. Run `pnpm install`, then `pnpm desktop:install` to download the Electron binary.
 3. Run `pnpm demo` to open the desktop on a synthetic project with scripted providers. To use your own clients on Apple silicon, stage a package with `node scripts/package.mjs --id my-build` and open `bin/desktop` in the folder it prints. The script expects the pinned Node binary under `internal/tools` and a committed working tree.
 
-To try a published build without the source, follow the [preview guide](docs/preview.md). Each provider needs its own client, signed in on your machine. [Provider routes](docs/providers.md) lists the setup for each and which routes have a live run on record.
+To try a published build without the source, follow the [preview guide](docs/preview.md). Each provider needs its own client, signed in on your machine. [Provider routes](docs/providers.md) lists the setup for each.
 
 ## Google and your account
 
