@@ -424,3 +424,16 @@ Eight claims cover the chat path's version range and the trust checks it keeps. 
 - The catalog claim in `apps/controller/src/chat/catalog.test.ts` connects chat on a build the chat client accepts while the writer profile reports a build mismatch. The profile claim keeps the writer profiles on their exact pinned builds.
 
 A live client on the Mac confirms what the scripted clients cannot: each client's real `--version` output, its time to answer, and a chat turn on a build other than the tested one.
+
+## Linux preview platform gate
+
+Ten tests protect the platform gate from the 2026-10-31 amendment to ADR 0013. They run on every platform, with host values passed in, so the macOS job and both Linux jobs prove the same table.
+
+- The gate table in `apps/controller/src/providers/platform.test.ts` crosses the four families with macOS arm64 and x64, Linux x64, arm64 and riscv64, and Windows. It expects an allow or one exact refusal line for each cell. Google is refused on both Linux architectures with its own line, and Windows is refused with one line for every family.
+- The shared client gate gives the platform line first and the home line second, so a missing HOME on Linux reads as a home problem.
+- Local connection setup passes the platform gate on Linux and stops at it on Windows and on Intel Macs.
+- The Local token claim checks the keychain line for every platform except macOS. The controller claim in `apps/controller/src/commands/local-linux.test.ts` configures Local on a Linux host: token mode is refused by `ConfigureLocal` and by a desktop-supplied token with that line, and no-authentication mode connects through the probe with no token held.
+- The discovery claims check the search directories for Linux and macOS, the Codex native build path for each supported computer, and a scripted npm layout on a temp folder. The layout resolves to the native build through the same trust checks and refuses it once other users can write it.
+- The Biome claim maps each computer to its platform package, refuses musl and unknown systems, and checks that the installed package for this computer matches the root version.
+
+The scripted layout and the gate table cannot show that a real client on Linux prints the version output the parser reads, that the npm package really sits at the path the table names, or that process ownership settles on a Linux kernel. Only a Linux machine with the clients installed confirms those.

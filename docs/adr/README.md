@@ -16,7 +16,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0010](0010-independent-authority-quality-effects.md) | Separate authority, quality and effects in task policy | Accepted |
 | [0011](0011-finite-review-methods.md) | Run review methods as finite jobs with credit | Accepted |
 | [0012](0012-milestones-d0-to-d3.md) | Deliver in milestones D0 through D3 with a minimum core | Accepted |
-| [0013](0013-macos-first-local-optional.md) | Start on Apple Silicon macOS with local inference optional | Accepted |
+| [0013](0013-macos-first-local-optional.md) | Start on Apple Silicon macOS with local inference optional | Accepted, amended 2026-10-31 for the Linux preview |
 | [0014](0014-stable-build-controls-candidate.md) | Develop CrewKite with a stable build that controls a candidate build | Accepted |
 | [0015](0015-neutral-public-history.md) | Keep public history neutral and the working record private | Accepted |
 | [0016](0016-reuse-with-provenance.md) | Reuse open source only with recorded provenance | Accepted |
