@@ -358,7 +358,31 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         const changes: ChatChangesRead = {
           taskId,
           base: thread.base,
-          files: seeded ? [{ path: 'net.mjs', additions: 5, deletions: 2, patch: DIFF }] : [],
+          files: seeded
+            ? [
+                {
+                  path: 'net.mjs',
+                  additions: 5,
+                  deletions: 2,
+                  patch: DIFF,
+                  hunks: [
+                    {
+                      key: 'a'.repeat(64),
+                      oldStart: 1,
+                      oldLines: 3,
+                      newStart: 1,
+                      newLines: 6,
+                      decision: 'undecided',
+                    },
+                  ],
+                  hunkControls: true,
+                  decided: false,
+                },
+              ]
+            : [],
+          total: seeded ? 1 : 0,
+          next: null,
+          listing: seeded ? 'b'.repeat(64) : null,
         };
         return data(changes);
       }

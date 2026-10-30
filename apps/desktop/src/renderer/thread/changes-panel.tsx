@@ -12,6 +12,7 @@ import {
   readChanges,
   type ThreadSource,
 } from './commands.ts';
+import { HunkView } from './hunk-view.tsx';
 import { CodeBlock } from './markdown.tsx';
 
 const refusals: Record<string, string> = {
@@ -23,10 +24,42 @@ const refusals: Record<string, string> = {
   'scratch-unreadable':
     'The scratch copy holds new links or special files, or a link from the base commit changed. Restore them, then accept again.',
   'branch-not-created': 'The branch was not created. Choose another name and try again.',
+  'listing-changed': 'The changes moved since this list was read. Review the list again.',
 };
 
 type Files = ChatChangesRead['files'];
 type Skipped = NonNullable<ChatThread['skipped']>;
+
+// Pages a read can take before it starts over, so a list that keeps moving cannot loop forever.
+const MAX_PAGE_ATTEMPTS = 3;
+
+/**
+ * Every page of the Changes list under one listing, so the tab shows each entry once and Accept
+ * names the list the person saw. A list that moves between pages is read again from the start.
+ */
+async function readAllPages(
+  source: ThreadSource,
+  taskId: string,
+  active: () => boolean,
+): Promise<ChatChangesRead | null> {
+  for (let attempt = 0; attempt < MAX_PAGE_ATTEMPTS; attempt++) {
+    const first = await readChanges(source, taskId);
+    const files = [...first.files];
+    let next = first.next;
+    try {
+      while (next && first.listing && active()) {
+        const page = await readChanges(source, taskId, { after: next, listing: first.listing });
+        files.push(...page.files);
+        next = page.next;
+      }
+    } catch (failure) {
+      if (attempt + 1 < MAX_PAGE_ATTEMPTS) continue;
+      throw failure;
+    }
+    return active() ? { ...first, files, next: null } : null;
+  }
+  return null;
+}
 
 // The diff each thread last accepted. While the Changes tab shows the same diff, the branch already
 // holds it and a second acceptance would only collide with that branch name. The note says where
@@ -259,6 +292,7 @@ function AcceptControl({
   title,
   thread,
   files,
+  listing,
   lastReply,
   onAccepted,
 }: {
@@ -267,6 +301,8 @@ function AcceptControl({
   title: string;
   thread: ChatThread | null;
   files: Files;
+  /** The listing every page was read under. Accept publishes that list or refuses. */
+  listing: string | null;
   lastReply: string | undefined;
   /** The base advances to the accepted commit, so the diff needs a new read. */
   onAccepted: () => void;
@@ -298,6 +334,7 @@ function AcceptControl({
         taskId,
         branch: branch.trim(),
         ...(message.trim() ? { message: message.trim() } : {}),
+        ...(listing ? { listing } : {}),
       });
       if (answer.accepted) {
         acceptedDiffs.set(taskId, { branch: answer.branch, files, note: answer.note });
@@ -506,9 +543,9 @@ export function ChangesPanel({
   // biome-ignore lint/correctness/useExhaustiveDependencies: refreshKey and reads ask for a new read
   useEffect(() => {
     let active = true;
-    readChanges(source, taskId).then(
+    readAllPages(source, taskId, () => active).then(
       (next) => {
-        if (!active) return;
+        if (!active || !next) return;
         setData(next);
         setError(null);
       },
@@ -543,6 +580,7 @@ export function ChangesPanel({
       title={title}
       thread={thread}
       files={data.files}
+      listing={data.listing}
       lastReply={lastReply}
       onAccepted={reread}
     />
@@ -600,7 +638,15 @@ export function ChangesPanel({
                 onDiscarded={reread}
               />
               {expanded &&
-                (file.patch ? (
+                (file.hunkControls && file.patch ? (
+                  <HunkView
+                    source={source}
+                    taskId={taskId}
+                    file={file}
+                    running={Boolean(thread?.activeTurnId)}
+                    onChanged={reread}
+                  />
+                ) : file.patch ? (
                   <pre className="th-patch">
                     {file.patch.split('\n').map((line, index) => (
                       // biome-ignore lint/suspicious/noArrayIndexKey: patch lines have no identity beyond their position

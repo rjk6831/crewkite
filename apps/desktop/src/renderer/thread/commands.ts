@@ -22,11 +22,14 @@ import {
   type ChatTurnEventsRead,
   ChatTurnEventsReadSchema,
   type CommandResult,
+  CommentChatChangePayloadSchema,
   CompleteChatMentionPayloadSchema,
   ConfigureChatThreadPayloadSchema,
+  DecideChatHunkPayloadSchema,
   DeleteChatPromptPayloadSchema,
   DeleteChatThreadPayloadSchema,
   DiscardChatChangePayloadSchema,
+  DiscardChatHunkPayloadSchema,
   EditProjectNotePayloadSchema,
   HandoffChatThreadPayloadSchema,
   ImportChatAttachmentPayloadSchema,
@@ -140,11 +143,16 @@ export const readTurnEvents = (
     ReadChatTurnEventsPayloadSchema.parse(input),
     ChatTurnEventsReadSchema,
   );
-export const readChanges = (source: ThreadSource, taskId: string): Promise<ChatChangesRead> =>
+/** One page of the Changes list. Pass the first page's `listing` and the last `next` to read on. */
+export const readChanges = (
+  source: ThreadSource,
+  taskId: string,
+  page: { after?: string; listing?: string } = {},
+): Promise<ChatChangesRead> =>
   read(
     source,
     'ReadChatChanges',
-    ReadChatChangesPayloadSchema.parse({ taskId }),
+    ReadChatChangesPayloadSchema.parse({ taskId, ...page }),
     ChatChangesReadSchema,
   );
 /** Turns, tokens, allowance, wall time, checks and branches of one thread or one project. */
@@ -366,6 +374,30 @@ export async function discardChange(
   if (result.outcome === 'applied') return { discarded: true };
   return { discarded: false, reason: result.reason ?? 'not-discarded', next: result.next ?? null };
 }
+
+/** The hunk commands answer applied or a refusal with the next step, like Discard. */
+export type HunkStep = { done: true } | { done: false; next: string };
+async function hunkStep(source: ThreadSource, command: string, payload: unknown) {
+  const result = await dispatch(source, command, payload);
+  if (result.outcome === 'applied') return { done: true } as const;
+  return { done: false, next: result.next ?? 'The change did not apply.' } as const;
+}
+export const decideHunk = (
+  source: ThreadSource,
+  input: Input<typeof DecideChatHunkPayloadSchema>,
+): Promise<HunkStep> =>
+  hunkStep(source, 'DecideChatHunk', DecideChatHunkPayloadSchema.parse(input));
+export const discardHunk = (
+  source: ThreadSource,
+  input: Input<typeof DiscardChatHunkPayloadSchema>,
+): Promise<HunkStep> =>
+  hunkStep(source, 'DiscardChatHunk', DiscardChatHunkPayloadSchema.parse(input));
+/** The controller quotes the hunk and sends the comment as a message, queued while a turn runs. */
+export const commentChange = (
+  source: ThreadSource,
+  input: Input<typeof CommentChatChangePayloadSchema>,
+): Promise<HunkStep> =>
+  hunkStep(source, 'CommentChatChange', CommentChatChangePayloadSchema.parse(input));
 
 export type GitStep =
   | { done: true; url: string | null; via: 'gh' | 'compare-link' | null }
