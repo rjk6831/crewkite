@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { copyFileSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { type TestContext, test } from 'node:test';
@@ -30,24 +30,7 @@ import { ChatService } from './service.ts';
 
 const migrations = fileURLToPath(new URL('../../migrations/', import.meta.url));
 
-/**
- * Applies every migration in file order on a copy numbered without gaps. A lane that reserves a
- * later number than the files beside it still applies, and an integration renumber changes
- * nothing here.
- */
-function migrate(store: Store, scratch: string) {
-  const copy = join(scratch, 'migrations');
-  mkdirSync(copy, { recursive: true });
-  const files = readdirSync(migrations)
-    .filter((name) => /^\d{3}-[a-z0-9-]+\.sql$/.test(name))
-    .sort();
-  for (const [index, name] of files.entries())
-    copyFileSync(
-      join(migrations, name),
-      join(copy, `${String(index + 1).padStart(3, '0')}-${name.slice(4)}`),
-    );
-  store.applyMigrations(copy);
-}
+const migrate = (store: Store) => store.applyMigrations(migrations);
 
 function opened(t: TestContext, start: string[] = []) {
   const directory = mkdtempSync(join(tmpdir(), 'crewkite-notes-'));
@@ -57,7 +40,7 @@ function opened(t: TestContext, start: string[] = []) {
   const open = () => {
     const store = new Store(path);
     stores.push(store);
-    migrate(store, directory);
+    migrate(store);
     return store;
   };
   t.after(() => {
@@ -320,7 +303,7 @@ function chatHarness(
   const repository = createSyntheticRepository(join(directory, 'demo-shop'));
   const store = new Store(join(directory, 'state.sqlite'));
   t.after(() => store.close());
-  migrate(store, directory);
+  migrate(store);
   const project: Project = { id: fixtures.task.projectId, name: 'demo-shop', revision: 0 };
   store.transaction(() => {
     store.put('project', project.id, 0, project);

@@ -283,4 +283,4 @@ When a resume fails and a new session starts, the notes block is taken out of th
 
 The command line claim in `apps/cli/src/chat/notes.test.ts` drives list, add and remove through a real controller socket and checks each refusal sentence and exit status. A change answers with the project and its byte count, and the command line reads the list again.
 
-The migration for notes is number 020. Until migrations 018 and 019 from other lanes merge, the tests in `project-notes.test.ts` apply the migrations from a copy numbered without gaps, so they pass. The command line test starts a controller on the real migration folder, so it fails until 018 and 019 are present.
+The migration for notes is number 019, which follows 018 without a gap. The tests in `project-notes.test.ts` and the command line test apply the real migration folder.
