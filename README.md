@@ -5,7 +5,7 @@
   <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="107">
 </picture>
 
-CrewKite is a local workspace for the coding agents you already pay for. It is not a harness and not a wrapper. It runs the OpenAI, Anthropic and Google clients you have signed in, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
+CrewKite is a local workspace for the coding agents you already pay for. It runs the OpenAI, Anthropic and Google clients you have signed in, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
