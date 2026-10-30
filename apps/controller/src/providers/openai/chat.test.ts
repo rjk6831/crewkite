@@ -67,6 +67,7 @@ import {
   type ChatToolKind,
 } from '@crewkite/contracts';
 import type { ChatTurnRequest } from '../../chat/adapter.ts';
+import { turnNotesBlock } from '../../chat/prompt.ts';
 import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
@@ -165,6 +166,8 @@ input.on('line', (line) => {
   const value = JSON.parse(line);
   if (value.method === 'turn/start' && scenario === 'refuse')
     return send({ id: value.id, error: { code: -32602, message: 'Invalid params: thread not loaded\nretry later' } });
+  if (value.method === 'thread/resume' && given.lostThread)
+    return send({ id: value.id, error: { code: -32600, message: 'no rollout found for thread' } });
   if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : 'approved');
   if (value.id === undefined) return;
   // A hung client never answers the interrupt.
@@ -234,7 +237,11 @@ function turn(
       modalities?: string[];
       /** The servers config/read reports as configured. */
       mcp?: Record<string, unknown>;
+      /** A client that no longer has the thread, so thread/resume answers with an error. */
+      lostThread?: boolean;
     };
+    /** The message, when a test needs more than the default. */
+    prompt?: string;
     threadTools?: OpenAiChatDeps['threadTools'];
     readOnly?: boolean;
     files?: File[];
@@ -271,7 +278,7 @@ function turn(
     taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
     role: 'assistant',
     selection: { family: 'openai', model: 'gpt-6.1-sol', effort: options.effort ?? 'low' },
-    prompt,
+    prompt: options.prompt ?? prompt,
     systemContext,
     history: [],
     session: options.session ?? null,
@@ -690,6 +697,32 @@ test('an image or audio file goes as a local input only to a model that takes it
       input: row.input,
       effort: 'low',
     });
+  }
+});
+
+test('a thread the client lost starts again with the notes once, in the system context', async () => {
+  const first = turn('reply');
+  const { session } = await first.settled();
+  assert(session);
+  const notes = ['Use pnpm, not npm.'];
+  const block = turnNotesBlock(notes, undefined);
+  // Rows: a resumed thread gets the block in front of the message. A lost thread starts again with
+  // the notes in its system context, so the block must not ride in the message a second time.
+  const rows = [
+    { name: 'a resumed thread keeps the block', lost: false, text: `${block}\n\n${prompt}` },
+    { name: 'a lost thread drops the block', lost: true, text: `${systemContext}\n\n${prompt}` },
+  ];
+  for (const row of rows) {
+    const run = turn('reply', {
+      session,
+      prompt: `${block}\n\n${prompt}`,
+      detail: row.lost ? { lostThread: true } : undefined,
+    });
+    await run.settled();
+    const sent = run.frames().find((frame) => frame.method === 'turn/start');
+    assert(sent);
+    const text = (sent.params.input as { text: string }[]).at(-1)?.text ?? '';
+    assert.equal(text, row.text, row.name);
   }
 });
 

@@ -27,7 +27,12 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
-import { attachedLine, attachedSection, withoutThreadToolsLine } from '../../chat/prompt.ts';
+import {
+  attachedLine,
+  attachedSection,
+  stripTurnNotes,
+  withoutThreadToolsLine,
+} from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
@@ -773,9 +778,10 @@ class OpenAiChatTurn {
     const { systemContext, selection } = this.request;
     // A client that did not list its servers runs this turn without the tools, so the packet
     // must not name them.
-    const prompt = this.mcpConfig
-      ? this.request.prompt
-      : withoutThreadToolsLine(this.request.prompt);
+    // A new thread reads the notes in the system context. When a resume failed, the prompt still
+    // carries the block meant for the resumed thread, which would repeat them.
+    const asked = fresh ? stripTurnNotes(this.request.prompt) : this.request.prompt;
+    const prompt = this.mcpConfig ? asked : withoutThreadToolsLine(asked);
     const transcript = history
       ? this.request.history
           .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.text}`)

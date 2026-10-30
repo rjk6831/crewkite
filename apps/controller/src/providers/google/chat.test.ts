@@ -40,7 +40,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { type AgentEvent, AgentEventSchema } from '@crewkite/contracts';
 import type { AcpChatPeerCase } from '../../../../../packages/testkit/src/providers/acp-peer.ts';
 import type { ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
-import { byteSize } from '../../chat/prompt.ts';
+import { byteSize, turnNotesBlock } from '../../chat/prompt.ts';
 import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
@@ -368,6 +368,23 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       'You are working in a scratch copy of demo.\n\nEarlier in this conversation:\n\nUser: earlier question\n\nAssistant: earlier answer\n\nWhat does this project do?',
     );
     assert.equal(lost.result.stopReason, 'done');
+
+    // The controller puts a notes block in front of a message for a resumed session. When the
+    // session is lost, the new one reads the notes in its system context, so the block goes.
+    const block = turnNotesBlock(['Use pnpm, not npm.'], undefined);
+    const lostWithNotes = await run(
+      g,
+      request(g, {
+        session: first.result.session,
+        prompt: `${block}\n\nWhat does this project do?`,
+      }),
+    );
+    assert.equal(
+      promptText(lostWithNotes.frames).includes('CrewKite attaches'),
+      false,
+      'a lost session does not get the resumed block',
+    );
+    assert.ok(promptText(lostWithNotes.frames).endsWith('\n\nWhat does this project do?'));
 
     // With the thread tools, session/new and session/load each carry the one server, read-only
     // turns included, and each turn has its own token.

@@ -18,7 +18,7 @@ import {
   chatFailure,
 } from '../../chat/adapter.ts';
 import { googleMcpEntries } from '../../chat/mcp-servers.ts';
-import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import { attachedLine, attachedSection, stripTurnNotes } from '../../chat/prompt.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
@@ -1252,7 +1252,9 @@ export function googleChatAdapter(deps: {
             if (request.systemContext) parts.push(request.systemContext);
             if (prior) parts.push(historyBlock(request.history));
           }
-          parts.push(request.prompt);
+          // A new session reads the notes in the system context. After a failed resume the prompt
+          // still carries the block meant for the old session, which would repeat them.
+          parts.push(prior && !resumed ? stripTurnNotes(request.prompt) : request.prompt);
           stage = 'prompt';
           const prompt = promptBlocks(
             parts.filter(Boolean).join('\n\n'),
