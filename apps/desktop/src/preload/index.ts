@@ -183,6 +183,12 @@ const bridge: DesktopSource = {
         await ipcRenderer.invoke('crewkite:mcp-thread', { taskId, name, policy }),
       ),
   },
+  onboarding: {
+    finished: async () => (await ipcRenderer.invoke('crewkite:onboarding-read')) === true,
+    setFinished: async (finished) => {
+      await ipcRenderer.invoke('crewkite:onboarding-write', finished === true);
+    },
+  },
   onOpenThread(listener) {
     openThread.add(listener);
     return () => {

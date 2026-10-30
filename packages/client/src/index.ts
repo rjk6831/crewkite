@@ -73,6 +73,11 @@ export interface DesktopSource {
   forgetLocalToken?(): Promise<LocalTokenStatus>;
   /** The person's MCP servers. The page sees names and counts, never a secret. */
   mcp?: McpBridge;
+  /** Whether the first-run welcome has ended. Main keeps the one flag in the desktop profile. */
+  onboarding?: {
+    finished(): Promise<boolean>;
+    setFinished(finished: boolean): Promise<void>;
+  };
 }
 export type LocalTokenStatus = { available: boolean; reason?: string; remembered: boolean };
 export type ThreadAttentionInput = {

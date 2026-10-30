@@ -2,6 +2,7 @@ import { join } from 'node:path';
 import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
 import { installThreadAttention } from './attention.ts';
 import { installBridge } from './bridge.ts';
+import { installOnboarding, OnboardingStore } from './onboarding-store.ts';
 import { DesktopController, prepareStateDirectory, resolveRuntime } from './runtime.ts';
 import { rendererURL, secureSession, secureWindow } from './security.ts';
 import { BoundsStore, clampBounds, MINIMUM_SIZE } from './window-bounds.ts';
@@ -82,6 +83,7 @@ async function start() {
     });
     await installBridge(window, controller);
     installThreadAttention(window);
+    installOnboarding(window, new OnboardingStore(paths.profile));
     if (closing || window.isDestroyed()) return;
     await window.loadURL(rendererURL);
     window.show();
