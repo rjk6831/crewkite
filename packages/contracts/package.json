@@ -1,11 +1,12 @@
 {
   "name": "@crewkite/contracts",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
-    "./hash": "./src/hash.ts"
+    "./hash": "./src/hash.ts",
+    "./version": "./src/version.ts"
   },
   "dependencies": {
     "zod": "4.6.7"
