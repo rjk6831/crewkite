@@ -24,12 +24,12 @@ export type DesktopCommand = Command extends infer Item
     : never
   : never;
 export type ConnectionState = 'connecting' | 'connected' | 'offline';
+/** The share page main rendered for a preview. */
+export type DesktopShare = { html: string; filename: string; turns: number; omitted: number };
 /**
  * A file main found for the composer. The renderer sends the path on to the controller and never
  * opens it. `thumbnail` is a small PNG data URL, present only for an image main could decode.
  */
-/** The share page main rendered for a preview. */
-export type DesktopShare = { html: string; filename: string; turns: number; omitted: number };
 export type DesktopFile = { path: string; name: string; bytes: number; thumbnail: string | null };
 export type DesktopAttachInput =
   | { from: 'picker' }
