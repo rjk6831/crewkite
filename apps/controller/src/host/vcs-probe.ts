@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 
-// Every project, thread and acceptance step runs git, so the controller asks once whether it can.
+// Every project, thread and acceptance step runs git, so the controller asks whether it can.
 // Without this, a computer with no git reports a ready controller and a project folder that is
 // "not a readable repository".
 
@@ -28,12 +28,26 @@ export function detectGit(path: string | undefined = process.env.PATH): GitState
   }
 }
 
-let found: GitState | undefined;
-/** The answer for this process, found on first use. */
-export const gitState = (): GitState => {
-  found ??= detectGit();
-  return found;
-};
+const RETRY_MS = 30_000;
+
+/**
+ * A reader of the git state. A working git is kept for good. A failure is kept for about 30
+ * seconds, so installing git or fixing the path shows up without restarting the controller.
+ */
+export function cachedGitState(
+  detect: () => GitState = detectGit,
+  now: () => number = Date.now,
+): () => GitState {
+  let found: { state: GitState; at: number } | undefined;
+  return () => {
+    if (!found || (found.state !== 'ready' && now() - found.at >= RETRY_MS))
+      found = { state: detect(), at: now() };
+    return found.state;
+  };
+}
+
+/** The answer for this process. */
+export const gitState = cachedGitState();
 
 /** The sentence health and a refused project registration give, or null when git runs. */
 export const gitProblem = (state: GitState): string | null =>
