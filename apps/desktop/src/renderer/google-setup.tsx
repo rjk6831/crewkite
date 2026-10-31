@@ -5,14 +5,64 @@ import {
   googleTermsCurrent,
   type Snapshot,
 } from '@crewkite/contracts';
+import { Check } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
 import {
+  GOOGLE_PROGRESS_STEPS,
+  type GoogleSetupProgress,
   type GoogleSetupStage,
+  googleSetupProgress,
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
 } from './google-setup-flow.ts';
 import type { Workspace } from './source.ts';
+import './google-setup.css';
+
+// A first connect downloads about 110 MB and waits on a browser sign-in, so the card reads the
+// status each second for up to 15 minutes while a step runs.
+const POLL_ATTEMPTS = 900;
+
+/** The whole connect as one bar, the current step named, and every step listed under it. */
+function GoogleProgress({ progress }: { progress: GoogleSetupProgress }) {
+  const index = GOOGLE_PROGRESS_STEPS.findIndex(({ id }) => id === progress.step);
+  const position = `Step ${index + 1} of ${GOOGLE_PROGRESS_STEPS.length}`;
+  const label = GOOGLE_PROGRESS_STEPS[index]?.label ?? '';
+  return (
+    <div className="gs-progress">
+      <p className="gs-progress-head" role="status">
+        {position}: {label}
+      </p>
+      <div
+        className="gs-progress-track"
+        role="progressbar"
+        aria-label="Google connect progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={progress.percent}
+        aria-valuetext={`${progress.percent} percent. ${position}, ${label}. ${progress.detail}`}
+      >
+        <div className="gs-progress-fill" style={{ width: `${progress.percent}%` }} />
+      </div>
+      <p className="muted small">{progress.detail}</p>
+      <ol className="gs-progress-steps" aria-label="Connect steps">
+        {GOOGLE_PROGRESS_STEPS.map((step, at) => (
+          <li
+            key={step.id}
+            className={at < index ? 'is-done' : at === index ? 'is-current' : undefined}
+            aria-current={at === index ? 'step' : undefined}
+          >
+            <span className="gs-progress-mark" aria-hidden="true">
+              {at < index && <Check size={12} />}
+            </span>
+            {at < index && <span className="gs-sr-only">Done: </span>}
+            {step.label}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
 
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
@@ -144,6 +194,7 @@ export function GoogleSetup({
       read: workspace.refresh,
       active: () =>
         mounted.current && generation.current === currentGeneration && !controller.signal.aborted,
+      attempts: POLL_ATTEMPTS,
     })
       .then((result) => {
         if (pollAbort.current === controller) pollAbort.current = null;
@@ -205,8 +256,8 @@ export function GoogleSetup({
         pollAbort.current?.abort();
         pollAbort.current = null;
         setRequested(null);
-        // The poll gives up after about 20 seconds, and a browser sign-in often takes longer.
-        // Once the flow ends, the slow-setup line no longer describes anything.
+        // The poll gives up after 15 minutes, and a browser sign-in can take longer. Once the
+        // flow ends, the slow-setup line no longer describes anything.
         setPollTimedOut(false);
       }
     }
@@ -280,6 +331,10 @@ export function GoogleSetup({
         ? 'Sign-in required'
         : 'Unknown';
   const codingReady = ready && profile?.available === true;
+  const progress = googleSetupProgress(
+    { googleAcpInstall: installation, googleAcpSetup: setup },
+    requested,
+  );
   const officialClient = installed
     ? 'Installed'
     : installation?.state === 'idle'
@@ -366,9 +421,13 @@ export function GoogleSetup({
           </button>
         )}
       </div>
-      {requested && <p role="status">{stageLabels[requested]}…</p>}
-      {!requested && installing && <p role="status">{stageLabels.install}…</p>}
-      {!requested && !installing && active && <p role="status">Google setup is running…</p>}
+      {progress ? (
+        <GoogleProgress progress={progress} />
+      ) : requested ? (
+        <p role="status">{stageLabels[requested]}…</p>
+      ) : active ? (
+        <p role="status">Google setup is running…</p>
+      ) : null}
       {ready && <p role="status">Google coding setup is ready.</p>}
       {pollTimedOut && !ready && (
         <p role="status">Taking longer than expected. Review status before retrying.</p>

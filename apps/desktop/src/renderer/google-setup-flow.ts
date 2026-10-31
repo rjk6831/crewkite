@@ -5,6 +5,7 @@ import {
   googleTermsCurrent,
   type WorkspaceState,
 } from '@crewkite/contracts';
+import { formatSize } from './format-size.ts';
 
 type GoogleState = Pick<WorkspaceState, 'googleAcpInstall' | 'googleAcpSetup'>;
 type GoogleCommand = Extract<
@@ -158,4 +159,84 @@ export async function pollGoogleSetupStatus({
     if (!active()) return 'stopped';
   }
   return 'timeout';
+}
+
+export type GoogleProgressStep = 'download' | 'verify' | 'initialize' | 'authenticate' | 'discover';
+export const GOOGLE_PROGRESS_STEPS: readonly { id: GoogleProgressStep; label: string }[] = [
+  { id: 'download', label: 'Download the official client' },
+  { id: 'verify', label: 'Unpack and verify it' },
+  { id: 'initialize', label: 'Initialize' },
+  { id: 'authenticate', label: 'Sign in with Google' },
+  { id: 'discover', label: 'Discover models' },
+];
+// Shares of the whole bar. The download takes most of a first connect.
+const weights: Record<GoogleProgressStep, number> = {
+  download: 50,
+  verify: 15,
+  initialize: 10,
+  authenticate: 15,
+  discover: 10,
+};
+const setupSteps: Partial<Record<string, GoogleProgressStep>> = {
+  initializing: 'initialize',
+  authenticating: 'authenticate',
+  discovering: 'discover',
+};
+
+export type GoogleSetupProgress = {
+  step: GoogleProgressStep;
+  /** The whole connect, 0 to 100. */
+  percent: number;
+  /** What the current step is doing, in a sentence. */
+  detail: string;
+};
+
+/**
+ * Where a running connect stands: the step the controller reports first, then the step this card
+ * asked for. The install reports bytes while it downloads and unpacks; the later steps report
+ * only that they run. Null when nothing runs.
+ */
+export function googleSetupProgress(
+  state: GoogleState,
+  requested: GoogleSetupStage | null,
+): GoogleSetupProgress | null {
+  const install = state.googleAcpInstall;
+  const setup = state.googleAcpSetup;
+  let step: GoogleProgressStep | undefined;
+  let fraction = 0;
+  let detail = '';
+  if (install?.operationId && (install.state === 'installing' || install.state === 'stopping')) {
+    const progress = install.progress;
+    step = !progress || progress.step === 'download' ? 'download' : 'verify';
+    if (progress && progress.step !== 'verify') {
+      fraction = Math.min(1, progress.bytes / progress.totalBytes);
+      const amount = `${formatSize(progress.bytes)} of ${formatSize(progress.totalBytes)}`;
+      detail =
+        progress.step === 'download'
+          ? `Downloading the official client: ${Math.floor(fraction * 100)} percent, ${amount}.`
+          : `Unpacking the client: ${Math.floor(fraction * 100)} percent, ${amount}.`;
+    } else
+      detail = progress
+        ? 'Checking the Google signatures on the client.'
+        : 'Starting the download of the official client.';
+  } else if (setup?.operationId && setup.state !== 'unknown') {
+    step = setupSteps[setup.state];
+  }
+  if (!step && requested && requested !== 'clear')
+    step = requested === 'install' ? 'download' : requested;
+  if (!step) return null;
+  if (!detail)
+    detail = {
+      download: 'Starting the download of the official client.',
+      verify: 'Checking the Google signatures on the client.',
+      initialize: 'Starting the client and reading what it offers. No prompt is sent.',
+      authenticate: 'Finish the Google sign-in in your browser.',
+      discover: 'Reading the models and modes your account offers. No prompt is sent.',
+    }[step];
+  let before = 0;
+  for (const { id } of GOOGLE_PROGRESS_STEPS) {
+    if (id === step) break;
+    before += weights[id];
+  }
+  return { step, percent: Math.round(before + weights[step] * fraction), detail };
 }
