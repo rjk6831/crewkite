@@ -65,3 +65,6 @@ Sprint 2
 - I made pasted text longer than one message go in as a file.
 - I removed the shipped Anthropic model list: the picker shows the client's rows, then model IDs this home ran turns on.
 - I let effort levels be any name a client reports, so a new level needs no release.
+- I showed the subagents a provider client starts under the tool call that started them, with a live count on the turn chip and each subagent's latest action on the card.
+- I made a client item or tool call that CrewKite has no reader for show as a card.
+- I added an Allow subagents switch to each crew role, on by default, that passes each client's own control.
