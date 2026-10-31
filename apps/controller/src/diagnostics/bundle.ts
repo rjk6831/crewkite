@@ -46,6 +46,8 @@ export type DiagnosticsSource = {
   events: (taskId: string, count: number) => Event[];
   /** The folder that becomes ~ and whose volume the free disk figure describes. */
   userHome?: string;
+  /** Google setup, install, client operations and profile reasons, as the controller holds them. */
+  google?: () => unknown;
 };
 
 const SETTINGS_FILE = 'cli.json';
@@ -125,6 +127,10 @@ export function buildDiagnostics(
       events = source.events(payload.taskId, DIAGNOSTIC_EVENTS);
     } catch {}
   }
+  let google: unknown = { available: false };
+  try {
+    if (source.google) google = source.google();
+  } catch {}
   const log = readControllerLogTail(source.home, DIAGNOSTIC_LOG_BYTES);
   const text: Record<(typeof DIAGNOSTIC_PARTS)[number]['name'], string> = {
     'versions.json': json({
@@ -147,6 +153,7 @@ export function buildDiagnostics(
       userHome,
     ),
     'system.json': json(systemFacts(userHome)),
+    'google-setup.json': json(google),
   };
   return DIAGNOSTIC_PARTS.map((part) => ({
     name: part.name,

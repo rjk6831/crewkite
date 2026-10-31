@@ -2452,9 +2452,14 @@ test('a Google setup step left unknown clears on an explicit stop once its group
         key: id('cmd'),
         actor: { id: 'terminal', kind: 'cli' },
         command,
-        expectedRevision: ['AcknowledgeGoogleTerms'].includes(command)
-          ? 0
-          : controller.store.googleAcpSetup().revision,
+        ...(command === 'ReadDiagnostics'
+          ? {}
+          : {
+              expectedRevision:
+                command === 'AcknowledgeGoogleTerms'
+                  ? 0
+                  : controller.store.googleAcpSetup().revision,
+            }),
         payload,
       }),
       'local-owner',
@@ -2491,6 +2496,23 @@ test('a Google setup step left unknown clears on an explicit stop once its group
     );
     const key = stuck(controller, absent);
     assert.equal((await initialize(controller)).reason, 'google-ownership-unknown');
+    // The diagnostics bundle shows the stuck step and that its group is gone.
+    const bundle = await send(controller, 'ReadDiagnostics', {});
+    const files = (bundle.data as { files: { name: string; text: string }[] }).files;
+    const google = JSON.parse(files.find((file) => file.name === 'google-setup.json')?.text ?? '');
+    assert.equal(google.setup.state, 'unknown');
+    assert.equal(google.setup.operationId, key);
+    assert.deepEqual(
+      google.operations.newest.map(
+        (row: { commandId: string; state: string; groupPresent: boolean }) => [
+          row.commandId,
+          row.state,
+          row.groupPresent,
+        ],
+      ),
+      [[key, 'unknown', false]],
+    );
+    assert.equal(google.profiles[0].id, 'google-acp-v1');
     // A restart keeps the row unknown: a historical group proves nothing without a person's Stop.
     await controller.close();
     controller = open();
