@@ -3916,6 +3916,7 @@ export * from './history-search.ts';
 export * from './mcp.ts';
 export * from './notes.ts';
 export * from './plan-lanes.ts';
+export * from './subagents.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

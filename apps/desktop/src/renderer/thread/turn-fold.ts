@@ -352,5 +352,7 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
     }
     case 'turn.completed':
       return finish(view, event);
+    case 'tool.subagents':
+      return view;
   }
 }

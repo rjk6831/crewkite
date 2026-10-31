@@ -2,6 +2,7 @@ import { z } from 'zod';
 import { ChatChecksEditSchema, ChatChecksStateSchema } from './checks.ts';
 import { ClientVersionStatusSchema } from './client-versions.ts';
 import { ChatPlanConflictsSchema, chatPlanLaneSchema } from './plan-lanes.ts';
+import { AllowSubagentsSchema, subagentActivityFields } from './subagents.ts';
 
 // Shared shape of a chat thread, its turns and the live agent stream.
 // Every provider adapter translates its native protocol into these events.
@@ -100,7 +101,13 @@ export const ChatCrewSchema = z
   .strictObject({
     name: z.string().min(1).max(60),
     members: z
-      .array(z.strictObject({ role: ChatCrewRoleSchema, selection: ChatModelSelectionSchema }))
+      .array(
+        z.strictObject({
+          role: ChatCrewRoleSchema,
+          selection: ChatModelSelectionSchema,
+          allowSubagents: AllowSubagentsSchema,
+        }),
+      )
       .min(1)
       .max(5),
   })
@@ -393,6 +400,8 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     diff: ChatFileDiffSchema.optional(),
     summary: z.string().max(4096).optional(),
   }),
+  // The subagents one tool call started, as the client reported them so far.
+  z.strictObject({ type: z.literal('tool.subagents'), ...turnRef, ...subagentActivityFields }),
   z.strictObject({
     type: z.literal('permission.requested'),
     ...turnRef,

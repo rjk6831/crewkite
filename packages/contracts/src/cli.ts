@@ -79,7 +79,7 @@ export type CliJsonLine = z.infer<typeof CliJsonLineSchema>;
 
 /** The hash of the shape `CLI_JSON_LINE_VERSION` names. Change them together. */
 export const CLI_JSON_LINE_SHAPE =
-  '502283e9ce9ee1113fda5b87f41309f575c84d80c42000860fbff53b339b24b4';
+  '02c504d11eca3533ba524da18aa8788cec36df6fbddc25b4838b26f4914011da';
 
 /**
  * Exit codes of every CLI command. 0: the request applied, or the followed turn finished. 1: it
