@@ -5,13 +5,20 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { ChatFamily } from '@crewkite/contracts';
 import {
+  adviceContext,
+  askContext,
   attachedLine,
   attachedSection,
+  challengeContext,
   deltaPacket,
   type EarlierFile,
   earlierReach,
   handoffPacket,
   instructionFiles,
+  orchestratorContext,
+  readOnlyRules,
+  reviewContext,
+  sliceBrief,
   spokenText,
   systemContext,
   THREAD_TOOLS_LINE,
@@ -206,4 +213,48 @@ test('a request holds the new message once and lists each file once, in the sect
     packet,
     /New message from the person: the files attached to this message, with no text\.$/,
   );
+});
+
+test('a read-only brief lets the OpenAI client read through read-only commands and keeps the others off commands', () => {
+  const briefs = (family: ChatFamily) => [
+    reviewContext('demo', '/s', 'abc', [], family),
+    adviceContext('demo', '/s', family, null),
+    askContext('demo', '/s', family),
+    challengeContext('demo', '/s', family, null),
+    orchestratorContext('demo', '/s', family),
+  ];
+  for (const brief of briefs('openai')) {
+    assert.match(brief, /run read-only commands such as ls, cat, sed -n/);
+    assert.doesNotMatch(brief, /do not run commands/);
+  }
+  for (const family of ['anthropic', 'google', 'local'] as const)
+    for (const brief of briefs(family)) {
+      assert.match(brief, /do not run commands\. You may read and search files/, family);
+      assert.doesNotMatch(brief, /read-only commands/, family);
+    }
+  assert.match(readOnlyRules('openai', 'answer'), /to answer: run read-only commands/);
+});
+
+test('the orchestrator brief names the slices as the parallel workers and keeps the JSON out of the summary', () => {
+  const brief = orchestratorContext('demo', '/s', 'openai');
+  assert.match(brief, /Slices whose dependencies are done start together/);
+  assert.match(brief, /The slices are the parallel workers/);
+  assert.match(
+    brief,
+    /asks for a number of agents or subagents, split the work into that many slices/,
+  );
+  assert.match(brief, /does not repeat its JSON/);
+  assert.doesNotMatch(brief, /one at a time in dependency order/);
+});
+
+test('a read-only slice brief asks for reads and searches', () => {
+  const plan = { planId: 'p1', goal: 'Find the bug.', slices: [{}] };
+  const slice = {
+    id: 1,
+    title: 'Look',
+    brief: 'Find where totals round.',
+    files: [],
+    readOnly: true,
+  };
+  assert.match(sliceBrief(plan, slice, 'Assigned.'), /Read and search the files it needs/);
 });

@@ -48,6 +48,7 @@ test('installation Stop waits for owned signature closure and recovery never rep
         assert.ok(child.pid);
         lifecycle.owned(child.pid);
         if (index === 1) {
+          input.onProgress?.({ step: 'verify', bytes: 10, totalBytes: 10 });
           ready.resolve();
           await release.promise;
           assert.equal(input.signal?.aborted, true);
@@ -68,6 +69,9 @@ test('installation Stop waits for owned signature closure and recovery never rep
     assert.equal(operation.install(input), pending);
     await ready.promise;
     assert.equal(operation.status().state, 'installing');
+    // The running step reaches the status from memory. The journal never records it.
+    assert.deepEqual(operation.status().progress, { step: 'verify', bytes: 10, totalBytes: 10 });
+    assert.ok(records().every((record) => record.status.progress === undefined));
     assert.equal(
       (await operation.install({ ...input, requestHash: 'b'.repeat(64) })).outcome,
       'denied',

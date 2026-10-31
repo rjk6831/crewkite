@@ -131,6 +131,7 @@ export function McpCard() {
               </span>
               <span className="st-actions">
                 <button
+                  className="button secondary"
                   type="button"
                   onClick={() => {
                     setEditing(server.name);
@@ -146,6 +147,7 @@ export function McpCard() {
                   Edit
                 </button>
                 <button
+                  className="button secondary"
                   type="button"
                   onClick={() => bridge && void run(() => bridge.remove(server.name))}
                 >
@@ -191,6 +193,7 @@ export function McpCard() {
         )}
         <div className="st-actions">
           <button
+            className="button secondary"
             type="button"
             disabled={!bridge || !draft.name || !draft.command}
             onClick={() =>

@@ -4,6 +4,7 @@ import type { ChatCatalogRead } from '@crewkite/contracts';
 import {
   crewFromPreset,
   familyModel,
+  flightPreset,
   preferredSelection,
   readCrewPresets,
   readThreadDefaults,
@@ -206,4 +207,11 @@ test('a preset carries each pinned effort into the crew and drops an effort the 
   // The test models offer low and high only, so a saved medium becomes the default, low.
   pin('high', 'medium');
   assert.deepEqual(efforts(), ['builder:high', 'reviewer:low']);
+});
+
+test('Balanced and Glide start the Solo crew on a thread with none, and keep a crew the thread has', () => {
+  assert.equal(flightPreset(false, 'balanced'), 'Solo');
+  assert.equal(flightPreset(false, 'glide'), 'Solo');
+  assert.equal(flightPreset(false, 'manual'), null);
+  assert.equal(flightPreset(true, 'glide'), null);
 });

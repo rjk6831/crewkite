@@ -5,6 +5,7 @@ import {
   googleTermsCurrent,
   type WorkspaceState,
 } from '@crewkite/contracts';
+import { formatSize } from './format-size.ts';
 
 type GoogleState = Pick<WorkspaceState, 'googleAcpInstall' | 'googleAcpSetup'>;
 type GoogleCommand = Extract<
@@ -15,10 +16,11 @@ type GoogleCommand = Extract<
       | 'InstallGoogleAcp'
       | 'InitializeGoogleAcp'
       | 'AuthenticateGoogleAcp'
-      | 'DiscoverGoogleAcp';
+      | 'DiscoverGoogleAcp'
+      | 'StopGoogleAcpSetup';
   }
 >;
-export type GoogleSetupStage = 'install' | 'initialize' | 'authenticate' | 'discover';
+export type GoogleSetupStage = 'clear' | 'install' | 'initialize' | 'authenticate' | 'discover';
 export type GoogleSetupFlowResult =
   | { kind: 'ready' }
   | { kind: 'stopped' }
@@ -27,28 +29,17 @@ export type GoogleSetupFlowResult =
 const applied = (result: CommandResult) =>
   result.outcome === 'applied' || result.outcome === 'already-applied';
 
-function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' | null {
+export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' | null {
   const setup = state.googleAcpSetup;
   const installation = state.googleAcpInstall;
-  if (
-    installation?.state === 'unknown' ||
-    installation?.state === 'blocked' ||
-    setup?.state === 'unknown' ||
-    setup?.state === 'blocked'
-  ) {
-    return null;
-  }
-  if (installation?.operationId || setup?.operationId) return null;
-  if (
-    !setup?.client &&
-    installation &&
-    installation.state !== 'idle' &&
-    installation.state !== 'installed'
-  ) {
-    return null;
-  }
+  if (installation?.state === 'unknown' || installation?.operationId) return null;
+  // A step whose ownership was lost is cleared first. The controller clears it only when it can
+  // prove the step's process ended, and the setup then starts that step again.
+  if (setup?.state === 'unknown') return setup.operationId ? 'clear' : null;
+  if (setup?.operationId) return null;
   const installed = installation?.state === 'installed' || !!setup?.client;
-  if (!installed) return 'install';
+  if (!installed)
+    return !installation || ['idle', 'blocked'].includes(installation.state) ? 'install' : null;
   if (setup?.state === 'ready') return 'ready';
   if (!setup || setup.state === 'uninitialized') return 'initialize';
   if (setup.state === 'authentication-required') {
@@ -56,6 +47,11 @@ function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' | null 
   }
   if (setup.state === 'discovery-required') {
     return setup.proofId && setup.auth.status === 'authenticated' ? 'discover' : null;
+  }
+  // A blocked setup retries the step its saved proof reached, one attempt per click.
+  if (setup.state === 'blocked') {
+    if (!setup.proofId) return 'initialize';
+    return setup.auth.status === 'authenticated' ? 'discover' : 'authenticate';
   }
   return null;
 }
@@ -96,7 +92,14 @@ export async function runGoogleSetupFlow({
     onStage(stage);
     const setup = state.googleAcpSetup;
     let input: GoogleCommand;
-    if (stage === 'install') {
+    if (stage === 'clear') {
+      if (!setup?.operationId) return { kind: 'blocked' };
+      input = {
+        command: 'StopGoogleAcpSetup',
+        expectedRevision: setup.revision,
+        payload: { profileId: 'google-acp-v1', operationId: setup.operationId },
+      };
+    } else if (stage === 'install') {
       input = {
         command: 'InstallGoogleAcp',
         expectedRevision: 0,
@@ -156,4 +159,84 @@ export async function pollGoogleSetupStatus({
     if (!active()) return 'stopped';
   }
   return 'timeout';
+}
+
+export type GoogleProgressStep = 'download' | 'verify' | 'initialize' | 'authenticate' | 'discover';
+export const GOOGLE_PROGRESS_STEPS: readonly { id: GoogleProgressStep; label: string }[] = [
+  { id: 'download', label: 'Download the official client' },
+  { id: 'verify', label: 'Unpack and verify it' },
+  { id: 'initialize', label: 'Initialize' },
+  { id: 'authenticate', label: 'Sign in with Google' },
+  { id: 'discover', label: 'Discover models' },
+];
+// Shares of the whole bar. The download takes most of a first connect.
+const weights: Record<GoogleProgressStep, number> = {
+  download: 50,
+  verify: 15,
+  initialize: 10,
+  authenticate: 15,
+  discover: 10,
+};
+const setupSteps: Partial<Record<string, GoogleProgressStep>> = {
+  initializing: 'initialize',
+  authenticating: 'authenticate',
+  discovering: 'discover',
+};
+
+export type GoogleSetupProgress = {
+  step: GoogleProgressStep;
+  /** The whole connect, 0 to 100. */
+  percent: number;
+  /** What the current step is doing, in a sentence. */
+  detail: string;
+};
+
+/**
+ * Where a running connect stands: the step the controller reports first, then the step this card
+ * asked for. The install reports bytes while it downloads and unpacks; the later steps report
+ * only that they run. Null when nothing runs.
+ */
+export function googleSetupProgress(
+  state: GoogleState,
+  requested: GoogleSetupStage | null,
+): GoogleSetupProgress | null {
+  const install = state.googleAcpInstall;
+  const setup = state.googleAcpSetup;
+  let step: GoogleProgressStep | undefined;
+  let fraction = 0;
+  let detail = '';
+  if (install?.operationId && (install.state === 'installing' || install.state === 'stopping')) {
+    const progress = install.progress;
+    step = !progress || progress.step === 'download' ? 'download' : 'verify';
+    if (progress && progress.step !== 'verify') {
+      fraction = Math.min(1, progress.bytes / progress.totalBytes);
+      const amount = `${formatSize(progress.bytes)} of ${formatSize(progress.totalBytes)}`;
+      detail =
+        progress.step === 'download'
+          ? `Downloading the official client: ${Math.floor(fraction * 100)} percent, ${amount}.`
+          : `Unpacking the client: ${Math.floor(fraction * 100)} percent, ${amount}.`;
+    } else
+      detail = progress
+        ? 'Checking the Google signatures on the client.'
+        : 'Starting the download of the official client.';
+  } else if (setup?.operationId && setup.state !== 'unknown') {
+    step = setupSteps[setup.state];
+  }
+  if (!step && requested && requested !== 'clear')
+    step = requested === 'install' ? 'download' : requested;
+  if (!step) return null;
+  if (!detail)
+    detail = {
+      download: 'Starting the download of the official client.',
+      verify: 'Checking the Google signatures on the client.',
+      initialize: 'Starting the client and reading what it offers. No prompt is sent.',
+      authenticate: 'Finish the Google sign-in in your browser.',
+      discover: 'Reading the models and modes your account offers. No prompt is sent.',
+    }[step];
+  let before = 0;
+  for (const { id } of GOOGLE_PROGRESS_STEPS) {
+    if (id === step) break;
+    before += weights[id];
+  }
+  return { step, percent: Math.round(before + weights[step] * fraction), detail };
 }

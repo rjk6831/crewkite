@@ -705,6 +705,8 @@ export function startAcpProcess<T>(
   let stopper: (() => void) | undefined;
   let code: number | null = null,
     signal: NodeJS.Signals | null = null;
+  let killedAt: number | undefined;
+  let streamsClosed = false;
   const closed = Promise.withResolvers<void>();
   const failed = Promise.withResolvers<never>();
   void failed.promise.catch(() => {});
@@ -713,6 +715,7 @@ export function startAcpProcess<T>(
     if (group > 0 && !groupAbsent(group)) {
       try {
         process.kill(-group, value);
+        if (value === 'SIGKILL') killedAt ??= now();
         if (completed && reason === null && value === 'SIGTERM') cleanupTerminated = true;
       } catch {}
     }
@@ -763,8 +766,26 @@ export function startAcpProcess<T>(
   child.once('close', (exitCode, exitSignal) => {
     code = exitCode;
     signal = exitSignal;
+    streamsClosed = true;
     closed.resolve();
   });
+  // Timers run before the poll phase that reaps a child. When synchronous work holds the loop past
+  // the cutoff, the kill and the cutoff run in one pass, before the close event can arrive, and a
+  // client that exited in time would read as unowned. The cutoff decides after one poll phase. A
+  // group already gone gets one more turn for its queued close, and a group still present gets
+  // the usual gap after a late kill.
+  function cutoff(settle: () => void) {
+    setImmediate(() => {
+      if (finished || streamsClosed) return;
+      if (group > 0 && groupAbsent(group)) {
+        timers.push(schedule(settle, 0));
+        return;
+      }
+      const late = killedAt === undefined ? 0 : killedAt + 250 - now();
+      if (late > 0) timers.push(schedule(settle, late));
+      else settle();
+    });
+  }
   function stop(cause: 'stopped' | 'deadline' = 'stopped') {
     if (finished || stopping) return;
     stopping = true;
@@ -820,7 +841,9 @@ export function startAcpProcess<T>(
       shutdown();
       const closedInTime = await Promise.race([
         closed.promise.then(() => true),
-        new Promise<false>((resolve) => timers.push(schedule(() => resolve(false), 500))),
+        new Promise<false>((resolve) =>
+          timers.push(schedule(() => cutoff(() => resolve(false)), 500)),
+        ),
       ]);
       const quiescent = closedInTime && group > 0 && groupAbsent(group);
       if (quiescent) {

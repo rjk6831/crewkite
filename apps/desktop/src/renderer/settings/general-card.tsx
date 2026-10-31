@@ -8,8 +8,10 @@ import { useState } from 'react';
 import { familyName } from '../components.tsx';
 import { runExport } from '../diagnostics.tsx';
 import { EffortSelect } from '../thread/model-picker.tsx';
+import { RoleInfo } from '../thread/role-info.tsx';
 import {
   type CrewPreset,
+  crewPresetHints,
   crewRoleNames,
   handoffModes,
   permissionPolicies,
@@ -29,11 +31,6 @@ type Entry = ChatCatalogRead['families'][number];
 type Choice = { entry: Entry; model: Entry['models'][number] };
 
 const presetId = (name: string) => name.toLowerCase().replace(/\s+/g, '-');
-const presetHints: Record<CrewPreset['name'], string> = {
-  Solo: 'The builder only. Nothing runs after a reply.',
-  Pair: 'A builder and a reviewer on another family.',
-  'Full crew': 'Builder, reviewer, challenger and fixer, with an orchestrator that plans the work.',
-};
 // The fixer and the orchestrator are the builder's model unless the person pins another.
 const autoLabel = (role: string) =>
   role === 'builder'
@@ -287,15 +284,18 @@ export function GeneralCard({
             <span className="st-field">
               <span className="st-name">Crew preset: {preset.name}</span>
               <small className="st-hint">
-                {presetHints[preset.name]} A thread starts from it under Crew in the inspector.
+                {crewPresetHints[preset.name]} A thread picks it under Crew in the inspector.
               </small>
             </span>
             <div className="st-controls st-crew">
               {preset.members.map((member) => (
                 <div key={member.role} className="st-crew-role">
-                  <label htmlFor={`settings-${presetId(preset.name)}-${member.role}`}>
-                    {crewRoleNames[member.role]}
-                  </label>
+                  <span className="role-name">
+                    <label htmlFor={`settings-${presetId(preset.name)}-${member.role}`}>
+                      {crewRoleNames[member.role]}
+                    </label>
+                    <RoleInfo of={member.role} />
+                  </span>
                   <span className="st-crew-pick">
                     <SelectionFields
                       id={`settings-${presetId(preset.name)}-${member.role}`}
@@ -320,6 +320,20 @@ export function GeneralCard({
             </div>
           </div>
         ))}
+        <div className="st-row">
+          <span className="st-field">
+            <span className="st-name">Other roles</span>
+            <small className="st-hint">A thread runs these outside any crew preset.</small>
+          </span>
+          <div className="st-controls st-crew">
+            <span className="role-name">
+              Advisor <RoleInfo of="advisor" />
+            </span>
+            <span className="role-name">
+              Ask <RoleInfo of="ask" />
+            </span>
+          </div>
+        </div>
         <div className="st-row">
           <span className="st-field" id="settings-theme">
             <span className="st-name">Theme</span>
@@ -373,6 +387,7 @@ export function GeneralCard({
           <div className="st-controls">
             <button
               type="button"
+              className="button secondary"
               onClick={() => void runExport(source, threadId).then(setExportNote)}
             >
               Export diagnostics

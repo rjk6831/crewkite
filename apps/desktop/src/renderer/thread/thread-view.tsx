@@ -30,6 +30,7 @@ import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { catalogLabels, ModelLabels } from './model-labels.ts';
 import { outputLimitLine } from './output-limit.ts';
+import { planRow } from './plan-card.ts';
 import { PlanCard } from './plan-card.tsx';
 import { ProjectNotesProvider } from './project-notes.tsx';
 import { QueuedList } from './queued-list.tsx';
@@ -338,7 +339,20 @@ function ThreadBody({
     const line = outputLimitLine(limit);
     return state.messages.some((message) => message.text === line) ? null : line;
   };
+  // The plan card sits under the orchestrator turn that proposed it. See planRow.
+  const planTurn = planRow(items, plan);
+  const planInline = planTurn !== null;
   const actions = (item: ThreadItem): ReactNode => {
+    const controls = turnActions(item);
+    if (!planInline || item.kind !== 'turn' || item.turn.id !== planTurn) return controls;
+    return (
+      <>
+        {controls}
+        {planned}
+      </>
+    );
+  };
+  const turnActions = (item: ThreadItem): ReactNode => {
     if (item.kind !== 'turn' && item.kind !== 'failure') return null;
     const turnId = item.kind === 'turn' ? item.turn.id : item.turnId;
     const note = item.kind === 'turn' ? state.historyNotes[turnId] : undefined;
@@ -455,9 +469,9 @@ function ThreadBody({
             items={items}
             empty={empty}
             footer={
-              (planned || checked || offer) && (
+              ((planned && !planInline) || checked || offer) && (
                 <>
-                  {planned}
+                  {!planInline && planned}
                   {checked}
                   {offer && (
                     <LimitOfferCard

@@ -12,6 +12,7 @@ import { formatSize } from './format-size.ts';
 import {
   anthropicUsageCard,
   gaugeAge,
+  gaugeColor,
   gaugeHue,
   nativeUsageClients,
   projectUsagePresentation,
@@ -219,15 +220,26 @@ test('native usage gauges show the remaining percent without inventing freshness
   assert(rows.every((row) => row.readAt === DEMO_TIME));
   // Decision 14: one color rule for every family, and an age label that never greys the fill.
   const hues: [number, number][] = [
-    [100, 120],
-    [97, 117],
-    [80, 100],
-    [60, 55],
-    [40, 35],
-    [14, 10.5],
+    [100, 130],
+    [92.5, 109],
+    [85, 88],
+    [70, 58],
+    [60, 48.666666666666664],
+    [55, 44],
+    [40, 32],
+    [25, 18],
+    [10, 4],
     [0, 0],
   ];
   for (const [percent, hue] of hues) assert.equal(gaugeHue(percent), hue, `${percent} percent`);
+  // A continuous ramp: readings 15 points apart never share a colour, and empty is deep red.
+  assert.equal(gaugeColor(100), 'hsl(130 68% 40%)');
+  assert.equal(gaugeColor(83), 'hsl(84 71% 42%)');
+  assert.equal(gaugeColor(0), 'hsl(0 75% 32%)');
+  assert.equal(gaugeColor(-5), gaugeColor(0));
+  assert.equal(gaugeColor(140), gaugeColor(100));
+  const ramp = [100, 85, 70, 55, 40, 25, 10, 0].map(gaugeColor);
+  assert.equal(new Set(ramp).size, ramp.length);
   const readAt = (minutes: number) => new Date(nowMs - minutes * 60_000).toISOString();
   const ages: [string | null, string, boolean][] = [
     [readAt(4), 'read 4 min ago', false],
@@ -338,7 +350,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         window('weekly', 'weekly', 63, 2880),
         window('weekly-fable', 'weekly', 20, 2880),
       ]),
-      expect: { bars: ['5 h 68%', 'week 63%'], resetsIn: 2880 * 60_000, read: 'Read 2 min ago' },
+      expect: { bars: ['5 h 68%', 'week 63%'], resetsIn: 2880 * 60_000, read: 'read 2 m ago' },
     },
     {
       claim: 'OpenAI primary is the five-hour bar and secondary the weekly bar',
@@ -346,7 +358,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         window('client:primary', 'five-hour', 12, 40),
         window('client:secondary', 'weekly', 70, 4000),
       ]),
-      expect: { bars: ['5 h 12%', 'week 70%'], resetsIn: 40 * 60_000, read: 'Read 2 min ago' },
+      expect: { bars: ['5 h 12%', 'week 70%'], resetsIn: 40 * 60_000, read: 'read 2 m ago' },
     },
     {
       claim: 'a family with one window gets one bar, and an unconnected reader asks for Connect',
@@ -357,7 +369,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         defaultModel: null,
         readAt: at(-125),
       }),
-      expect: { bars: ['99% left'], needsConnect: true, read: 'Read 2 h ago' },
+      expect: { bars: ['99% left'], needsConnect: true, read: 'read 2 h ago' },
     },
     {
       claim: 'Local has no bars, reads No limits and carries the hardware line',

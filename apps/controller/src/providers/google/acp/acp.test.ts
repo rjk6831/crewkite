@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn as spawnProcess } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import fs, {
   chmodSync,
@@ -16,7 +17,12 @@ import { userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { type ApprovalBinding, CommandSchema, GOOGLE_TERMS_VERSION } from '@crewkite/contracts';
+import {
+  type ApprovalBinding,
+  type CommandResult,
+  CommandSchema,
+  GOOGLE_TERMS_VERSION,
+} from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { createTestClock, createTestIds } from '../../../../../../packages/testkit/src/fixtures.ts';
 import type { AcpPeerCase } from '../../../../../../packages/testkit/src/providers/acp-peer.ts';
@@ -2369,6 +2375,189 @@ test('a controller that registers the Google client sets it up at launch and lea
     await controller.googleAcpPreparation;
     assert.deepEqual(controller.store.googleAcpSetup(), setup);
     assert.equal(steps(controller).length, 3);
+  } finally {
+    await controller.close();
+    f.dispose();
+  }
+});
+
+test('an acp setup whose stop timers run in one held pass still proves its group closed', async () => {
+  // A controller loop held past the cutoff runs the stop timers together, before the close event
+  // of a client that exited in time can arrive. The setup must still read as owned to the end.
+  const f = fixture('complete');
+  try {
+    const held: (() => void)[] = [];
+    let holding = true;
+    const outcome = await startGoogleAcpSetup({
+      client: f.client,
+      directory: f.directory(),
+      environment,
+      operation: 'initialize',
+      priorProof: null,
+      lifecycle: f.lifecycle,
+      spawn: spawnCheckChild as AcpSpawn,
+      schedule: (work, milliseconds) => {
+        if (holding && (milliseconds === 100 || milliseconds === 250)) {
+          held.push(work);
+          return () => {};
+        }
+        if (holding && milliseconds === 500) {
+          holding = false;
+          for (const timer of held) timer();
+          work();
+          return () => {};
+        }
+        const timer = setTimeout(work, milliseconds);
+        return () => clearTimeout(timer);
+      },
+    }).result;
+    assert.equal(held.length, 2);
+    assert.equal(outcome.quiescent, true);
+    assert.notEqual(outcome.reason, 'ownership');
+    assert.deepEqual(f.phases, ['intent', 'owned', 'quiescent']);
+  } finally {
+    f.dispose();
+  }
+});
+
+test('a Google setup step left unknown clears on an explicit stop once its group is gone', async () => {
+  const f = fixture('complete');
+  const started: string[] = [];
+  const clock = createTestClock();
+  const id = createTestIds();
+  const client = { HOME: userInfo().homedir, PATH: process.env.PATH };
+  const open = () =>
+    new Controller({
+      home: join(f.home, 'controller'),
+      now: clock.now,
+      id,
+      googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+      googleAcp: {
+        reviewMappings: [f.mapping],
+        spawn: ((...args: Parameters<AcpSpawn>) => {
+          started.push('spawn');
+          return spawnCheckChild(...args);
+        }) as AcpSpawn,
+        resolve: (proof) => ({
+          ...resolveGoogleAcpProfile({ home: f.home, proof, environment: client }),
+          client: f.client,
+          environment: client,
+        }),
+      },
+    });
+  const send = (controller: Controller, command: string, payload: object) =>
+    controller.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: id('cmd'),
+        actor: { id: 'terminal', kind: 'cli' },
+        command,
+        ...(command === 'ReadDiagnostics'
+          ? {}
+          : {
+              expectedRevision:
+                command === 'AcknowledgeGoogleTerms'
+                  ? 0
+                  : controller.store.googleAcpSetup().revision,
+            }),
+        payload,
+      }),
+      'local-owner',
+    );
+  const initialize = (controller: Controller) =>
+    send(controller, 'InitializeGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' });
+  // A group that existed and exited, the way the cut-off client group looks afterwards.
+  const exited = spawnProcess(process.execPath, ['-e', ''], { detached: true, stdio: 'ignore' });
+  await new Promise((resolve) => exited.once('close', resolve));
+  const absent = exited.pid as number;
+  assert(groupAbsent(absent));
+  const stuck = (controller: Controller, group: number | null) => {
+    const key = id('cmd');
+    controller.store.transaction(() => {
+      const setup = controller.store.googleAcpSetup();
+      controller.store.beginGoogleMetadata(key, 'acp-initialize', setup.revision + 1, clock.now());
+      if (group) controller.store.ownGoogleMetadata(key, group);
+      controller.store.unknownGoogleMetadata(key);
+      controller.store.putGoogleAcpSetup({
+        ...setup,
+        revision: setup.revision + 1,
+        state: 'unknown',
+        operationId: key,
+      });
+    });
+    return key;
+  };
+  let controller = open();
+  try {
+    assert.equal(
+      (await send(controller, 'AcknowledgeGoogleTerms', { textVersion: GOOGLE_TERMS_VERSION }))
+        .outcome,
+      'applied',
+    );
+    const key = stuck(controller, absent);
+    assert.equal((await initialize(controller)).reason, 'google-ownership-unknown');
+    // The diagnostics bundle shows the stuck step and that its group is gone.
+    const bundle = await send(controller, 'ReadDiagnostics', {});
+    const files = (bundle.data as { files: { name: string; text: string }[] }).files;
+    const google = JSON.parse(files.find((file) => file.name === 'google-setup.json')?.text ?? '');
+    assert.equal(google.setup.state, 'unknown');
+    assert.equal(google.setup.operationId, key);
+    assert.deepEqual(
+      google.operations.newest.map(
+        (row: { commandId: string; state: string; groupPresent: boolean }) => [
+          row.commandId,
+          row.state,
+          row.groupPresent,
+        ],
+      ),
+      [[key, 'unknown', false]],
+    );
+    assert.equal(google.profiles[0].id, 'google-acp-v1');
+    // A restart keeps the row unknown: a historical group proves nothing without a person's Stop.
+    await controller.close();
+    controller = open();
+    assert.equal(controller.store.googleAcpSetup().state, 'unknown');
+    assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'unknown');
+
+    const stop = (operationId: string) =>
+      send(controller, 'StopGoogleAcpSetup', { profileId: 'google-acp-v1', operationId });
+    const cleared = await stop(key);
+    assert.equal(cleared.outcome, 'applied');
+    const setup = controller.store.googleAcpSetup();
+    assert.equal(setup.state, 'blocked');
+    assert.equal(setup.operationId, null);
+    assert.deepEqual(
+      controller.store.googleMetadataOperations().map((row) => row.state),
+      ['quiescent'],
+    );
+    assert.ok(controller.store.receipt(`google-metadata-settled:${key}`));
+    assert.deepEqual(started, []);
+
+    // A quota read in flight holds the step until it ends, then the step runs.
+    const read = Promise.withResolvers<CommandResult>();
+    controller.usageRead = {
+      key: id('cmd'),
+      hash: 'a'.repeat(64),
+      principal: 'local-owner',
+      abort: new AbortController(),
+      promise: read.promise,
+      resolve: read.resolve,
+    };
+    const pending = initialize(controller);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(started, []);
+    controller.usageRead = undefined;
+    read.resolve({ outcome: 'applied' });
+    assert.equal((await pending).outcome, 'applied');
+    assert.ok(started.length > 0);
+    assert.equal(controller.store.googleAcpSetup().state, 'authentication-required');
+
+    // A step that never recorded a group stays unknown and says why.
+    const hidden = stuck(controller, null);
+    const refused = await stop(hidden);
+    assert.equal(refused.reason, 'google-ownership-unknown');
+    assert.match(refused.next ?? '', /recorded no process group/);
+    assert.equal(controller.store.googleAcpSetup().state, 'unknown');
   } finally {
     await controller.close();
     f.dispose();

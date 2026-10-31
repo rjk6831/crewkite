@@ -45,7 +45,12 @@ const clientFacts = (profiles: NativeProfileResolution[]): ProviderClientFact[] 
 
 /** The `ReadDiagnostics` command. A thread that does not exist is refused, as every read does. */
 export function readDiagnostics(
-  deps: { home: string; store: Store; profiles: () => NativeProfileResolution[] },
+  deps: {
+    home: string;
+    store: Store;
+    profiles: () => NativeProfileResolution[];
+    google?: () => unknown;
+  },
   payload: ReadDiagnosticsPayload,
 ): CommandResult {
   if (payload.taskId && !deps.store.get<Task>('task', payload.taskId))
@@ -56,6 +61,7 @@ export function readDiagnostics(
       controllerVersion: CREWKITE_VERSION,
       clients: () => clientFacts(deps.profiles()),
       events: (taskId, count) => newestEvents(deps.store, taskId, count ?? DIAGNOSTIC_EVENTS),
+      ...(deps.google ? { google: deps.google } : {}),
     },
     payload,
   );

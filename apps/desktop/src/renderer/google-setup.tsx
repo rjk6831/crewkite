@@ -5,14 +5,65 @@ import {
   googleTermsCurrent,
   type Snapshot,
 } from '@crewkite/contracts';
+import { Check } from 'lucide-react';
 import { useEffect, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
+import { formatLocalTime } from './format-time.ts';
 import {
+  GOOGLE_PROGRESS_STEPS,
+  type GoogleSetupProgress,
   type GoogleSetupStage,
+  googleSetupProgress,
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
 } from './google-setup-flow.ts';
 import type { Workspace } from './source.ts';
+import './google-setup.css';
+
+// A first connect downloads about 110 MB and waits on a browser sign-in, so the card reads the
+// status each second for up to 15 minutes while a step runs.
+const POLL_ATTEMPTS = 900;
+
+/** The whole connect as one bar, the current step named, and every step listed under it. */
+function GoogleProgress({ progress }: { progress: GoogleSetupProgress }) {
+  const index = GOOGLE_PROGRESS_STEPS.findIndex(({ id }) => id === progress.step);
+  const position = `Step ${index + 1} of ${GOOGLE_PROGRESS_STEPS.length}`;
+  const label = GOOGLE_PROGRESS_STEPS[index]?.label ?? '';
+  return (
+    <div className="gs-progress">
+      <p className="gs-progress-head" role="status">
+        {position}: {label}
+      </p>
+      <div
+        className="gs-progress-track"
+        role="progressbar"
+        aria-label="Google connect progress"
+        aria-valuemin={0}
+        aria-valuemax={100}
+        aria-valuenow={progress.percent}
+        aria-valuetext={`${progress.percent} percent. ${position}, ${label}. ${progress.detail}`}
+      >
+        <div className="gs-progress-fill" style={{ width: `${progress.percent}%` }} />
+      </div>
+      <p className="muted small">{progress.detail}</p>
+      <ol className="gs-progress-steps" aria-label="Connect steps">
+        {GOOGLE_PROGRESS_STEPS.map((step, at) => (
+          <li
+            key={step.id}
+            className={at < index ? 'is-done' : at === index ? 'is-current' : undefined}
+            aria-current={at === index ? 'step' : undefined}
+          >
+            <span className="gs-progress-mark" aria-hidden="true">
+              {at < index && <Check size={12} />}
+            </span>
+            {at < index && <span className="gs-sr-only">Done: </span>}
+            {step.label}
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
+}
 
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
@@ -33,12 +84,33 @@ const setupLabels: Record<string, string> = {
 // Refusal codes the controller sends when setup cannot start, in the words the card shows.
 const refusalText: Record<string, string> = {
   'google-operation-active':
-    'Google setup is already running, often still installing the client. This card follows it until it ends.',
+    'Another Google step is running, such as the quota read or a coding turn. Try again when it ends.',
   'google-ownership-unknown':
-    'CrewKite cannot tell which process owns the Google setup. Open Advanced repair controls to clear it.',
+    'CrewKite cannot prove the last Google step ended, so Google setup is paused. Press Clear and try again.',
+  'google-install-active': 'The official client is still installing. This card follows it.',
+  'google-install-ownership-unknown':
+    'CrewKite cannot prove the last install check ended. Refresh status in a minute.',
+  'acp-setup-timeout': 'The Google client did not answer in time. Press Try again.',
+  'acp-setup-failed': 'The Google client stopped before the step finished. Press Try again.',
+  'acp-setup-stopped': 'The step was stopped before it finished.',
+  'acp-proof-unavailable': 'The saved setup no longer matches the client. Press Try again.',
+  'acp-setup-not-current': 'The setup moved on since this card read it. Review the status above.',
+  'response-timeout': 'The controller has not answered yet. The step may still be running.',
+};
+
+// Why the coding setup is not ready, from the Google profile, in plain words.
+const profileText: Record<string, string> = {
+  'client-unavailable': 'The official client is not installed.',
+  'client-build-mismatch': 'The installed client does not match the reviewed build.',
+  'unsupported-platform': 'Google coding setup needs a Mac with Apple silicon.',
+  'native-home-unavailable': 'The client cannot read your home folder from this controller.',
+  'auth-method-mismatch': 'The client does not offer personal Google sign-in.',
+  'authentication-required': 'Google sign-in has not finished.',
+  'qualification-pending': 'Setup is complete. The route still needs qualification.',
 };
 
 const stageLabels: Record<GoogleSetupStage, string> = {
+  clear: 'Clearing the stuck setup step',
   install: 'Installing and verifying the official client',
   initialize: 'Initializing Google ACP',
   authenticate: 'Waiting for Google account sign-in',
@@ -70,10 +142,12 @@ export function GoogleSetup({
   const generation = useRef(0);
   const mounted = useRef(true);
   const connected = workspace.connection === 'connected' && !workspace.preview;
-  const active = !!setup?.operationId;
-  const installing = !!installation?.operationId;
+  // A step whose ownership is unknown runs nothing this card can follow. It waits for Clear.
+  const active = !!setup?.operationId && setup.state !== 'unknown';
+  const installing = !!installation?.operationId && installation.state !== 'unknown';
   const installed = installation?.state === 'installed' || !!setup?.client;
-  const unknown = setup?.state === 'unknown' || installation?.state === 'unknown';
+  const installUnknown = installation?.state === 'unknown';
+  const unknown = setup?.state === 'unknown' || installUnknown;
   const needsRepair = unknown || setup?.state === 'blocked' || installation?.state === 'blocked';
   const ready = setup?.state === 'ready';
   const working = !!requested || active || installing || cancelBusy;
@@ -92,7 +166,8 @@ export function GoogleSetup({
   // A setup started from another card, or before this one opened, keeps running in the controller.
   // Follow it, so the card shows the step and turns Connect off until it ends.
   useEffect(() => {
-    if (!(active || installing) || requested || pollAbort.current) return;
+    // After a 15-minute follow times out the card stops reading every second and says so.
+    if (!(active || installing) || requested || pollAbort.current || pollTimedOut) return;
     startPolling(generation.current);
   });
 
@@ -121,6 +196,7 @@ export function GoogleSetup({
       read: workspace.refresh,
       active: () =>
         mounted.current && generation.current === currentGeneration && !controller.signal.aborted,
+      attempts: POLL_ATTEMPTS,
     })
       .then((result) => {
         if (pollAbort.current === controller) pollAbort.current = null;
@@ -139,7 +215,7 @@ export function GoogleSetup({
   }
 
   async function connectGoogle() {
-    if (!connected || working || unknown || !termsAccepted) return;
+    if (!connected || working || installUnknown || !termsAccepted) return;
     stopPolling();
     const currentGeneration = generation.current;
     setMessage(null);
@@ -159,7 +235,13 @@ export function GoogleSetup({
         setMessage('Google coding setup is ready. Quota reporting remains a separate status.');
       } else if (result.kind === 'blocked') {
         const reason = result.result?.reason;
-        const known = reason ? refusalText[reason] : undefined;
+        // A refused clear names the process that still runs in its next step.
+        const known =
+          result.result?.next && reason === 'google-ownership-unknown'
+            ? result.result.next
+            : reason
+              ? refusalText[reason]
+              : undefined;
         setMessage(
           known ??
             (reason
@@ -176,8 +258,8 @@ export function GoogleSetup({
         pollAbort.current?.abort();
         pollAbort.current = null;
         setRequested(null);
-        // The poll gives up after about 20 seconds, and a browser sign-in often takes longer.
-        // Once the flow ends, the slow-setup line no longer describes anything.
+        // The poll gives up after 15 minutes, and a browser sign-in can take longer. Once the
+        // flow ends, the slow-setup line no longer describes anything.
         setPollTimedOut(false);
       }
     }
@@ -229,7 +311,21 @@ export function GoogleSetup({
   }
 
   const primaryLabel =
-    setup?.state === 'authentication-required' ? 'Sign in with Google' : 'Connect Google';
+    setup?.state === 'unknown'
+      ? 'Clear and try again'
+      : setup?.state === 'blocked' || installation?.state === 'blocked'
+        ? 'Try again'
+        : setup?.state === 'authentication-required'
+          ? 'Sign in with Google'
+          : 'Connect Google';
+  const profileReason =
+    profile && !profile.available && 'reason' in profile
+      ? profile.reason === 'acp-capability-missing'
+        ? setup?.proofId
+          ? 'The client did not report the model choices or review mode CrewKite needs.'
+          : 'The client is installed and has not finished initializing.'
+        : profileText[profile.reason]
+      : undefined;
   const googleAccount =
     setup?.auth.status === 'authenticated'
       ? 'Signed in'
@@ -237,6 +333,10 @@ export function GoogleSetup({
         ? 'Sign-in required'
         : 'Unknown';
   const codingReady = ready && profile?.available === true;
+  const progress = googleSetupProgress(
+    { googleAcpInstall: installation, googleAcpSetup: setup },
+    requested,
+  );
   const officialClient = installed
     ? 'Installed'
     : installation?.state === 'idle'
@@ -261,7 +361,9 @@ export function GoogleSetup({
         </p>
       ))}
       {termsAcknowledged ? (
-        <p className="muted small">You acknowledged this on {setup?.googleTerms?.at}.</p>
+        <p className="muted small">
+          You acknowledged this on {formatLocalTime(setup?.googleTerms?.at) ?? 'an unknown date'}.
+        </p>
       ) : (
         <label className="check-row small">
           <input
@@ -302,7 +404,7 @@ export function GoogleSetup({
         <Fact label="Quota available" value={quotaAvailable} />
       </div>
       <div className="dialog-footer">
-        {!ready && !working && !needsRepair && (
+        {!ready && !working && !installUnknown && (
           <button
             className="button primary"
             type="button"
@@ -323,17 +425,24 @@ export function GoogleSetup({
           </button>
         )}
       </div>
-      {requested && <p role="status">{stageLabels[requested]}…</p>}
-      {!requested && installing && <p role="status">{stageLabels.install}…</p>}
-      {!requested && !installing && active && <p role="status">Google setup is running…</p>}
+      {progress ? (
+        <GoogleProgress progress={progress} />
+      ) : requested ? (
+        <p role="status">{stageLabels[requested]}…</p>
+      ) : active ? (
+        <p role="status">Google setup is running…</p>
+      ) : null}
       {ready && <p role="status">Google coding setup is ready.</p>}
       {pollTimedOut && !ready && (
         <p role="status">Taking longer than expected. Review status before retrying.</p>
       )}
       {installation?.reason && (
         <p className="muted small">
-          {installation.reason}. {installation.next}
+          {refusalText[installation.reason] ?? `${installation.reason}.`} {installation.next}
         </p>
+      )}
+      {installed && !codingReady && !working && profileReason && (
+        <p className="muted small">{profileReason}</p>
       )}
       <p className="muted small">
         Discovery choices establish configuration facts. A verified review mapping and route
@@ -349,8 +458,8 @@ export function GoogleSetup({
         <details>
           <summary>Advanced repair controls</summary>
           <p className="muted small">
-            Setup needs a fresh status check before another action. Automatic setup is paused to
-            avoid repeating an operation with uncertain ownership.
+            Automatic setup is paused so no step runs twice. {primaryLabel} clears a step whose
+            process has ended and starts it again. Refresh status reads the setup again.
           </p>
           <button
             className="button secondary"

@@ -24,7 +24,7 @@ import { adjacentThread, canSend, shortcutFor } from './composer-rules.ts';
 import { acceptsType, deliveryNote, deliveryOf, tryWithChoices } from './file-fit.ts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
 import { outputLimitLine, outputSplit, statsSplit } from './output-limit.ts';
-import { planCard, planOverrides } from './plan-card.ts';
+import { planCard, planlessText, planOverrides, planRow } from './plan-card.ts';
 import {
   announcements,
   earlierCursor,
@@ -44,7 +44,14 @@ import {
   TRY_AGAIN_AFTER_MS,
   threadItems,
 } from './thread-state.ts';
-import { type Block, replySource, runLabel, type ToolBlock, viewBlocks } from './turn-fold.ts';
+import {
+  type Block,
+  blankTurn,
+  replySource,
+  runLabel,
+  type ToolBlock,
+  viewBlocks,
+} from './turn-fold.ts';
 
 const id = (prefix: string, n: number) => `${prefix}_0${String(n).padStart(25, '0')}`;
 const task = id('tsk', 1);
@@ -857,6 +864,14 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
     // The live events are gone after a reload; the turn row still carries the stats line.
     assert.deepEqual(turnOf(threadItems(state)).stats, stats, role);
   }
+  // A plan slice's turn keeps its slice, so its chip names the slice and its builder role.
+  const plain = read('reviewer');
+  const sliced: ChatThreadRead = {
+    ...plain,
+    turns: plain.turns.map((value) => ({ ...value, role: 'ask' as const, slice: 2 })),
+  };
+  const state = reduceThread(initialThreadState(task), { type: 'loaded', read: sliced });
+  assert.equal(turnOf(threadItems(state)).identity?.slice, 2);
 });
 
 test('events that a thread read or a stored turn read already covers apply once', () => {
@@ -1689,4 +1704,31 @@ test('the plan card offers what the flight mode allows and sends only the picks 
   assert.deepEqual(planOverrides(balanced, { 2: 1 }), [
     { sliceId: 2, family: 'google', model: 'google-model' },
   ]);
+});
+
+test('an orchestrator reply shows its summary without the plan block, also while it streams', () => {
+  const summary = 'Two slices run side by side.';
+  const block = '```json plan\n{"planId": "p1"}\n```';
+  assert.equal(planlessText(`${summary}\n\n${block}\n`), summary);
+  assert.equal(planlessText(`${summary}\n\n\`\`\`json plan\n{"planId": `), summary);
+  assert.equal(
+    planlessText(`${summary}\n\n${block}\n\nAfter the plan.`),
+    `${summary}\n\nAfter the plan.`,
+  );
+  const other = '```json\n{"a": 1}\n```';
+  assert.equal(planlessText(`${summary}\n\n${other}`), `${summary}\n\n${other}`);
+  assert.equal(planlessText(block), '');
+});
+
+test('the plan card follows the orchestrator turn while that turn is loaded, and waits at the end otherwise', () => {
+  const orchestrator = id('trn', 7);
+  const row = (turnId: string): ThreadItem => ({
+    kind: 'turn',
+    key: `turn:${turnId}`,
+    turn: blankTurn(turnId),
+  });
+  const items = [row(id('trn', 6)), row(orchestrator), row(id('trn', 8))];
+  assert.equal(planRow(items, { orchestratorTurnId: orchestrator }), orchestrator);
+  assert.equal(planRow(items.slice(2), { orchestratorTurnId: orchestrator }), null);
+  assert.equal(planRow(items, null), null);
 });

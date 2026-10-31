@@ -7,7 +7,12 @@ import {
 import { z } from 'zod';
 import { groupAbsent } from '../../../host/worker.ts';
 import { nativeSynchronousHook } from '../../anthropic/native-discovery.ts';
-import { type AcpInstallDependencies, type AcpInstallResult, installGoogleAcp } from './install.ts';
+import {
+  type AcpInstallDependencies,
+  type AcpInstallProgress,
+  type AcpInstallResult,
+  installGoogleAcp,
+} from './install.ts';
 
 export type GoogleInstallStatus = GoogleAcpInstallStatus;
 export const InstallRecordSchema = z
@@ -96,6 +101,7 @@ export class GoogleAcpInstallation {
     abort: AbortController;
     promise: Promise<InstallOperationResult>;
     record: InstallRecord;
+    progress: AcpInstallProgress | null;
   };
   private closed = false;
   constructor(options: Options) {
@@ -106,7 +112,8 @@ export class GoogleAcpInstallation {
     try {
       const saved = this.options.latest();
       if (!saved) return idle();
-      if (this.active) return saved.status;
+      // Progress lives in memory. The journal keeps steps, not every chunk of the download.
+      if (this.active) return { ...saved.status, progress: this.active.progress };
       if (saved.phase === 'complete' && saved.status.state !== 'unknown') return saved.status;
       return canRelease(saved)
         ? {
@@ -235,6 +242,7 @@ export class GoogleAcpInstallation {
       abort: new AbortController(),
       promise: completion.promise,
       record,
+      progress: null as AcpInstallProgress | null,
     };
     this.active = active;
     const save = (phase: InstallRecord['phase']) => {
@@ -247,7 +255,14 @@ export class GoogleAcpInstallation {
       try {
         if (this.closed) active.abort.abort();
         const outcome: AcpInstallResult = await (this.options.install ?? installGoogleAcp)(
-          { home: input.home, consent: 'explicit', signal: active.abort.signal },
+          {
+            home: input.home,
+            consent: 'explicit',
+            signal: active.abort.signal,
+            onProgress: (progress) => {
+              active.progress = progress;
+            },
+          },
           {
             ...dependencies,
             import: {

@@ -12,6 +12,12 @@
   max-width: 1080px;
   margin: 0 auto;
 }
+.st-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
 .settings-page h1 {
   margin-bottom: 4px;
   font-size: 22px;

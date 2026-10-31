@@ -3171,6 +3171,19 @@ export const GoogleAcpInstallStatusSchema = z.strictObject({
   observedAt: TimestampSchema.nullable(),
   reason: z.string().min(1).max(200).nullable(),
   next: z.string().min(1).max(500),
+  /**
+   * The running install's step, read from memory and never journaled. Download and extract count
+   * bytes; verify runs the two signature checks and counts none.
+   */
+  progress: z
+    .strictObject({
+      step: z.enum(['download', 'extract', 'verify']),
+      bytes: z.number().int().nonnegative().safe(),
+      totalBytes: z.number().int().positive().safe(),
+    })
+    .refine((progress) => progress.bytes <= progress.totalBytes)
+    .nullable()
+    .optional(),
 });
 export type GoogleAcpInstallStatus = z.infer<typeof GoogleAcpInstallStatusSchema>;
 

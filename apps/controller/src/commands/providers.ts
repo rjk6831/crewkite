@@ -15,6 +15,7 @@ import {
   NativeProfileSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { groupAbsent } from '../host/worker.ts';
 import {
   ConnectionRecordSchema,
   NativeConnectionChecks,
@@ -60,12 +61,33 @@ import {
 } from './schemas.ts';
 
 // Provider setup: ACP install and sign-in, connection checks, the Local connection and profiles.
+// The diagnostics bundle carries this many of the newest Google client operations.
+const GOOGLE_DIAGNOSTIC_OPERATIONS = 50;
 // The connection revision at which a no-authentication connect met a runtime that wants a token.
 // Memory only: the next connect probes again.
 const tokenAsked = new WeakMap<object, number>();
 
 export class ProviderCommands {
   executeAcpSetup(
+    this: Controller,
+    command: AcpSetupCommand,
+    principal: string,
+  ): Promise<CommandResult> {
+    // A quota read holds the Google journal for at most its 20 second deadline. The quota read
+    // starts each time the desktop connects, so a setup step pressed on the welcome screen meets
+    // it. The step waits for the read to end and then runs.
+    const reading =
+      command.command === 'StopGoogleAcpSetup' || this.acpSetupRuntime?.key === command.key
+        ? undefined
+        : this.usageRead?.promise;
+    if (reading) {
+      const run = () => this.startAcpSetup(command, principal);
+      return reading.then(run, run);
+    }
+    return this.startAcpSetup(command, principal);
+  }
+
+  startAcpSetup(
     this: Controller,
     command: AcpSetupCommand,
     principal: string,
@@ -134,6 +156,12 @@ export class ProviderCommands {
   ): CommandResult {
     const setup = this.store.googleAcpSetup();
     if (command.command === 'StopGoogleAcpSetup') {
+      if (
+        setup.state === 'unknown' &&
+        setup.operationId === command.payload.operationId &&
+        this.acpSetupRuntime?.key !== setup.operationId
+      )
+        return this.clearUnknownAcpSetup(setup);
       if (
         setup.operationId !== command.payload.operationId ||
         !['initializing', 'authenticating', 'discovering', 'stopping'].includes(setup.state)
@@ -229,6 +257,67 @@ export class ProviderCommands {
       reason: 'acp-setup-pending',
       data: { kind: 'google-acp-setup', setup: next },
     };
+  }
+
+  /**
+   * An explicit Stop on a setup whose ownership is unknown, in a controller that holds no runtime
+   * for it. Process absence is the one fact the controller can prove afterwards, and only ESRCH
+   * counts, as for an unknown writer. A row that never recorded a group may hide a spawned
+   * process, so it proves nothing. Every Google metadata row this controller does not run and
+   * whose group is proven gone closes, since they share one gate, and a receipt keeps the proof.
+   * The setup goes to blocked with no operation, from where Connect starts the step again.
+   */
+  clearUnknownAcpSetup(
+    this: Controller,
+    setup: ReturnType<typeof GoogleAcpSetupSchema.parse>,
+  ): CommandResult {
+    const live = new Set([this.acpSetupRuntime?.key, this.usageRead?.key]);
+    const rows = this.store
+      .googleMetadataOperations()
+      .filter((row) => !live.has(row.command_id) && ['owned', 'unknown'].includes(row.state));
+    const own = rows.find((row) => row.command_id === setup.operationId);
+    const proven = (row: (typeof rows)[number]) =>
+      row.process_group !== null && groupAbsent(row.process_group);
+    if (!own || !proven(own))
+      return {
+        outcome: 'blocked',
+        reason: 'google-ownership-unknown',
+        next: own?.process_group
+          ? `The Google client from this setup still runs as process group ${own.process_group}. Quit it, then clear again.`
+          : 'This setup recorded no process group, so CrewKite cannot prove it ended. Export diagnostics and report it.',
+        data: { kind: 'google-acp-setup', setup },
+      };
+    const absentAt = this.now();
+    for (const row of rows.filter(proven)) {
+      const group = row.process_group as number;
+      this.store.finishGoogleMetadata(row.command_id, group, absentAt);
+      const record = this.nativeArtifact({
+        commandId: row.command_id,
+        kind: row.kind,
+        outcome: 'unknown',
+        groups: [group],
+        absentAt,
+      });
+      this.store.saveReceipt(
+        `google-metadata-settled:${row.command_id}`,
+        record.hash,
+        'local-owner',
+        {
+          outcome: 'applied',
+          entity: record,
+        },
+      );
+    }
+    const next = GoogleAcpSetupSchema.parse({
+      ...setup,
+      revision: setup.revision + 1,
+      state: 'blocked',
+      operationId: null,
+      reason: null,
+    });
+    this.store.putGoogleAcpSetup(next);
+    this.profiles = this.resolveProfiles();
+    return { outcome: 'applied', data: { kind: 'google-acp-setup', setup: next } };
   }
 
   /**
@@ -472,6 +561,51 @@ export class ProviderCommands {
     }
   }
 
+  /**
+   * What the diagnostics bundle says about Google: the setup and install state, the newest client
+   * operations with whether each recorded group still exists, and every Google profile's reason.
+   * A stuck connect reads from it: a row whose group is gone clears with Stop, one still present
+   * names the process to quit.
+   */
+  googleDiagnostics(this: Controller) {
+    const rows = this.store.googleMetadataOperations();
+    const live = new Set([this.acpSetupRuntime?.key, this.usageRead?.key]);
+    const states: Record<string, number> = {};
+    for (const row of rows) states[row.state] = (states[row.state] ?? 0) + 1;
+    return {
+      setup: this.store.googleAcpSetup(),
+      install: this.googleInstallation().status(),
+      running: {
+        setup: this.acpSetupRuntime?.key ?? null,
+        quotaRead: this.usageRead?.key ?? null,
+      },
+      operations: {
+        total: rows.length,
+        states,
+        newest: rows.slice(-GOOGLE_DIAGNOSTIC_OPERATIONS).map((row) => ({
+          commandId: row.command_id,
+          kind: row.kind,
+          state: row.state,
+          authorityRevision: row.authority_revision,
+          pid: row.pid,
+          processGroup: row.process_group,
+          groupPresent: row.process_group === null ? null : !groupAbsent(row.process_group),
+          runningHere: live.has(row.command_id),
+          clearedByStop: !!this.store.receipt(`google-metadata-settled:${row.command_id}`),
+          startedAt: row.started_at,
+          finishedAt: row.finished_at,
+        })),
+      },
+      profiles: this.resolveProfiles()
+        .filter((profile) => profile.facts.family === 'google')
+        .map((profile) => ({
+          id: profile.facts.id,
+          available: profile.facts.available,
+          reason: 'reason' in profile.facts ? String(profile.facts.reason) : null,
+        })),
+    };
+  }
+
   googleInstallation(this: Controller): GoogleAcpInstallation {
     if (this.googleInstallOperation) return this.googleInstallOperation;
     const read = (key?: string) => {
@@ -541,6 +675,9 @@ export class ProviderCommands {
         ...(receipt.result.outcome === 'applied' ? { outcome: 'already-applied' as const } : {}),
       };
     if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    // The same wait as a setup step: a quota read in flight ends within its deadline.
+    if (command.command === 'InstallGoogleAcp' && !receipt && this.usageRead)
+      await this.usageRead.promise.catch(() => {});
     const operation = this.googleInstallation();
     let result: CommandResult;
     if (command.command === 'StopGoogleAcpInstall') {
