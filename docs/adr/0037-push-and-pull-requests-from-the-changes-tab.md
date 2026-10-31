@@ -9,7 +9,7 @@ Accept to branch (ADR 0008) leaves a local branch and a `git switch` line. Every
 
 ## Decision
 
-- The Changes tab gets a commit message field above Accept to branch. It is prefilled from the thread title and the first line of the last reply, and I can edit it.
+- The Changes tab gets a commit message field above Accept to branch. It is prefilled with the thread title as the subject and an empty body, and I can edit it. Amended 2026-11-01: it used to add the first line of the last reply as the body, which read as the model talking.
 - After an accept, the tab offers Push branch, then Open pull request, then the branch's CI status.
 - Push asks once in plain words before it sends: the branch, the remote, and that my own git credentials are used. The command carries `confirmed: true` only from that button.
 - The controller runs `git push <remote> refs/heads/<branch>:refs/heads/<branch>` in the project with prompts off, a two-minute limit and bounded output. It never passes a force flag. It pushes only the commit the thread recorded at Accept and refuses when the branch moved since.

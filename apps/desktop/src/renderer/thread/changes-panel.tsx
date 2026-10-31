@@ -90,17 +90,9 @@ function branchName(title: string, taskId: string) {
   return `crewkite/${slug || taskId.slice(-8).toLowerCase()}`;
 }
 
-// The title names the change. The first line of the last reply is usually the assistant's own
-// summary of what it did, which is the closest thing to a commit body the thread already has.
-function suggestedMessage(title: string, reply: string | undefined) {
-  const subject = title.replace(/\s+/g, ' ').trim();
-  const summary = reply
-    ?.split('\n')
-    .map((line) => line.replace(/^[#>*\-\s]+/, '').trim())
-    .find(Boolean)
-    ?.slice(0, 200);
-  return summary ? `${subject}\n\n${summary}` : subject;
-}
+// The thread title names the change, so it is the subject. The body stays empty for the person
+// to write, since the start of a reply read as the model talking about its next step.
+export const suggestedMessage = (title: string) => title.replace(/\s+/g, ' ').trim();
 
 const CI_POLL_MS = 30_000;
 
@@ -293,7 +285,6 @@ function AcceptControl({
   thread,
   files,
   listing,
-  lastReply,
   onAccepted,
 }: {
   source: ThreadSource;
@@ -303,12 +294,11 @@ function AcceptControl({
   files: Files;
   /** The listing every page was read under. Accept publishes that list or refuses. */
   listing: string | null;
-  lastReply: string | undefined;
   /** The base advances to the accepted commit, so the diff needs a new read. */
   onAccepted: () => void;
 }) {
   const [branch, setBranch] = useState(() => branchName(title, taskId));
-  const [message, setMessage] = useState(() => suggestedMessage(title, lastReply));
+  const [message, setMessage] = useState(() => suggestedMessage(title));
   const edited = useRef(false);
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
@@ -319,11 +309,10 @@ function AcceptControl({
   const done = Boolean(last && diff?.branch === last.branch && sameFiles(diff.files, files));
   const note = accepted?.note ?? (last && diff?.branch === last.branch ? diff.note : null);
 
-  // The suggestion follows the last reply that wrote the copy. Once the person types, it stays
-  // theirs.
+  // The suggestion follows the thread title. Once the person types, it stays theirs.
   useEffect(() => {
-    if (!edited.current) setMessage(suggestedMessage(title, lastReply));
-  }, [title, lastReply]);
+    if (!edited.current) setMessage(suggestedMessage(title));
+  }, [title]);
 
   async function accept(event: FormEvent) {
     event.preventDefault();
@@ -521,7 +510,6 @@ export function ChangesPanel({
   thread,
   refreshKey,
   focusPath,
-  lastReply,
 }: {
   source: ThreadSource;
   taskId: string;
@@ -529,8 +517,6 @@ export function ChangesPanel({
   thread: ChatThread | null;
   refreshKey: number;
   focusPath: string | null;
-  /** The text of the last builder or fixer reply, for the commit message suggestion. */
-  lastReply: string | undefined;
 }) {
   const [data, setData] = useState<ChatChangesRead | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -581,7 +567,6 @@ export function ChangesPanel({
       thread={thread}
       files={data.files}
       listing={data.listing}
-      lastReply={lastReply}
       onAccepted={reread}
     />
   );
