@@ -267,9 +267,9 @@ test('Anthropic lists the client rows, then model IDs this home finished turns o
         null,
         db,
         [
-          ['model-live', 'used', ['default']],
-          ['model-old', 'used', ['default', 'high']],
-          ['model-older', 'used', ['default', 'low']],
+          ['model-live', 'used', ['default'], 'default'],
+          ['model-old', 'used', ['high'], 'high'],
+          ['model-older', 'used', ['low'], 'low'],
         ],
       ],
       [
@@ -277,16 +277,34 @@ test('Anthropic lists the client rows, then model IDs this home finished turns o
         live,
         db,
         [
-          ['model-live', 'live', ['default', 'low', 'brand-new']],
-          ['model-old', 'used', ['default', 'high']],
-          ['model-older', 'used', ['default', 'low']],
+          ['model-live', 'live', ['low', 'brand-new'], 'low'],
+          ['model-old', 'used', ['high'], 'high'],
+          ['model-older', 'used', ['low'], 'low'],
         ],
       ],
     ];
   for (const [label, rows, turns, expected] of cases)
     assert.deepEqual(
-      read(rows, turns)?.models.map((model) => [model.model, model.source, model.efforts]),
+      read(rows, turns)?.models.map((model) => [
+        model.model,
+        model.source,
+        model.efforts,
+        model.defaultEffort,
+      ]),
       expected,
       label,
     );
+  // A model with levels lists no Default and preselects medium when it has one. A model with
+  // none keeps the lone default, so the picker hides its effort control.
+  const levels = read(
+    [
+      { value: 'a', model: 'model-a', label: 'A', efforts: ['low', 'medium', 'high'] },
+      { value: 'b', model: 'model-b', label: 'B', efforts: [] },
+    ],
+    undefined,
+  )?.models.map((model) => [model.model, model.efforts, model.defaultEffort]);
+  assert.deepEqual(levels, [
+    ['model-a', ['low', 'medium', 'high'], 'medium'],
+    ['model-b', ['default'], 'default'],
+  ]);
 });

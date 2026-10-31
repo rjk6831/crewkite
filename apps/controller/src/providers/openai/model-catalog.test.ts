@@ -251,7 +251,7 @@ test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged 
     assert.deepEqual(
       live?.models.map((entry) => [entry.model, entry.label, entry.source, entry.efforts]),
       [
-        ['claude-sonnet-5-5', 'Sonnet 5.5', 'live', ['default', 'low', 'high']],
+        ['claude-sonnet-5-5', 'Sonnet 5.5', 'live', ['low', 'high']],
         ['claude-haiku-5-5', 'Haiku 5.5', 'live', ['default']],
       ],
     );

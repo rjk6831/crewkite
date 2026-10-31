@@ -70,6 +70,7 @@ import {
   ChangesView,
   ComposerView,
   CrewView,
+  effortSuffix,
   FamilyMark,
   HelpView,
   handoffLabels,
@@ -1077,7 +1078,11 @@ export function App(props: AppProps) {
                   Text,
                   { key: 'model' },
                   FamilyMark({ family: selection.family, colors }),
-                  h(Text, { color: colors.muted }, ` ${selection.model} ${selection.effort}`),
+                  h(
+                    Text,
+                    { color: colors.muted },
+                    ` ${selection.model}${effortSuffix(selection.effort)}`,
+                  ),
                 )
               : h(Text, { key: 'model', color: colors.muted }, 'No provider connected'),
             thread

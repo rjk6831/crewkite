@@ -14,7 +14,7 @@ import { REOBSERVE_MS } from '../local-setup-flow.ts';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import { FamilyMark } from './family-mark.tsx';
-import { MODEL_ID, modelGroups } from './model-groups.ts';
+import { effortLevels, MODEL_ID, modelGroups, shownEffort } from './model-groups.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 
@@ -441,12 +441,12 @@ export function ModelPicker({
           )}
         </div>
       )}
-      {entry && model && model.efforts.length > 0 && selection && (
+      {entry && model && effortLevels(model.efforts).length > 0 && selection && (
         <span className="th-effort">
           <EffortSelect
             label="Effort"
-            efforts={model.efforts}
-            value={selection.effort}
+            efforts={effortLevels(model.efforts)}
+            value={shownEffort(selection.effort, model)}
             onChange={(effort) => onSelect({ ...selection, effort })}
           />
         </span>

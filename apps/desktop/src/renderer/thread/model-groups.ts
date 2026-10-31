@@ -1,4 +1,4 @@
-import type { ChatCatalogRead, ChatModelSelection } from '@crewkite/contracts';
+import type { ChatCatalogRead, ChatEffort, ChatModelSelection } from '@crewkite/contracts';
 
 type Entry = ChatCatalogRead['families'][number];
 
@@ -22,3 +22,19 @@ export function modelGroups(entry: Entry, selection: ChatModelSelection | null) 
     typed: picked !== null && !entry.models.some((model) => model.model === picked) ? picked : null,
   };
 }
+
+/** The levels a model offers. A model that lists none, such as a Local one, has no effort control. */
+export const effortLevels = (efforts: readonly ChatEffort[]): ChatEffort[] =>
+  efforts.filter((effort) => effort !== 'default');
+
+/**
+ * The effort a selection shows. A thread saved with Default on a model that lists levels runs at
+ * the model's preselected level, so it shows that level.
+ */
+export const shownEffort = (
+  effort: ChatEffort,
+  model: { efforts: readonly ChatEffort[]; defaultEffort: ChatEffort } | undefined,
+): ChatEffort =>
+  effort === 'default' && model && effortLevels(model.efforts).length
+    ? model.defaultEffort
+    : effort;
