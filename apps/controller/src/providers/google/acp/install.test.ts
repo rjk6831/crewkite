@@ -167,13 +167,48 @@ test('the fixed installer validates before publishing and preserves existing inp
         },
       },
     };
+    const progress: { step: string; bytes: number; totalBytes: number }[] = [];
     const result = await installGoogleAcp(
-      { home, consent: 'explicit', signal: controller.signal },
+      {
+        home,
+        consent: 'explicit',
+        signal: controller.signal,
+        onProgress: (value) => {
+          progress.push(value);
+          // A listener that throws never stops the install.
+          if (scenario === 'success') throw Error('display failed');
+        },
+      },
       dependencies,
     );
     if (scenario === 'success' || scenario === 'staging' || scenario === 'retry-staging') {
       assert.equal(result.imported, true, JSON.stringify(result));
       assert.equal(signatures, 2);
+      // Download counts archive bytes, extract counts the unpacked files, then verify runs.
+      const inflated = sample.release.files.reduce((total, file) => total + file.bytes, 0);
+      const steps = [...new Set(progress.map((value) => value.step))];
+      assert.deepEqual(steps, ['download', 'extract', 'verify']);
+      assert.deepEqual(
+        progress.findLast((value) => value.step === 'download'),
+        {
+          step: 'download',
+          bytes: sample.release.bytes,
+          totalBytes: sample.release.bytes,
+        },
+      );
+      assert.deepEqual(
+        progress.findLast((value) => value.step === 'extract'),
+        {
+          step: 'extract',
+          bytes: inflated,
+          totalBytes: inflated,
+        },
+      );
+      for (const [index, value] of progress.entries()) {
+        assert.ok(value.bytes <= value.totalBytes);
+        const prior = progress[index - 1];
+        if (prior?.step === value.step) assert.ok(value.bytes >= prior.bytes);
+      }
       const pin = readFileSync(join(home, 'providers/google-acp-v1/pin.json'));
       const again = await installGoogleAcp({ home, consent: 'explicit' }, dependencies);
       assert.equal(again.reason, 'already-imported');

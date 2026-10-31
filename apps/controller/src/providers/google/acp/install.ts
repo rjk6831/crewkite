@@ -47,13 +47,19 @@ export type AcpInstallResult = (
       client: null;
     }
 ) & { cleanupReason?: 'temporary-cleanup-failed' };
+/** How far the running install is. Download and extract count bytes; verify counts none. */
+export type AcpInstallProgress = {
+  step: 'download' | 'extract' | 'verify';
+  bytes: number;
+  totalBytes: number;
+};
 export type AcpInstallDependencies = {
   fetch?: typeof fetch;
   release?: Release;
   import?: AcpImportDependencies;
 };
 
-function verifier(expected: { bytes: number; sha256: string }) {
+function verifier(expected: { bytes: number; sha256: string }, counted?: (bytes: number) => void) {
   let length = 0;
   const hash = createHash('sha256');
   return new Transform({
@@ -61,6 +67,7 @@ function verifier(expected: { bytes: number; sha256: string }) {
       length += chunk.length;
       if (length > expected.bytes) return done(Error('archive-refused'));
       hash.update(chunk);
+      counted?.(length);
       done(null, chunk);
     },
     flush(done) {
@@ -74,7 +81,13 @@ function verifier(expected: { bytes: number; sha256: string }) {
 }
 
 /** The frozen archive hash is checked before this two-entry layout is read or inflated. */
-async function extract(path: string, target: string, expected: Release, signal: AbortSignal) {
+async function extract(
+  path: string,
+  target: string,
+  expected: Release,
+  signal: AbortSignal,
+  counted: (bytes: number) => void,
+) {
   const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
   try {
     if ((await file.stat()).size !== expected.bytes) throw Error('archive-refused');
@@ -149,7 +162,9 @@ async function extract(path: string, target: string, expected: Release, signal: 
     }
     if (localAt !== centralAt || directoryAt !== expected.bytes - 22)
       throw Error('archive-refused');
+    let written = 0;
     for (const entry of entries) {
+      const before = written;
       await pipeline(
         createReadStream(path, {
           fd: file.fd,
@@ -158,10 +173,11 @@ async function extract(path: string, target: string, expected: Release, signal: 
           end: entry.start + entry.file.compressed - 1,
         }),
         createInflateRaw(),
-        verifier(entry.file),
+        verifier(entry.file, (bytes) => counted(before + bytes)),
         createWriteStream(join(target, entry.file.name), { flags: 'wx', mode: 0o600 }),
         { signal },
       );
+      written += entry.file.bytes;
     }
   } finally {
     await file.close();
@@ -170,7 +186,12 @@ async function extract(path: string, target: string, expected: Release, signal: 
 
 /** Installation pins only the reviewed release. Authentication remains a separate action. */
 export async function installGoogleAcp(
-  options: { home: string; consent: 'explicit'; signal?: AbortSignal },
+  options: {
+    home: string;
+    consent: 'explicit';
+    signal?: AbortSignal;
+    onProgress?: (progress: AcpInstallProgress) => void;
+  },
   dependencies: AcpInstallDependencies = {},
 ): Promise<AcpInstallResult> {
   const refused = (
@@ -184,6 +205,13 @@ export async function installGoogleAcp(
   let temporary: string | undefined;
   let failure: 'download-unavailable' | 'archive-refused' | 'install-unavailable' =
     'install-unavailable';
+  // A report is for display. A listener that throws never stops the install.
+  const report = (step: AcpInstallProgress['step'], bytes: number, totalBytes: number) => {
+    try {
+      options.onProgress?.({ step, bytes, totalBytes });
+    } catch {}
+  };
+  const inflated = expected.files.reduce((total, file) => total + file.bytes, 0);
   const run = async (): Promise<AcpInstallResult> => {
     try {
       signal.throwIfAborted();
@@ -228,13 +256,17 @@ export async function installGoogleAcp(
         return refused('download-unavailable');
       }
       failure = 'archive-refused';
+      report('download', 0, expected.bytes);
       await pipeline(
         response.body,
-        verifier(expected),
+        verifier(expected, (bytes) => report('download', bytes, expected.bytes)),
         createWriteStream(archive, { flags: 'wx', mode: 0o600 }),
         { signal },
       );
-      await extract(archive, temporary, expected, signal);
+      report('extract', 0, inflated);
+      await extract(archive, temporary, expected, signal, (bytes) =>
+        report('extract', bytes, inflated),
+      );
       signal.throwIfAborted();
       failure = 'install-unavailable';
       unlinkSync(archive);
@@ -249,6 +281,7 @@ export async function installGoogleAcp(
         { flag: 'wx', mode: 0o600 },
       );
       signal.throwIfAborted();
+      report('verify', inflated, inflated);
       const lifecycle = dependencies.import?.lifecycle;
       const verify = dependencies.import?.verifySignature;
       const imported = await importGoogleAcp(
