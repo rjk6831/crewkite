@@ -6,6 +6,7 @@ import { ExternalLink } from './external-link.tsx';
 import { formatSize } from './format-size.ts';
 import {
   connectLocalFlow,
+  followDiscovery,
   lastSeen,
   lowMemory,
   REOBSERVE_MS,
@@ -131,10 +132,11 @@ export function LocalSetup({
         });
         if (!applied(result.outcome))
           return result.next ?? result.reason ?? 'The runtime could not be read.';
-        for (let step = 0; step < 20 && mounted.current; step++) {
-          if (!(await refresh()).localSetup?.operation) break;
-          await new Promise((resolve) => window.setTimeout(resolve, 500));
-        }
+        await followDiscovery({
+          read: async () => (await refresh()).localSetup,
+          wait: () => new Promise((resolve) => window.setTimeout(resolve, 500)),
+          active: () => mounted.current,
+        });
         return null;
       } catch {
         return 'The runtime could not be read. Reconnect and try again.';
