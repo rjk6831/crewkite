@@ -107,11 +107,14 @@ export function catalog(): ChatCatalogRead {
       },
       {
         family: 'google',
-        connected: false,
-        reason: 'Sign in to the Google client to use it.',
-        models: [],
-        defaultModel: null,
-        remaining: [],
+        connected: true,
+        reason: null,
+        models: fill(pair('large-3', 'fast-3')),
+        defaultModel: 'large-3',
+        remaining: [
+          reading('five-hour', 'Five-hour', 85, 240),
+          reading('weekly', 'Weekly', 65, 4320),
+        ],
         accepts: null,
       },
       {
