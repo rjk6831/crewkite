@@ -3980,7 +3980,7 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
       : {}),
     // The saved mode names the setup. The probe decides the connection: the none rows run
     // against a runtime with auth off and the token rows against one that wants a token.
-    localProbe: async () => authMode === 'none',
+    localProbe: async () => (authMode === 'none' ? true : 'token-required'),
     localInputHelper:
       authMode === 'none'
         ? undefined
@@ -4259,8 +4259,11 @@ test('Local reads keep the selection while its model key is loaded and clear it 
     const done = () =>
       (reopened as unknown as { localOperation?: { done: Promise<void> } }).localOperation?.done;
     // A cold runtime misses the first probe and answers the second: no window opens.
-    const options = (reopened as unknown as { options: { localProbe: () => Promise<boolean> } })
-      .options;
+    const options = (
+      reopened as unknown as {
+        options: { localProbe: () => Promise<boolean | 'token-required' | 'unavailable'> };
+      }
+    ).options;
     let probes = 0;
     options.localProbe = async () => ++probes > 1;
     await local('BeginLocalConnectionInput', { consent: 'explicit' });
@@ -4268,10 +4271,30 @@ test('Local reads keep the selection while its model key is loaded and clear it 
     assert.equal(probes, 2);
     assert.equal(reopened.snapshot().localSetup?.connectedWithoutToken, true);
     assert.equal(reopened.snapshot().localSetup?.operation, null);
+    // A runtime that never answers, or fails with no word on auth, opens no token window. The
+    // connect ends as failed after three timed out probes, or at once after a refusal.
+    for (const [answer, tries] of [
+      [false, 3],
+      ['unavailable', 1],
+    ] as const) {
+      await local('DisconnectLocal');
+      probes = 0;
+      options.localProbe = async () => {
+        probes++;
+        return answer;
+      };
+      await local('BeginLocalConnectionInput', { consent: 'explicit' });
+      await done();
+      assert.equal(probes, tries, String(answer));
+      const failed = reopened.snapshot().localSetup;
+      assert.equal(failed?.operation, null, String(answer));
+      assert.equal(failed?.connected, false, String(answer));
+      assert.equal(failed?.reason, 'connection-unavailable', String(answer));
+    }
     // A saved none mode meeting a runtime that wants a token opens the window and keeps the mode.
     await local('DisconnectLocal');
     await local('ConfigureLocal', { endpoint: 'ws://127.0.0.1:12345', authMode: 'none' });
-    options.localProbe = async () => false;
+    options.localProbe = async () => 'token-required';
     await local('BeginLocalConnectionInput', { consent: 'explicit' });
     assert.equal(reopened.snapshot().localSetup?.operation?.kind, 'input');
     assert.equal(reopened.snapshot().localSetup?.authMode, 'none');

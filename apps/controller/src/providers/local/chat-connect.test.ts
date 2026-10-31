@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { createServer } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import { test } from 'node:test';
-import { localProbeFailure, probeLocal } from './chat-connect.ts';
+import { LOCAL_PROBE_TIMEOUTS_MS, localProbeFailure, probeLocal } from './chat-connect.ts';
 
 // Claim: a runtime that rejects the handshake with 401 or 403 is told apart from one that is down,
 // slow or broken, because only the first one is asking for a token. The probe reads the status
@@ -38,4 +38,22 @@ test('the loopback probe tells a runtime that asks for a token from one that is 
       server.close();
     }
   }
+});
+
+// Claim: a runtime that takes the connection and does not answer in time reads as a timeout, which
+// the connect tries again, apart from a refusal, which says nothing more on a second try.
+test('the loopback probe reports a runtime that does not answer in time as a timeout', async () => {
+  if (Object.hasOwn(process.env, 'LM_API_TOKEN')) return;
+  const sockets = new Set<import('node:stream').Duplex>();
+  const server = createServer();
+  server.on('upgrade', (_request, socket) => sockets.add(socket));
+  await new Promise<void>((resolve) => server.listen(0, '127.0.0.1', resolve));
+  try {
+    const { port } = server.address() as AddressInfo;
+    assert.equal(await probeLocal(`ws://127.0.0.1:${port}`, 300), 'timeout');
+  } finally {
+    for (const socket of sockets) socket.destroy();
+    server.close();
+  }
+  assert.deepEqual(LOCAL_PROBE_TIMEOUTS_MS, [2000, 4000, 6000]);
 });

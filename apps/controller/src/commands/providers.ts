@@ -33,7 +33,11 @@ import {
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
 import { startGoogleAcpSetup } from '../providers/google/acp/writer.ts';
-import { type LocalProbe, probeLocal } from '../providers/local/chat-connect.ts';
+import {
+  LOCAL_PROBE_TIMEOUTS_MS,
+  type LocalProbe,
+  probeLocal,
+} from '../providers/local/chat-connect.ts';
 import {
   localConfiguredConnectionHash,
   resolveLocalConnection,
@@ -1503,22 +1507,27 @@ export class ProviderCommands {
           void handle.result.then(finish, () => finish(null));
         };
         // The probe runs on every connect, in both saved modes, and writes only the connection's
-        // `connectedWithoutToken`. A runtime that answers without a token connects with none. One
-        // that does not opens the token window for this connection, whatever mode is saved. A cold
-        // runtime can miss the first probe, so a miss is tried once more before the window opens.
+        // `connectedWithoutToken`. A runtime that answers without a token connects with none. Only
+        // a runtime that answers 401 or 403 opens the token window, whatever mode is saved. A
+        // runtime busy loading a model answers slowly, so a probe that times out is tried again
+        // with a longer wait. One that never answers ends the connect as failed, with no window.
         const endpoint = control.endpoint;
         if (!endpoint) throw Error('Local endpoint is unavailable.');
         const injected = this.options.localProbe;
-        const probe: (endpoint: string) => Promise<LocalProbe> = injected
+        // An injected yes or no stands for auth off or a missed probe.
+        const probe: (endpoint: string, timeoutMs: number) => Promise<LocalProbe> = injected
           ? async (value) => {
               const found = await injected(value);
-              return found === true ? 'open' : found === false ? 'unavailable' : found;
+              return found === true ? 'open' : found === false ? 'timeout' : found;
             }
           : probeLocal;
         void (async () => {
-          let found = await probe(endpoint).catch((): LocalProbe => 'unavailable');
-          if (found === 'unavailable' && !runtime.stopped && !this.closed)
-            found = await probe(endpoint).catch((): LocalProbe => 'unavailable');
+          let found: LocalProbe = 'timeout';
+          for (const timeoutMs of LOCAL_PROBE_TIMEOUTS_MS) {
+            if (runtime.stopped || this.closed) break;
+            found = await probe(endpoint, timeoutMs).catch((): LocalProbe => 'unavailable');
+            if (found !== 'timeout') break;
+          }
           return found;
         })().then((found) => {
           const open = found === 'open';
@@ -1541,6 +1550,22 @@ export class ProviderCommands {
             // The desktop supplied the token for this connect. No window opens.
             if (this.localSecret) this.localSecret.supplied = false;
             return finish(null);
+          }
+          if (!open && found !== 'token-required' && !runtime.stopped && !this.closed) {
+            // No answer, or one that says nothing about auth. The card says the connection failed
+            // and Connect tries again. A token window would not help.
+            finish(null);
+            this.store.transaction(() => {
+              const current = this.localControl();
+              if (
+                current.operation ||
+                current.endpoint !== endpoint ||
+                current.connectionRevision !== control.connectionRevision
+              )
+                return;
+              this.saveLocal({ ...current, connectionFailed: true });
+            });
+            return;
           }
           if (!open || runtime.stopped || this.closed) {
             try {

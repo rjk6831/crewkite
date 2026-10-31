@@ -246,6 +246,7 @@
 }
 .st-segment {
   display: inline-flex;
+  align-self: flex-start;
   overflow: hidden;
   border: 1px solid var(--border-strong);
   border-radius: 6px;
@@ -253,6 +254,7 @@
 .st-segment label {
   position: relative;
   flex-direction: row;
+  white-space: nowrap;
   padding: 7px 16px;
   color: var(--text-muted);
   cursor: pointer;
@@ -261,8 +263,10 @@
   border-left: 1px solid var(--border-strong);
 }
 .st-segment label.is-on {
-  background: var(--surface-hover);
+  background: color-mix(in srgb, var(--accent) 16%, transparent);
+  box-shadow: inset 0 0 0 1px var(--accent);
   color: var(--text);
+  font-weight: 600;
 }
 .st-segment input {
   position: absolute;
