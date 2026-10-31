@@ -521,8 +521,10 @@ export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
 /** Files on one message. Saved threads hold path strings in `attachments`, which still parse. */
 const files = z.array(ChatAttachmentSchema).max(32).default([]);
 const legacyAttachments = z.array(z.string().min(1).max(4096)).max(32).default([]);
+/** The most characters one message's text holds. Longer pasted text goes in as a file. */
+export const CHAT_MESSAGE_TEXT_MAX = 65_536;
 /** Message text. It may be empty when the message carries at least one file. */
-const messageText = z.string().max(65_536);
+const messageText = z.string().max(CHAT_MESSAGE_TEXT_MAX);
 const textOrFiles = (message: { text: string; files: readonly unknown[] }) =>
   message.text.length > 0 || message.files.length > 0;
 const TEXT_OR_FILES = 'A message needs text or at least one file.';
