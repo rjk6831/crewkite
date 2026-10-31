@@ -30,6 +30,14 @@ const setupLabels: Record<string, string> = {
   unknown: 'Setup status unknown',
 };
 
+// Refusal codes the controller sends when setup cannot start, in the words the card shows.
+const refusalText: Record<string, string> = {
+  'google-operation-active':
+    'Google setup is already running, often still installing the client. This card follows it until it ends.',
+  'google-ownership-unknown':
+    'CrewKite cannot tell which process owns the Google setup. Open Advanced repair controls to clear it.',
+};
+
 const stageLabels: Record<GoogleSetupStage, string> = {
   install: 'Installing and verifying the official client',
   initialize: 'Initializing Google ACP',
@@ -81,6 +89,13 @@ export function GoogleSetup({
     };
   }, []);
 
+  // A setup started from another card, or before this one opened, keeps running in the controller.
+  // Follow it, so the card shows the step and turns Connect off until it ends.
+  useEffect(() => {
+    if (!(active || installing) || requested || pollAbort.current) return;
+    startPolling(generation.current);
+  });
+
   function stopPolling() {
     generation.current += 1;
     pollAbort.current?.abort();
@@ -108,6 +123,7 @@ export function GoogleSetup({
         mounted.current && generation.current === currentGeneration && !controller.signal.aborted,
     })
       .then((result) => {
+        if (pollAbort.current === controller) pollAbort.current = null;
         if (result === 'timeout' && mounted.current && generation.current === currentGeneration) {
           setPollTimedOut(true);
         }
@@ -142,10 +158,13 @@ export function GoogleSetup({
       if (result.kind === 'ready') {
         setMessage('Google coding setup is ready. Quota reporting remains a separate status.');
       } else if (result.kind === 'blocked') {
+        const reason = result.result?.reason;
+        const known = reason ? refusalText[reason] : undefined;
         setMessage(
-          result.result?.reason
-            ? [result.result.reason, result.result.next].filter(Boolean).join(' ')
-            : 'Setup stopped before the next step could be confirmed. Review status before retrying.',
+          known ??
+            (reason
+              ? [reason, result.result?.next].filter(Boolean).join(' ')
+              : 'Setup stopped before the next step could be confirmed. Review status before retrying.'),
         );
       }
     } catch {
@@ -305,6 +324,8 @@ export function GoogleSetup({
         )}
       </div>
       {requested && <p role="status">{stageLabels[requested]}…</p>}
+      {!requested && installing && <p role="status">{stageLabels.install}…</p>}
+      {!requested && !installing && active && <p role="status">Google setup is running…</p>}
       {ready && <p role="status">Google coding setup is ready.</p>}
       {pollTimedOut && !ready && (
         <p role="status">Taking longer than expected. Review status before retrying.</p>

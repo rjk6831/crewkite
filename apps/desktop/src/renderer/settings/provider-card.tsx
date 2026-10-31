@@ -173,9 +173,22 @@ export function ProviderCard({
   /** The installed client against its tested build. The catalog entry's own when left out. */
   client?: ClientVersionStatus;
   /** Reads the client again, after the person updates or installs it. */
-  onCheck?: () => void;
+  onCheck?: () => Promise<void> | void;
 }) {
   const found = client ?? entry?.client;
+  // The check often finds what was already shown, so the button says it ran and when.
+  const [checking, setChecking] = useState(false);
+  const [checkedAt, setCheckedAt] = useState<string | null>(null);
+  async function check() {
+    if (!onCheck || checking) return;
+    setChecking(true);
+    try {
+      await onCheck();
+    } finally {
+      setChecking(false);
+      setCheckedAt(new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }));
+    }
+  }
   const titleId = useId();
   const card = useRef<HTMLElement>(null);
   useEffect(() => {
@@ -199,10 +212,16 @@ export function ProviderCard({
         <div className={found.accepted ? 'st-client' : 'st-client is-refused'}>
           <p role="status">{found.message}</p>
           {onCheck && (
-            <button type="button" className="button secondary" onClick={onCheck}>
-              Check again
+            <button
+              type="button"
+              className="button secondary"
+              disabled={checking}
+              onClick={() => void check()}
+            >
+              {checking ? 'Checking…' : 'Check again'}
             </button>
           )}
+          {checkedAt && !checking && <small className="st-hint">Checked at {checkedAt}.</small>}
         </div>
       )}
       <div className="st-body">
