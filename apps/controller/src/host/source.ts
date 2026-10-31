@@ -59,8 +59,9 @@ const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const MAX_SOURCE_FILES = 10_000;
 // A chat thread copies the whole repository, so its file count has no cap of its own. The copy
 // checks free disk space instead (chat/scratch-copy.ts).
-// The most bytes one listing of a base tree may print: about 1 KiB per path for a million paths.
-const MAX_TREE_LISTING_BYTES = 1024 * 1024 * 1024;
+// The most bytes one listing of a repository may print. Past 512 MiB the text no longer fits one
+// JavaScript string.
+const MAX_TREE_LISTING_BYTES = 512 * 1024 * 1024;
 const MAX_LINK_EXPANSIONS = 40;
 // BOM handling off, so a name that starts with U+FEFF keeps it.
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
@@ -79,13 +80,12 @@ export function git(
 
 /** Every path of a base tree, NUL separated. A large repository lists past the usual read limit. */
 function listTree(path: string, base: string): Buffer {
-  return runGit(
-    path,
-    ['ls-tree', '-rz', '--full-tree', base],
-    undefined,
-    undefined,
-    MAX_TREE_LISTING_BYTES,
-  );
+  return listing(path, ['ls-tree', '-rz', '--full-tree', base]);
+}
+
+/** A Git command that prints one line per path, so its output grows with the repository. */
+function listing(path: string, args: string[]): Buffer {
+  return runGit(path, args, undefined, undefined, MAX_TREE_LISTING_BYTES);
 }
 
 function runGit(
@@ -256,7 +256,10 @@ function scanSource(projectId: string, path: string) {
     });
   };
   const indexed = new Set<string>();
-  const records = git(path, ['ls-files', '--stage', '-z']).toString().split('\0').filter(Boolean);
+  const records = listing(path, ['ls-files', '--stage', '-z'])
+    .toString()
+    .split('\0')
+    .filter(Boolean);
   for (const record of records) {
     const match = /^(\d{6}) ([a-f0-9]+) ([0-3])\t(.+)$/s.exec(record);
     if (!match) throw new Error('Source index metadata is invalid.');
@@ -345,7 +348,7 @@ function scanSource(projectId: string, path: string) {
   }
   for (const name of baseEntries.keys())
     if (!indexed.has(name)) changed(name, 'deleted', true, false);
-  const untracked = git(path, ['ls-files', '--others', '--exclude-standard', '-z'])
+  const untracked = listing(path, ['ls-files', '--others', '--exclude-standard', '-z'])
     .toString()
     .split('\0')
     .filter(Boolean);

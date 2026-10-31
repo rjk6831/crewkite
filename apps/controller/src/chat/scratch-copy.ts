@@ -121,40 +121,57 @@ export function copyScratch(
   };
   const chunkBytes = options.chunkBytes ?? CHUNK_BYTES;
   const free = options.free ?? freeBytes;
-  // A clone takes no new space, so a copy that may clone checks only the headroom up front and
-  // then checks again as it writes. A copy that writes every byte checks the whole size first.
+  // A clone takes no new space, so a copy that may clone checks only the headroom up front. Once
+  // it writes, from the start or after the volume refused a clone, it checks what is left to copy.
   const room = (needed: number) => {
     const available = free(directory);
     if (available < needed + HEADROOM_BYTES)
       throw new ScratchNoRoom(
-        `The scratch copy of ${name} needs about ${gigabytes(needed + HEADROOM_BYTES)} free, counting 1 GB of room to spare, and the disk has ${gigabytes(available)}. Free some space and send the message again.`,
+        `The scratch copy of ${name} needs about ${gigabytes(needed + HEADROOM_BYTES)} free, counting 1 GB of room to spare, and the disk has ${gigabytes(available)}.${process.platform === 'darwin' ? ' Finder can show more, because it counts space macOS can purge.' : ''} Free some space and send the message again.`,
       );
   };
   room(cloning ? 0 : total);
-  let checkedAt = 0;
-  let writtenBytes = 0;
-  materialize(directory, files, links, (file, target) => {
-    if (cloning && options.checkout && cloneOne(options.checkout.root, file, target)) cloned++;
-    else {
-      rmSync(target, { force: true });
-      if (!('content' in file) && options.stream && file.bytes > chunkBytes)
-        options.stream(file, target);
-      else writeFileSync(target, bytesOf(file), { flag: 'wx', mode: 0o600 });
-      written++;
-      writtenBytes += file.bytes;
-      if (writtenBytes - checkedAt >= ROOM_CHECK_BYTES) {
-        checkedAt = writtenBytes;
-        room(0);
+  try {
+    return fill();
+  } catch (error) {
+    // A copy that stopped part way is never used, and on a full disk its bytes are what is short.
+    rmSync(directory, { recursive: true, force: true });
+    throw error;
+  }
+
+  function fill() {
+    let restChecked = !cloning;
+    let checkedAt = 0;
+    let writtenBytes = 0;
+    materialize(directory, files, links, (file, target) => {
+      if (cloning && options.checkout && cloneOne(options.checkout.root, file, target)) cloned++;
+      else {
+        // The volume just refused a clone, so every byte left is written.
+        if (!cloning && !restChecked) {
+          restChecked = true;
+          room(total - bytes);
+        }
+        rmSync(target, { force: true });
+        if (!('content' in file) && options.stream && file.bytes > chunkBytes) {
+          room(file.bytes);
+          options.stream(file, target);
+        } else writeFileSync(target, bytesOf(file), { flag: 'wx', mode: 0o600 });
+        written++;
+        writtenBytes += file.bytes;
+        if (writtenBytes - checkedAt >= ROOM_CHECK_BYTES) {
+          checkedAt = writtenBytes;
+          room(0);
+        }
       }
-    }
-    bytes += file.bytes;
-    if (bytes - reported >= PROGRESS_BYTES) {
-      reported = bytes;
-      options.onProgress?.({ name, bytes, total });
-    }
-  });
-  options.onProgress?.({ name, bytes: total, total });
-  return { cloned, written };
+      bytes += file.bytes;
+      if (bytes - reported >= PROGRESS_BYTES) {
+        reported = bytes;
+        options.onProgress?.({ name, bytes, total });
+      }
+    });
+    options.onProgress?.({ name, bytes: total, total });
+    return { cloned, written };
+  }
 
   function cloneOne(root: string, file: FileEntry | FileContent, target: string): boolean {
     try {

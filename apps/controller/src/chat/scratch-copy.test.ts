@@ -4,6 +4,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import {
   appendFileSync,
   copyFileSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -246,7 +247,17 @@ test('a copy checks free disk space: the whole size when it writes, the headroom
     const headroom = 1024 * 1024 * 1024;
     const read = (files: readonly FileEntry[]) =>
       readPlannedBlobs(root, files as typeof plan.files);
-    const cases: { name: string; checkout: boolean; free: number; refused: boolean }[] = [
+    // A volume that cannot clone refuses the first attempt, as ext4 or a second volume does.
+    const refuses: CloneFile = () => {
+      throw Object.assign(new Error('not supported'), { code: 'ENOTSUP' });
+    };
+    const cases: {
+      name: string;
+      checkout: boolean;
+      clone?: CloneFile;
+      free: number;
+      refused: boolean;
+    }[] = [
       {
         name: 'a written copy one byte short',
         checkout: false,
@@ -271,12 +282,19 @@ test('a copy checks free disk space: the whole size when it writes, the headroom
         free: headroom - 1,
         refused: true,
       },
+      {
+        name: 'a copy whose volume refuses the clone then needs the whole rest',
+        checkout: true,
+        clone: refuses,
+        free: headroom,
+        refused: true,
+      },
     ];
     for (const [index, row] of cases.entries()) {
       const target = join(out, String(index));
       const run = () =>
         copyScratch(target, plan.files, plan.links, {
-          ...(row.checkout ? { checkout: { root, base }, clone: copyFileSync } : {}),
+          ...(row.checkout ? { checkout: { root, base }, clone: row.clone ?? copyFileSync } : {}),
           read,
           stream: (file, to) => blobToFile(root, (file as (typeof plan.files)[number]).oid, to),
           name: 'fixture',
@@ -293,6 +311,8 @@ test('a copy checks free disk space: the whole size when it writes, the headroom
           row.name,
         );
       else assert.doesNotThrow(run, row.name);
+      // A refused copy leaves nothing on the disk it found short.
+      if (row.refused) assert.equal(existsSync(target), false, row.name);
     }
   } finally {
     rmSync(root, { recursive: true, force: true });
