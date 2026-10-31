@@ -33,6 +33,11 @@ export const DIAGNOSTIC_PARTS = [
     name: 'system.json',
     about: 'Architecture, memory and free disk space on the volume that holds your home folder.',
   },
+  {
+    name: 'google-setup.json',
+    about:
+      'The Google setup and install state, the recent Google client operations and why each Google profile is or is not ready.',
+  },
 ] as const;
 export const DIAGNOSTIC_PART_NAMES = DIAGNOSTIC_PARTS.map((part) => part.name) as [
   (typeof DIAGNOSTIC_PARTS)[number]['name'],

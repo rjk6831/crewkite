@@ -9,9 +9,9 @@ import { crewkiteHome } from './settings.ts';
 export const diagnosticsHelp = `Usage: crewkite diagnostics export <folder> [--thread task-id] [--home path]
 
 Writes a new folder with versions, the pinned provider client digests, saved settings, the end of
-the controller log, the last 200 events of the thread named by --thread, and system facts. Secrets,
-your home folder and email addresses are removed. The folder must not exist yet. Nothing is sent
-anywhere.
+the controller log, the last 200 events of the thread named by --thread, system facts, and the
+Google setup state with its recent client operations. Secrets, your home folder and email
+addresses are removed. The folder must not exist yet. Nothing is sent anywhere.
 `;
 
 /** `crewkite diagnostics export <folder>`: the same bundle the desktop's Settings exports. */

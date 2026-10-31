@@ -1662,7 +1662,12 @@ export class Controller {
         return this.savedPrompts(command);
       case 'ReadDiagnostics':
         return readDiagnostics(
-          { home: this.home, store: this.store, profiles: () => this.resolveProfiles() },
+          {
+            home: this.home,
+            store: this.store,
+            profiles: () => this.resolveProfiles(),
+            google: () => this.googleDiagnostics(),
+          },
           command.payload,
         );
       case 'ReadProjectNotes':

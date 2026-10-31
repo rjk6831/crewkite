@@ -55,6 +55,27 @@ test('the diagnostics bundle holds exactly the listed parts, redacted, from a fi
       },
     ],
     events: (_taskId: string, count: number) => events.slice(-count),
+    google: () => ({
+      setup: {
+        state: 'unknown',
+        operationId: 'cmd_01M69BW1J2CTWNBH0QKA4P08Y5',
+        googleTerms: { version: '2026-10-31', at: '2026-10-31T15:25:35.053Z' },
+      },
+      operations: {
+        newest: [
+          {
+            commandId: 'cmd_01M69BW1J2CTWNBH0QKA4P08Y5',
+            kind: 'acp-initialize',
+            state: 'unknown',
+            pid: 37479,
+            groupPresent: false,
+            note: `client at ${userHome}/providers for ann@example.com`,
+            accessToken: 'google-secret',
+          },
+        ],
+      },
+      profiles: [{ id: 'google-acp-v1', available: false, reason: 'acp-capability-missing' }],
+    }),
   };
   const taskId = 'tsk_01ARZ3NDEKTSV4RRFFQ69G5FAV';
 
@@ -70,7 +91,13 @@ test('the diagnostics bundle holds exactly the listed parts, redacted, from a fi
   const part = (name: string) => files.find((file) => file.name === name)?.text ?? '';
 
   const everything = files.map((file) => file.text).join('\n');
-  for (const secret of ['log-secret-', 'settings-secret', 'ann@example.com', userHome])
+  for (const secret of [
+    'log-secret-',
+    'settings-secret',
+    'google-secret',
+    'ann@example.com',
+    userHome,
+  ])
     assert.equal(everything.includes(secret), false, secret);
 
   const log = part('controller.log');
@@ -109,6 +136,26 @@ test('the diagnostics bundle holds exactly the listed parts, redacted, from a fi
     memory: { totalBytes: number };
   };
   assert.ok(system.arch && system.memory.totalBytes > 0);
+
+  // The Google part holds the setup, its operations and the profile reasons, redacted alike.
+  const google = JSON.parse(part('google-setup.json')) as {
+    setup: { state: string; operationId: string };
+    operations: { newest: { kind: string; state: string; pid: number; note: string }[] };
+    profiles: { id: string; reason: string }[];
+  };
+  assert.equal(google.setup.state, 'unknown');
+  assert.equal(google.operations.newest[0]?.kind, 'acp-initialize');
+  assert.equal(google.operations.newest[0]?.pid, 37479);
+  assert.equal(google.operations.newest[0]?.note, 'client at ~/providers for [redacted]');
+  assert.equal(google.profiles[0]?.reason, 'acp-capability-missing');
+  // A Google source that fails leaves the part in place and says so.
+  const failing = buildDiagnostics({
+    ...source,
+    google: () => {
+      throw Error('store closed');
+    },
+  });
+  assert.deepEqual(JSON.parse(failing.at(-1)?.text ?? '{}'), { available: false });
 
   // Without a desktop or a thread, the parts are still all there. The bundle names the product
   // version the controller holds and says which thread is missing.

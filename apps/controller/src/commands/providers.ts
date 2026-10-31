@@ -61,6 +61,8 @@ import {
 } from './schemas.ts';
 
 // Provider setup: ACP install and sign-in, connection checks, the Local connection and profiles.
+// The diagnostics bundle carries this many of the newest Google client operations.
+const GOOGLE_DIAGNOSTIC_OPERATIONS = 50;
 // The connection revision at which a no-authentication connect met a runtime that wants a token.
 // Memory only: the next connect probes again.
 const tokenAsked = new WeakMap<object, number>();
@@ -557,6 +559,51 @@ export class ProviderCommands {
     } finally {
       runtime.resolve(CommandResultSchema.parse(result));
     }
+  }
+
+  /**
+   * What the diagnostics bundle says about Google: the setup and install state, the newest client
+   * operations with whether each recorded group still exists, and every Google profile's reason.
+   * A stuck connect reads from it: a row whose group is gone clears with Stop, one still present
+   * names the process to quit.
+   */
+  googleDiagnostics(this: Controller) {
+    const rows = this.store.googleMetadataOperations();
+    const live = new Set([this.acpSetupRuntime?.key, this.usageRead?.key]);
+    const states: Record<string, number> = {};
+    for (const row of rows) states[row.state] = (states[row.state] ?? 0) + 1;
+    return {
+      setup: this.store.googleAcpSetup(),
+      install: this.googleInstallation().status(),
+      running: {
+        setup: this.acpSetupRuntime?.key ?? null,
+        quotaRead: this.usageRead?.key ?? null,
+      },
+      operations: {
+        total: rows.length,
+        states,
+        newest: rows.slice(-GOOGLE_DIAGNOSTIC_OPERATIONS).map((row) => ({
+          commandId: row.command_id,
+          kind: row.kind,
+          state: row.state,
+          authorityRevision: row.authority_revision,
+          pid: row.pid,
+          processGroup: row.process_group,
+          groupPresent: row.process_group === null ? null : !groupAbsent(row.process_group),
+          runningHere: live.has(row.command_id),
+          clearedByStop: !!this.store.receipt(`google-metadata-settled:${row.command_id}`),
+          startedAt: row.started_at,
+          finishedAt: row.finished_at,
+        })),
+      },
+      profiles: this.resolveProfiles()
+        .filter((profile) => profile.facts.family === 'google')
+        .map((profile) => ({
+          id: profile.facts.id,
+          available: profile.facts.available,
+          reason: 'reason' in profile.facts ? String(profile.facts.reason) : null,
+        })),
+    };
   }
 
   googleInstallation(this: Controller): GoogleAcpInstallation {
