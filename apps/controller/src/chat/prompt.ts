@@ -72,6 +72,18 @@ export function systemContext(
 }
 
 /**
+ * The rule line of a read-only brief. The OpenAI client reads and searches through shell
+ * commands, so its line allows the read-only ones. Its turn runs in a read-only sandbox, and a
+ * command outside the client's read-only set is refused. The other clients read through their
+ * own file tools and run no command on a read-only turn.
+ */
+export function readOnlyRules(family: ChatFamily, purpose: string): string {
+  if (family === 'openai')
+    return `Do not edit, create or delete files. You may read and search files to ${purpose}: run read-only commands such as ls, cat, sed -n, head, wc, rg, grep and find inside the scratch copy. Do not run a command that changes a file, installs a package or reaches the network.`;
+  return `Do not edit, create or delete files, and do not run commands. You may read and search files to ${purpose}.`;
+}
+
+/**
  * The project's notes as a section, or an empty string. The controller holds a project to 16 KiB
  * and 200 notes. A longer list is cut at a whole note, so the section never outgrows its share.
  */
@@ -221,6 +233,7 @@ export function reviewContext(
   directory: string,
   base: string,
   files: readonly ReviewFile[] | null,
+  family: ChatFamily,
   statesFindings = false,
   /** Why the changes could not be read, when the cause was their size. */
   unreadable?: string,
@@ -228,7 +241,7 @@ export function reviewContext(
   const lines = [
     `You are reviewing changes in the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     `Review the current changes in that copy against the base commit ${base}.`,
-    'Do not edit, create or delete files, and do not run commands. You may read and search files to check a change against the code around it.',
+    readOnlyRules(family, 'check a change against the code around it'),
     'List your findings ordered by severity, most severe first. For each one, name the file and the line, say what is wrong and why it matters, and say what you would change. If you find nothing worth reporting, say so in one sentence.',
     ...(statesFindings
       ? [
@@ -273,11 +286,12 @@ export function reviewContext(
 export function adviceContext(
   projectName: string,
   directory: string,
+  family: ChatFamily,
   answer: string | null,
 ): string {
   const lines = [
     `You are giving a second opinion in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
-    'Do not edit, create or delete files, and do not run commands. You may read and search files to check the answer.',
+    readOnlyRules(family, 'check the answer'),
     'Say what holds up, what is wrong or missing, and what you would do next. Keep it under 300 words.',
   ];
   if (answer === null) return [...lines, 'There is no earlier answer in this thread.'].join('\n');
@@ -289,10 +303,10 @@ export function adviceContext(
 }
 
 /** Brief for an ask turn: a read-only answer to one side question about the thread. */
-export function askContext(projectName: string, directory: string): string {
+export function askContext(projectName: string, directory: string, family: ChatFamily): string {
   return [
     `You are answering a side question in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
-    'Do not edit, create or delete files, and do not run commands. You may read and search files to answer.',
+    readOnlyRules(family, 'answer'),
     'Answer the question directly. The thread goes on without you, so do not offer to make changes.',
   ].join('\n');
 }
@@ -301,11 +315,12 @@ export function askContext(projectName: string, directory: string): string {
 export function challengeContext(
   projectName: string,
   directory: string,
+  family: ChatFamily,
   answer: string | null,
 ): string {
   const lines = [
     `You are challenging the last answer in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
-    'Do not edit, create or delete files, and do not run commands. You may read and search files to check an assumption.',
+    readOnlyRules(family, 'check an assumption'),
     'Name the assumptions the answer rests on, starting with the one that would change it most if it were wrong. For each, say whether it is verified, unverified or wrong, and what evidence would settle it. Keep it under 300 words.',
   ];
   if (answer === null) return [...lines, 'There is no earlier answer in this thread.'].join('\n');
@@ -325,10 +340,14 @@ export const PLAN_EXAMPLE =
  * validates. The controller picks the model for each slice, so the brief asks for difficulty and
  * leaves the choice of family out.
  */
-export function orchestratorContext(projectName: string, directory: string): string {
+export function orchestratorContext(
+  projectName: string,
+  directory: string,
+  family: ChatFamily,
+): string {
   return [
     `You are the orchestrator in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
-    'Do not edit, create or delete files, and do not run commands. You may read and search files to plan the work.',
+    readOnlyRules(family, 'plan the work'),
     'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan, picks the model for each slice and runs the slices one at a time in dependency order, with a review after each.',
     'Reply with a short summary, then exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
     PLAN_EXAMPLE,
@@ -379,7 +398,7 @@ export function sliceBrief(
       ? `Files for this slice, relative to the scratch copy:\n${slice.files.join('\n')}`
       : '',
     slice.readOnly
-      ? 'This slice only reads. Do not edit, create or delete files. Report what you found.'
+      ? 'This slice only reads. Read and search the files it needs, change none of them, and report what you found.'
       : 'Do only this slice. Later slices cover the rest of the plan. Say which files you changed and why.',
   ]
     .filter(Boolean)
