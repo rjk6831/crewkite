@@ -1215,9 +1215,11 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.match(google[4].prompt, /^Person:\nThink harder\.$/m);
   const changed = off.read();
   assert.equal(changed.turns.at(-1)?.handoffFrom, 'google');
+  // The listed model shows its picker label (the fixture labels google-model as google), and an
+  // ID the catalog does not list shows as itself.
   assert.equal(
     changed.messages.at(-2)?.text,
-    'Continued on Google (google-model-2) from Google (google-model). Reason: model changed in the composer.',
+    'Continued on Google (google-model-2) from Google (google). Reason: model changed in the composer.',
   );
 
   // The cap decision clears the saved session before the turn runs. When that turn fails, the
