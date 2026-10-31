@@ -107,7 +107,21 @@ export type TurnView = {
   /** Set when the reply stopped at its output limit. */
   outputLimit: ChatOutputLimit | null;
   failure: ChatFailure | null;
+  /** The brief a plan slice turn ran on. It shows folded under the chip. */
+  brief?: string;
 };
+
+/** The folded label of a slice turn's brief, such as `Slice 1 brief`. */
+export function briefLabel(identity: TurnIdentity | null): string {
+  const slice = identity?.slice === undefined ? 'Slice' : `Slice ${identity.slice}`;
+  const kind =
+    identity?.role === 'reviewer'
+      ? 'review brief'
+      : identity?.role === 'fixer'
+        ? 'fix brief'
+        : 'brief';
+  return `${slice} ${kind}`;
+}
 
 /** The badge a role shows on its reply. The builder's own reply has none. */
 export const roleLabels: Record<ChatRole, string | null> = {

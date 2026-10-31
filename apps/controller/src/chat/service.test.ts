@@ -2317,13 +2317,16 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           return;
         }
         const lines = read.messages.map((message) => message.text);
+        // The card carries the assignment reason, so the thread writes no line that repeats it.
         assert.ok(
-          lines.includes(
-            'Slice 1 (medium) assigned to OpenAI: the crew builder, ranked 2 of 3 by Most allowance left.',
+          !lines.some(
+            (line) =>
+              /^Slice \d+ \(\w+\) assigned to /.test(line) &&
+              !line.endsWith('picked on the plan card.'),
           ),
           row.name,
         );
-        // An override keeps the controller's line and adds the person's pick after it.
+        // An override adds the person's pick as a line.
         if ('picked' in row) assert.ok(lines.includes(row.picked), row.name);
         const builtOn = 'builtOn' in row ? row.builtOn : 'openai';
         assert.equal(card?.slices[0].assignment?.family, builtOn, row.name);
