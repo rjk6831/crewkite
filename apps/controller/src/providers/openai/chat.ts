@@ -94,15 +94,25 @@ export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
 // answers the edits that stay inside scratch. allow-all lets the client work inside its sandbox and
 // asks only to leave it. The policy goes on thread/start and thread/resume, which still take
 // `untrusted`. The client's config loader refuses `approval_policy = "untrusted"` at startup, and
-// the app-server then exits before it answers initialize, so the launch override stays on-request.
-const approvalPolicy = (request: ChatTurnRequest) =>
-  request.permissionPolicy === 'allow-all' ? 'on-request' : 'untrusted';
+// the app-server then exits before it answers initialize, so the launch override stays on-request
+// for a turn that edits.
+//
 // Every read-only role (review, advice, challenge, ask, the orchestrator and a read-only slice)
-// runs in the read-only sandbox under `untrusted`. The client reads and searches through shell
-// commands, and it runs the ones on its own read-only list, such as cat, sed -n and rg, without
-// asking. The brief says so (readOnlyRules in chat/prompt.ts), since a brief that forbade every
-// command left the model with no way to read. Any other command comes back as a question, and
-// serverRequest denies it.
+// runs in the read-only sandbox under `never`. The client reads and searches through shell
+// commands, and under `untrusted` it asked about most of them (pwd, ls -la, rg --files), which a
+// read-only turn could only deny, so the model was left with no way to read. Under `never` each
+// command runs inside the sandbox without a question, and the sandbox refuses every write and
+// every network call; a refused command fails in place and is never escalated. The brief keeps
+// the model to read-only commands (readOnlyRules in chat/prompt.ts). serverRequest still denies a
+// question that arrives on a read-only turn.
+const approvalPolicy = (request: ChatTurnRequest) =>
+  request.readOnly
+    ? 'never'
+    : request.permissionPolicy === 'allow-all'
+      ? 'on-request'
+      : 'untrusted';
+const launchApprovalPolicy = (request: ChatTurnRequest) =>
+  request.readOnly ? 'never' : 'on-request';
 const sandboxMode = (request: ChatTurnRequest) =>
   request.readOnly ? 'read-only' : 'workspace-write';
 // `other` spans every tool CrewKite cannot name, so no thread grant covers it. Only commands and
@@ -117,7 +127,7 @@ function nativeChatArguments(directory: string, request: ChatTurnRequest): strin
     openai_base_url: '',
     chatgpt_base_url: 'https://chatgpt.com/backend-api/',
     service_tier: 'default',
-    approval_policy: 'on-request',
+    approval_policy: launchApprovalPolicy(request),
     approvals_reviewer: 'user',
     sandbox_mode: sandboxMode(request),
     web_search: 'disabled',

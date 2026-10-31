@@ -73,9 +73,10 @@ export function systemContext(
 
 /**
  * The rule line of a read-only brief. The OpenAI client reads and searches through shell
- * commands, so its line allows the read-only ones. Its turn runs in a read-only sandbox, and a
- * command outside the client's read-only set is refused. The other clients read through their
- * own file tools and run no command on a read-only turn.
+ * commands, so its line allows the read-only ones. Its turn runs in a read-only sandbox that
+ * never asks: each command runs without a question, and the sandbox refuses any write or network
+ * call. The other clients read through their own file tools and run no command on a read-only
+ * turn.
  */
 export function readOnlyRules(family: ChatFamily, purpose: string): string {
   if (family === 'openai')
