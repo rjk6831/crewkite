@@ -499,7 +499,7 @@ test('a message sent during a turn waits and starts when the turn ends', {
       end: 'answer',
       asked: [first, ...later],
     },
-    { name: 'stop clears', send: later, remove: null, end: 'stop', asked: [first] },
+    { name: 'stop pauses', send: later, remove: null, end: 'stop', asked: [first] },
     {
       name: 'dequeue removes',
       send: later,
@@ -568,7 +568,15 @@ test('a message sent during a turn waits and starts when the turn ends', {
     const removed = waiting.thread.queued.find((message) => message.text === row.remove);
     if (removed) store.transaction(() => service.configure({ taskId, dequeue: removed.id }));
 
-    const idle = settles(thread);
+    // A stopped turn leaves its queue paused, so the thread frees with messages still waiting.
+    const idle =
+      row.end === 'stop'
+        ? next(
+            thread,
+            (event) =>
+              event.type === 'chat.thread' && (event.payload as ChatThread).activeTurnId === null,
+          )
+        : settles(thread);
     const effects: (() => void)[] = [];
     const ended = store.transaction(() =>
       row.end === 'stop'
@@ -578,7 +586,7 @@ test('a message sent during a turn waits and starts when the turn ends', {
             effects,
           ),
     );
-    // Stop hands the cleared messages back, so the composer can offer the text again.
+    // Stop names the messages still waiting. Nothing goes back to the composer.
     if (row.end === 'stop')
       assert.deepEqual(
         ended.data?.kind === 'chat-queue' ? ended.data.messages.map((m) => m.text) : null,
@@ -592,6 +600,12 @@ test('a message sent during a turn waits and starts when the turn ends', {
     assert.deepEqual(
       users(after).map((message) => message.text),
       row.asked,
+      row.name,
+    );
+    // The paused queue keeps every message, in order, and starts none of them by itself.
+    assert.deepEqual(
+      [after.thread.queued.map((message) => message.text), after.thread.queuePaused],
+      row.end === 'stop' ? [row.send.slice(0, 8), true] : [[], undefined],
       row.name,
     );
     // A queued message joins the conversation under the ID it had while it waited.
@@ -630,7 +644,8 @@ test('a message sent during a turn waits and starts when the turn ends', {
 
     // A side question carries the thread packet. With no thread tools, the packet does not name
     // them, and the turn carries the same answer for the client's config.
-    const asking = settles(thread);
+    // A new message starts at once beside a paused queue.
+    const asking = turnReaches(thread, 'done');
     const effects2: (() => void)[] = [];
     store.transaction(() =>
       service.ask(
@@ -644,6 +659,29 @@ test('a message sent during a turn waits and starts when the turn ends', {
     assert.match(side?.prompt ?? '', /^This is a side question to OpenAI/, row.name);
     assert.doesNotMatch(side?.prompt ?? '', /Thread tools are available/, row.name);
     assert.equal(side?.threadTools, false, row.name);
+    if (row.end !== 'stop') continue;
+    assert.equal(thread.read().thread.queued.length, Math.min(row.send.length, 8), row.name);
+
+    // Send now on a paused message starts that one. The rest stay paused, and the queue clears
+    // its pause once it empties.
+    const chosen = thread.read().thread.queued[1];
+    const sentNow = turnReaches(thread, 'done');
+    const now = act(store, (work) => service.steer({ taskId, messageId: chosen.id }, work));
+    assert.equal(now.outcome, 'applied', row.name);
+    await sentNow;
+    const resumed = thread.read();
+    assert.equal(users(resumed).at(-1)?.id, chosen.id, row.name);
+    assert.deepEqual(
+      resumed.thread.queued.map((message) => message.id),
+      waiting.thread.queued.filter((message) => message.id !== chosen.id).map((m) => m.id),
+      row.name,
+    );
+    assert.equal(resumed.thread.queuePaused, true, row.name);
+    store.transaction(() => {
+      for (const message of resumed.thread.queued)
+        service.configure({ taskId, dequeue: message.id });
+    });
+    assert.equal(thread.read().thread.queuePaused, undefined, row.name);
   }
 
   // One running turn per family: a second thread's message on the same family waits in its own

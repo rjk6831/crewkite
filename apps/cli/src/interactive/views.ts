@@ -15,7 +15,10 @@ import { createElement as h, type ReactNode } from 'react';
 import { modelGroups } from '../../../desktop/src/renderer/thread/model-groups.ts';
 import { outputLimitLine } from '../../../desktop/src/renderer/thread/output-limit.ts';
 import { planCard } from '../../../desktop/src/renderer/thread/plan-card.ts';
-import type { ThreadItem } from '../../../desktop/src/renderer/thread/thread-state.ts';
+import {
+  pausedQueueLine,
+  type ThreadItem,
+} from '../../../desktop/src/renderer/thread/thread-state.ts';
 import {
   type Block,
   roleLabels,
@@ -481,7 +484,13 @@ export function QueuedList({ thread, colors }: { thread: ChatThread; colors: Pal
   return h(
     Box,
     { flexDirection: 'column' },
-    h(Text, { color: colors.muted }, `Queued (${thread.queued.length})`),
+    h(
+      Text,
+      { color: colors.muted },
+      thread.queuePaused
+        ? (pausedQueueLine(thread.queued.length) ?? '')
+        : `Queued (${thread.queued.length})`,
+    ),
     ...thread.queued.map((message, index) =>
       h(
         Text,

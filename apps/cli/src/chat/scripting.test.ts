@@ -9,7 +9,7 @@ import { createSyntheticRepository } from '../../../../packages/testkit/src/repo
 import { printRequested, runCli } from '../main.ts';
 import { startScriptedController } from '../scripted-controller.ts';
 import { connectChat } from './connect.ts';
-import { clearedQueueLine, runPrint } from './scripting.ts';
+import { runPrint, waitingQueueLine } from './scripting.ts';
 
 const failure = {
   stage: 'stream' as const,
@@ -122,7 +122,7 @@ test('print mode streams the reply, uses only a registered checkout and exits wi
     plainEnv,
   );
   const taskId = await started.promise;
-  // A message queued behind the running reply is cleared by the stop, and the stop says so.
+  // A message queued behind the running reply stays, paused, and the stop says it is waiting.
   const queuing = await connectChat(home);
   const queued = await queuing.sendMessage({
     taskId,
@@ -134,7 +134,7 @@ test('print mode streams the reply, uses only a registered checkout and exits wi
   queuing.transport.close();
   const stopped = capture();
   assert.equal(await runCli(['thread', 'stop', taskId, '--home', home], stopped.output), 0);
-  assert.equal(stopped.io.out, 'Cleared 1 queued message.\n');
+  assert.equal(stopped.io.out, 'Stopped. 1 queued message is waiting.\n');
   assert.equal(await printing, 3);
 
   // A checkout the controller does not hold is refused without registering it, and the refusal
@@ -402,7 +402,7 @@ test('a computer without git reports degraded health and names git when it refus
   }
 });
 
-test('thread stop names how many queued messages it cleared and says nothing when it cleared none', () => {
+test('thread stop names how many queued messages wait behind it and says nothing when none do', () => {
   const message = {
     id: 'msg_00000000000000000000000001',
     at: '2026-10-23T12:00:00.000Z',
@@ -424,7 +424,7 @@ test('thread stop names how many queued messages it cleared and says nothing whe
         outcome: 'applied' as const,
         data: { kind: 'chat-queue' as const, messages: [message] },
       },
-      line: 'Cleared 1 queued message.',
+      line: 'Stopped. 1 queued message is waiting.',
     },
     {
       name: 'three messages',
@@ -432,8 +432,8 @@ test('thread stop names how many queued messages it cleared and says nothing whe
         outcome: 'applied' as const,
         data: { kind: 'chat-queue' as const, messages: [message, message, message] },
       },
-      line: 'Cleared 3 queued messages.',
+      line: 'Stopped. 3 queued messages are waiting.',
     },
   ];
-  for (const row of rows) assert.equal(clearedQueueLine(row.result), row.line, row.name);
+  for (const row of rows) assert.equal(waitingQueueLine(row.result), row.line, row.name);
 });

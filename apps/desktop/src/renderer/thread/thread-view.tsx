@@ -43,6 +43,7 @@ import {
   latestContext,
   liveSignals,
   newestTurnId,
+  pausedQueueLine,
   type ThreadItem,
   type ThreadSettings,
   triedFamilies,
@@ -215,21 +216,13 @@ function ThreadBody({
     },
     [source, task.id, dispatch, waits],
   );
-  // Stop clears the queue, and the texts the controller took out go back into an empty composer.
+  // Stop ends the reply and keeps the queue, paused. Nothing goes into the composer.
   const stop = useCallback(async () => {
     if (!activeTurn) return;
-    const result = await stopTurn(source, { taskId: task.id, turnId: activeTurn });
-    const cleared = result.data?.kind === 'chat-queue' ? result.data.messages : [];
-    if (cleared.length)
-      composer.current?.restore(
-        cleared.map((item) => item.text).join('\n\n'),
-        cleared.flatMap((item) => item.files),
-      );
-    // The text and files come back as one plain message. A queued action has to be chosen again.
-    if (cleared.some((item) => item.role !== 'assistant' || item.attachments.length))
-      setNotice('The queued text is back in the composer. Pick the action or attachments again.');
+    await stopTurn(source, { taskId: task.id, turnId: activeTurn });
   }, [source, task.id, activeTurn]);
-  // The controller stops the reply and starts this message with what the stopped turn was doing.
+  // While a reply runs, the controller stops it and starts this message with what the stopped
+  // turn was doing. On a paused queue it starts this message at once.
   const sendNow = useCallback(
     (id: string) =>
       steerMessage(source, { taskId: task.id, messageId: id }).then(
@@ -406,12 +399,15 @@ function ThreadBody({
     [],
   );
 
-  // A running turn is the usual reason to wait. These two hold the queue after a turn has ended.
+  // A running turn is the usual reason to wait. These hold the queue after a turn has ended.
+  const paused = !!thread?.queuePaused && activeTurn === null;
   const held = thread?.ownershipUnknown
     ? 'Waiting for a provider process from an earlier turn to exit. Quit it, then send another message.'
-    : offer
-      ? 'Waiting for a provider. Continue on another one above, or send another message.'
-      : null;
+    : paused
+      ? pausedQueueLine(queued?.length ?? 0)
+      : offer
+        ? 'Waiting for a provider. Continue on another one above, or send another message.'
+        : null;
   const badge = thread?.scratchReady
     ? 'Scratch copy'
     : thread?.base
@@ -497,6 +493,7 @@ function ThreadBody({
             queued={queued ?? []}
             held={held}
             running={activeTurn !== null}
+            paused={paused && !thread?.ownershipUnknown}
             onRemove={dequeue}
             onSendNow={sendNow}
           />

@@ -574,9 +574,14 @@ export const ChatThreadSchema = z.strictObject({
   handoffMode: ChatSavedHandoffModeSchema.default('most-left'),
   /**
    * Messages sent while a turn was running, oldest first. Each starts its own turn, in order,
-   * once the thread is free. Stopping the running turn clears them.
+   * once the thread is free, unless the queue is paused.
    */
   queued: z.array(ChatQueuedMessageSchema).max(8).default([]),
+  /**
+   * Stop ended the running turn and kept the queue. A paused queue starts nothing by itself: each
+   * message waits for Send now or Remove. It clears when the queue empties.
+   */
+  queuePaused: z.boolean().optional(),
   /** The crew the thread runs and how far it runs on its own. A thread with no crew is manual. */
   crew: ChatCrewSchema.nullable().default(null),
   flightMode: ChatFlightModeSchema.default('manual'),

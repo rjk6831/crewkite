@@ -23,6 +23,7 @@ import {
   rankFamilies,
   TaskIdSchema,
 } from '@crewkite/contracts';
+import { pausedQueueLine } from '../../../desktop/src/renderer/thread/thread-state.ts';
 import { crewkiteHome, loadSettings } from '../settings.ts';
 import { callerDirectory, checkoutAt, projectsForCheckout } from './checkout.ts';
 import { applied, type ChatClient, CommandRefused, threadMessage } from './client.ts';
@@ -66,10 +67,9 @@ export function jsonLine(line: CliJsonLine): string {
   return `${JSON.stringify(CliJsonLineSchema.parse(line))}\n`;
 }
 
-/** What `thread stop` says when the stop took messages out of the queue, or null when it took none. */
-export function clearedQueueLine(result: CommandResult): string | null {
-  const count = result.data?.kind === 'chat-queue' ? result.data.messages.length : 0;
-  return count > 0 ? `Cleared ${count} queued ${count === 1 ? 'message' : 'messages'}.` : null;
+/** What `thread stop` says when messages wait behind the stop, or null when none do. */
+export function waitingQueueLine(result: CommandResult): string | null {
+  return pausedQueueLine(result.data?.kind === 'chat-queue' ? result.data.messages.length : 0);
 }
 
 const resultLine = (
@@ -508,6 +508,7 @@ function threadSummaryText(read: ChatThreadRead): string {
     `Model ${thread.selection ? `${thread.selection.family}/${thread.selection.model}` : 'not chosen'}`,
     `Permission policy ${thread.permissionPolicy}, flight ${thread.flightMode}`,
     thread.activeTurnId ? `Running turn ${thread.activeTurnId}` : 'No turn running',
+    ...(thread.queuePaused ? [pausedQueueLine(thread.queued.length) ?? ''] : []),
     ...thread.queued.map((message) => `Queued: ${terminalText(message.text.split('\n')[0])}`),
   ];
   for (const message of read.messages) {
@@ -675,8 +676,8 @@ export async function runThreadCommand(args: string[], io: Io, connect: Connect)
           turnId: read.thread.activeTurnId,
         });
         const code = await report('StopChatTurn', result, taskId);
-        const cleared = clearedQueueLine(result);
-        if (!json && code === 0 && cleared) await io.out(`${cleared}\n`);
+        const waiting = waitingQueueLine(result);
+        if (!json && code === 0 && waiting) await io.out(`${waiting}\n`);
         return code;
       }
       case 'accept': {
