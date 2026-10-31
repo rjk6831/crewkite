@@ -6,7 +6,7 @@ This file lists what changed in each release, newest first. A release is tagged 
 
 ### 0.1.0
 
-This version gathers rc-05, rc-05+ and sprint 2. Every package.json and the version CrewKite reports carry the same number.
+This version gathers rc-05, rc-05+ and rc-05++. Every package.json and the version CrewKite reports carry the same number.
 
 rc-05
 
@@ -28,7 +28,7 @@ rc-05+
 - I added project checks to the crew chain, each run after asking the thread's permission.
 - I added an extension seam with a versioned contract, off by default.
 
-Sprint 2
+rc-05++
 
 - I added usage analytics for a thread and for a project, with a CSV export in the desktop and in `crewkite usage`.
 - I added search over thread history in the desktop rail and in `crewkite search`.
@@ -59,7 +59,7 @@ Sprint 2
 - I skipped the welcome for anyone who already has a project.
 - I let chat accept a range of client builds within the tested major version, and named the found version on each provider card.
 - I added a Linux preview from source for OpenAI, Anthropic and Local, with Linux CI.
-- I moved the `--json` lines to `v: 3`, because this sprint added fields to the thread, turn and event shapes they embed.
+- I moved the `--json` lines to `v: 3`, because this version added fields to the thread, turn and event shapes they embed.
 - I removed the 100,000-file cap on a thread's scratch copy and check free disk space before the copy instead.
 - I made the Local search cover every file and say how many were too large to search, and let it read lines of a file of any size.
 - I made pasted text longer than one message go in as a file.
