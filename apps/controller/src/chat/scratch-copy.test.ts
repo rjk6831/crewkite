@@ -18,6 +18,7 @@ import { test } from 'node:test';
 import { applyPublication, preparePublication } from '../host/publication.ts';
 import {
   blobToFile,
+  type FileEntry,
   hashCandidateFiles,
   readPlannedBlobs,
   scratchPlan,
@@ -25,7 +26,7 @@ import {
 } from '../host/source.ts';
 import { discardScratchPath, scratchChanges } from './changes.ts';
 import type { ImportProgress } from './files.ts';
-import { type CloneFile, copyScratch } from './scratch-copy.ts';
+import { type CloneFile, copyScratch, freeBytes, ScratchNoRoom } from './scratch-copy.ts';
 
 // Over the 64 MiB the older whole-base read allowed, so the copy and every later read must not
 // load the base at once.
@@ -234,4 +235,76 @@ test('a volume that cannot clone and an edited checkout both fall back to writin
   assert.equal(edited.same, true);
   assert.equal(calls, 0);
   assert.equal(edited.result.cloned, 0);
+});
+
+test('a copy checks free disk space: the whole size when it writes, the headroom when it clones', () => {
+  const { root, base } = repository();
+  const out = mkdtempSync(join(tmpdir(), 'scratch-room-'));
+  try {
+    const plan = scratchPlan(root, base);
+    const total = plan.files.reduce((sum, file) => sum + file.bytes, 0);
+    const headroom = 1024 * 1024 * 1024;
+    const read = (files: readonly FileEntry[]) =>
+      readPlannedBlobs(root, files as typeof plan.files);
+    const cases: { name: string; checkout: boolean; free: number; refused: boolean }[] = [
+      {
+        name: 'a written copy one byte short',
+        checkout: false,
+        free: total + headroom - 1,
+        refused: true,
+      },
+      {
+        name: 'a written copy with exactly enough',
+        checkout: false,
+        free: total + headroom,
+        refused: false,
+      },
+      {
+        name: 'a cloned copy with only the headroom',
+        checkout: true,
+        free: headroom,
+        refused: false,
+      },
+      {
+        name: 'a cloned copy under the headroom',
+        checkout: true,
+        free: headroom - 1,
+        refused: true,
+      },
+    ];
+    for (const [index, row] of cases.entries()) {
+      const target = join(out, String(index));
+      const run = () =>
+        copyScratch(target, plan.files, plan.links, {
+          ...(row.checkout ? { checkout: { root, base }, clone: copyFileSync } : {}),
+          read,
+          stream: (file, to) => blobToFile(root, (file as (typeof plan.files)[number]).oid, to),
+          name: 'fixture',
+          free: () => row.free,
+        });
+      if (row.refused)
+        assert.throws(
+          run,
+          (error: unknown) =>
+            error instanceof ScratchNoRoom &&
+            /^The scratch copy of fixture needs about \d+\.\d GB free, counting 1 GB of room to spare, and the disk has \d+\.\d GB\./.test(
+              error.message,
+            ),
+          row.name,
+        );
+      else assert.doesNotThrow(run, row.name);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+    rmSync(out, { recursive: true, force: true });
+  }
+});
+
+test('free disk space is read from the nearest folder that exists', () => {
+  const out = mkdtempSync(join(tmpdir(), 'scratch-free-'));
+  try {
+    assert.ok(freeBytes(join(out, 'not/yet/made')) > 0);
+  } finally {
+    rmSync(out, { recursive: true, force: true });
+  }
 });

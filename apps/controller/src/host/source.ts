@@ -57,8 +57,10 @@ export type CommittedSource = {
 };
 const MAX_SOURCE_BYTES = 64 * 1024 * 1024;
 const MAX_SOURCE_FILES = 10_000;
-// A chat thread copies the whole repository, so its cap is higher. The byte limit still holds.
-const MAX_SCRATCH_FILES = 100_000;
+// A chat thread copies the whole repository, so its file count has no cap of its own. The copy
+// checks free disk space instead (chat/scratch-copy.ts).
+// The most bytes one listing of a base tree may print: about 1 KiB per path for a million paths.
+const MAX_TREE_LISTING_BYTES = 1024 * 1024 * 1024;
 const MAX_LINK_EXPANSIONS = 40;
 // BOM handling off, so a name that starts with U+FEFF keeps it.
 const utf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
@@ -73,6 +75,17 @@ export function git(
   identity?: { name: string; email: string; at: string },
 ): Buffer {
   return runGit(directory, args, input, identity, MAX_SOURCE_BYTES);
+}
+
+/** Every path of a base tree, NUL separated. A large repository lists past the usual read limit. */
+function listTree(path: string, base: string): Buffer {
+  return runGit(
+    path,
+    ['ls-tree', '-rz', '--full-tree', base],
+    undefined,
+    undefined,
+    MAX_TREE_LISTING_BYTES,
+  );
 }
 
 function runGit(
@@ -212,7 +225,7 @@ function scanSource(projectId: string, path: string) {
   }
   // Raw bytes avoid repository filters. Transformed checkouts can show as changed.
   const baseEntries = new Map(
-    git(path, ['ls-tree', '-rz', '--full-tree', base])
+    listTree(path, base)
       .toString()
       .split('\0')
       .filter(Boolean)
@@ -398,7 +411,9 @@ export function committedFiles(
 ): FileContent[] | CommittedSource {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(base))
     throw new Error('Invalid committed source identity.');
-  const output = git(path, ['ls-tree', '-rz', '--full-tree', base]);
+  const output = options?.scratch
+    ? listTree(path, base)
+    : git(path, ['ls-tree', '-rz', '--full-tree', base]);
   if (options?.scratch) return scratchSource(path, output);
   const records = output.toString('utf8').split('\0').filter(Boolean);
   if (!Buffer.from(output.toString('utf8')).equals(output))
@@ -438,10 +453,6 @@ function classifyScratch(output: Buffer): ScratchClasses {
     if (stop > start) records.push(output.subarray(start, stop));
     start = stop + 1;
   }
-  if (records.length > MAX_SCRATCH_FILES)
-    throw new Error(
-      `The base commit has ${records.length.toLocaleString('en-US')} files. A scratch copy holds at most ${MAX_SCRATCH_FILES.toLocaleString('en-US')}.`,
-    );
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
   const classes: ScratchClasses = { regular: [], linked: [], encoded: [], skipped: [], kept: [] };
@@ -534,7 +545,7 @@ export type ScratchPlan = {
 export function scratchPlan(path: string, base: string): ScratchPlan {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(base))
     throw new Error('Invalid committed source identity.');
-  const classes = classifyScratch(git(path, ['ls-tree', '-rz', '--full-tree', base]));
+  const classes = classifyScratch(listTree(path, base));
   const { regular, linked, encoded } = classes;
   const blobs = readBlobs(
     path,
@@ -868,7 +879,7 @@ function walkScratch<T>(
   const files: T[] = [];
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
-  const limit = scope ? MAX_SCRATCH_FILES : MAX_SOURCE_FILES;
+  const limit = scope ? Number.POSITIVE_INFINITY : MAX_SOURCE_FILES;
   // A copy file that would sit over or under a base path is a collision.
   for (const { path } of scope?.values() ?? []) safePath(path, seen, prefixes);
   let total = 0;
@@ -1105,8 +1116,7 @@ export function treeFromFiles(
   files: readonly FileContent[],
   kept?: readonly KeptEntry[],
 ): string {
-  if (files.length + (kept?.length ?? 0) > (kept ? MAX_SCRATCH_FILES : MAX_SOURCE_FILES))
-    throw Error('Source exceeds the file limit.');
+  if (!kept && files.length > MAX_SOURCE_FILES) throw Error('Source exceeds the file limit.');
   const seen = new Set<string>(),
     prefixes = new Map<string, string>();
   let total = 0;
@@ -1198,10 +1208,6 @@ export function treeFromScratch(input: {
   contents?: ReadonlyMap<string, Buffer>;
 }): string {
   const { plan, candidates } = input;
-  if (candidates.length + plan.kept.length > MAX_SCRATCH_FILES)
-    throw new ScratchTooLarge(
-      `The scratch copy holds more than ${MAX_SCRATCH_FILES.toLocaleString('en-US')} files, the most CrewKite compares.`,
-    );
   const seen = new Set<string>();
   const prefixes = new Map<string, string>();
   for (const entry of plan.kept) {

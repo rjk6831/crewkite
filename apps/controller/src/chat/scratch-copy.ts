@@ -8,9 +8,10 @@ import {
   openSync,
   readSync,
   rmSync,
+  statfsSync,
   writeFileSync,
 } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import {
   type FileContent,
   type FileEntry,
@@ -45,9 +46,35 @@ export type ScratchCopyOptions = {
   stream?: (file: FileEntry, target: string) => void;
   /** The most bytes one `read` call asks for, apart from a single larger file. */
   chunkBytes?: number;
+  /** Free bytes on the disk that holds a path. Tests pass their own. */
+  free?: (path: string) => number;
 };
 
 const CHUNK_BYTES = 32 * 1024 * 1024;
+// The free space a copy leaves on the disk, so the computer and the turn's own writes keep room.
+const HEADROOM_BYTES = 1024 * 1024 * 1024;
+// How many written bytes pass between checks of free space while files are written out.
+const ROOM_CHECK_BYTES = 256 * 1024 * 1024;
+
+/** The disk lacks room for a copy. The message names what the copy needs and what is free. */
+export class ScratchNoRoom extends Error {}
+
+/** Bytes free to this process on the disk that holds `path` or its nearest existing folder. */
+export function freeBytes(path: string): number {
+  let at = path;
+  for (;;) {
+    try {
+      const stats = statfsSync(at);
+      return stats.bavail * stats.bsize;
+    } catch (error) {
+      const parent = dirname(at);
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT' || parent === at) throw error;
+      at = parent;
+    }
+  }
+}
+
+const gigabytes = (bytes: number) => `${(bytes / 1e9).toFixed(1)} GB`;
 
 /**
  * Fill a new empty scratch directory with the base's files and links. The rules for paths, links
@@ -93,6 +120,19 @@ export function copyScratch(
     return bytes;
   };
   const chunkBytes = options.chunkBytes ?? CHUNK_BYTES;
+  const free = options.free ?? freeBytes;
+  // A clone takes no new space, so a copy that may clone checks only the headroom up front and
+  // then checks again as it writes. A copy that writes every byte checks the whole size first.
+  const room = (needed: number) => {
+    const available = free(directory);
+    if (available < needed + HEADROOM_BYTES)
+      throw new ScratchNoRoom(
+        `The scratch copy of ${name} needs about ${gigabytes(needed + HEADROOM_BYTES)} free, counting 1 GB of room to spare, and the disk has ${gigabytes(available)}. Free some space and send the message again.`,
+      );
+  };
+  room(cloning ? 0 : total);
+  let checkedAt = 0;
+  let writtenBytes = 0;
   materialize(directory, files, links, (file, target) => {
     if (cloning && options.checkout && cloneOne(options.checkout.root, file, target)) cloned++;
     else {
@@ -101,6 +141,11 @@ export function copyScratch(
         options.stream(file, target);
       else writeFileSync(target, bytesOf(file), { flag: 'wx', mode: 0o600 });
       written++;
+      writtenBytes += file.bytes;
+      if (writtenBytes - checkedAt >= ROOM_CHECK_BYTES) {
+        checkedAt = writtenBytes;
+        room(0);
+      }
     }
     bytes += file.bytes;
     if (bytes - reported >= PROGRESS_BYTES) {
