@@ -6,7 +6,7 @@ import type { DesktopFile } from '@crewkite/client';
 export type AttachRequest =
   | { from: 'picker' }
   | { from: 'clipboard' }
-  | { from: 'clipboard-text' }
+  | { from: 'clipboard-text'; length: number }
   | { from: 'paths'; paths: string[] };
 
 /** A message holds at most 32 files, so one request never needs more. */
@@ -26,11 +26,15 @@ export function attachRequest(value: unknown): AttachRequest | null {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
   const input = value as Record<string, unknown>;
   const keys = Object.keys(input);
-  if (
-    (input.from === 'picker' || input.from === 'clipboard' || input.from === 'clipboard-text') &&
-    keys.length === 1
-  )
+  if ((input.from === 'picker' || input.from === 'clipboard') && keys.length === 1)
     return { from: input.from };
+  if (
+    input.from === 'clipboard-text' &&
+    keys.length === 2 &&
+    Number.isSafeInteger(input.length) &&
+    (input.length as number) > 0
+  )
+    return { from: 'clipboard-text', length: input.length as number };
   if (
     input.from === 'paths' &&
     keys.length === 2 &&

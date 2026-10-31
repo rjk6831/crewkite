@@ -467,12 +467,13 @@ export function Composer({
     if (pasted.length === 0 && canAttach) {
       const area = event.currentTarget;
       const kept = area.value.length - (area.selectionEnd - area.selectionStart);
-      if (kept + event.clipboardData.getData('text/plain').length > CHAT_MESSAGE_TEXT_MAX) {
+      const text = event.clipboardData.getData('text/plain');
+      if (kept + text.length > CHAT_MESSAGE_TEXT_MAX) {
         event.preventDefault();
         setNote(
           `The pasted text is over ${CHAT_MESSAGE_TEXT_MAX.toLocaleString('en-US')} characters, so it goes in as a file.`,
         );
-        attach({ from: 'paste-text' });
+        attach({ from: 'paste-text', length: text.length });
       }
       return;
     }

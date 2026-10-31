@@ -98,11 +98,17 @@ test('main sends an import by path only for a path it gave the window', () => {
   for (const [claim, input, want] of opens) assert.equal(resolved(input), want, claim);
 });
 
-test('main takes clipboard text only as a request with no other field', () => {
+test('main takes clipboard text only as a length with no other field', () => {
   const cases: [unknown, unknown][] = [
-    [{ from: 'clipboard-text' }, { from: 'clipboard-text' }],
-    [{ from: 'clipboard-text', text: 'from the page' }, null],
-    [{ from: 'clipboard-text', paths: ['/etc/passwd'] }, null],
+    [
+      { from: 'clipboard-text', length: 70_000 },
+      { from: 'clipboard-text', length: 70_000 },
+    ],
+    [{ from: 'clipboard-text' }, null],
+    [{ from: 'clipboard-text', length: 0 }, null],
+    [{ from: 'clipboard-text', length: 1.5 }, null],
+    [{ from: 'clipboard-text', length: 70_000, text: 'from the page' }, null],
+    [{ from: 'clipboard-text', length: 70_000, paths: ['/etc/passwd'] }, null],
   ];
   for (const [input, expected] of cases) assert.deepEqual(attachRequest(input), expected);
 });

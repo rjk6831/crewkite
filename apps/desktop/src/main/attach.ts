@@ -83,7 +83,7 @@ export class ComposerFiles {
 
   async find(request: AttachRequest): Promise<DesktopFile[]> {
     if (request.from === 'clipboard') return this.paste();
-    if (request.from === 'clipboard-text') return this.pasteText();
+    if (request.from === 'clipboard-text') return this.pasteText(request.length);
     const paths =
       request.from === 'paths'
         ? request.paths
@@ -106,9 +106,15 @@ export class ComposerFiles {
 
   // Text too long for one message. Main reads the clipboard itself, so the page cannot name the
   // bytes that land in the file.
-  private async pasteText(): Promise<DesktopFile[]> {
-    const text = Buffer.from(await clipboard.readText(), 'utf8');
-    if (!text.length) return [];
+  private async pasteText(length: number): Promise<DesktopFile[]> {
+    // The text the page pasted, matched by its length. A middle-click paste on Linux comes from
+    // the selection, which main cannot read, and a clipboard changed since the paste differs too.
+    const found = await clipboard.readText();
+    if (found.length !== length)
+      throw new Error(
+        'The pasted text could not be read from the clipboard. Copy it again and paste with the keyboard.',
+      );
+    const text = Buffer.from(found, 'utf8');
     if (text.length > MAX_CHAT_PASTE_BYTES)
       throw new Error('The pasted text is over 32 MiB. Save it as a file and attach that.');
     return this.save(text, 'pasted-text', 'txt', 'The pasted text could not be saved.');
