@@ -34,8 +34,11 @@ export type DesktopFile = { path: string; name: string; bytes: number; thumbnail
 export type DesktopAttachInput =
   | { from: 'picker' }
   | { from: 'drop' | 'paste'; files: readonly File[] }
-  /** Clipboard text too long for a message. Main reads the clipboard itself and saves it. */
-  | { from: 'paste-text' };
+  /**
+   * Clipboard text too long for a message, with the length the page saw. Main reads the clipboard
+   * itself, saves it only when the length matches, and the page never sends the text.
+   */
+  | { from: 'paste-text'; length: number };
 /** A stored attachment, named by thread, hash and name. The page never names a path. */
 export type DesktopAttachmentTarget = {
   action: 'preview' | 'reveal' | 'save';
