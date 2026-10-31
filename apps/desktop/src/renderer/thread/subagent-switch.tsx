@@ -27,7 +27,7 @@ export function SubagentSwitch({
           role="switch"
           checked={checked}
           aria-checked={checked}
-          disabled={note !== null}
+          disabled={note?.disabled === true}
           aria-describedby={note ? `${id}-note` : undefined}
           onChange={(event) => onChange(event.target.checked)}
         />
@@ -37,7 +37,7 @@ export function SubagentSwitch({
       </label>
       {note && (
         <small id={`${id}-note`} className="sa-switch-note">
-          {note}
+          {note.text}
         </small>
       )}
     </span>

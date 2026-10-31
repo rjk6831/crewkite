@@ -559,17 +559,15 @@ function CrewTab({
       ...(role === 'builder' ? { selection } : {}),
     });
   }
-  // A role left on keeps no field, so a crew that never turned subagents off keeps its shape.
+  // The person's choice is saved as set, since a role with no choice takes its family default.
   function allowSubagents(role: string, on: boolean) {
     if (!crew) return;
     onConfigure({
       crew: {
         ...crew,
-        members: crew.members.map((member) => {
-          if (member.role !== role) return member;
-          const { allowSubagents: _was, ...rest } = member;
-          return on ? rest : { ...rest, allowSubagents: false };
-        }),
+        members: crew.members.map((member) =>
+          member.role === role ? { ...member, allowSubagents: on } : member,
+        ),
       },
     });
   }
@@ -639,7 +637,7 @@ function CrewTab({
                     id={`${idBase}-${role}-subagents`}
                     role={crewRoleNames[role]}
                     family={member.selection.family}
-                    checked={allowsSubagents(member)}
+                    checked={allowsSubagents(member, member.selection.family)}
                     onChange={(on) => allowSubagents(role, on)}
                   />
                 </span>

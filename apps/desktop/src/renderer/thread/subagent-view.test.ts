@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { AgentEvent, ChatCatalogRead } from '@crewkite/contracts';
+import { type AgentEvent, allowsSubagents, type ChatCatalogRead } from '@crewkite/contracts';
 import { crewFromPreset, readCrewPresets, writeCrewPresets } from '../settings/preferences.ts';
 import {
   subagentBadge,
@@ -126,21 +126,23 @@ test('the fold keeps the newest report on the parent card, even one that arrives
   assert.equal(view.blocks[0].kind === 'tool' && view.blocks[0].title, 'Task Survey the tests');
 });
 
-test('a preset keeps a role switched off across a save and passes it to the crew it starts', () => {
+test('a preset keeps what the person set for each role across a save and passes it to the crew it starts', () => {
   const values = new Map<string, string>();
   const store = {
     getItem: (key: string) => values.get(key) ?? null,
     setItem: (key: string, value: string) => void values.set(key, value),
   };
   const [, pair] = readCrewPresets(store);
-  assert(pair.members.every((member) => member.allowSubagents === true));
+  assert(pair.members.every((member) => member.allowSubagents === undefined));
   writeCrewPresets(
     readCrewPresets(store).map((preset) =>
       preset.name === 'Pair'
         ? {
             ...preset,
             members: preset.members.map((member) =>
-              member.role === 'reviewer' ? { ...member, allowSubagents: false } : member,
+              member.role === 'reviewer'
+                ? { ...member, allowSubagents: false }
+                : { ...member, allowSubagents: true },
             ),
           }
         : preset,
@@ -172,10 +174,19 @@ test('a preset keeps a role switched off across a save and passes it to the crew
   assert.deepEqual(
     crew?.members.map((member) => [member.role, member.allowSubagents]),
     [
-      ['builder', undefined],
+      ['builder', true],
       ['reviewer', false],
     ],
   );
-  assert.equal(subagentSwitchNote('openai'), null);
-  assert.match(subagentSwitchNote('local') ?? '', /no subagents/);
+});
+
+test('the switch line says why OpenAI starts off and why Local has nothing to switch', () => {
+  assert.equal(subagentSwitchNote('anthropic'), null);
+  assert.equal(subagentSwitchNote('google'), null);
+  assert.equal(subagentSwitchNote('openai')?.disabled, false);
+  assert.match(subagentSwitchNote('openai')?.text ?? '', /approval policy/);
+  assert.equal(subagentSwitchNote('local')?.disabled, true);
+  // A role saved without the switch shows the family default.
+  assert.equal(allowsSubagents({}, 'openai'), false);
+  assert.equal(allowsSubagents({}, 'anthropic'), true);
 });

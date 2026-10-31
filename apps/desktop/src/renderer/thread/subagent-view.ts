@@ -131,11 +131,19 @@ export function subagentRows(activity: SubagentActivity, ended: boolean): Subage
 }
 
 /**
- * Why a role's subagent switch does nothing for a family, or null when the family's client takes
- * it. Local runs one model with no subagents of its own.
+ * The line under a role's subagent switch, and whether the switch does anything for the family.
+ * Local runs one model with no subagents of its own. OpenAI subagents start off, since their
+ * approvals rely on the client passing the turn's policy to each one.
  */
 export function subagentSwitchNote(family: TurnIdentity['family'] | null | undefined) {
-  return family === 'local' ? 'Local starts no subagents, so there is nothing to turn off.' : null;
+  if (family === 'local')
+    return { text: 'Local starts no subagents, so there is nothing to turn off.', disabled: true };
+  if (family === 'openai')
+    return {
+      text: "Off until you turn it on: subagent approvals rely on the client passing this turn's approval policy to each subagent, which a live check has yet to confirm.",
+      disabled: false,
+    };
+  return null;
 }
 
 /** The line under the rows when the client reported more subagents than the card lists. */

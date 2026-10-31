@@ -225,8 +225,8 @@ export function withThreadDefaults<Input, Result extends { outcome: string; enti
 // Crew presets keep only the roles the person pinned to a model and effort. Every other role is
 // picked when a thread starts from the preset, so a preset still works after a family disconnects.
 const presetKey = 'crewkite-crew-presets-v1';
-// The roles a preset keeps subagents off for, saved apart so the pin file keeps its shape for the
-// CLI. Every role left out allows them.
+// The subagent switch of each role the person set, saved apart so the pin file keeps its shape
+// for the CLI. A role left out takes its family's default.
 const subagentsKey = 'crewkite-crew-subagents-v1';
 
 export const crewRoleNames: Record<ChatCrewRole, string> = {
@@ -246,7 +246,7 @@ export const crewPresetNames = Object.keys(presetRoles) as CrewPresetName[];
 export type CrewPreset = {
   name: CrewPresetName;
   /** Null picks the role's model and effort when a thread starts from the preset. */
-  /** allowSubagents is false when the person turned the role's subagents off. */
+  /** allowSubagents is what the person set for the role. Missing takes the family default. */
   members: { role: ChatCrewRole; selection: ChatModelSelection | null; allowSubagents?: boolean }[];
 };
 
@@ -260,7 +260,7 @@ export function readCrewPresets(store: Store | null = browserStore()): CrewPrese
     }
   };
   const saved = read(presetKey);
-  const off = read(subagentsKey);
+  const switches = read(subagentsKey);
   return crewPresetNames.map((name) => ({
     name,
     members: presetRoles[name].map((role) => {
@@ -268,7 +268,9 @@ export function readCrewPresets(store: Store | null = browserStore()): CrewPrese
       return {
         role,
         selection: pinned.success ? pinned.data : null,
-        allowSubagents: off?.[name]?.[role] !== false,
+        ...(typeof switches?.[name]?.[role] === 'boolean'
+          ? { allowSubagents: switches[name][role] as boolean }
+          : {}),
       };
     }),
   }));
@@ -283,19 +285,19 @@ export function writeCrewPresets(presets: CrewPreset[], store: Store | null = br
       ),
     ]),
   );
-  const off = Object.fromEntries(
+  const switches = Object.fromEntries(
     presets.map((preset) => [
       preset.name,
       Object.fromEntries(
         preset.members.flatMap(({ role, allowSubagents }) =>
-          allowSubagents === false ? [[role, false]] : [],
+          typeof allowSubagents === 'boolean' ? [[role, allowSubagents]] : [],
         ),
       ),
     ]),
   );
   try {
     store?.setItem(presetKey, JSON.stringify(pins));
-    store?.setItem(subagentsKey, JSON.stringify(off));
+    store?.setItem(subagentsKey, JSON.stringify(switches));
   } catch {}
 }
 
@@ -361,7 +363,11 @@ export function crewFromPreset(
             ? builder
             : (best(taken) ?? best([builder.family]) ?? builder)));
     if (role !== 'fixer' && role !== 'orchestrator') taken.push(selection.family);
-    members.push({ role, selection, ...(allowSubagents === false ? { allowSubagents } : {}) });
+    members.push({
+      role,
+      selection,
+      ...(typeof allowSubagents === 'boolean' ? { allowSubagents } : {}),
+    });
   }
   return { name: preset.name, members };
 }

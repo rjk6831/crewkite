@@ -1,5 +1,9 @@
 import type { DesktopSource } from '@crewkite/client';
-import type { ChatCatalogRead, ChatModelSelection } from '@crewkite/contracts';
+import {
+  allowsSubagents,
+  type ChatCatalogRead,
+  type ChatModelSelection,
+} from '@crewkite/contracts';
 import { useState } from 'react';
 import { familyName } from '../components.tsx';
 import { runExport } from '../diagnostics.tsx';
@@ -305,7 +309,7 @@ export function GeneralCard({
                       id={`settings-${presetId(preset.name)}-${member.role}-subagents`}
                       role={`${preset.name} ${crewRoleNames[member.role]}`}
                       family={member.selection?.family ?? null}
-                      checked={member.allowSubagents !== false}
+                      checked={allowsSubagents(member, member.selection?.family)}
                       onChange={(allowSubagents) =>
                         pin(preset.name, member.role, { allowSubagents })
                       }
