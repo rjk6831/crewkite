@@ -243,6 +243,20 @@ const presetRoles = {
 } as const satisfies Record<string, readonly ChatCrewRole[]>;
 export type CrewPresetName = keyof typeof presetRoles;
 export const crewPresetNames = Object.keys(presetRoles) as CrewPresetName[];
+/**
+ * The preset a flight mode starts. The controller runs Balanced and Glide only with a crew, so
+ * picking one on a thread with none starts Solo, the builder alone, with that mode. Null keeps the
+ * crew the thread has.
+ */
+export function flightPreset(hasCrew: boolean, mode: ChatFlightMode): CrewPresetName | null {
+  return hasCrew || mode === 'manual' ? null : 'Solo';
+}
+/** What each preset holds, in the words Settings and the Crew tab show. */
+export const crewPresetHints: Record<CrewPresetName, string> = {
+  Solo: 'The builder only. Nothing runs after a reply.',
+  Pair: 'A builder and a reviewer on another family.',
+  'Full crew': 'Builder, reviewer, challenger and fixer, with an orchestrator that plans the work.',
+};
 export type CrewPreset = {
   name: CrewPresetName;
   /** Null picks the role's model and effort when a thread starts from the preset. */

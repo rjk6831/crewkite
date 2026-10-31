@@ -37,9 +37,11 @@ import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
 import { McpThreadMenu } from '../settings/mcp-card.tsx';
 import {
   crewFromPreset,
+  crewPresetHints,
   crewPresetNames,
   crewRoleNames,
   flightModes,
+  flightPreset,
   handoffModes,
   permissionPolicies,
   readCrewPresets,
@@ -534,10 +536,13 @@ function CrewTab({
   source,
   thread,
   onConfigure,
+  onDone,
 }: {
   source: ThreadSource;
   thread: ChatThread | null;
   onConfigure: (patch: ThreadSettings) => void;
+  /** Closes the panel. */
+  onDone: () => void;
 }) {
   // Read once when the tab opens and again when a model read ends. A preset only needs to know
   // which families are connected, and every extra catalog read waits in the controller's queue.
@@ -589,11 +594,13 @@ function CrewTab({
       },
     });
   }
-  function start(name: string) {
+  // A preset replaces the whole crew, so Solo or Pair is the way back from Full crew. The flight
+  // mode travels in the same call when the person picked one before the thread had a crew.
+  function start(name: string, flightMode?: ChatFlightMode) {
     const preset = readCrewPresets().find((value) => value.name === name);
     if (!preset || !thread) return;
     const next = catalog && crewFromPreset(preset, catalog, thread.selection, thread.handoffMode);
-    setNote(next ? null : 'Connect a provider in Settings, then start from a preset.');
+    setNote(next ? null : 'Connect a provider in Settings, then pick a crew.');
     if (!next) return;
     const builder = next.members.find((member) => member.role === 'builder')?.selection;
     const moved =
@@ -601,7 +608,17 @@ function CrewTab({
       (builder.family !== thread.selection?.family ||
         builder.model !== thread.selection?.model ||
         builder.effort !== thread.selection?.effort);
-    onConfigure({ crew: next, ...(moved ? { selection: builder } : {}) });
+    onConfigure({
+      crew: next,
+      ...(moved ? { selection: builder } : {}),
+      ...(flightMode ? { flightMode } : {}),
+    });
+  }
+  // Balanced or Glide on a thread with no crew starts Solo with that mode. See flightPreset.
+  function fly(next: ChatFlightMode) {
+    const preset = flightPreset(crew !== null, next);
+    if (preset) start(preset, next);
+    else onConfigure({ flightMode: next });
   }
   return (
     <div className="th-facts">
@@ -611,6 +628,23 @@ function CrewTab({
         <dt>Chain</dt>
         <dd>{chainLine(thread?.crewChain ?? null)}</dd>
       </dl>
+      <fieldset className="th-crew-presets" disabled={!thread}>
+        <legend>Crew</legend>
+        <div className="th-crew-preset-row">
+          {crewPresetNames.map((name) => (
+            <button
+              key={name}
+              type="button"
+              className="th-pill th-outline"
+              aria-pressed={crew?.name === name}
+              title={crewPresetHints[name]}
+              onClick={() => start(name)}
+            >
+              {name}
+            </button>
+          ))}
+        </div>
+      </fieldset>
       <ul className="th-crew-roles" aria-label="Roles">
         {ChatCrewRoleSchema.options.map((role) => {
           const member = crew?.members.find((value) => value.role === role);
@@ -672,40 +706,24 @@ function CrewTab({
         </p>
       )}
       <label>
-        Start from preset
-        <select value="" disabled={!thread} onChange={(event) => start(event.target.value)}>
-          <option value="" disabled>
-            Choose a preset
-          </option>
-          {crewPresetNames.map((name) => (
-            <option key={name} value={name}>
-              {name}
-            </option>
-          ))}
-        </select>
-      </label>
-      <label>
         Flight mode
         <select
           value={mode.id}
           title={mode.title}
           disabled={!thread}
-          onChange={(event) => onConfigure({ flightMode: event.target.value as ChatFlightMode })}
+          onChange={(event) => fly(event.target.value as ChatFlightMode)}
         >
           {flightModes.map((item) => (
-            <option
-              key={item.id}
-              value={item.id}
-              title={item.title}
-              disabled={!crew && item.id !== 'manual'}
-            >
+            <option key={item.id} value={item.id} title={item.title}>
               {item.label}
             </option>
           ))}
         </select>
       </label>
       <p className="th-muted">
-        {crew ? mode.title : 'Start from a preset to run the crew in Balanced or Glide.'}
+        {crew
+          ? mode.title
+          : 'Balanced and Glide run with a crew. Picking one here starts the Solo crew, the builder alone, and Pair or Full crew above add the other roles.'}
       </p>
       <AutoHandoff thread={thread} onConfigure={onConfigure} />
       <ChecksSettings
@@ -721,6 +739,11 @@ function CrewTab({
           {note}
         </p>
       )}
+      <div className="th-crew-done">
+        <button type="button" className="th-button" onClick={onDone}>
+          Done
+        </button>
+      </div>
     </div>
   );
 }
@@ -848,7 +871,9 @@ export function Inspector({
             refreshKey={`${turns.length}:${turns.at(-1)?.state ?? ''}`}
           />
         )}
-        {tab === 'crew' && <CrewTab source={source} thread={thread} onConfigure={onConfigure} />}
+        {tab === 'crew' && (
+          <CrewTab source={source} thread={thread} onConfigure={onConfigure} onDone={onClose} />
+        )}
         {tab === 'thread' && (
           <ThreadTab
             taskId={taskId}
