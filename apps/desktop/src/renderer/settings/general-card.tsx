@@ -10,6 +10,7 @@ import { runExport } from '../diagnostics.tsx';
 import { EffortSelect } from '../thread/model-picker.tsx';
 import {
   type CrewPreset,
+  crewPresetHints,
   crewRoleNames,
   handoffModes,
   permissionPolicies,
@@ -29,11 +30,6 @@ type Entry = ChatCatalogRead['families'][number];
 type Choice = { entry: Entry; model: Entry['models'][number] };
 
 const presetId = (name: string) => name.toLowerCase().replace(/\s+/g, '-');
-const presetHints: Record<CrewPreset['name'], string> = {
-  Solo: 'The builder only. Nothing runs after a reply.',
-  Pair: 'A builder and a reviewer on another family.',
-  'Full crew': 'Builder, reviewer, challenger and fixer, with an orchestrator that plans the work.',
-};
 // The fixer and the orchestrator are the builder's model unless the person pins another.
 const autoLabel = (role: string) =>
   role === 'builder'
@@ -287,7 +283,7 @@ export function GeneralCard({
             <span className="st-field">
               <span className="st-name">Crew preset: {preset.name}</span>
               <small className="st-hint">
-                {presetHints[preset.name]} A thread starts from it under Crew in the inspector.
+                {crewPresetHints[preset.name]} A thread picks it under Crew in the inspector.
               </small>
             </span>
             <div className="st-controls st-crew">
