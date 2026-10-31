@@ -2913,10 +2913,17 @@ export class ChatService {
       handoffFrom = selection.family;
       this.setHandoff(task.id, { from: selection.family, reason: 'model' });
       const name = familyName[selection.family];
+      // The picker's labels, the names with their versions, name the models. An ID the catalog
+      // does not list, such as one typed in, shows as itself.
+      const models = this.deps
+        .catalog(task.id)
+        .families.find((entry) => entry.family === selection.family)?.models;
+      const label = (model: string) =>
+        models?.find((entry) => entry.model === model)?.label ?? model;
       this.appendEntry(task, {
         kind: 'chat-system',
         author: { kind: 'system', turnId: null },
-        text: `Continued on ${name} (${selection.model}) from ${name} (${before}). Reason: ${handoffReason('model')}.`,
+        text: `Continued on ${name} (${label(selection.model)}) from ${name} (${label(before)}). Reason: ${handoffReason('model')}.`,
       });
     }
     const turn = ChatTurnSchema.parse({
