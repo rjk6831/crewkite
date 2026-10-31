@@ -19,6 +19,7 @@ import {
 } from '../../chat/adapter.ts';
 import { googleMcpEntries } from '../../chat/mcp-servers.ts';
 import { attachedLine, attachedSection, stripTurnNotes } from '../../chat/prompt.ts';
+import { SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
@@ -76,6 +77,8 @@ const toolUpdate = z.object({
   toolCallId: z.string().min(1).max(200),
   title: optionalText,
   kind: optionalText,
+  name: optionalText,
+  _meta: z.unknown().optional(),
   status: optionalText,
   rawInput: z.unknown().optional(),
   rawOutput: z.unknown().optional(),
@@ -159,6 +162,16 @@ const toolKind = (kind: string | null | undefined): ChatToolKind =>
   toolKinds.get(kind ?? '') ?? 'other';
 // Kinds whose result goes only to the model. A fetch arrives as other.
 const passiveKinds = new Set<ChatToolKind>(['read', 'search', 'other']);
+// The agent's tool that hands work to a subagent. A turn with subagents off disables it on the
+// session, the way the writer keeps it off.
+const SUBAGENT_TOOL = 'invoke_subagent';
+const subagentWords = /subagent/i;
+/** The call starts a subagent: its title, kind, name or metadata names one. */
+function startsSubagent(update: ToolUpdate) {
+  const meta = fields(update._meta);
+  const named = [update.title, update.kind, update.name, fields(meta.mcp).tool, meta.toolName];
+  return named.some((value) => typeof value === 'string' && subagentWords.test(value));
+}
 // The agent answers a stop with this line. The thread already ends with its own Stopped line.
 const stopLine = /\s*the request was cancell?ed by the client\.?\s*$/i;
 
@@ -655,6 +668,9 @@ export function googleChatAdapter(deps: {
         string,
         { rpc: RpcId; callId: string; options: Map<string, ChatPermissionOption['kind']> }
       >();
+      const subagents = new SubagentTracker(turnId, (event) => send(event));
+      // A tool call frame without an ID this file can read still gets a card under its own ID.
+      let unnamedCalls = 0;
 
       // One line of metadata per frame goes to the private work folder, so a client whose framing
       // does not match this file can be diagnosed from a real run.
@@ -794,6 +810,12 @@ export function googleChatAdapter(deps: {
           place ??=
             found ?? (resolve(scratch, parsed.data.path) === scratch ? null : parsed.data.path);
         }
+        if (fresh && startsSubagent(update)) {
+          const model = inputField(update.rawInput, ['model']);
+          subagents.update(call.id, call.id, {
+            ...(typeof model === 'string' ? { model } : {}),
+          });
+        }
         if (fresh) {
           const raw = update.rawInput === undefined ? undefined : JSON.stringify(update.rawInput);
           send({
@@ -841,6 +863,11 @@ export function googleChatAdapter(deps: {
         if (call.done) return;
         call.done = true;
         const outcome = call.denied ? 'denied' : status;
+        if (subagents.parentOf(call.id) === call.id)
+          subagents.settle(
+            call.id,
+            outcome === 'ok' ? 'done' : outcome === 'denied' ? 'stopped' : 'failed',
+          );
         const files = [...call.diffs];
         if (outcome === 'ok' && call.kind === 'edit')
           for (const path of call.paths) changed.add(path);
@@ -861,7 +888,9 @@ export function googleChatAdapter(deps: {
           ...(note ? { summary: clip(note, 4000) } : {}),
         });
       }
-      function closeTools() {
+      /** The turn is over. `state` is what a subagent still running became. */
+      function closeTools(state: 'done' | 'stopped') {
+        subagents.close(state);
         for (const call of calls.values())
           finish(call, 'error', 'The turn ended before this tool reported a result.');
       }
@@ -885,7 +914,16 @@ export function googleChatAdapter(deps: {
           if (!call.done && passiveKinds.has(call.kind) && !asking(call)) finish(call, 'ok');
       }
       function tool(raw: Record<string, unknown>, announced: boolean) {
-        const parsed = toolUpdate.safeParse(raw);
+        let parsed = toolUpdate.safeParse(raw);
+        // A new call whose ID this file cannot read still shows, as a card that no later update
+        // reaches.
+        if (!parsed.success && announced)
+          parsed = toolUpdate.safeParse({
+            title: typeof raw.title === 'string' ? raw.title : undefined,
+            kind: typeof raw.kind === 'string' ? raw.kind : undefined,
+            rawInput: raw.rawInput,
+            toolCallId: `${turnId}:call:${++unnamedCalls}`,
+          });
         if (!parsed.success)
           return unreadable('The Google client sent a tool update this app could not read.');
         let update = parsed.data;
@@ -935,8 +973,29 @@ export function googleChatAdapter(deps: {
         usage = next;
         send({ type: 'usage.context', turnId, ...next });
       }
+      /**
+       * A tool call from a session other than the turn's, which a subagent's own session would be.
+       * While a subagent runs, its title becomes that subagent's latest action. Nothing from the
+       * other session reaches the reply or opens a card.
+       */
+      function otherSession(params: Record<string, unknown>) {
+        const newest = subagents.running().at(-1);
+        const raw = fields(params.update);
+        if (
+          phase !== 'turn' ||
+          !newest ||
+          (raw.sessionUpdate !== 'tool_call' && raw.sessionUpdate !== 'tool_call_update')
+        )
+          return;
+        const parsed = toolUpdate.safeParse(raw);
+        if (!parsed.success) return;
+        const kind = toolKind(parsed.data.kind);
+        const action =
+          cardTitle(kind, null, parsed.data.rawInput) || parsed.data.title?.trim() || null;
+        if (action) subagents.update(newest, newest, { action });
+      }
       function update(params: Record<string, unknown>) {
-        if (params.sessionId !== sessionId) return;
+        if (params.sessionId !== sessionId) return otherSession(params);
         const kind = updateKind.safeParse(params.update);
         if (!kind.success) return unreadable('The Google client sent an update without a kind.');
         const raw = params.update as Record<string, unknown>;
@@ -1156,6 +1215,11 @@ export function googleChatAdapter(deps: {
               : []),
             ...googleMcpEntries(request.mcp),
           ];
+          // The crew role turned subagents off, so the session goes without the delegation tool.
+          const sessionMeta =
+            request.subagents === false
+              ? { _meta: { antigravity: { disabledTools: [SUBAGENT_TOOL] } } }
+              : {};
           let resumed = false;
           if (prior && handshake.agentCapabilities?.loadSession && !cancelled) {
             phase = 'replay';
@@ -1166,6 +1230,7 @@ export function googleChatAdapter(deps: {
                 sessionId: prior.sessionId,
                 cwd: scratch,
                 mcpServers,
+                ...sessionMeta,
               });
               resumed = true;
             } catch (error) {
@@ -1178,7 +1243,7 @@ export function googleChatAdapter(deps: {
           if (!resumed && !cancelled) {
             phase = 'setup';
             sessionId = newSession.parse(
-              await live.request('session/new', { cwd: scratch, mcpServers }),
+              await live.request('session/new', { cwd: scratch, mcpServers, ...sessionMeta }),
             ).sessionId;
           }
           const id = sessionId;
@@ -1280,7 +1345,8 @@ export function googleChatAdapter(deps: {
           phase = 'done';
           stage = 'finish';
           closeItem();
-          closeTools();
+          // The agent answered the prompt, so the subagents it started have finished.
+          closeTools('done');
           const reason = reply.success ? reply.data.stopReason : 'unreadable';
           if (reason === 'cancelled') terminal = { stopReason: 'stopped', failure: null };
           else if (reason === 'refusal')
@@ -1415,7 +1481,7 @@ export function googleChatAdapter(deps: {
         const rest = afterStop.replace(stopLine, '');
         if (rest.trim()) chunk('text', rest);
         closeItem();
-        closeTools();
+        closeTools('stopped');
         send({ type: 'turn.completed', turnId, ...ending });
         closed = true;
         frames.close();

@@ -35,6 +35,7 @@ import { ChatClientRefused } from '../../chat/clients.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
 import { anthropicMcpEntries, mcpToolAnswer } from '../../chat/mcp-servers.ts';
 import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import { SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
@@ -146,6 +147,14 @@ const streamEvent = z.object({
         partial_json: z.string().optional(),
       })
       .optional(),
+  }),
+});
+// A subagent's own assistant frame. Only its model and tool calls are read; its text stays out
+// of the reply.
+const nestedAssistant = z.object({
+  message: z.object({
+    model: loose(z.string()),
+    content: z.array(z.unknown()).max(4096).catch([]),
   }),
 });
 const assistant = z.object({
@@ -271,6 +280,9 @@ const toolKinds = new Map<string, ChatToolKind>([
   ['NotebookEdit', 'edit'],
   ['Bash', 'command'],
 ]);
+// The tools that start a subagent. Builds name it Task or Agent, and a turn with subagents off
+// disallows both.
+const SUBAGENT_TOOLS = new Set(['Task', 'Agent']);
 const options: ChatPermissionOption[] = [
   { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
   { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
@@ -516,6 +528,8 @@ function chatArguments(
     request.permissionPolicy === 'ask' ? 'default' : 'acceptEdits',
     // Review and advice turns read only. The thread tools only read, on every turn.
     ...(allowed.length ? ['--allowedTools', allowed.join(',')] : []),
+    // The crew role turned subagents off, so the tools that start one are not offered.
+    ...(request.subagents === false ? ['--disallowedTools', [...SUBAGENT_TOOLS].join(',')] : []),
     // The config option takes several values, so the flag after it closes the list. Strict mode
     // goes on every turn: with no thread tools the config is empty and no other server loads.
     '--mcp-config',
@@ -763,6 +777,7 @@ function startTurn(
   const noticed = new Set<string>();
   const texts: string[] = [];
   const timers: Array<() => void> = [];
+  const subagents = new SubagentTracker(turnId, send);
   let resolveResult!: (value: ChatTurnResult) => void;
   const outcomePromise = new Promise<ChatTurnResult>((resolve) => {
     resolveResult = resolve;
@@ -853,7 +868,12 @@ function startTurn(
     const inside = file === undefined ? null : local(file);
     const path = inside ?? file;
     const target =
-      path ?? text(input.pattern) ?? text(input.command) ?? text(input.path) ?? text(input.url);
+      path ??
+      text(input.pattern) ??
+      text(input.command) ??
+      text(input.path) ??
+      text(input.url) ??
+      (SUBAGENT_TOOLS.has(name) ? text(input.description) : undefined);
     return {
       kind: toolKinds.get(name) ?? 'other',
       path: path ?? null,
@@ -885,13 +905,15 @@ function startTurn(
     }
     return found;
   };
+  const titleOf = (name: string, input: Record<string, unknown>) => {
+    const { kind, target } = describe(name, input);
+    return target ? (kind === 'other' ? `${name} ${target}` : target).replace(/\s+/g, ' ') : name;
+  };
   const startTool = (callId: string, name: string, input: Record<string, unknown>) => {
     if (tools.has(callId) || !id.safeParse(callId).success) return;
-    const { kind, path, target } = describe(name, input);
+    const { kind, path } = describe(name, input);
     tools.set(callId, { path: kind === 'edit' ? path : null, done: false });
-    const title = target
-      ? (kind === 'other' ? `${name} ${target}` : target).replace(/\s+/g, ' ')
-      : name;
+    const title = titleOf(name, input);
     // shortcut: an input over 64 KiB, such as a whole file for Write, is left off the event.
     // Upgrade: store large inputs as artifacts and reference them.
     const small = Buffer.byteLength(JSON.stringify(input), 'utf8') <= MAX_INPUT_BYTES;
@@ -903,6 +925,11 @@ function startTurn(
       title: clip(title, 1024),
       ...(small ? { input } : {}),
     });
+    // The subagent starts with the call. Its frames name this call as their parent.
+    if (SUBAGENT_TOOLS.has(name))
+      subagents.update(callId, callId, {
+        model: typeof input.model === 'string' ? input.model : null,
+      });
   };
   const answer = (requestId: string, ask: Ask, choice: string) => {
     const allow = choice === 'allow-once' || choice === 'allow-thread';
@@ -1062,6 +1089,9 @@ function startTurn(
       const parsedBlock = block.safeParse(raw);
       if (!parsedBlock.success || parsedBlock.data.type !== 'tool_result') continue;
       const { tool_use_id: callId, content: output, is_error: failed } = parsedBlock.data;
+      // A subagent finishes when its parent call's result arrives.
+      if (callId && subagents.parentOf(callId) === callId)
+        subagents.settle(callId, failed ? 'failed' : 'done');
       const tool = callId ? tools.get(callId) : undefined;
       if (!callId || !tool || tool.done) continue;
       tool.done = true;
@@ -1309,6 +1339,28 @@ function startTurn(
     timers.push(schedule(terminate, RESULT_GRACE_MS));
   };
 
+  // A frame from a subagent. It counts under its parent call and its tool calls become the
+  // subagent's latest action. Its text and its tool cards never reach the reply. Its permission
+  // asks arrive as control requests, which carry no parent and take the usual path.
+  const onNested = (parent: string, type: string, value: unknown) => {
+    if (!id.safeParse(parent).success) return;
+    if (type !== 'assistant') return subagents.update(parent, parent);
+    const parsed = nestedAssistant.safeParse(value);
+    if (!parsed.success) return subagents.update(parent, parent);
+    let action: string | null = null;
+    for (const raw of parsed.data.message.content) {
+      const content = block.safeParse(raw);
+      if (content.success && content.data.type === 'tool_use' && content.data.name)
+        action = titleOf(content.data.name, record(content.data.input));
+    }
+    subagents.update(parent, parent, {
+      ...(action ? { action } : {}),
+      ...(parsed.data.message.model && MODEL.test(parsed.data.message.model)
+        ? { model: parsed.data.message.model }
+        : {}),
+    });
+  };
+
   const handleLine = (line: string) => {
     let value: unknown;
     try {
@@ -1319,8 +1371,13 @@ function startTurn(
     const head = frame.safeParse(value);
     if (!head.success) return unknown('unnamed');
     const { type, subtype } = head.data;
-    // Subagent frames carry the parent's tool call ID. The parent's own tool card covers them.
-    const nested = typeof head.data.parent_tool_use_id === 'string';
+    // Subagent frames carry the parent's tool call ID.
+    const parent = head.data.parent_tool_use_id;
+    if (
+      typeof parent === 'string' &&
+      (type === 'stream_event' || type === 'assistant' || type === 'user')
+    )
+      return onNested(parent, type, value);
     switch (type) {
       case 'system':
         if (subtype === 'init') return onInit(value);
@@ -1329,11 +1386,11 @@ function startTurn(
         if (QUIET_SYSTEM.has(subtype ?? '')) return;
         return unknown(`system/${label(subtype)}`);
       case 'stream_event':
-        return nested ? undefined : onStream(value);
+        return onStream(value);
       case 'assistant':
-        return nested ? undefined : onAssistant(value);
+        return onAssistant(value);
       case 'user':
-        return nested ? undefined : onUser(value);
+        return onUser(value);
       case 'control_request':
         return onControl(value);
       case 'control_cancel_request':
@@ -1361,6 +1418,8 @@ function startTurn(
       for (const item of message.items)
         if (item && !item.done && item.text && (item.kind === 'text' || item.kind === 'thinking'))
           complete(item, item.text);
+    // A subagent whose parent call got no result did not finish.
+    subagents.close('stopped');
     const signedOut = SIGNED_OUT.test(stderr);
     const { stopReason, failure }: Outcome = outcome ?? {
       stopReason: 'error',

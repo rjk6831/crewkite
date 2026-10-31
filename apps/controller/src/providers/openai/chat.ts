@@ -35,6 +35,7 @@ import {
   stripTurnNotes,
   withoutThreadToolsLine,
 } from '../../chat/prompt.ts';
+import { readableType, SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
@@ -119,7 +120,9 @@ function nativeChatArguments(directory: string, request: ChatTurnRequest): strin
     'features.remote_plugin': false,
     'features.apps': false,
     'features.hooks': false,
-    'features.multi_agent': false,
+    // The client's own switch for subagents. The process lives for one turn, so the crew role's
+    // choice holds for exactly this turn.
+    'features.multi_agent': request.subagents !== false,
     log_dir: join(directory, 'logs'),
   };
   return [
@@ -327,6 +330,45 @@ const mcpNames = z.object({
 });
 const mcpStatus = z.object({ name: z.string(), status: z.string() });
 const searchItem = z.object({ query: maybe(z.string()) });
+// Items that carry the reply, its reasoning, the person's message or the client's bookkeeping.
+// Every other item is work the model did, and one CrewKite has no reader for still gets a card.
+const CONTENT_ITEMS = new Set([
+  'agentMessage',
+  'userMessage',
+  'reasoning',
+  'plan',
+  'contextCompaction',
+]);
+// An item whose type names an agent reports subagents. Every field is read on its own, so a
+// shape this file does not know still shows its card.
+const AGENT_ITEM = /agent/i;
+const agentStatus = z
+  .object({ status: maybe(z.string()) })
+  .nullish()
+  .catch(null);
+const agentWork = z.object({
+  tool: maybe(z.string()),
+  kind: maybe(z.string()),
+  status: maybe(z.string()),
+  model: maybe(z.string()),
+  receiverThreadIds: maybe(z.array(z.string()).max(64)),
+  agentThreadId: maybe(z.string()),
+  newThreadId: maybe(z.string()),
+  agentsStates: maybe(z.record(z.string(), agentStatus)),
+});
+/** A status word as a subagent state, or undefined when the word says nothing CrewKite reads. */
+const agentState = (status: string | null | undefined) =>
+  !status
+    ? undefined
+    : /error|fail/i.test(status)
+      ? ('failed' as const)
+      : /interrupt|cancel|abort/i.test(status)
+        ? ('stopped' as const)
+        : /complet|done|finish|shut|clos/i.test(status)
+          ? ('done' as const)
+          : /run|progress|pend|init|start|wait/i.test(status)
+            ? ('running' as const)
+            : undefined;
 const toolEnd = z.object({
   status: maybe(z.string()),
   exitCode: maybe(z.number().int()),
@@ -434,6 +476,7 @@ class OpenAiChatTurn {
   private readonly output = new Map<string, number>();
   private readonly changed = new Set<string>();
   private readonly approvals = new Map<string, RpcId>();
+  private readonly subagents: SubagentTracker;
   private approvalCount = 0;
   private reported = false;
   private readonly windows = new Map<string, OpenAiUsageWindow>();
@@ -456,6 +499,7 @@ class OpenAiChatTurn {
     this.reportUsage = openAiUsageReporter(deps.onUsage);
     this.threadTools = request.threadTools === false ? null : (deps.threadTools?.(request) ?? null);
     this.trace = frameTrace(request.now ?? Date.now, TRACE_LIMITS);
+    this.subagents = new SubagentTracker(request.turnId, (event) => this.send(event));
     let finish: (result: ChatTurnResult) => void = () => {};
     const result = new Promise<ChatTurnResult>((resolve) => {
       finish = resolve;
@@ -986,7 +1030,8 @@ class OpenAiChatTurn {
 
   private notification(method: string, params: unknown) {
     const thread = scope.safeParse(params);
-    if (thread.success && this.threadId && thread.data.threadId !== this.threadId) return;
+    if (thread.success && this.threadId && thread.data.threadId !== this.threadId)
+      return this.childNotification(thread.data.threadId, method, params);
     const turnId = this.request.turnId;
     switch (method) {
       case 'turn/started':
@@ -1113,7 +1158,16 @@ class OpenAiChatTurn {
       detail = searchItem.safeParse(raw).data?.query?.trim() ?? '';
       title = detail ? `Search the web for ${detail}` : 'Search the web';
       input = { query: detail || null };
-    } else return;
+    } else if (CONTENT_ITEMS.has(head.type)) return;
+    else {
+      const work = AGENT_ITEM.test(head.type) ? agentWork.safeParse(raw).data : undefined;
+      const what = work?.tool ?? work?.kind;
+      title = what
+        ? `${readableType(head.type)}: ${readableType(what).toLowerCase()}`
+        : readableType(head.type);
+      detail = title;
+      input = { type: clip(head.type, 200), ...(what ? { tool: clip(what, 200) } : {}) };
+    }
     this.tools.set(head.id, detail);
     this.send({
       type: 'tool.started',
@@ -1123,6 +1177,72 @@ class OpenAiChatTurn {
       title: clip(title, 1024),
       input,
     });
+    if (AGENT_ITEM.test(head.type)) this.agentWork(head.id, raw, false);
+  }
+
+  /**
+   * The subagents an agent item names: the threads it sent to, the one it reports on and every
+   * thread in its state map. A subagent keeps the card that first named it, so a later wait
+   * updates the call that started it. An item that names no thread counts as one subagent of its
+   * own, finished when the item completes.
+   */
+  private agentWork(callId: string, raw: unknown, completed: boolean) {
+    const work = agentWork.safeParse(raw).data;
+    const states = work?.agentsStates ?? {};
+    const ids = new Set(
+      [
+        ...(work?.receiverThreadIds ?? []),
+        work?.agentThreadId,
+        work?.newThreadId,
+        ...Object.keys(states),
+      ].filter((value): value is string => typeof value === 'string' && value !== ''),
+    );
+    const own = ids.size === 0;
+    if (own) ids.add(callId);
+    const item = agentState(work?.status);
+    for (const id of ids) {
+      const state =
+        agentState(states[id]?.status) ??
+        (work?.agentThreadId === id ? agentState(work?.kind) : undefined) ??
+        (own && completed ? (item === 'failed' ? 'failed' : 'done') : undefined);
+      this.subagents.update(callId, id, {
+        ...(state ? { state } : {}),
+        ...(work?.model ? { model: work.model } : {}),
+      });
+    }
+  }
+
+  /**
+   * A notification from a subagent's own thread. Its items become the subagent's latest action
+   * and its turn ending finishes it. Nothing it says reaches the reply or opens a card.
+   */
+  private childNotification(threadId: string, method: string, params: unknown) {
+    if (!this.subagents.parentOf(threadId)) return;
+    if (method === 'turn/completed') {
+      const status = turnDone.safeParse(params).data?.turn.status;
+      return this.subagents.update(threadId, threadId, {
+        state: status === 'failed' ? 'failed' : status === 'interrupted' ? 'stopped' : 'done',
+      });
+    }
+    if (method !== 'item/started') return;
+    const raw = itemFrame.safeParse(params).data?.item;
+    const head = itemHead.safeParse(raw).data;
+    if (!head || CONTENT_ITEMS.has(head.type)) return;
+    const action =
+      head.type === 'commandExecution'
+        ? commandItem.safeParse(raw).data?.command?.trim() || 'Run a command'
+        : head.type === 'fileChange'
+          ? `Edit ${this.paths(raw)
+              .map((entry) => entry.path)
+              .join(', ')}`.trim()
+          : head.type === 'webSearch'
+            ? 'Search the web'
+            : head.type === 'mcpToolCall'
+              ? [mcpItem.safeParse(raw).data?.server, mcpItem.safeParse(raw).data?.tool]
+                  .filter(Boolean)
+                  .join(': ') || 'Call a tool'
+              : readableType(head.type);
+    this.subagents.update(threadId, threadId, { state: 'running', action });
   }
 
   private completed(raw: unknown) {
@@ -1151,8 +1271,9 @@ class OpenAiChatTurn {
       }
       return this.send({ type: 'thinking.completed', turnId, itemId: head.id });
     }
-    if (!['commandExecution', 'fileChange', 'mcpToolCall', 'webSearch'].includes(head.type)) return;
+    if (CONTENT_ITEMS.has(head.type)) return;
     this.started(raw);
+    if (AGENT_ITEM.test(head.type)) this.agentWork(head.id, raw, true);
     const value = toolEnd.safeParse(raw).data;
     const status =
       value?.status === 'declined'
@@ -1422,6 +1543,8 @@ class OpenAiChatTurn {
 
   private end(outcome: Outcome) {
     if (this.outcome) return;
+    // A finished turn finished its subagents with it. Any other ending leaves them unfinished.
+    this.subagents.close(outcome.stopReason === 'done' ? 'done' : 'stopped');
     this.outcome = outcome;
     try {
       this.emit({ type: 'turn.completed', turnId: this.request.turnId, ...outcome });

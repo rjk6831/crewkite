@@ -66,6 +66,11 @@ export type ChatTurnRequest = Readonly<{
   permissionGrants?: readonly ChatToolKind[];
   /** Review and advice turns. The adapter offers no edit or command tool and declines any ask. */
   readOnly?: boolean;
+  /**
+   * False when the crew role turned subagents off. The adapter passes the client's own switch.
+   * Absent allows them.
+   */
+  subagents?: boolean;
   /** Wall-clock budget for the whole turn, in milliseconds. */
   deadlineMs: number;
   /** Environment for the native client: HOME, PATH and what the profile already resolved. */

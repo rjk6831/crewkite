@@ -144,6 +144,7 @@ import {
 } from './prompt.ts';
 import { failedByRestart, restartFailure } from './restart-failure.ts';
 import { copyScratch } from './scratch-copy.ts';
+import { turnAllowsSubagents } from './subagents.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
 import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
 
@@ -1865,6 +1866,7 @@ export class ChatService {
       // A reviewer or advisor reads only, so what the thread allowed does not reach it.
       permissionGrants,
       readOnly: !writer,
+      subagents: turnAllowsSubagents(thread.crew, turn.role),
       // Decided with the thread tools above: the person's servers a turn starts follow this turn's
       // family and this policy, and never exceed it.
       mcp: this.deps.mcp?.compose({
