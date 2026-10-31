@@ -270,3 +270,73 @@ test('the fixed installer validates before publishing and preserves existing inp
     assert.equal(existsSync(join(home, 'providers/google-acp-v1/pin.json')), false);
   }
 });
+
+const signed = {
+  verifySignature: async () => ({
+    verified: true as const,
+    signerTeamId: 'EQHXZ8M8AV',
+    requirement: googleAcpDeveloperIdRequirement('EQHXZ8M8AV'),
+    quiescent: true as const,
+  }),
+};
+
+test('a download that stops making progress ends as stalled, and Stop still cancels', async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'acp-stall-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sample = fixture();
+  // The body sends a few bytes, then nothing. Only the stall rule ends it. An aborted fetch errors
+  // its body, as the platform fetch does.
+  const hanging = (async (_url: unknown, init?: RequestInit) =>
+    new Response(
+      new ReadableStream({
+        start(stream) {
+          stream.enqueue(sample.archive.subarray(0, 16));
+          init?.signal?.addEventListener('abort', () => stream.error(init.signal?.reason), {
+            once: true,
+          });
+        },
+      }),
+    )) as typeof fetch;
+  for (const name of ['stall', 'stop'] as const) {
+    const home = join(root, name);
+    mkdirSync(home, { mode: 0o700 });
+    const controller = new AbortController();
+    const started = performance.now();
+    if (name === 'stop') setTimeout(() => controller.abort(), 50);
+    const result = await installGoogleAcp(
+      { home, consent: 'explicit', signal: controller.signal },
+      {
+        release: sample.release,
+        fetch: hanging,
+        stallMs: name === 'stall' ? 150 : 60_000,
+        import: signed,
+      },
+    );
+    assert.equal(result.reason, name === 'stall' ? 'stalled' : 'cancelled');
+    assert.ok(performance.now() - started < 5_000);
+    assert.equal(existsSync(join(home, 'providers/google-acp-v1/pin.json')), false);
+  }
+  // Steady progress keeps the install going past the stall time.
+  const home = join(root, 'slow');
+  mkdirSync(home, { mode: 0o700 });
+  let sent = 0;
+  const slow = (async () =>
+    new Response(
+      new ReadableStream({
+        async pull(stream) {
+          await new Promise((resolve) => setTimeout(resolve, 40));
+          const part = sample.archive.subarray(sent, sent + 64);
+          sent += part.length;
+          if (part.length) stream.enqueue(part);
+          if (sent >= sample.archive.length) stream.close();
+        },
+      }),
+    )) as typeof fetch;
+  const started = performance.now();
+  const result = await installGoogleAcp(
+    { home, consent: 'explicit' },
+    { release: sample.release, fetch: slow, stallMs: 120, import: signed },
+  );
+  assert.equal(result.reason, 'imported', JSON.stringify(result));
+  assert.ok(performance.now() - started > 120);
+});
