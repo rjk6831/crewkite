@@ -32,8 +32,13 @@ export const ChatRoleSchema = z.enum([
 /** Roles whose turns edit the scratch copy. Every other role runs read only. */
 export const writesScratch = (role: z.infer<typeof ChatRoleSchema>) =>
   role === 'assistant' || role === 'fixer';
-// The clients name their own levels. OpenAI offers up to ultra on some models, Anthropic up to max.
-export const ChatEffortSchema = z.enum([
+/**
+ * An effort level as the client names it. The clients name their own levels and add new ones, so
+ * any short lowercase name passes, and `default` leaves the level to the client. The names below
+ * are the ones seen so far, which the desktop labels; a new name shows as the client wrote it.
+ */
+export const ChatEffortSchema = z.string().regex(/^[a-z][a-z0-9._-]{0,31}$/);
+export const CHAT_KNOWN_EFFORTS = [
   'minimal',
   'low',
   'medium',
@@ -42,7 +47,9 @@ export const ChatEffortSchema = z.enum([
   'ultra',
   'max',
   'default',
-]);
+] as const;
+/** An effort the client applies, so not `default`. */
+export const ChatSetEffortSchema = ChatEffortSchema.refine((value) => value !== 'default');
 /**
  * How the thread picks the next family when a limit stops a turn and automatic handoff is on.
  * most-left takes the family with the most allowance left. resets-first spends the allowance that
@@ -834,7 +841,7 @@ export const CancelChatPlanPayloadSchema = z.strictObject({
 
 /** Sent when a model read ends, so open pickers read the catalog again. */
 export const ChatCatalogChangeSchema = z.strictObject({
-  family: z.literal('openai'),
+  family: z.enum(['openai', 'anthropic']),
   models: z.number().int().min(0).max(64),
   /** What went wrong, in words for the person. Null when the read stored a list. */
   reason: z.string().min(1).max(400).nullable(),
@@ -1013,9 +1020,10 @@ export const ChatCatalogEntrySchema = z.strictObject({
         /**
          * Where the entry came from. live: the client listed it on this account just now. known:
          * CrewKite ships it and the client could not confirm it. typed: the person entered the ID.
-         * Missing reads as live.
+         * used: a turn in this home finished on it, and the client's list leaves it out. Missing
+         * reads as live.
          */
-        source: z.enum(['live', 'known', 'typed']).optional(),
+        source: z.enum(['live', 'known', 'typed', 'used']).optional(),
       }),
     )
     .max(64),
