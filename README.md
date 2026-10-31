@@ -74,6 +74,18 @@ After 0.1.0, in rough order. [docs/roadmap.md](docs/roadmap.md) has the detail.
 - Project notes fetched when a model needs them, and routing that weighs context size beside allowance.
 - Published bench results: tokens, time and checks passed per family on the same tasks.
 
+## Why I built it
+
+I build products for underserved niche markets, and I start each one by talking with the people who have the problem. Along the way I kept running into problems in my own workflow that no tool solved.
+
+I work across several AI subscriptions and a local model, because each one is strongest at something different: backend work, frontend and design, or catching defects in review. Using them together on one repository meant separate apps and terminals, watching every usage meter, and writing handoffs by hand. Each new agent reread the whole context, and the style of the work drifted with every switch.
+
+CrewKite is the controller I wanted: every provider in one thread, held to how I want my work done. Its review methods draw on open-source projects like multi, ADHD and Ponytail, [credited in the docs](docs/credits.md), so you get those ideas without having to find them first.
+
+CrewKite is free and open source. Other people's open-source work has helped me a great deal, and this is my turn to give back. I am measuring efficiency with a benchmark now, and I will not claim gains until the numbers are in. Until then, what I want most is your feedback. My best product decisions have come from real people telling me what they need. Try it, and tell me where it falls short.
+
+Raymond J. Kraft
+
 ## Principles
 
 - Qualify official clients on their supported subscription path. Cloud-provider authentication stays with those clients, and CrewKite never reads or stores a provider credential. The one secret it can keep is the token of a model runtime on this device, only when I turn on Remember the Local token, and Forget removes it. CrewKite never falls back to paid API billing on its own.
