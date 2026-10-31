@@ -79,6 +79,16 @@ const idle = (): GoogleInstallStatus => ({
   reason: null,
   next: 'Install the official client before authentication.',
 });
+// One plain sentence per install failure. The card shows it once, with no reason code.
+const failureText: Partial<Record<string, string>> = {
+  cancelled: 'Installation stopped. Start a new installation when ready.',
+  stalled: 'The download stopped making progress. Try again.',
+  'download-unavailable': 'The download could not start. Check the connection and try again.',
+  'archive-refused': 'The downloaded client did not match the reviewed release. Try again.',
+  'signature-refused': 'The Google signature check on the client failed.',
+  'pin-conflict': 'A different Google client is already installed in this home.',
+  'invalid-import': 'The unpacked client did not pass its checks. Try again.',
+};
 const resultFor = (status: GoogleInstallStatus): InstallOperationResult => ({
   outcome: status.state === 'installed' ? 'applied' : 'blocked',
   ...(status.reason ? { reason: status.reason } : {}),
@@ -312,9 +322,7 @@ export class GoogleAcpInstallation {
               ? outcome.cleanupReason
                 ? 'The official client is installed. Temporary cleanup failed; inspect the private installation directory before authentication.'
                 : 'The official client is installed. Authenticate separately.'
-              : outcome.reason === 'cancelled'
-                ? 'Installation stopped. Start a new installation when ready.'
-                : 'Check the installation failure and try again.',
+              : (failureText[outcome.reason] ?? 'The installation did not finish. Try again.'),
         };
         save('complete');
         result = resultFor(active.record.status);

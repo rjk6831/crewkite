@@ -169,6 +169,21 @@ test('installation Stop waits for owned signature closure and recovery never rep
     assert.equal(warned.reason, 'temporary-cleanup-failed');
     assert.match(warned.next ?? '', /Temporary cleanup failed/);
     await warning.close();
+    // A stall and a stop each read as one plain sentence, with the reason code kept apart.
+    for (const [reason, next] of [
+      ['stalled', 'The download stopped making progress. Try again.'],
+      ['cancelled', 'Installation stopped. Start a new installation when ready.'],
+    ] as const) {
+      const ended = new GoogleAcpInstallation({
+        ...journal,
+        install: async () => ({ imported: false, reason, client: null }),
+      });
+      const result = await ended.install({ ...input, key: `ended-${reason}` });
+      assert.equal(result.reason, reason);
+      assert.equal(result.next, next);
+      assert.equal(result.data.install.next, next);
+      await ended.close();
+    }
     journal.append({
       ...previous,
       key: 'uncertain',

@@ -43,7 +43,12 @@ export type AcpInstallResult = (
   | AcpImportResult
   | {
       imported: false;
-      reason: 'download-unavailable' | 'archive-refused' | 'cancelled' | 'install-unavailable';
+      reason:
+        | 'download-unavailable'
+        | 'archive-refused'
+        | 'cancelled'
+        | 'stalled'
+        | 'install-unavailable';
       client: null;
     }
 ) & { cleanupReason?: 'temporary-cleanup-failed' };
@@ -57,7 +62,14 @@ export type AcpInstallDependencies = {
   fetch?: typeof fetch;
   release?: Release;
   import?: AcpImportDependencies;
+  /** How long the download or the unpack may go without progress before the install stops. */
+  stallMs?: number;
 };
+
+/** The download or unpack stops when no bytes arrive for this long. */
+export const ACP_INSTALL_STALL_MS = 90_000;
+// Larger reads and inflate output keep the unpack of the 383 MB client to a few hundred writes.
+const CHUNK = 1024 * 1024;
 
 function verifier(expected: { bytes: number; sha256: string }, counted?: (bytes: number) => void) {
   let length = 0;
@@ -171,10 +183,15 @@ async function extract(
           autoClose: false,
           start: entry.start,
           end: entry.start + entry.file.compressed - 1,
+          highWaterMark: CHUNK,
         }),
-        createInflateRaw(),
+        createInflateRaw({ chunkSize: CHUNK }),
         verifier(entry.file, (bytes) => counted(before + bytes)),
-        createWriteStream(join(target, entry.file.name), { flags: 'wx', mode: 0o600 }),
+        createWriteStream(join(target, entry.file.name), {
+          flags: 'wx',
+          mode: 0o600,
+          highWaterMark: CHUNK,
+        }),
         { signal },
       );
       written += entry.file.bytes;
@@ -198,15 +215,28 @@ export async function installGoogleAcp(
     reason: Exclude<AcpInstallResult['reason'], AcpImportResult['reason']>,
   ): AcpInstallResult => ({ imported: false, reason, client: null });
   const expected = dependencies.release ?? release;
-  const signal = AbortSignal.any([
-    AbortSignal.timeout(180000),
-    ...(options.signal ? [options.signal] : []),
-  ]);
+  // The download and the unpack stop only when no bytes arrive for the stall time. A slow
+  // connection or a slow disk keeps going while it makes progress. Stop from the person cancels.
+  const stall = new AbortController();
+  const stallMs = dependencies.stallMs ?? ACP_INSTALL_STALL_MS;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const watch = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => stall.abort(), stallMs);
+  };
+  const signal = AbortSignal.any([stall.signal, ...(options.signal ? [options.signal] : [])]);
+  const stopped = () => (options.signal?.aborted ? 'cancelled' : 'stalled');
   let temporary: string | undefined;
   let failure: 'download-unavailable' | 'archive-refused' | 'install-unavailable' =
     'install-unavailable';
   // A report is for display. A listener that throws never stops the install.
+  let reported = -1;
   const report = (step: AcpInstallProgress['step'], bytes: number, totalBytes: number) => {
+    if (step !== 'verify') watch();
+    // One report per tenth of a percent is enough for the bar. The first and last always go.
+    const tick = Math.floor((bytes * 1000) / totalBytes) + (step === 'download' ? 0 : 2000);
+    if (tick === reported && bytes !== 0 && bytes !== totalBytes) return;
+    reported = tick;
     try {
       options.onProgress?.({ step, bytes, totalBytes });
     } catch {}
@@ -235,6 +265,7 @@ export async function installGoogleAcp(
       validateAcpDirectory(imports, options.home);
       temporary = mkdtempSync(join(imports, '.google-acp-install-'));
       const archive = join(temporary, 'release.zip');
+      watch();
       failure = 'download-unavailable';
       const response = await (dependencies.fetch ?? fetch)(expected.url, {
         signal,
@@ -268,6 +299,7 @@ export async function installGoogleAcp(
         report('extract', bytes, inflated),
       );
       signal.throwIfAborted();
+      clearTimeout(watchdog);
       failure = 'install-unavailable';
       unlinkSync(archive);
       writeFileSync(
@@ -314,10 +346,12 @@ export async function installGoogleAcp(
       return imported.imported || imported.reason === 'ownership'
         ? imported
         : signal.aborted
-          ? refused('cancelled')
+          ? refused(stopped())
           : imported;
     } catch {
-      return refused(signal.aborted ? 'cancelled' : failure);
+      return refused(signal.aborted ? stopped() : failure);
+    } finally {
+      clearTimeout(watchdog);
     }
   };
   const result = await run();
