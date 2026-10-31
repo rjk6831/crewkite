@@ -225,6 +225,8 @@ const offeredTools = (request: ChatTurnRequest, threads = false): readonly Local
 // 2,048 and 30 percent of C, so a small window still gets a usable reply and a large one a reply
 // in proportion. Reasoning counts inside R. The rule lives in contracts as `localBudget`.
 const MAP_SHARE = 0.18;
+// The outline ranks files by imports and fits a token budget, so a sample of a large copy serves.
+const MAP_FILES = 50_000;
 const SUMMARY_SHARE = 0.6;
 const SUMMARY_TOKENS = 300;
 // Chat templates wrap each message in role markers. This is a margin, measured nowhere.
@@ -346,7 +348,7 @@ async function buildPrompt(
         base: request.scratch.base,
         // Listing the tree is only needed when the cache misses.
         get files() {
-          return listFiles(root, request.environment);
+          return listFiles(root, request.environment, MAP_FILES);
         },
         read: (path) => readScratchFile(root, path),
         budgetTokens: mapBudget,

@@ -256,3 +256,28 @@ test('search covers every file and says how many were too large to search', asyn
     rmSync(root, { recursive: true, force: true });
   }
 });
+
+test('read_range on a large file cuts long lines on a character, keeps CRLF breaks and a last bare CR', async () => {
+  const { root, scratch, context } = fixture();
+  try {
+    // Line 1 is one byte then two-byte characters, so the 2,000 byte keep ends inside one.
+    // Line 2 ends in CRLF. A filler line takes the file past 8 MiB. The last line ends in a bare CR.
+    const body = Buffer.concat([
+      Buffer.from(`a${'é'.repeat(3000)}\n`),
+      Buffer.from('crlf\r\n'),
+      Buffer.from(`${'z'.repeat(9 * 1024 * 1024)}\n`),
+      Buffer.from('end\r'),
+    ]);
+    writeFileSync(join(scratch, 'mixed.log'), body);
+    const read = await runTool('read_range', { path: 'mixed.log', start: 1, end: 4 }, context);
+    assert.equal(read.status, 'ok');
+    const rows = read.output.split('\n');
+    assert.equal(rows[0], 'mixed.log lines 1-4 of 4');
+    assert.equal(rows[1], `1: a${'é'.repeat(499)} [line cut]`);
+    assert.equal(rows[2], '2: crlf');
+    assert.equal(rows[3], `3: ${'z'.repeat(500)} [line cut]`);
+    assert.equal(rows[4], '4: end\r');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

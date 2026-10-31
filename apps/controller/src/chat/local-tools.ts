@@ -2,19 +2,31 @@ import { execFileSync, spawn } from 'node:child_process';
 import {
   closeSync,
   constants,
+  existsSync,
   fstatSync,
   ftruncateSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
+  read,
   readdirSync,
   readFileSync,
-  readSync,
   realpathSync,
   statSync,
   writeSync,
 } from 'node:fs';
-import { basename, dirname, isAbsolute, matchesGlob, relative, resolve, sep } from 'node:path';
+import { tmpdir } from 'node:os';
+import {
+  basename,
+  dirname,
+  isAbsolute,
+  join,
+  matchesGlob,
+  relative,
+  resolve,
+  sep,
+} from 'node:path';
 import { StringDecoder } from 'node:string_decoder';
 import {
   type ChatFileDiffSchema,
@@ -46,6 +58,8 @@ const HIT_CHARS = 200;
 const LINE_CHARS = 500;
 const OUTPUT_BYTES = 64 * 1024;
 const READ_BYTES = 8 * 1024 * 1024;
+// The most bytes kept of one line read from a large file: four bytes for each shown character.
+const LINE_KEEP_BYTES = LINE_CHARS * 4;
 const SEARCH_FILE_BYTES = 1024 * 1024;
 // The most bytes one listing of the copy may print: about 1 KiB per path for a million paths.
 const LIST_BYTES = 1024 * 1024 * 1024;
@@ -389,54 +403,94 @@ function readText(file: ScratchFile) {
 }
 
 /**
- * Lines `start` to `end` of a file too large to read whole, and its line count. It reads the
- * open file in 1 MiB steps, so memory holds only the asked lines.
+ * Lines `start` to `end` of a file too large to read whole, and its line count. It reads the open
+ * file in 1 MiB steps and awaits each, so the controller keeps serving while a large file is
+ * counted, and it keeps at most `LINE_KEEP_BYTES` of each asked line.
  */
-function readLargeRange(file: ScratchFile, start: number, end: number) {
+async function readLargeRange(file: ScratchFile, start: number, end: number) {
   if (!lstatSync(file.full, { throwIfNoEntry: false })?.isFile())
     throw new ToolError(`${file.relative} is not a file.`);
   const { fd, stat } = openInside(file.root, file.full, file.relative, constants.O_RDONLY);
   try {
     if (!stat.isFile()) throw new ToolError(`${file.relative} is not a file.`);
     const chunk = Buffer.allocUnsafe(1024 * 1024);
-    const kept: Buffer[] = [];
+    const kept: { bytes: Buffer; cut: boolean; ended: boolean }[] = [];
     let current: Buffer[] = [];
+    let currentBytes = 0;
+    let cut = false;
     let line = 1;
     let position = 0;
     let endsWithNewline = false;
+    const keep = (from: number, to: number) => {
+      const room = LINE_KEEP_BYTES - currentBytes;
+      if (room <= 0) {
+        if (to > from) cut = true;
+        return;
+      }
+      const stop = Math.min(to, from + room);
+      if (stop < to) cut = true;
+      current.push(Buffer.from(chunk.subarray(from, stop)));
+      currentBytes += stop - from;
+    };
+    const close = (ended: boolean) => {
+      kept.push({ bytes: Buffer.concat(current), cut, ended });
+      current = [];
+      currentBytes = 0;
+      cut = false;
+    };
     for (;;) {
-      const read = readSync(fd, chunk, 0, chunk.length, position);
-      if (!read) break;
-      if (position === 0 && chunk.subarray(0, Math.min(read, 8000)).includes(0))
+      const count = await readAt(fd, chunk, position);
+      if (!count) break;
+      if (position === 0 && chunk.subarray(0, Math.min(count, 8000)).includes(0))
         throw new ToolError(`${file.relative} is not UTF-8 text.`);
-      position += read;
+      position += count;
       let from = 0;
-      for (let at = chunk.indexOf(10); at >= 0 && at < read; at = chunk.indexOf(10, at + 1)) {
+      for (let at = chunk.indexOf(10); at >= 0 && at < count; at = chunk.indexOf(10, at + 1)) {
         if (line >= start && line <= end) {
-          current.push(Buffer.from(chunk.subarray(from, at)));
-          kept.push(Buffer.concat(current));
+          keep(from, at);
+          close(true);
         }
-        current = [];
         line++;
         from = at + 1;
       }
-      if (from < read && line >= start && line <= end)
-        current.push(Buffer.from(chunk.subarray(from, read)));
-      endsWithNewline = chunk[read - 1] === 10;
+      if (from < count && line >= start && line <= end) keep(from, count);
+      endsWithNewline = chunk[count - 1] === 10;
     }
     // A file without a final newline still has its last line.
     const total = position === 0 || endsWithNewline ? line - 1 : line;
-    if (current.length) kept.push(Buffer.concat(current));
-    const rows = kept.map((row) => {
-      const text = row.toString('utf8').replace(/\r$/, '');
-      if (!Buffer.from(row.toString('utf8')).equals(row))
+    if (line >= start && line <= end && !endsWithNewline && position > 0) close(false);
+    const rows = kept.map(({ bytes, cut: shortened, ended }) => {
+      // A cut can fall inside a character, so the partial character goes.
+      const whole = shortened ? completeUtf8(bytes) : bytes;
+      const text = whole.toString('utf8');
+      if (!Buffer.from(text).equals(whole))
         throw new ToolError(`${file.relative} is not UTF-8 text.`);
-      return text;
+      // The same lines `lines()` gives: a carriage return before a newline is part of the break.
+      const row = ended && !shortened ? text.replace(/\r$/, '') : text;
+      return row;
     });
-    return { rows, total };
+    return { rows, cut: kept.map((row) => row.cut), total };
   } finally {
     closeSync(fd);
   }
+}
+
+const readAt = (fd: number, buffer: Buffer, position: number) =>
+  new Promise<number>((settle, fail) =>
+    read(fd, buffer, 0, buffer.length, position, (error, bytes) =>
+      error ? fail(error) : settle(bytes),
+    ),
+  );
+
+/** `bytes` without a last character that a cut left incomplete. */
+function completeUtf8(bytes: Buffer): Buffer {
+  let at = bytes.length;
+  // Step back over continuation bytes to the lead byte of the last character.
+  while (at > 0 && at > bytes.length - 4 && (bytes[at - 1] & 0xc0) === 0x80) at--;
+  if (at === 0) return bytes;
+  const lead = bytes[at - 1];
+  const size = lead >= 0xf0 ? 4 : lead >= 0xe0 ? 3 : lead >= 0xc0 ? 2 : 1;
+  return size > bytes.length - (at - 1) ? bytes.subarray(0, at - 1) : bytes;
 }
 
 function writeAll(fd: number, text: string) {
@@ -483,43 +537,76 @@ export function unifiedDiff(file: string, before: string, after: string, context
   };
 }
 
-/** Files in scratch, without ignored ones when scratch is a Git checkout. Symlinks are skipped. */
-export function listFiles(scratch: string, environment: NodeJS.ProcessEnv) {
+// An empty repository whose only job is to apply a copy's .gitignore rules to a plain folder.
+let emptyRepository: string | null = null;
+function ignoreRules(): string {
+  if (emptyRepository && existsSync(emptyRepository)) return emptyRepository;
+  const folder = mkdtempSync(join(tmpdir(), 'crewkite-list-'));
+  execFileSync('git', ['init', '--bare', '--quiet', folder], {
+    stdio: 'ignore',
+    env: { PATH: process.env.PATH ?? '/usr/bin:/bin', GIT_CONFIG_NOSYSTEM: '1' },
+  });
+  emptyRepository = folder;
+  return folder;
+}
+
+/**
+ * Files in scratch, without the ones its .gitignore rules leave out. Symlinks are skipped. Search
+ * takes every file; a caller that only needs a sample, such as completion, passes `limit`.
+ */
+export function listFiles(scratch: string, environment: NodeJS.ProcessEnv, limit?: number) {
   const root = kernelPath(scratch);
-  let paths: string[];
-  try {
-    paths = execFileSync(
-      'git',
-      ['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--deduplicate'],
-      {
-        cwd: root,
-        // A chat scratch copy is a plain folder. Without the ceiling, Git walks up into the
-        // repository that holds it and lists nothing when that repository ignores the copy, as a
-        // checkout ignores a home under internal/. Outside a checkout Git fails and the walk below
-        // lists the copy.
-        env: withGitCeiling(environment, root),
-        maxBuffer: LIST_BYTES,
-        timeout: 60_000,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      },
-    )
+  const run = (args: string[]) =>
+    execFileSync('git', args, {
+      cwd: root,
+      env: withGitCeiling(environment, root),
+      maxBuffer: LIST_BYTES,
+      timeout: 60_000,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    })
       .toString('utf8')
       .split('\0')
       .filter(Boolean);
+  let paths: string[] | null = null;
+  try {
+    // Without the ceiling, Git walks up into the repository that holds the copy and lists nothing
+    // when that repository ignores it, as a checkout ignores a home under internal/.
+    paths = run(['ls-files', '-z', '--cached', '--others', '--exclude-standard', '--deduplicate']);
   } catch {
-    paths = [];
+    try {
+      // A chat copy has no .git of its own. Git lists it as a work tree of an empty repository,
+      // so build output and other ignored folders stay out, as they do in a checkout.
+      paths = run([
+        '--git-dir',
+        ignoreRules(),
+        '--work-tree',
+        root,
+        'ls-files',
+        '-z',
+        '--others',
+        '--exclude-standard',
+        // The walk below leaves dependency folders out too, ignored or not.
+        '--exclude=node_modules',
+      ]);
+    } catch {
+      // Without Git the walk below lists the copy.
+    }
+  }
+  if (paths === null) {
+    const walked: string[] = [];
+    paths = walked;
     const walk = (directory: string) => {
       for (const entry of readdirSync(resolve(root, directory), { withFileTypes: true })) {
         const child = directory ? `${directory}/${entry.name}` : entry.name;
         if (entry.isDirectory() && entry.name !== '.git' && entry.name !== 'node_modules')
           walk(child);
-        else if (entry.isFile()) paths.push(child);
+        else if (entry.isFile()) walked.push(child);
       }
     };
     walk('');
   }
   const files: { path: string; bytes: number }[] = [];
-  for (const file of paths.sort()) {
+  for (const file of paths.sort().slice(0, limit)) {
     const stat = lstatSync(resolve(root, file), { throwIfNoEntry: false });
     if (stat?.isFile()) files.push({ path: file, bytes: stat.size });
   }
@@ -546,16 +633,16 @@ function search(scratch: string, environment: NodeJS.ProcessEnv, pattern: string
   let large = 0;
   for (const file of listFiles(scratch, environment)) {
     if (file.path.split('/').includes('.git')) continue;
-    if (file.bytes > SEARCH_FILE_BYTES) {
-      large++;
-      continue;
-    }
     if (
       glob &&
       !matchesGlob(file.path, glob) &&
       !(!glob.includes('/') && matchesGlob(basename(file.path), glob))
     )
       continue;
+    if (file.bytes > SEARCH_FILE_BYTES) {
+      large++;
+      continue;
+    }
     let text: string;
     try {
       // listFiles saw a file at this path. A folder above it can still be a link.
@@ -586,11 +673,13 @@ function search(scratch: string, environment: NodeJS.ProcessEnv, pattern: string
     }
     if (more) break;
   }
-  const skipped = large
-    ? [
-        `${large.toLocaleString('en-US')} ${large === 1 ? 'file' : 'files'} over 1 MiB ${large === 1 ? 'was' : 'were'} not searched. Use read_range or run on them.`,
-      ]
-    : [];
+  // With the hit limit reached the walk stopped early, so the count would be short.
+  const skipped =
+    large && !more
+      ? [
+          `${large.toLocaleString('en-US')} ${large === 1 ? 'file' : 'files'} over 1 MiB ${large === 1 ? 'was' : 'were'} not searched. Use read_range or run on them.`,
+        ]
+      : [];
   if (!hits.length) return ['No matches.', ...skipped].join('\n');
   return [
     ...hits,
@@ -814,14 +903,17 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
           const wanted = Math.min(Math.max(call.start, call.end), call.start + READ_LINES - 1);
           const size = lstatSync(file.full, { throwIfNoEntry: false })?.size ?? 0;
           // A file past the whole-file read limit is read in steps, so only the asked lines load.
-          const large = size > READ_BYTES ? readLargeRange(file, call.start, wanted) : null;
+          const large = size > READ_BYTES ? await readLargeRange(file, call.start, wanted) : null;
           const all = large ? null : lines(readText(file));
           const total = large ? large.total : (all as string[]).length;
           if (call.start > total) throw new ToolError(`${file.relative} has ${total} lines.`);
           const end = Math.min(wanted, total);
           const picked = large ? large.rows : (all as string[]).slice(call.start - 1, end);
           const shown = picked.map((row, index) => {
-            const cut = row.length > LINE_CHARS ? `${row.slice(0, LINE_CHARS)} [line cut]` : row;
+            const cut =
+              row.length > LINE_CHARS || large?.cut[index]
+                ? `${row.slice(0, LINE_CHARS)} [line cut]`
+                : row;
             return `${call.start + index}: ${cut}`;
           });
           const header = `${file.relative} lines ${call.start}-${end} of ${total}`;

@@ -15,6 +15,8 @@ import { fitBytes, listFiles, readScratchFile } from './local-tools.ts';
 // A folder is a candidate only when it holds a listed file, so an ignored folder never shows.
 
 const LISTING_MS = 3000;
+// Completion offers a sample of a large copy. A path past it still works when typed in full.
+const LISTING_FILES = 50_000;
 
 /**
  * Keep the paths whose every parent folder resolves inside the copy. The listing checks only the
@@ -71,7 +73,7 @@ export function createMentionIndex(now: () => number): MentionIndex {
       if (!listing || current - listing.at > LISTING_MS || current < listing.at) {
         const paths = insideCopy(
           scratch,
-          listFiles(scratch, environment)
+          listFiles(scratch, environment, LISTING_FILES)
             .map(({ path }) => path)
             .filter((path) => !path.split('/').includes('.git')),
         );
