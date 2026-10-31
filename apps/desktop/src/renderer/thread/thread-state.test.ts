@@ -24,7 +24,7 @@ import { adjacentThread, canSend, shortcutFor } from './composer-rules.ts';
 import { acceptsType, deliveryNote, deliveryOf, tryWithChoices } from './file-fit.ts';
 import { limitOffer, offerChoices } from './handoff-offer.ts';
 import { outputLimitLine, outputSplit, statsSplit } from './output-limit.ts';
-import { planCard, planOverrides } from './plan-card.ts';
+import { planCard, planlessText, planOverrides } from './plan-card.ts';
 import {
   announcements,
   earlierCursor,
@@ -1689,4 +1689,18 @@ test('the plan card offers what the flight mode allows and sends only the picks 
   assert.deepEqual(planOverrides(balanced, { 2: 1 }), [
     { sliceId: 2, family: 'google', model: 'google-model' },
   ]);
+});
+
+test('an orchestrator reply shows its summary without the plan block, also while it streams', () => {
+  const summary = 'Two slices run side by side.';
+  const block = '```json plan\n{"planId": "p1"}\n```';
+  assert.equal(planlessText(`${summary}\n\n${block}\n`), summary);
+  assert.equal(planlessText(`${summary}\n\n\`\`\`json plan\n{"planId": `), summary);
+  assert.equal(
+    planlessText(`${summary}\n\n${block}\n\nAfter the plan.`),
+    `${summary}\n\nAfter the plan.`,
+  );
+  const other = '```json\n{"a": 1}\n```';
+  assert.equal(planlessText(`${summary}\n\n${other}`), `${summary}\n\n${other}`);
+  assert.equal(planlessText(block), '');
 });

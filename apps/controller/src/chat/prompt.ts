@@ -348,8 +348,9 @@ export function orchestratorContext(
   return [
     `You are the orchestrator in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     readOnlyRules(family, 'plan the work'),
-    'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan, picks the model for each slice and runs the slices one at a time in dependency order, with a review after each.',
-    'Reply with a short summary, then exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
+    'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan and picks the model for each slice. Slices whose dependencies are done start together, each in its own copy of the project, with at most one turn per provider at a time. Each slice that changes files gets a review.',
+    'The slices are the parallel workers, and CrewKite starts them after your turn. Your own turn only reads and plans, so you start no agent to do the work. When the person asks for a number of agents or subagents, split the work into that many slices where it divides that way, leave the independent ones without depends, and say in your summary which slices run side by side.',
+    'Reply with a short summary in plain sentences: what each slice does and which ones run side by side. The person sees the plan as a card, so the summary does not repeat its JSON or list its fields. End the reply with exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
     PLAN_EXAMPLE,
     'Rules:',
     '- planId: letters, digits, dot, underscore or hyphen, at most 64 characters.',

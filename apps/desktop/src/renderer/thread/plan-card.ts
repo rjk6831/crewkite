@@ -115,3 +115,20 @@ export function planOverrides(
     return pick && !same ? [{ sliceId: slice.id, family: pick.family, model: pick.model }] : [];
   });
 }
+
+// The controller's fence for a plan block: a `json` block tagged `plan`. While the reply streams,
+// an opened block with no closing fence yet runs to the end of the text.
+const PLAN_BLOCK =
+  /^[ \t]*```json[ \t]+plan[ \t]*\r?\n(?:[\s\S]*?\r?\n[ \t]*```[ \t]*(?=\r?\n|$)|[\s\S]*$)/gm;
+
+/**
+ * An orchestrator reply as the thread shows it: the plan block is left out, since the plan card
+ * shows the same plan. The stored reply keeps the block, because the controller reads the slice
+ * briefs from it, and Copy reply copies it whole.
+ */
+export function planlessText(text: string): string {
+  return text
+    .replace(PLAN_BLOCK, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
