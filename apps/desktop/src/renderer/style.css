@@ -514,7 +514,7 @@ kbd {
 .nav-bottom {
   flex-shrink: 0;
   margin-top: auto;
-  padding-bottom: 12px;
+  padding-bottom: 10px;
 }
 .nav-item {
   display: flex;
@@ -542,13 +542,10 @@ kbd {
   align-items: center;
   gap: 7px;
   border-top: 1px solid var(--border);
-  margin-top: 17px;
-  padding: 13px 3px 0;
+  margin-top: 8px;
+  padding: 10px 3px 0;
   color: var(--text-dim);
   font-size: 10px;
-}
-.connection-line .icon-button {
-  margin-left: auto;
 }
 .connection-dot.connected {
   background: var(--green);
@@ -558,6 +555,7 @@ kbd {
 }
 .connection-status {
   display: flex;
+  flex: 1;
   align-items: center;
   gap: 7px;
   min-width: 0;
@@ -648,6 +646,7 @@ kbd {
   padding: 12px 0 0;
 }
 .navigation.is-collapsed .connection-status {
+  flex: none;
   justify-content: center;
   width: 40px;
   height: 20px;

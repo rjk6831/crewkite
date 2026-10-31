@@ -1386,16 +1386,16 @@
 /* Left rail allowance summary */
 .rail-usage {
   display: grid;
-  gap: 10px;
+  gap: 7px;
   margin: 0 -12px;
-  padding: 12px 18px;
+  padding: 8px 14px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
 }
 .rail-usage-row {
   position: relative;
   display: grid;
-  gap: 3px;
+  gap: 2px;
   font-size: 11px;
 }
 .rail-usage-row:focus-visible {

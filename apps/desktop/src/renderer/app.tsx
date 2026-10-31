@@ -554,6 +554,11 @@ export function App() {
     setNewThread(projectId ?? task?.projectId ?? projects[0]?.id ?? '');
     setPage('tasks');
   }
+  // The wordmark leads home: a new thread in the current project, out of Settings.
+  function goHome() {
+    if (header) startThread();
+    else setPage('tasks');
+  }
   // A project the person just added is selected in the rail, and its New thread opens with the
   // cursor in the message box.
   const [addedProject, setAddedProject] = useState<string | null>(null);
@@ -709,9 +714,9 @@ export function App() {
           <button
             type="button"
             className="brand"
-            onClick={() => setAbout(true)}
-            aria-label="About CrewKite"
-            data-tooltip="About CrewKite"
+            onClick={goHome}
+            aria-label="CrewKite home"
+            data-tooltip="Home"
           >
             <img
               className="brand-wordmark"
@@ -886,12 +891,6 @@ export function App() {
             <span className="nav-text">Settings</span>
             <ChevronRight size={13} aria-hidden="true" />
           </button>
-          {!collapsed && (
-            <button type="button" className="nav-item" onClick={() => setAbout(true)}>
-              <Info size={16} />
-              About and acknowledgments
-            </button>
-          )}
           <div className="connection-line">
             <span className="connection-status" data-tooltip={connectionLabel}>
               <span className={`connection-dot ${connection}`} />
@@ -909,6 +908,15 @@ export function App() {
                 <RefreshCw size={15} />
               </button>
             )}
+            <button
+              type="button"
+              className="icon-button"
+              onClick={() => setAbout(true)}
+              aria-label="About CrewKite"
+              data-tooltip="About CrewKite"
+            >
+              <Info size={15} />
+            </button>
             <button
               type="button"
               className="icon-button"
@@ -996,6 +1004,7 @@ export function App() {
             theme={themeMode}
             onTheme={setThemeMode}
             threadId={task?.id}
+            onClose={() => setPage('tasks')}
             onShowWelcome={() => {
               onboarding.restart();
               setNewThread(null);
