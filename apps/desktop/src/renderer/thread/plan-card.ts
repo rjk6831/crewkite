@@ -4,6 +4,7 @@ import type {
   ChatPlanSliceStatus,
   ChatPlanState,
 } from '@crewkite/contracts';
+import type { ThreadItem } from './thread-state.ts';
 
 type Slice = ChatPlanState['slices'][number];
 
@@ -131,4 +132,18 @@ export function planlessText(text: string): string {
     .replace(PLAN_BLOCK, '')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * The turn whose row the plan card follows: the orchestrator turn that proposed the plan, so the
+ * slices after it read below the card in time order and a finished card stays where it happened.
+ * Null while that turn is not among the loaded rows, and the card then waits at the end.
+ */
+export function planRow(
+  items: readonly ThreadItem[],
+  plan: Pick<ChatPlanState, 'orchestratorTurnId'> | null,
+): string | null {
+  if (!plan) return null;
+  const id = plan.orchestratorTurnId;
+  return items.some((item) => item.kind === 'turn' && item.turn.id === id) ? id : null;
 }
