@@ -70,7 +70,19 @@ These stay out of the first build. Each one gets its own gates when I enable it:
 - Arbitrary agent swarms and a plugin marketplace
 - A permanent background service and automatic updates
 - A CI helper for user projects: inspect workflows, explain cost and coverage, propose a candidate patch on request
-- Platforms beyond macOS, each with its own writer qualification
+- Platforms beyond macOS, each with its own writer qualification. Linux runs a chat preview in 0.1.0; Windows waits on the port of process groups, the control socket and the file trust checks
+
+## After 0.1.0
+
+The README lists these in rough order. Each gets its own ADR or amendment before it ships.
+
+- Named builders: a crew roster with a provider, model and effort per builder, a live view of slice ownership, and each builder's subagents
+- An API key route per provider, with the full Anthropic model list and a Google route inside Google's terms
+- The Windows port
+- Google, task writers, formatting and verification on Linux, with packaged installers
+- Large repository copy, comparison and acceptance off the controller's main thread; per-hunk review for large files through git's own diff
+- Project notes fetched on demand; routing that weighs context size beside allowance
+- Published bench results per family
 
 ## How I will judge it
 

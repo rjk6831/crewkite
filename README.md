@@ -37,6 +37,16 @@ A crew can work a large request in slices. In the Full crew preset an orchestrat
 
 To try a published build without the source, follow the [preview guide](docs/preview.md). Each provider needs its own client, signed in on your machine. Chat accepts a range of client builds within the major version I tested: OpenAI from 0.163.0 (tested with 0.163.0), Anthropic from 2.1.0 (tested with 2.1.302) and the Google quota reader from 1.4.0 (tested with 1.4.2). Settings names the version it found. [Provider routes](docs/providers.md#client-versions) lists the update command for each and the setup.
 
+## Platforms
+
+- macOS on Apple silicon runs all four families.
+- Linux x64 and arm64 run OpenAI, Anthropic and Local in a preview. Google, task writers, formatting and verification stay on macOS for now.
+- Windows does not run CrewKite yet.
+
+### Why no Windows yet
+
+CrewKite's safety rests on POSIX behavior. Each provider client runs in its own process group, so Stop ends it and everything it started. The control socket is a Unix domain socket that only your user can open. Every client binary passes owner and permission checks before it runs, and file reads and writes refuse links that lead out of the working copy. Windows answers each of these differently, with job objects, named pipes and access control lists, so the port rewrites that whole layer. I will not ship Windows with weaker versions of these checks. The port is in progress, and Windows ships when it enforces what macOS and Linux enforce today. WSL2 is untested.
+
 ## Plans per family
 
 CrewKite puts no plan gate of its own. Each family works on whatever plan its provider allows, and the provider's limits apply. CrewKite sets no API key and never falls back to paid API billing. The OpenAI route stops with a message when its client is signed in with an API key, because that bills per token. [Provider routes](docs/providers.md#plans-per-family) has the longer notes on each line.
@@ -51,6 +61,18 @@ CrewKite puts no plan gate of its own. Each family works on whatever plan its pr
 ## Google and your account
 
 Google's third-party access FAQ says that third-party access through its coding client login violates its terms. Its headless FAQ also excludes consumer CLI wrappers. The dated links are in [Google and your account](docs/providers.md#google-and-your-account). Google does not name CrewKite, and CrewKite has no exception from Google. Using the Google route is your own choice and your own risk. Settings shows this summary and keeps Connect Google off until you tick a box that says you have read Google's terms, accept the risk, and that Roots No Limits LLC is not liable for Google's actions against your account. The controller refuses Google use without that acknowledgement, and it asks again when this text changes.
+
+## Roadmap
+
+After 0.1.0, in rough order. [docs/roadmap.md](docs/roadmap.md) has the detail.
+
+- Named builders. A crew roster where each builder has its own provider, model and effort, with a live view of who works on which slice and the subagents each one starts.
+- An API key route for each provider. It gives the full model list for Anthropic and a Google route inside Google's terms.
+- Windows, once the port above is done.
+- Google on Linux, plus Linux task writers, formatting and verification, alongside packaged Linux installers.
+- Large repository work off the controller's main thread, and per-hunk review for large files.
+- Project notes fetched when a model needs them, and routing that weighs context size beside allowance.
+- Published bench results: tokens, time and checks passed per family on the same tasks.
 
 ## Principles
 
