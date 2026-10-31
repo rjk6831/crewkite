@@ -21,7 +21,7 @@ This record amends the Manager paragraph of ADR 0038 and leaves that record's te
   - Hard and medium: the crew builder's model when its family ranks, otherwise the next ranked family with its default model.
   - Easy: Local when it is connected and the slice fits, otherwise the top-ranked family. A slice fits when the bytes of its named files are within the Local prompt room from the A5 rule and none of them is an image.
   - `hint.family` breaks a tie among ranked candidates. It never adds a candidate.
-  - Each assignment writes a system line with its reason, for example "Slice 2 (easy) assigned to Local: 5,478 token room, Local first." The same line goes in the packet.
+  - Each assignment carries its reason, for example "Slice 2 (easy) assigned to Local: 5,478 token room, Local first." The plan card shows it on the slice row and the same line goes in the packet. The thread writes no line that repeats it; a slice with no family to run on still gets one. Amended 2026-11-01: the thread used to write one line per assignment, which repeated the card. The slice brief, the user message of a slice turn, shows folded under the slice chip as "Slice 1 brief".
 - The chain: each slice runs as an ordinary builder turn with the slice brief and files. The ADR 0038 review chain runs once per slice with the same caps. The challenger runs once after the last slice. One line closes it, for example "Crew finished: 3 slices, 4 reviews, 1 fix."
 - Failure: a slice that fails stops the chain. The slices after it show "not run", and each can be run on its own from the card. Stop marks every slice not yet done as not run. A slice is queued, running, done, failed or not run.
 - The plan card in the thread follows the flight mode.

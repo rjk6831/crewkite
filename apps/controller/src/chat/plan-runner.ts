@@ -388,12 +388,14 @@ export class PlanRunner {
       slices,
     };
     this.host.putThread(task, { ...thread, plan: state });
+    // The plan card shows each assignment and its reason, so only a slice with no family to run
+    // on gets a line of its own.
     for (const slice of slices)
-      this.host.line(
-        task,
-        slice.assignment?.reason ??
+      if (!slice.assignment)
+        this.host.line(
+          task,
           `Slice ${slice.id} (${slice.difficulty}) has no family to run on: no connected family has allowance left.`,
-      );
+        );
     if (state.phase === 'running') this.pump(task, effects);
   }
 

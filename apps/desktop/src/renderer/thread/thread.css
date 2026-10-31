@@ -1792,6 +1792,13 @@ button.th-first-run-item:hover {
   margin: 4px 0 0;
   overflow-wrap: anywhere;
 }
+.th-brief-body {
+  margin: 4px 0 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 320px;
+  overflow-y: auto;
+}
 .th-attachment-open {
   display: inline-flex;
   align-items: center;

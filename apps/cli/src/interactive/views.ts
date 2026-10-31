@@ -21,6 +21,7 @@ import {
 } from '../../../desktop/src/renderer/thread/thread-state.ts';
 import {
   type Block,
+  briefLabel,
   roleLabels,
   runLabel,
   type ToolBlock,
@@ -320,6 +321,7 @@ function TurnHeader({
     identity ? FamilyMark({ family: identity.family, colors }) : h(Text, null, '◆'),
     h(Text, { color: colors.muted }, identity ? safeText(identity.model) : 'Starting'),
     role ? h(Text, { color: colors.accent }, `[${role}]`) : null,
+    turn.brief ? h(Text, { color: colors.muted }, briefLabel(identity)) : null,
     turn.ended
       ? turn.status === 'stopped'
         ? h(Text, { color: colors.muted }, 'Stopped')

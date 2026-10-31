@@ -47,6 +47,7 @@ import {
 import {
   type Block,
   blankTurn,
+  briefLabel,
   replySource,
   runLabel,
   type ToolBlock,
@@ -903,6 +904,44 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
   };
   const state = reduceThread(initialThreadState(task), { type: 'loaded', read: sliced });
   assert.equal(turnOf(threadItems(state)).identity?.slice, 2);
+  // The brief the slice ran on folds under its chip and leaves no user bubble.
+  const brief = 'Slice 2 of 4 in plan p1: Read the totals';
+  const briefed: ChatThreadRead = {
+    ...sliced,
+    messages: [
+      {
+        id: id('msg', 10),
+        taskId: task,
+        at: stamp,
+        cursor: '10',
+        author: { kind: 'user' },
+        text: brief,
+        attachments: [],
+        files: [],
+      },
+      ...sliced.messages,
+    ],
+  };
+  const folded = threadItems(
+    reduceThread(initialThreadState(task), { type: 'loaded', read: briefed }),
+  );
+  assert.deepEqual(
+    folded.map((item) => item.kind),
+    ['turn'],
+  );
+  assert.equal(turnOf(folded).brief, brief);
+  assert.equal(briefLabel(turnOf(folded).identity), 'Slice 2 brief');
+  // A message that started no slice turn stays a bubble.
+  const plainItems = threadItems(
+    reduceThread(initialThreadState(task), {
+      type: 'loaded',
+      read: { ...briefed, turns: plain.turns },
+    }),
+  );
+  assert.deepEqual(
+    plainItems.map((item) => item.kind),
+    ['user', 'turn'],
+  );
 });
 
 test('events that a thread read or a stored turn read already covers apply once', () => {
