@@ -39,8 +39,16 @@ export const subagentActivityFields = {
 
 /**
  * Whether a crew role lets its client start subagents. A crew saved before the switch leaves it
- * out, and a missing value allows them, so only an explicit false turns them off.
+ * out, and then the family decides: subagents are on, except for the families listed below.
  */
 export const AllowSubagentsSchema = z.boolean().optional();
-export const allowsSubagents = (member: { allowSubagents?: boolean } | null | undefined) =>
-  member?.allowSubagents !== false;
+/**
+ * Families whose subagents stay off until the person turns them on for a role. OpenAI child
+ * approvals rely on the client passing the turn's approval policy to each child, which a live
+ * check has yet to confirm.
+ */
+export const SUBAGENTS_OFF_UNLESS_ALLOWED: readonly string[] = ['openai'];
+export const allowsSubagents = (
+  member: { allowSubagents?: boolean } | null | undefined,
+  family?: string,
+) => member?.allowSubagents ?? !SUBAGENTS_OFF_UNLESS_ALLOWED.includes(family ?? '');

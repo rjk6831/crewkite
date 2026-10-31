@@ -5,20 +5,28 @@ import { allowsSubagents, MAX_SUBAGENTS } from './subagents.ts';
 
 const selection = { family: 'openai', model: 'model-a', effort: 'medium' } as const;
 
-test('a crew role allows subagents unless the saved crew turns them off', () => {
-  const table: { name: string; member: Record<string, unknown>; allow: boolean }[] = [
-    { name: 'a crew saved before the switch', member: {}, allow: true },
-    { name: 'a role left on', member: { allowSubagents: true }, allow: true },
-    { name: 'a role turned off', member: { allowSubagents: false }, allow: false },
-  ];
+test('a crew role allows subagents as saved, and a role saved without the switch takes the family default', () => {
+  const table: { name: string; member: Record<string, unknown>; family: string; allow: boolean }[] =
+    [
+      { name: 'saved before the switch', member: {}, family: 'anthropic', allow: true },
+      { name: 'saved before the switch', member: {}, family: 'google', allow: true },
+      { name: 'saved before the switch', member: {}, family: 'openai', allow: false },
+      { name: 'turned on', member: { allowSubagents: true }, family: 'openai', allow: true },
+      { name: 'turned off', member: { allowSubagents: false }, family: 'anthropic', allow: false },
+    ];
   for (const row of table) {
     const crew = ChatCrewSchema.parse({
       name: 'Pair',
       members: [{ role: 'builder', selection, ...row.member }],
     });
-    assert.equal(allowsSubagents(crew.members[0]), row.allow, row.name);
+    assert.equal(
+      allowsSubagents(crew.members[0], row.family),
+      row.allow,
+      `${row.name} ${row.family}`,
+    );
   }
-  assert.equal(allowsSubagents(undefined), true, 'a turn with no crew role');
+  assert.equal(allowsSubagents(undefined, 'google'), true, 'a turn with no crew role');
+  assert.equal(allowsSubagents(undefined, 'openai'), false, 'an OpenAI turn with no crew role');
   assert.equal(
     ChatCrewSchema.safeParse({
       name: 'Pair',
