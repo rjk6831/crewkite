@@ -1127,8 +1127,11 @@ export class ChatService {
     return { outcome: 'applied' };
   }
 
-  /** The read-only thread tools for one thread, as the MCP server and the Local functions call them. */
-  threadReads(taskId: string, scratch?: string): ThreadReads {
+  /**
+   * The read-only thread tools for one thread, as the MCP server and the Local functions call
+   * them. `asking` is the turn that reads, which the reads leave out.
+   */
+  threadReads(taskId: string, scratch?: string, asking?: string): ThreadReads {
     return createThreadReader(
       {
         store: this.deps.store,
@@ -1138,6 +1141,7 @@ export class ChatService {
         now: () => Date.parse(this.deps.now()),
       },
       taskId,
+      asking,
     );
   }
 

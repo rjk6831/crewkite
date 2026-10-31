@@ -66,6 +66,7 @@ import { detectType } from './files.ts';
 import { McpRegistry } from './mcp-servers.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
+import { AskingTurnError, answer } from './thread-tools/broker.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
 
@@ -3592,6 +3593,24 @@ test('the thread reader returns bounded, redacted reads of its own thread only',
     assert.ok(Buffer.byteLength(live.text) <= 8 * 1024);
     assert.equal(live.role, 'assistant');
   }
+  // The turn that asks reads the thread without itself: thread_turns and thread_live leave it
+  // out, and thread_turn on its id says so, through the broker too.
+  const asking = thread.read().thread.activeTurnId as string;
+  const own = thread.service.threadReads(thread.taskId, undefined, asking);
+  assert.deepEqual(
+    reads.turns({ limit: 50 }).turns.map((turn) => turn.id),
+    [first.id, asking],
+  );
+  assert.deepEqual(
+    own.turns({ limit: 50 }).turns.map((turn) => turn.id),
+    [first.id],
+  );
+  assert.equal(own.live().state, 'none');
+  assert.throws(() => own.turn({ id: asking }), AskingTurnError);
+  assert.equal(own.turn({ id: first.id }).id, first.id);
+  assert.deepEqual(await answer(own, 'thread_turn', { id: asking }), {
+    error: 'That id is the turn asking, which has no reply yet. Read an earlier turn.',
+  });
   // Rows: what the redaction catches before any text leaves.
   for (const [raw, shown] of [
     [`key ${secret} here`, 'key [redacted] here'],

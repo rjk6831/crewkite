@@ -27,6 +27,7 @@ import { ScratchTooLarge } from '../host/source.ts';
 import type { Store } from '../store/index.ts';
 import { scratchChanges } from './changes.ts';
 import { redact } from './redact.ts';
+import { AskingTurnError } from './thread-tools/broker.ts';
 
 export { redact };
 
@@ -134,15 +135,22 @@ function target(event: Extract<AgentEvent, { type: 'tool.started' }>): string | 
 
 /**
  * The thread's reads for one turn. Each call reads the store again, so a later call sees turns
- * that ended since. A turn of another thread is never found.
+ * that ended since. A turn of another thread is never found. `asking` is the turn that reads:
+ * thread_turns, thread_turn and thread_live leave it out, since it has no reply yet and a model
+ * that saw its own empty turn took it for the last one.
  */
-export function createThreadReader(source: ThreadReaderSource, taskId: string): ThreadReads {
+export function createThreadReader(
+  source: ThreadReaderSource,
+  taskId: string,
+  asking?: string,
+): ThreadReads {
   const { store } = source;
   const rows = (): ChatTurn[] =>
     store.db
       .prepare('SELECT body FROM chat_turns WHERE task_id=? ORDER BY sequence')
       .all(taskId)
       .map((row) => ChatTurnSchema.parse(JSON.parse(row.body as string)));
+  const others = (): ChatTurn[] => rows().filter((turn) => turn.id !== asking);
   const entryText = (id: string | null): string => {
     if (!id) return '';
     const row = store.db
@@ -196,7 +204,7 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
 
   return {
     turns(args) {
-      const picked = rows()
+      const picked = others()
         .filter(
           (turn) =>
             (args.since === undefined || turn.sequence > args.since) &&
@@ -223,7 +231,8 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
     },
 
     turn(args) {
-      const turn = rows().find((value) => value.id === args.id);
+      if (asking !== undefined && args.id === asking) throw new AskingTurnError();
+      const turn = others().find((value) => value.id === args.id);
       if (!turn) throw new Error('No turn with that id in this thread.');
       const list = events(turn.id);
       const text = redact(reply(turn, () => list));
@@ -322,7 +331,7 @@ export function createThreadReader(source: ThreadReaderSource, taskId: string): 
     },
 
     live() {
-      const turn = rows().findLast((value) => OPEN.has(value.state));
+      const turn = others().findLast((value) => OPEN.has(value.state));
       if (!turn) return ThreadLiveResultSchema.parse({ state: 'none' });
       const list = events(turn.id);
       return ThreadLiveResultSchema.parse({
