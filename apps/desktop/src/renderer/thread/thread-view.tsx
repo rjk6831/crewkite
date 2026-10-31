@@ -28,6 +28,7 @@ import { limitOffer } from './handoff-offer.ts';
 import type { HistoryFind } from './history-reveal.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
+import { catalogLabels, ModelLabels } from './model-labels.ts';
 import { outputLimitLine } from './output-limit.ts';
 import { PlanCard } from './plan-card.tsx';
 import { ProjectNotesProvider } from './project-notes.tsx';
@@ -130,6 +131,7 @@ function ThreadBody({
   } = useThread(source, task.id, connection);
   const reveal = useReveal(find, items, state.loaded, reach);
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
+  const labels = useMemo(() => catalogLabels(catalog), [catalog]);
   const [inspector, setInspector] = useState<{
     open: boolean;
     tab: InspectorTab;
@@ -420,120 +422,122 @@ function ThreadBody({
   );
 
   return (
-    <div className={inspector.open ? 'thread has-inspector' : 'thread'}>
-      <section className="th-main" aria-label="Thread">
-        <header className="th-bar">
-          {thread?.selection && (
-            <span className="th-bar-family" title={modelLine(thread.selection)}>
-              <FamilyMark family={thread.selection.family} />
-              <span className="th-sr">{familyName(thread.selection.family)}</span>
+    <ModelLabels.Provider value={labels}>
+      <div className={inspector.open ? 'thread has-inspector' : 'thread'}>
+        <section className="th-main" aria-label="Thread">
+          <header className="th-bar">
+            {thread?.selection && (
+              <span className="th-bar-family" title={modelLine(thread.selection, labels)}>
+                <FamilyMark family={thread.selection.family} />
+                <span className="th-sr">{familyName(thread.selection.family)}</span>
+              </span>
+            )}
+            <ThreadTitle source={source} task={task} />
+            <span className="th-project">{projectName}</span>
+            <ExtensionThreadActions source={source} taskId={task.id} />
+            <span className="th-badge" title={thread?.base ?? 'No base commit yet'}>
+              <GitBranch size={11} aria-hidden="true" />
+              {badge}
             </span>
-          )}
-          <ThreadTitle source={source} task={task} />
-          <span className="th-project">{projectName}</span>
-          <ExtensionThreadActions source={source} taskId={task.id} />
-          <span className="th-badge" title={thread?.base ?? 'No base commit yet'}>
-            <GitBranch size={11} aria-hidden="true" />
-            {badge}
-          </span>
-          <button
-            ref={toggle}
-            type="button"
-            className="th-icon th-bar-toggle"
-            aria-label="Toggle inspector"
-            aria-pressed={inspector.open}
-            title="Inspector"
-            onClick={() => setInspector({ ...inspector, open: !inspector.open })}
-          >
-            <PanelRight size={16} aria-hidden="true" />
-          </button>
-        </header>
-        <MessageList
-          items={items}
-          empty={empty}
-          footer={
-            (planned || checked || offer) && (
-              <>
-                {planned}
-                {checked}
-                {offer && (
-                  <LimitOfferCard
-                    key={offer.turnId}
-                    source={source}
-                    taskId={task.id}
-                    offer={offer}
-                  />
-                )}
-              </>
-            )
-          }
-          actions={actions}
-          wantsHistory={wantsHistory}
-          onTurnVisible={loadHistory}
-          taskId={task.id}
-          reveal={reveal}
-          earlier={hasEarlier ? { onLoad: loadEarlier, note: earlierNote } : null}
-          onResolve={resolve}
-          onOpenChanges={openChanges}
-        />
-        <QueuedList
-          queued={queued ?? []}
-          held={held}
-          running={activeTurn !== null}
-          onRemove={dequeue}
-          onSendNow={sendNow}
-        />
-        <Composer
-          ref={composer}
-          key={task.id}
-          source={source}
-          taskId={task.id}
-          thread={thread}
-          running={activeTurn !== null}
-          context={latestContext(items)}
-          currentFamily={lastFamily(state, items)}
-          blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
-          notice={notice}
-          onSend={send}
-          onStop={stop}
-          onConfigured={(selection) => dispatch({ type: 'configured', patch: { selection } })}
-          onHandoff={handoff}
-          onOpenCrew={() => setInspector({ open: true, tab: 'crew', focus: null })}
-          onCatalog={setCatalog}
-          localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
-          lastMessage={lastMessage}
-          onNewThread={onNewThread}
-          onOpenSettings={onOpenSettings}
-          onOpenChanges={() => setInspector({ open: true, tab: 'changes', focus: null })}
-        />
-        {/* A zero-width mark on alternate lines lets the same sentence be read twice in a row. */}
-        <p className="th-sr" role="status" aria-live="polite" aria-atomic="true">
-          {said.text}
-          {said.count % 2 === 0 ? '' : '\u200b'}
-        </p>
-      </section>
-      {sharing && (
-        <ShareDialog source={source} taskId={task.id} onClose={() => setSharing(false)} />
-      )}
-      {inspector.open && (
-        <Inspector
-          source={source}
-          taskId={task.id}
-          title={task.title}
-          thread={thread}
-          turns={turns}
-          messages={state.messages}
-          loaded={state.loaded}
-          header={header}
-          preview={preview}
-          tab={inspector.tab}
-          onTab={(tab) => setInspector({ ...inspector, tab })}
-          onClose={closeInspector}
-          changesKey={changesKey}
-          focusPath={inspector.focus}
-          onConfigure={(patch) => void configure(patch)}
-        />
-      )}
-    </div>
+            <button
+              ref={toggle}
+              type="button"
+              className="th-icon th-bar-toggle"
+              aria-label="Toggle inspector"
+              aria-pressed={inspector.open}
+              title="Inspector"
+              onClick={() => setInspector({ ...inspector, open: !inspector.open })}
+            >
+              <PanelRight size={16} aria-hidden="true" />
+            </button>
+          </header>
+          <MessageList
+            items={items}
+            empty={empty}
+            footer={
+              (planned || checked || offer) && (
+                <>
+                  {planned}
+                  {checked}
+                  {offer && (
+                    <LimitOfferCard
+                      key={offer.turnId}
+                      source={source}
+                      taskId={task.id}
+                      offer={offer}
+                    />
+                  )}
+                </>
+              )
+            }
+            actions={actions}
+            wantsHistory={wantsHistory}
+            onTurnVisible={loadHistory}
+            taskId={task.id}
+            reveal={reveal}
+            earlier={hasEarlier ? { onLoad: loadEarlier, note: earlierNote } : null}
+            onResolve={resolve}
+            onOpenChanges={openChanges}
+          />
+          <QueuedList
+            queued={queued ?? []}
+            held={held}
+            running={activeTurn !== null}
+            onRemove={dequeue}
+            onSendNow={sendNow}
+          />
+          <Composer
+            ref={composer}
+            key={task.id}
+            source={source}
+            taskId={task.id}
+            thread={thread}
+            running={activeTurn !== null}
+            context={latestContext(items)}
+            currentFamily={lastFamily(state, items)}
+            blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
+            notice={notice}
+            onSend={send}
+            onStop={stop}
+            onConfigured={(selection) => dispatch({ type: 'configured', patch: { selection } })}
+            onHandoff={handoff}
+            onOpenCrew={() => setInspector({ open: true, tab: 'crew', focus: null })}
+            onCatalog={setCatalog}
+            localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
+            lastMessage={lastMessage}
+            onNewThread={onNewThread}
+            onOpenSettings={onOpenSettings}
+            onOpenChanges={() => setInspector({ open: true, tab: 'changes', focus: null })}
+          />
+          {/* A zero-width mark on alternate lines lets the same sentence be read twice in a row. */}
+          <p className="th-sr" role="status" aria-live="polite" aria-atomic="true">
+            {said.text}
+            {said.count % 2 === 0 ? '' : '\u200b'}
+          </p>
+        </section>
+        {sharing && (
+          <ShareDialog source={source} taskId={task.id} onClose={() => setSharing(false)} />
+        )}
+        {inspector.open && (
+          <Inspector
+            source={source}
+            taskId={task.id}
+            title={task.title}
+            thread={thread}
+            turns={turns}
+            messages={state.messages}
+            loaded={state.loaded}
+            header={header}
+            preview={preview}
+            tab={inspector.tab}
+            onTab={(tab) => setInspector({ ...inspector, tab })}
+            onClose={closeInspector}
+            changesKey={changesKey}
+            focusPath={inspector.focus}
+            onConfigure={(patch) => void configure(patch)}
+          />
+        )}
+      </div>
+    </ModelLabels.Provider>
   );
 }

@@ -1,4 +1,5 @@
 import { FamilyMark } from './family-mark.tsx';
+import { useModelLabel } from './model-labels.ts';
 import { effortLabel } from './model-picker.tsx';
 import {
   type SubagentBadge as Badge,
@@ -25,8 +26,9 @@ export function SubagentBadge({ badge }: { badge: Badge }) {
  * the subagent badge beside it once the client starts any.
  */
 export function TurnChip({ turn }: { turn: TurnView }) {
+  const label = useModelLabel();
   if (!turn.identity) return null;
-  const chip = turnChip(turn.identity);
+  const chip = turnChip(turn.identity, label);
   const badge = subagentBadge(turnActivities(turn.blocks), turn.ended);
   return (
     <header className="th-turn-head sa-head">

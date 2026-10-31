@@ -26,10 +26,13 @@ import { layoutRows, mountPlan, rowTop, rowWindow } from './virtual-window.ts';
  * `OpenAI · large-1 · Ultra`, after the family mark. A default effort is left out: the client
  * picked it and the label would say nothing.
  */
-export function modelLine(selection: { family: string; model: string; effort?: string }) {
+export function modelLine(
+  selection: { family: string; model: string; effort?: string },
+  label: (family: string, model: string) => string = (_family, model) => model,
+) {
   const effort =
     selection.effort && selection.effort !== 'default' ? ` · ${effortLabel(selection.effort)}` : '';
-  return `${familyName(selection.family)} · ${selection.model}${effort}`;
+  return `${familyName(selection.family)} · ${label(selection.family, selection.model)}${effort}`;
 }
 
 type TurnHandlers = {

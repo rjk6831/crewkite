@@ -18,7 +18,6 @@ const largeKite = [
   '   █o█o █a█a   ',
   '   ◥o█o █a◤a   ',
   '    ◥o ◤a    ',
-  '     ╰',
 ];
 const smallKite = ['◢g◣l', '◥o◤a'];
 const panelOf: Record<string, ChatFamily> = {

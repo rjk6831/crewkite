@@ -307,7 +307,8 @@ test('each interactive view draws a scripted thread in colour and without it und
   );
   for (const panel of ['#40b0a8', '#e87860', '#4850a8', '#e0b860'])
     assert.ok(wordmark.includes(rgb(panel)));
-  assert.equal(gaugeHex(40), '#caca21');
+  assert.equal(gaugeHex(60), '#cabc21');
+  assert.equal(gaugeHex(40), '#ca8321');
   assert.equal(gaugeHex(0), '#ca2121');
   const fresh = renderToString(
     h(views.UsageLine, {

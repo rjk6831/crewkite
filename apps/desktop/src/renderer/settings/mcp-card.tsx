@@ -108,7 +108,7 @@ export function McpCard() {
     <section className="st-card" aria-labelledby="settings-mcp">
       <header className="st-card-head">
         <h2 id="settings-mcp">MCP servers</h2>
-        <span className="st-detail">Your own tools, per thread</span>
+        <span className="st-detail">Off until a thread turns one on</span>
       </header>
       <div className="st-body">
         <p className="st-note">

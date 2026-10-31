@@ -42,6 +42,20 @@ test('the chip names the role, family, model and an effort the person picked', (
   }
 });
 
+test('the chip shows the picker label for a listed model and the ID for one it does not list', () => {
+  const label = (family: string, model: string) =>
+    family === 'anthropic' && model === 'model-c-1-2' ? 'Model C 1.2' : model;
+  const listed = {
+    family: 'anthropic',
+    model: 'model-c-1-2',
+    effort: 'medium',
+    role: 'orchestrator',
+  } as const;
+  const typed = { ...listed, model: 'model-c-0-9' } as const;
+  assert.equal(turnChip(listed, label).model, 'Model C 1.2');
+  assert.equal(turnChip(typed, label).model, 'model-c-0-9');
+});
+
 test('the badge counts live while subagents run, settles to the total, and keeps failures and stops', () => {
   const rows: {
     name: string;

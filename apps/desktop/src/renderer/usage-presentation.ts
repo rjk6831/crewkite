@@ -335,13 +335,26 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
   };
 }
 
-/**
- * The ring color for a percent remaining, one rule for every family: hue 120 at 100 percent, 60 at
- * 40 percent and 0 at 0 percent, linear within each stretch. Age never changes it.
- */
+// Percent remaining and hue, from full to empty. Green holds near the top, yellow arrives by
+// 60 percent, orange by 40 and red near empty, linear between stops.
+const hueStops: readonly (readonly [number, number])[] = [
+  [100, 120],
+  [80, 100],
+  [60, 55],
+  [40, 35],
+  [20, 15],
+  [0, 0],
+];
+
+/** The ring color's hue for a percent remaining, one rule for every family. Age never changes it. */
 export function gaugeHue(percentRemaining: number): number {
   const percent = Math.min(100, Math.max(0, percentRemaining));
-  return percent >= 40 ? 60 + (percent - 40) : (percent * 60) / 40;
+  for (let i = 1; i < hueStops.length; i++) {
+    const [low, lowHue] = hueStops[i];
+    const [high, highHue] = hueStops[i - 1];
+    if (percent >= low) return lowHue + ((percent - low) * (highHue - lowHue)) / (high - low);
+  }
+  return 0;
 }
 export const gaugeColor = (percentRemaining: number) =>
   `hsl(${Math.round(gaugeHue(percentRemaining))} 72% 46%)`;

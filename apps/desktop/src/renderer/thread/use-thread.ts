@@ -30,6 +30,8 @@ const message = (failure: unknown) =>
 const MAX_EVENT_PAGES = 64;
 // 20 pages of 200 messages is 4,000 messages, past the 2,000 turn threads the view is sized for.
 const MAX_REACH_PAGES = 20;
+// How long a live event may wait for a frame before a timer applies it.
+const FLUSH_FALLBACK_MS = 250;
 
 // Loads the thread once, then applies the live stream on top. Events are held until the read
 // returns and then applied on top of it, and the reducer drops the ones the read already covers. A
@@ -75,10 +77,17 @@ export function useThread(
     let active = true;
     let ready = false;
     let frame = 0;
+    let timer = 0;
     const held: ThreadEvent[] = [];
     const buffer: ThreadEvent[] = [];
+    // Events go in once per frame. A window that is hidden, behind other windows or on another
+    // Space gets no frames, so a timer applies them too and a finished turn never waits for the
+    // window to be seen.
     const flush = () => {
+      if (frame) cancelAnimationFrame(frame);
+      if (timer) clearTimeout(timer);
       frame = 0;
+      timer = 0;
       const events = buffer.splice(0);
       if (!active || events.length === 0) return;
       dispatch({ type: 'events', events });
@@ -98,6 +107,7 @@ export function useThread(
       }
       buffer.push(entry);
       if (!frame) frame = requestAnimationFrame(flush);
+      if (!timer) timer = window.setTimeout(flush, FLUSH_FALLBACK_MS);
     });
     reading.current = true;
     setError(null);
@@ -125,6 +135,7 @@ export function useThread(
       active = false;
       unsubscribe();
       if (frame) cancelAnimationFrame(frame);
+      if (timer) clearTimeout(timer);
     };
   }, [source, taskId, connection, attempt, reload, clock]);
 
