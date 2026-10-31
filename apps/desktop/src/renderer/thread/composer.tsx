@@ -9,15 +9,16 @@ import {
   parseSlash,
   type SlashCommand,
 } from '@crewkite/client';
-import type {
-  ChatAttachment,
-  ChatCatalogRead,
-  ChatFamily,
-  ChatMention,
-  ChatModelSelection,
-  ChatThread,
-  LocalSetup,
-  WorkspaceState,
+import {
+  CHAT_MESSAGE_TEXT_MAX,
+  type ChatAttachment,
+  type ChatCatalogRead,
+  type ChatFamily,
+  type ChatMention,
+  type ChatModelSelection,
+  type ChatThread,
+  type LocalSetup,
+  type WorkspaceState,
 } from '@crewkite/contracts';
 import { ArrowUp, Paperclip, Square } from 'lucide-react';
 import {
@@ -459,9 +460,22 @@ export function Composer({
     if (!canAttach) return;
     attach({ from: 'drop', files: [...event.dataTransfer.files] });
   }
-  // A pasted file goes in as a chip. Pasted text goes in the box as usual.
+  // A pasted file goes in as a chip. Pasted text goes in the box as usual, unless the box would
+  // pass what one message holds; then main saves the clipboard text as a file chip.
   function onPaste(event: ClipboardEvent<HTMLTextAreaElement>) {
     const pasted = [...event.clipboardData.files];
+    if (pasted.length === 0 && canAttach) {
+      const area = event.currentTarget;
+      const kept = area.value.length - (area.selectionEnd - area.selectionStart);
+      if (kept + event.clipboardData.getData('text/plain').length > CHAT_MESSAGE_TEXT_MAX) {
+        event.preventDefault();
+        setNote(
+          `The pasted text is over ${CHAT_MESSAGE_TEXT_MAX.toLocaleString('en-US')} characters, so it goes in as a file.`,
+        );
+        attach({ from: 'paste-text' });
+      }
+      return;
+    }
     if (pasted.length === 0 || !canAttach) return;
     event.preventDefault();
     attach({ from: 'paste', files: pasted });

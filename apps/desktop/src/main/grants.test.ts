@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { type Command, CommandSchema } from '@crewkite/contracts';
-import { droppedPaths } from '../shared/attach.ts';
+import { attachRequest, droppedPaths } from '../shared/attach.ts';
 import { attachmentTarget } from '../shared/open-file.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
 
@@ -96,4 +96,13 @@ test('main sends an import by path only for a path it gave the window', () => {
     ['an extra field is refused', open({ path: secret }), null],
   ];
   for (const [claim, input, want] of opens) assert.equal(resolved(input), want, claim);
+});
+
+test('main takes clipboard text only as a request with no other field', () => {
+  const cases: [unknown, unknown][] = [
+    [{ from: 'clipboard-text' }, { from: 'clipboard-text' }],
+    [{ from: 'clipboard-text', text: 'from the page' }, null],
+    [{ from: 'clipboard-text', paths: ['/etc/passwd'] }, null],
+  ];
+  for (const [input, expected] of cases) assert.deepEqual(attachRequest(input), expected);
 });

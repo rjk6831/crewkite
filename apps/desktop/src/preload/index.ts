@@ -78,6 +78,7 @@ const pathOf = (file: File) => {
 // reads the clipboard image for it.
 const attachFiles: NonNullable<DesktopSource['attachFiles']> = async (input) => {
   if (input.from === 'picker') return findFiles({ from: 'picker' });
+  if (input.from === 'paste-text') return findFiles({ from: 'clipboard-text' });
   const files: unknown[] = [...input.files].slice(0, MAX_ATTACH_FILES);
   const paths = droppedPaths(files, pathOf);
   const found = paths.length > 0 ? await findFiles({ from: 'paths', paths }) : [];

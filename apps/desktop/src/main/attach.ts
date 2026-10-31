@@ -83,6 +83,7 @@ export class ComposerFiles {
 
   async find(request: AttachRequest): Promise<DesktopFile[]> {
     if (request.from === 'clipboard') return this.paste();
+    if (request.from === 'clipboard-text') return this.pasteText();
     const paths =
       request.from === 'paths'
         ? request.paths
@@ -100,10 +101,24 @@ export class ComposerFiles {
   private async paste(): Promise<DesktopFile[]> {
     const png = await clipboardImage();
     if (!png) return [];
+    return this.save(png, 'pasted-image', 'png', 'The pasted image could not be saved.');
+  }
+
+  // Text too long for one message. Main reads the clipboard itself, so the page cannot name the
+  // bytes that land in the file.
+  private async pasteText(): Promise<DesktopFile[]> {
+    const text = Buffer.from(await clipboard.readText(), 'utf8');
+    if (!text.length) return [];
+    if (text.length > MAX_CHAT_PASTE_BYTES)
+      throw new Error('The pasted text is over 32 MiB. Save it as a file and attach that.');
+    return this.save(text, 'pasted-text', 'txt', 'The pasted text could not be saved.');
+  }
+
+  private save(bytes: Buffer, stem: string, extension: string, failure: string): DesktopFile[] {
     this.folder ??= mkdtempSync(join(app.getPath('temp'), 'crewkite-paste-'));
     this.count += 1;
-    const path = join(this.folder, `pasted-image-${this.count}.png`);
-    writeFileSync(path, png, { flag: 'wx', mode: 0o600 });
+    const path = join(this.folder, `${stem}-${this.count}.${extension}`);
+    writeFileSync(path, bytes, { flag: 'wx', mode: 0o600 });
     this.pasted.push(path);
     // An image the composer dropped long ago has been copied or discarded by now.
     while (this.pasted.length > MAX_ATTACH_FILES) {
@@ -115,7 +130,7 @@ export class ComposerFiles {
     const file = describe(path);
     if (!file) {
       unlinkSync(path);
-      throw new Error('The pasted image could not be saved.');
+      throw new Error(failure);
     }
     this.grants.grant(file.path);
     return [file];
