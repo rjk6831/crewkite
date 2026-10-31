@@ -12,18 +12,21 @@ const nameOf = (message: ChatQueuedMessage) =>
 /**
  * Messages sent while a turn runs. They start in this order once the thread is free, and each one
  * joins the conversation only then. `held` says why they wait when a running turn is not the
- * reason. Send now stops the running reply and starts that message at once.
+ * reason. Send now stops the running reply and starts that message at once. After Stop the queue
+ * is paused: nothing starts by itself, and Send now starts that one message.
  */
 export function QueuedList({
   queued,
   held,
   running,
+  paused,
   onRemove,
   onSendNow,
 }: {
   queued: readonly ChatQueuedMessage[];
   held: string | null;
   running: boolean;
+  paused: boolean;
   /** Both settle either way. The caller reports a refusal. */
   onRemove: (id: string) => Promise<void>;
   onSendNow: (id: string) => Promise<void>;
@@ -49,12 +52,16 @@ export function QueuedList({
               {message.text.slice(0, SHOWN_CHARACTERS)}
             </span>
             <FileChips files={message.files.map(chipOf)} />
-            {running && (
+            {(running || paused) && (
               <button
                 type="button"
                 className="th-queued-remove"
                 disabled={busy !== null}
-                title="Stops the current reply and sends this message now."
+                title={
+                  running
+                    ? 'Stops the current reply and sends this message now.'
+                    : 'Sends this message now. The rest stay paused.'
+                }
                 aria-label={`Send now: ${nameOf(message)}`}
                 onClick={() => void act(message.id, onSendNow)}
               >

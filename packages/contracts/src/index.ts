@@ -3660,7 +3660,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ExtensionCommandResultSchema.extend({ kind: z.literal('extension-result') }),
   // The byte check on the page stays with the kind tag.
   ChatTurnEventsReadSchema.safeExtend({ kind: z.literal('chat-turn-events') }),
-  /** What a stop took out of the thread's queue, so the composer can give the text back. */
+  /** The messages still queued after a stop. They wait, paused, for Send now or Remove. */
   z.strictObject({
     kind: z.literal('chat-queue'),
     messages: z.array(ChatQueuedMessageSchema).max(8),

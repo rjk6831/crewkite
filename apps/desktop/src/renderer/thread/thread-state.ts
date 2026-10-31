@@ -491,6 +491,12 @@ export function threadItems(state: ThreadState): ThreadItem[] {
   return items;
 }
 
+/** The line a queue paused by Stop shows, and `thread stop` prints, or null for an empty one. */
+export function pausedQueueLine(count: number): string | null {
+  if (count <= 0) return null;
+  return `Stopped. ${count} queued ${count === 1 ? 'message is' : 'messages are'} waiting.`;
+}
+
 export function activeTurnId(state: ThreadState): string | null {
   const candidates = [state.thread?.activeTurnId ?? null, ...Object.keys(state.turns)];
   for (const id of candidates) {
