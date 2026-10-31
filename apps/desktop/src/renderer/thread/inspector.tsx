@@ -11,7 +11,6 @@ import {
   type ChatThread,
   type ChatTurn,
   type WorkspaceState,
-  writesScratch,
 } from '@crewkite/contracts';
 import { ArrowRightLeft, RefreshCw, X } from 'lucide-react';
 import {
@@ -863,11 +862,6 @@ export function Inspector({
             thread={thread}
             refreshKey={changesKey}
             focusPath={focusPath}
-            lastReply={
-              messages.findLast(
-                ({ author }) => author.kind === 'assistant' && writesScratch(author.role),
-              )?.text
-            }
           />
         )}
         {tab === 'usage' && <UsageTab source={source} header={header} preview={preview} />}
