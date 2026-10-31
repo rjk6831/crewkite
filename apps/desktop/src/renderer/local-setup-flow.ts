@@ -30,6 +30,12 @@ export const setupReasons: Record<NonNullable<LocalSetup['reason']>, string> = {
 /** How often an open Settings page or model picker reads the runtime again. */
 export const REOBSERVE_MS = 15_000;
 
+/**
+ * How long a card follows a model read it started on its own. The controller gives discovery 20
+ * seconds, so the follow outlasts it.
+ */
+export const DISCOVERY_FOLLOW_MS = 30_000;
+
 export const WITHOUT_TOKEN = 'Connected without a token. The runtime has auth off on loopback.';
 
 /**
@@ -305,6 +311,34 @@ export async function waitForLocalReadiness({
     }
   }
   return 'timeout';
+}
+
+/**
+ * Follows a model read the card started on its own until the controller ends it, so the card can
+ * keep its controls as they were for the whole read. A runtime busy loading a model can use the
+ * whole of the controller's discovery deadline. A follow that stopped after about 10 seconds left
+ * a longer read on screen as an owned operation: the controls greyed, the status line changed and
+ * the operation row appeared until the read ended. True when the read ended within the follow.
+ */
+export async function followDiscovery({
+  read,
+  wait,
+  active,
+  now = Date.now,
+  followMs = DISCOVERY_FOLLOW_MS,
+}: {
+  read: () => Promise<Pick<LocalSetup, 'operation'> | null | undefined>;
+  wait: () => Promise<void>;
+  active: () => boolean;
+  now?: () => number;
+  followMs?: number;
+}): Promise<boolean> {
+  const until = now() + followMs;
+  while (active() && now() < until) {
+    if (!(await read())?.operation) return true;
+    await wait();
+  }
+  return false;
 }
 
 /**

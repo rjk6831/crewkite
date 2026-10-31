@@ -4,6 +4,8 @@ import type { LocalSetup } from '@crewkite/contracts';
 import {
   connectInPlace,
   connectLocalFlow,
+  DISCOVERY_FOLLOW_MS,
+  followDiscovery,
   lastSeen,
   lowMemory,
   selectionConfirmed,
@@ -331,5 +333,49 @@ test('Local connect stops its command chain when component ownership changes', a
       result: { kind: 'connected', withoutToken: false },
       sent: ['BeginLocalConnectionInput', 'RefreshLocalModels'],
     },
+  );
+});
+
+// Claim: the card follows its own model read for as long as the controller runs it, so a slow
+// runtime never leaves the read on screen as an owned operation, and the follow still ends.
+test('a background model read is followed past ten seconds and stops at its deadline', async () => {
+  let clock = 0;
+  let reads = 0;
+  const running = { operation: { kind: 'discovery', state: 'owned' } } as Pick<
+    LocalSetup,
+    'operation'
+  >;
+  // A read that ends after 18 seconds, read every half second.
+  const ended = await followDiscovery({
+    read: async () => {
+      reads++;
+      return clock >= 18_000 ? { operation: null } : running;
+    },
+    wait: async () => {
+      clock += 500;
+    },
+    active: () => true,
+    now: () => clock,
+  });
+  assert.equal(ended, true);
+  assert.equal(clock, 18_000);
+  assert.equal(reads, 37);
+  // A read that never ends stops at the follow time, and a closed card stops at once.
+  clock = 0;
+  assert.equal(
+    await followDiscovery({
+      read: async () => running,
+      wait: async () => {
+        clock += 500;
+      },
+      active: () => true,
+      now: () => clock,
+    }),
+    false,
+  );
+  assert.equal(clock, DISCOVERY_FOLLOW_MS);
+  assert.equal(
+    await followDiscovery({ read: async () => running, wait: async () => {}, active: () => false }),
+    false,
   );
 });
