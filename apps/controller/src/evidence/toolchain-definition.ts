@@ -23,6 +23,8 @@ import {
   trustedBiome,
 } from '../host/toolchain.ts';
 
+// Every pnpm workspace. pnpm links each one under node_modules/.pnpm/node_modules, so the
+// inventory refuses a link to a workspace this list leaves out.
 export const toolchainWorkspaces = [
   'apps/controller',
   'apps/cli',
@@ -30,6 +32,7 @@ export const toolchainWorkspaces = [
   'packages/contracts',
   'packages/client',
   'packages/testkit',
+  'packages/bench',
 ] as const;
 export const verificationTarget = 'crewkite verify';
 export const journeyTitle =

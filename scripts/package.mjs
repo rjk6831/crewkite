@@ -21,6 +21,7 @@ import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { toolchainWorkspaces } from '../apps/controller/src/evidence/toolchain-definition.ts';
 import { biomePackageName } from '../apps/controller/src/host/biome-package.ts';
 import {
   copyInstalledDependencies,
@@ -317,14 +318,7 @@ export async function packageDesktop() {
     if (!lstatSync(join(checkout, path)).isFile())
       throw new Error(`The committed package input must be a regular file: ${path}.`);
   const lockHash = hash(join(checkout, 'pnpm-lock.yaml'));
-  const workspaces = [
-    'apps/controller',
-    'apps/cli',
-    'apps/desktop',
-    'packages/contracts',
-    'packages/client',
-    'packages/testkit',
-  ];
+  const workspaces = [...toolchainWorkspaces];
   const copyBudget = {
     deadline: Date.now() + 120000,
     now: Date.now,
