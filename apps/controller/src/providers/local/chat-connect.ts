@@ -53,8 +53,11 @@ export async function connectLocalModel(input: {
   }
 }
 
-/** What the loopback probe found: auth off, a runtime that asked for a token, or anything else. */
-export type LocalProbe = 'open' | 'token-required' | 'unavailable';
+/**
+ * What the loopback probe found: auth off, a runtime that answered 401 or 403, no answer within
+ * the time allowed, or a failure that says nothing about auth.
+ */
+export type LocalProbe = 'open' | 'token-required' | 'timeout' | 'unavailable';
 
 /**
  * A rejected handshake with status 401 or 403 means the runtime wants a token. The socket library
@@ -67,10 +70,11 @@ export function localProbeFailure(error: unknown): 'token-required' | 'unavailab
 
 /**
  * Probe a loopback endpoint with no token. The SDK reads LM_API_TOKEN when no token is passed, so
- * with that set the probe sends nothing and answers unavailable.
+ * with that set the probe sends nothing and answers that a token is wanted, since the environment
+ * already holds one for this runtime.
  */
 export async function probeLocal(endpoint: string, timeoutMs = 2000): Promise<LocalProbe> {
-  if (Object.hasOwn(process.env, 'LM_API_TOKEN')) return 'unavailable';
+  if (Object.hasOwn(process.env, 'LM_API_TOKEN')) return 'token-required';
   const runtime = new LMStudioClient({
     baseUrl: endpoint,
     verboseErrorMessages: false,
@@ -81,7 +85,7 @@ export async function probeLocal(endpoint: string, timeoutMs = 2000): Promise<Lo
     return await Promise.race([
       runtime.llm.listLoaded().then((): LocalProbe => 'open'),
       new Promise<LocalProbe>((resolve) => {
-        timer = setTimeout(() => resolve('unavailable'), timeoutMs);
+        timer = setTimeout(() => resolve('timeout'), timeoutMs);
       }),
     ]);
   } catch (error) {
@@ -91,6 +95,12 @@ export async function probeLocal(endpoint: string, timeoutMs = 2000): Promise<Lo
     runtime[Symbol.asyncDispose]().catch(() => {});
   }
 }
+
+/**
+ * How long each probe of one Connect waits. A runtime busy loading a large model answers slowly,
+ * so a probe that times out is tried again with a longer wait, about 12 seconds in all.
+ */
+export const LOCAL_PROBE_TIMEOUTS_MS = [2000, 4000, 6000] as const;
 
 /**
  * True when the runtime at a loopback endpoint lists its models without a token, which means its

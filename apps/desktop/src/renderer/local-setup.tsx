@@ -258,7 +258,10 @@ export function LocalSetup({
     })
       .then((result) => {
         if (control.signal.aborted || !mounted.current) return;
-        if (result === 'ready') setMessage(null);
+        // A connect that ended without a connection leaves the card's reason line, such as a
+        // failed connection, in place of the waiting line.
+        if (result === 'ready' || (result === 'stopped' && actionGeneration.current === generation))
+          setMessage(null);
         if (result === 'timeout') {
           setPollTimedOut(true);
           setMessage('Taking longer than expected. Try Refresh.');
@@ -462,41 +465,50 @@ export function LocalSetup({
           Disconnect Local
         </button>
       </div>
-      <fieldset
-        className="st-segment"
-        aria-label="Authentication"
-        disabled={blocked || !setup?.endpoint}
-      >
-        {(
-          [
-            ['token', 'Token'],
-            ['none', 'No token (loopback only)'],
-          ] as const
-        ).map(([mode, label]) => (
-          <label key={mode} className={authMode === mode ? 'is-on' : undefined}>
-            <input
-              type="radio"
-              name={`${titleId}-auth`}
-              value={mode}
-              checked={authMode === mode}
-              onChange={() => {
-                stopPolling();
-                if (setup?.endpoint && mode !== authMode)
-                  void action('Authentication setting', {
-                    command: 'ConfigureLocal',
-                    expectedRevision: setup.revision,
-                    payload: { endpoint: setup.endpoint, authMode: mode },
-                  });
-              }}
-            />
-            {label}
-          </label>
-        ))}
-      </fieldset>
+      <div className="st-field">
+        <span className="st-name" id={`${titleId}-auth`}>
+          Runtime token
+        </span>
+        <fieldset
+          className="st-segment"
+          aria-labelledby={`${titleId}-auth`}
+          aria-describedby={`${titleId}-auth-hint`}
+          disabled={blocked || !setup?.endpoint}
+        >
+          {(
+            [
+              ['token', 'Detect'],
+              ['none', 'No token'],
+            ] as const
+          ).map(([mode, label]) => (
+            <label key={mode} className={authMode === mode ? 'is-on' : undefined}>
+              <input
+                type="radio"
+                name={`${titleId}-auth`}
+                value={mode}
+                checked={authMode === mode}
+                onChange={() => {
+                  stopPolling();
+                  if (setup?.endpoint && mode !== authMode)
+                    void action('Authentication setting', {
+                      command: 'ConfigureLocal',
+                      expectedRevision: setup.revision,
+                      payload: { endpoint: setup.endpoint, authMode: mode },
+                    });
+                }}
+              />
+              {label}
+            </label>
+          ))}
+        </fieldset>
+        <small className="st-hint" id={`${titleId}-auth-hint`}>
+          {authMode === 'token'
+            ? 'Connect checks the runtime first and asks for its token only when the runtime answers that it needs one. The token stays in memory.'
+            : 'For a runtime with auth off on this device. If it asks for a token after all, Connect opens the token window for that connection.'}
+        </small>
+      </div>
       <p className="muted small">
-        Token mode asks for the runtime token in a native window and keeps it in memory. No token
-        mode skips the window when the runtime has auth off. A change here clears the connection and
-        the model selection.{' '}
+        A change here clears the connection and the model selection.{' '}
         <ExternalLink href="https://github.com/rjk6831/crewkite/blob/main/docs/local-models.md">
           Local models
         </ExternalLink>
