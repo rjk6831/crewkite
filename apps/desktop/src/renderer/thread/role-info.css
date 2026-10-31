@@ -1,0 +1,66 @@
+/* The info mark beside a role name and the description it shows on hover and keyboard focus. */
+.role-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-width: 0;
+}
+.role-info {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+}
+.role-info-button {
+  display: inline-grid;
+  place-items: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  background: none;
+  color: var(--text-dim);
+  cursor: help;
+}
+.role-info-button:hover {
+  color: var(--text);
+}
+.role-info-button:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.role-info-tip {
+  position: absolute;
+  top: calc(100% + 4px);
+  left: -6px;
+  z-index: 30;
+  width: max-content;
+  max-width: min(240px, 60vw);
+  padding: 7px 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  box-shadow: 0 8px 24px rgb(0 0 0 / 0.25);
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 400;
+  line-height: 1.45;
+  white-space: normal;
+  pointer-events: none;
+  opacity: 0;
+  visibility: hidden;
+  transition:
+    opacity 120ms ease-out,
+    visibility 0s linear 120ms;
+}
+.role-info:hover .role-info-tip,
+.role-info:focus-within .role-info-tip {
+  opacity: 1;
+  visibility: visible;
+  transition-delay: 0s;
+}
+@media (prefers-reduced-motion: reduce) {
+  .role-info-tip {
+    transition: none;
+  }
+}

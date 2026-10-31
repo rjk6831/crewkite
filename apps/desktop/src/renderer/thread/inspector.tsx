@@ -57,6 +57,7 @@ import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
 import { useModelLabel } from './model-labels.ts';
+import { RoleInfo } from './role-info.tsx';
 import { SubagentSwitch } from './subagent-switch.tsx';
 
 export type InspectorTab = 'changes' | 'usage' | 'analytics' | 'crew' | 'thread' | `ext:${string}`;
@@ -620,13 +621,16 @@ function CrewTab({
           const editable = member && choices.length > 0;
           return (
             <li key={role}>
-              {editable ? (
-                <label className="th-crew-role" htmlFor={`${idBase}-${role}`}>
-                  {crewRoleNames[role]}
-                </label>
-              ) : (
-                <span className="th-crew-role">{crewRoleNames[role]}</span>
-              )}
+              <span className="role-name">
+                {editable ? (
+                  <label className="th-crew-role" htmlFor={`${idBase}-${role}`}>
+                    {crewRoleNames[role]}
+                  </label>
+                ) : (
+                  <span className="th-crew-role">{crewRoleNames[role]}</span>
+                )}
+                <RoleInfo of={role} />
+              </span>
               {editable ? (
                 <span className="th-crew-pick">
                   <SelectionFields
@@ -665,6 +669,9 @@ function CrewTab({
           );
         })}
       </ul>
+      <p className="th-muted role-name">
+        Also in threads: Advisor <RoleInfo of="advisor" /> and Ask <RoleInfo of="ask" />
+      </p>
       {crew?.members.some((member) => member.role === 'orchestrator') && (
         <p className="th-muted">
           The orchestrator replaces the single builder turn with a plan of slices. The controller
