@@ -1162,6 +1162,13 @@ export function windowAppliesTo(
  * The tightest window that limits a model: lowest known percent, with its reset time. A window
  * named for another model of the family does not count. Without a model every window counts.
  */
+/**
+ * At or below this share left in a family's tightest window, CrewKite counts the family as low.
+ * A client's own early usage warning shows in the thread only then, or when CrewKite has no
+ * reading; otherwise it goes to the turn trace.
+ */
+export const LOW_ALLOWANCE_PERCENT = 20;
+
 export function tightestAllowance(
   entry: Pick<ChatCatalogEntry, 'remaining'>,
   model: string | null = null,

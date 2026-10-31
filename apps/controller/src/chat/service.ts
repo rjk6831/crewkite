@@ -49,6 +49,7 @@ import {
   scrubSecrets,
   type Task,
   TaskSchema,
+  tightestAllowance,
   writesScratch,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
@@ -1896,6 +1897,7 @@ export class ChatService {
       permissionGrants,
       readOnly: !writer,
       subagents: turnAllowsSubagents(thread.crew, turn.role, turn.selection.family),
+      allowanceLeft: this.allowanceLeft(task.id, turn.selection),
       // Decided with the thread tools above: the person's servers a turn starts follow this turn's
       // family and this policy, and never exceed it.
       mcp: this.deps.mcp?.compose({
@@ -1909,6 +1911,18 @@ export class ChatService {
       environment: this.deps.resolveEnvironment(turn.selection.family),
       now: () => Date.parse(this.deps.now()),
     };
+  }
+
+  /** CrewKite's reading of the tightest window the turn's family and model run on, or null. */
+  private allowanceLeft(taskId: string, selection: ChatModelSelection): number | null {
+    try {
+      const entry = this.deps
+        .catalog(taskId)
+        .families.find((value) => value.family === selection.family);
+      return entry ? tightestAllowance(entry, selection.model).percent : null;
+    } catch {
+      return null;
+    }
   }
 
   private ensureScratch(task: Task, root: string): ChatThread {

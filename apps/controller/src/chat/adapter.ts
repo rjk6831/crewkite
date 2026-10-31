@@ -10,6 +10,7 @@ import type {
   ChatSession,
   ChatToolKind,
 } from '@crewkite/contracts';
+import { LOW_ALLOWANCE_PERCENT } from '@crewkite/contracts';
 import type { ThreadMcp } from './mcp-servers.ts';
 
 // One interface for every provider behind the chat. The controller owns the thread, the
@@ -71,6 +72,11 @@ export type ChatTurnRequest = Readonly<{
    * the role has none. The adapter passes the client's own switch. Absent means the default.
    */
   subagents?: boolean;
+  /**
+   * CrewKite's own reading of the tightest window for this family and model when the turn
+   * started, in percent left. Null or absent when there is no reading.
+   */
+  allowanceLeft?: number | null;
   /** Wall-clock budget for the whole turn, in milliseconds. */
   deadlineMs: number;
   /** Environment for the native client: HOME, PATH and what the profile already resolved. */
@@ -140,4 +146,15 @@ export function chatFailure(
     resetsAt: input.resetsAt ?? null,
     nextAction,
   };
+}
+
+/**
+ * Whether a client's own early usage warning belongs in the thread: only when CrewKite's reading
+ * of the family's tightest window is at or below LOW_ALLOWANCE_PERCENT, or when there is none.
+ * Otherwise the adapter keeps it in the turn trace with the other client notes, since a client
+ * warns well before the allowance is low.
+ */
+export function usageWarningShows(request: Pick<ChatTurnRequest, 'allowanceLeft'>): boolean {
+  const left = request.allowanceLeft;
+  return left === undefined || left === null || left <= LOW_ALLOWANCE_PERCENT;
 }

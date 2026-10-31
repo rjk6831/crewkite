@@ -165,6 +165,12 @@ const scripts = {
     done('failed', given.error ?? limit),
   ],
   reply: () => [['item/completed', { ...ids(), item: message('message-1', 'Hello.') }], done()],
+  'usage-warning': () => [
+    ['warning', { message: 'You have used 80% of your usage limit.' }],
+    ['warning', { message: 'A setting in config.toml is deprecated.' }],
+    ['item/completed', { ...ids(), item: message('message-1', 'Hello.') }],
+    done(),
+  ],
 };
 const play = (name) => {
   for (const frame of scripts[name]()) send(Array.isArray(frame) ? { method: frame[0], params: frame[1] } : frame);
@@ -254,6 +260,7 @@ function turn(
     prompt?: string;
     threadTools?: OpenAiChatDeps['threadTools'];
     readOnly?: boolean;
+    allowanceLeft?: number | null;
     files?: File[];
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
@@ -310,6 +317,7 @@ function turn(
     now: () => Date.parse('2026-10-23T12:00:00.000Z'),
     files: options.files ?? [],
     readOnly: options.readOnly,
+    ...(options.allowanceLeft !== undefined ? { allowanceLeft: options.allowanceLeft } : {}),
   };
   const handle = adapter.startTurn(request, (event) => {
     events.push(event);
@@ -888,6 +896,28 @@ test('the next turn resumes the thread with its own approval policy and effort a
   }
   const tokens = minted.map((args) => args[args.indexOf('--token') + 1]);
   assert.equal(new Set(tokens).size, rows.length);
+});
+
+test("a client usage warning shows in the thread only when CrewKite's reading is low or missing", async () => {
+  // Any other client warning stays in the trace whatever the allowance.
+  for (const [left, shown] of [
+    [60, false],
+    [20, true],
+    [null, true],
+  ] as const) {
+    const run = turn('usage-warning', { allowanceLeft: left });
+    assert.equal((await run.settled()).stopReason, 'done');
+    assert.deepEqual(
+      run.events.flatMap((event) =>
+        event.type === 'provider.notice' ? [[event.message, event.trace === true]] : [],
+      ),
+      [
+        ['You have used 80% of your usage limit.', !shown],
+        ['A setting in config.toml is deprecated.', true],
+      ],
+      String(left),
+    );
+  }
 });
 
 test('a read-only turn runs in the read-only sandbox under never, and an edit turn keeps its policy', async () => {

@@ -202,6 +202,8 @@ function run(
     mcp?: ThreadMcp;
     /** Runs before the turn starts with the path the per-turn MCP config will be written to. */
     plant?: (path: string) => void;
+    /** CrewKite's reading of the tightest window when the turn starts. */
+    allowanceLeft?: number | null;
   } = {},
 ) {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
@@ -260,6 +262,7 @@ function run(
     readOnly: extra.readOnly,
     threadTools: extra.turnTools,
     mcp: extra.mcp,
+    ...(extra.allowanceLeft !== undefined ? { allowanceLeft: extra.allowanceLeft } : {}),
   };
   if (extra.plant) {
     mkdirSync(join(root, 'work', 'tmp'), { recursive: true, mode: 0o700 });
@@ -632,6 +635,55 @@ test('a file the API refuses or CrewKite cannot read fails the turn as attachmen
     assert.equal(turn.launched.argv.length > 0, row.spawned);
     if (row.message) assert.equal(failure?.message, row.message);
     assert.equal(existsSync(join(turn.work, 'files')), false);
+  }
+});
+
+test("the client's early usage warning shows in the thread only when CrewKite's reading is low or missing", async (t) => {
+  // The client warned with the weekly window about half left. Above the low line the warning
+  // goes to the turn trace; at or below it, or with no reading, it shows in the thread.
+  const rows = [
+    { left: 50, trace: true },
+    { left: 21, trace: true },
+    { left: 20, trace: false },
+    { left: 4, trace: false },
+    { left: null, trace: false },
+    { left: undefined, trace: false },
+  ];
+  for (const row of rows) {
+    const turn = run(
+      [
+        'read',
+        { out: init() },
+        {
+          out: {
+            type: 'rate_limit_event',
+            rate_limit_info: { status: 'allowed_warning', rateLimitType: 'five_hour' },
+          },
+        },
+        { out: done() },
+        'drain',
+      ],
+      null,
+      [],
+      'ask',
+      'default',
+      [],
+      prompt,
+      { allowanceLeft: row.left },
+    );
+    t.after(turn.cleanup);
+    assert.equal((await turn.handle.result).stopReason, 'done', String(row.left));
+    const warned = turn.events.filter(
+      (event) =>
+        event.type === 'provider.notice' &&
+        event.message === 'The Anthropic account is close to its usage limit.',
+    );
+    assert.equal(warned.length, 1, String(row.left));
+    assert.equal(
+      warned[0]?.type === 'provider.notice' && warned[0].trace === true,
+      row.trace,
+      String(row.left),
+    );
   }
 });
 
