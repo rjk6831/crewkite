@@ -15,10 +15,11 @@ type GoogleCommand = Extract<
       | 'InstallGoogleAcp'
       | 'InitializeGoogleAcp'
       | 'AuthenticateGoogleAcp'
-      | 'DiscoverGoogleAcp';
+      | 'DiscoverGoogleAcp'
+      | 'StopGoogleAcpSetup';
   }
 >;
-export type GoogleSetupStage = 'install' | 'initialize' | 'authenticate' | 'discover';
+export type GoogleSetupStage = 'clear' | 'install' | 'initialize' | 'authenticate' | 'discover';
 export type GoogleSetupFlowResult =
   | { kind: 'ready' }
   | { kind: 'stopped' }
@@ -27,28 +28,17 @@ export type GoogleSetupFlowResult =
 const applied = (result: CommandResult) =>
   result.outcome === 'applied' || result.outcome === 'already-applied';
 
-function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' | null {
+export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' | null {
   const setup = state.googleAcpSetup;
   const installation = state.googleAcpInstall;
-  if (
-    installation?.state === 'unknown' ||
-    installation?.state === 'blocked' ||
-    setup?.state === 'unknown' ||
-    setup?.state === 'blocked'
-  ) {
-    return null;
-  }
-  if (installation?.operationId || setup?.operationId) return null;
-  if (
-    !setup?.client &&
-    installation &&
-    installation.state !== 'idle' &&
-    installation.state !== 'installed'
-  ) {
-    return null;
-  }
+  if (installation?.state === 'unknown' || installation?.operationId) return null;
+  // A step whose ownership was lost is cleared first. The controller clears it only when it can
+  // prove the step's process ended, and the setup then starts that step again.
+  if (setup?.state === 'unknown') return setup.operationId ? 'clear' : null;
+  if (setup?.operationId) return null;
   const installed = installation?.state === 'installed' || !!setup?.client;
-  if (!installed) return 'install';
+  if (!installed)
+    return !installation || ['idle', 'blocked'].includes(installation.state) ? 'install' : null;
   if (setup?.state === 'ready') return 'ready';
   if (!setup || setup.state === 'uninitialized') return 'initialize';
   if (setup.state === 'authentication-required') {
@@ -56,6 +46,11 @@ function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' | null 
   }
   if (setup.state === 'discovery-required') {
     return setup.proofId && setup.auth.status === 'authenticated' ? 'discover' : null;
+  }
+  // A blocked setup retries the step its saved proof reached, one attempt per click.
+  if (setup.state === 'blocked') {
+    if (!setup.proofId) return 'initialize';
+    return setup.auth.status === 'authenticated' ? 'discover' : 'authenticate';
   }
   return null;
 }
@@ -96,7 +91,14 @@ export async function runGoogleSetupFlow({
     onStage(stage);
     const setup = state.googleAcpSetup;
     let input: GoogleCommand;
-    if (stage === 'install') {
+    if (stage === 'clear') {
+      if (!setup?.operationId) return { kind: 'blocked' };
+      input = {
+        command: 'StopGoogleAcpSetup',
+        expectedRevision: setup.revision,
+        payload: { profileId: 'google-acp-v1', operationId: setup.operationId },
+      };
+    } else if (stage === 'install') {
       input = {
         command: 'InstallGoogleAcp',
         expectedRevision: 0,

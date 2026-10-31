@@ -55,6 +55,9 @@ function FamilyRow({
   children: ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  // Once opened, the card stays mounted while hidden. A setup it started keeps its next steps:
+  // Google sign-in follows the install in the same click, and unmounting the card ended that.
+  const [opened, setOpened] = useState(false);
   const panel = useId();
   const state = ready
     ? 'Ready'
@@ -78,7 +81,10 @@ function FamilyRow({
           aria-expanded={open}
           aria-controls={panel}
           aria-label={`${open ? 'Hide' : ready ? 'Review' : 'Set up'} ${familyName(family)}`}
-          onClick={() => setOpen(!open)}
+          onClick={() => {
+            setOpen(!open);
+            setOpened(true);
+          }}
         >
           {open ? (
             <ChevronDown size={14} aria-hidden="true" />
@@ -90,7 +96,7 @@ function FamilyRow({
       </div>
       {/* The panel holds the same card Settings shows, so every setup rule and gate stays in it. */}
       <div id={panel} className="onb-family-card" hidden={!open}>
-        {open && children}
+        {(open || opened) && children}
       </div>
     </li>
   );
