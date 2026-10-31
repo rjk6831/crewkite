@@ -21,6 +21,7 @@ import {
   resolveAnthropicCompactNativeProfile,
   resolveAnthropicNativeProfile,
 } from './providers/anthropic/profile.ts';
+import { googleAcpCacheDirectory } from './providers/google/acp/install.ts';
 import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
 import { refreshAvailableMemory, startGpuProbe } from './providers/local/hardware.ts';
 import {
@@ -115,6 +116,11 @@ export async function startController(options: ControllerOptions) {
           }
         : undefined,
     registerGoogleAcp: !options.nativeProfile && !options.nativeProfiles,
+    // Every home shares one verified copy of the Google client archive in the user's cache.
+    googleAcpInstall:
+      !options.nativeProfile && !options.nativeProfiles
+        ? { cache: googleAcpCacheDirectory() }
+        : undefined,
     nativeProfiles: options.nativeProfile
       ? undefined
       : () => [
