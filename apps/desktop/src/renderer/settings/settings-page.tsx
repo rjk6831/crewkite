@@ -1,4 +1,5 @@
 import type { WorkspaceState } from '@crewkite/contracts';
+import { ArrowLeft } from 'lucide-react';
 import { useEffect } from 'react';
 import type { Workspace } from '../source.ts';
 import { projectUsagePresentation } from '../usage-presentation.ts';
@@ -27,6 +28,7 @@ export function SettingsPage({
   onTheme,
   onShowWelcome,
   threadId,
+  onClose,
 }: {
   workspace: Workspace;
   header: WorkspaceState;
@@ -35,6 +37,8 @@ export function SettingsPage({
   onShowWelcome?: () => void;
   /** The open thread, whose last events the diagnostics export carries. */
   threadId?: string;
+  /** Leaves Settings for the thread that was open. */
+  onClose?: () => void;
 }) {
   const { catalog, error, modelRead } = useCatalog(workspace.source, header);
   const actions = useProviderActions(workspace);
@@ -57,11 +61,32 @@ export function SettingsPage({
     actions,
     scopes,
   };
+  // Escape leaves Settings too, unless a field or an open dialog takes it.
+  useEffect(() => {
+    if (!onClose) return;
+    const keydown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented) return;
+      const target = event.target as HTMLElement | null;
+      if (target?.closest('input, textarea, select, [contenteditable="true"], dialog')) return;
+      if (document.querySelector('dialog[open]')) return;
+      onClose();
+    };
+    window.addEventListener('keydown', keydown);
+    return () => window.removeEventListener('keydown', keydown);
+  }, [onClose]);
   const entry = (family: string) => catalog?.families.find((value) => value.family === family);
   return (
     <main className="settings-page" aria-labelledby="settings-title">
       <div className="st-column">
-        <h1 id="settings-title">Settings</h1>
+        <div className="st-title">
+          <h1 id="settings-title">Settings</h1>
+          {onClose && (
+            <button type="button" className="button secondary" onClick={onClose}>
+              <ArrowLeft size={14} aria-hidden="true" />
+              Back to threads
+            </button>
+          )}
+        </div>
         {error && (
           <p className="st-error" role="status">
             {error} Model lists and connection state are unavailable until it reads again.
