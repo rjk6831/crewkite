@@ -146,16 +146,14 @@ function anthropic(input: ChatCatalogInput): Entry {
       row.value !== 'default' || !rows.some((other) => other !== row && other.model === row.model),
   );
   const listed = live.map((row) =>
-    chatModel(row.model, row.efforts.length ? ['default', ...row.efforts] : [], 'default', {
+    chatModel(row.model, row.efforts, 'default', {
       label: row.label,
       source: 'live',
     }),
   );
   const used = usedModels(input, 'anthropic')
     .filter((value) => !listed.some((model) => model.model === value.model))
-    .map((value) =>
-      chatModel(value.model, ['default', ...value.efforts], 'default', { source: 'used' }),
-    );
+    .map((value) => chatModel(value.model, value.efforts, 'default', { source: 'used' }));
   const models = present ? [...listed, ...used].slice(0, 64) : [];
   const reported = models.find((model) => model.model === input.anthropicModel)?.model;
   const standard = rows.find((row) => row.value === 'default')?.model;
@@ -295,13 +293,23 @@ function chatModel(
       }),
     ),
   ].slice(0, 8);
-  const list: ChatEffort[] = known.length ? known : ['default'];
+  // A Default entry names no level, so the picker would say nothing. A model with levels lists
+  // only the levels and preselects the one the client reports, else medium, else the first. A
+  // model with none keeps the lone default, and the picker hides its effort control.
+  const levels = known.filter((value) => value !== 'default');
+  const list: ChatEffort[] = levels.length ? levels : ['default'];
   const wanted = ChatEffortSchema.safeParse(preferred);
+  const preselected =
+    wanted.success && list.includes(wanted.data)
+      ? wanted.data
+      : list.includes('medium')
+        ? 'medium'
+        : list[0];
   return {
     model,
     label,
     efforts: list,
-    defaultEffort: wanted.success && list.includes(wanted.data) ? wanted.data : list[0],
+    defaultEffort: preselected,
     ...(hidden ? { hidden } : {}),
     source,
   };

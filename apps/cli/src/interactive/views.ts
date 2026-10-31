@@ -479,6 +479,9 @@ export function UserMessage({
   );
 }
 
+/** An effort after a model name. Default names no level, so it shows nothing. */
+export const effortSuffix = (effort: string) => (effort === 'default' ? '' : ` ${effort}`);
+
 export function QueuedList({ thread, colors }: { thread: ChatThread; colors: Palette }) {
   if (thread.queued.length === 0) return null;
   return h(
@@ -593,7 +596,7 @@ export function CrewView({ thread, colors }: { thread: ChatThread; colors: Palet
         { key: member.role },
         `  ${member.role.padEnd(13)}`,
         FamilyMark({ family: member.selection.family, colors }),
-        ` ${safeText(member.selection.model)} ${member.selection.effort}`,
+        ` ${safeText(member.selection.model)}${effortSuffix(member.selection.effort)}`,
       ),
     ),
     h(Text, null, `Flight mode: ${flightLabels[thread.flightMode]}`),
@@ -780,7 +783,7 @@ export function SettingsView({
     theme: settings.theme,
     animation: settings.animation,
     selection: settings.selection
-      ? `${familyNames[settings.selection.family]} ${settings.selection.model} ${settings.selection.effort}`
+      ? `${familyNames[settings.selection.family]} ${settings.selection.model}${effortSuffix(settings.selection.effort)}`
       : 'most allowance left',
     permissionPolicy: policyLabels[settings.permissionPolicy],
     handoffMode: handoffLabels[settings.handoffMode],

@@ -7,6 +7,7 @@ import {
 import { useState } from 'react';
 import { familyName } from '../components.tsx';
 import { runExport } from '../diagnostics.tsx';
+import { effortLevels, shownEffort } from '../thread/model-groups.ts';
 import { EffortSelect } from '../thread/model-picker.tsx';
 import { RoleInfo } from '../thread/role-info.tsx';
 import {
@@ -111,8 +112,8 @@ function ModelSelect({
 }
 
 /**
- * A model select and, when the model offers a choice, an effort select beside it. A new model
- * starts on its default effort.
+ * A model select and, when the model lists effort levels, an effort select beside it. A new
+ * model starts on its preselected level.
  */
 export function SelectionFields({
   id,
@@ -131,10 +132,10 @@ export function SelectionFields({
   autoText?: string;
   onChange: (next: ChatModelSelection | null) => void;
 }) {
-  const efforts =
-    choices.find(
-      ({ entry, model }) => entry.family === value?.family && model.model === value.model,
-    )?.model.efforts ?? [];
+  const model = choices.find(
+    ({ entry, model }) => entry.family === value?.family && model.model === value.model,
+  )?.model;
+  const levels = effortLevels(model?.efforts ?? []);
   return (
     <>
       <ModelSelect
@@ -145,11 +146,11 @@ export function SelectionFields({
         autoText={autoText}
         onChange={onChange}
       />
-      {value && efforts.length > 1 && (
+      {value && levels.length > 0 && (
         <EffortSelect
           label={effortLabel}
-          efforts={efforts}
-          value={value.effort}
+          efforts={levels}
+          value={shownEffort(value.effort, model)}
           onChange={(effort) => onChange({ ...value, effort })}
         />
       )}

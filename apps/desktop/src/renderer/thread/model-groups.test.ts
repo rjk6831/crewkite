@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatCatalogRead } from '@crewkite/contracts';
-import { MODEL_ID, modelGroups } from './model-groups.ts';
+import { effortLevels, MODEL_ID, modelGroups, shownEffort } from './model-groups.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 const model = (name: string, extra: Partial<Entry['models'][number]> = {}) => ({
@@ -71,4 +71,15 @@ test('the picker lists live models first, folds hidden ones, sets known ones apa
     ['', false],
   ] as const)
     assert.equal(MODEL_ID.test(text), ok, text);
+});
+
+test('a model that lists levels offers no Default, and a saved Default shows the preselected level', () => {
+  const levels = { efforts: ['low', 'medium', 'high'], defaultEffort: 'medium' };
+  const none = { efforts: ['default'], defaultEffort: 'default' };
+  assert.deepEqual(effortLevels(levels.efforts), ['low', 'medium', 'high']);
+  assert.deepEqual(effortLevels(none.efforts), []);
+  assert.equal(shownEffort('default', levels), 'medium');
+  assert.equal(shownEffort('high', levels), 'high');
+  assert.equal(shownEffort('default', none), 'default');
+  assert.equal(shownEffort('default', undefined), 'default');
 });

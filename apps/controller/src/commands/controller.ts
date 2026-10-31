@@ -815,6 +815,10 @@ export class Controller {
       if (models.length && !model && selection.family === 'local') return null;
       if (model && selection.effort !== 'default' && !model.efforts.includes(selection.effort))
         return null;
+      // A thread saved with Default on a model that lists levels runs at the preselected level,
+      // so the chip shows the level the turn asks for.
+      if (model && selection.effort === 'default' && !model.efforts.includes('default'))
+        return { ...selection, effort: model.defaultEffort };
       return selection;
     }
     for (const entry of families) {
