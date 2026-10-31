@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -8,6 +9,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -15,7 +17,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { deflateRawSync } from 'node:zlib';
 import { importGoogleAcp } from './import.ts';
-import { installGoogleAcp } from './install.ts';
+import { googleAcpCacheDirectory, installGoogleAcp } from './install.ts';
 import { googleAcpDeveloperIdRequirement } from './profile.ts';
 
 const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
@@ -339,4 +341,67 @@ test('a download that stops making progress ends as stalled, and Stop still canc
   );
   assert.equal(result.reason, 'imported', JSON.stringify(result));
   assert.ok(performance.now() - started > 120);
+});
+
+test('a verified archive in the user cache serves a new home without a download', async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'acp-cache-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const sample = fixture();
+  const cache = join(root, 'cache/crewkite');
+  let downloads = 0;
+  const dependencies = {
+    release: sample.release,
+    cache,
+    fetch: (async () => {
+      downloads++;
+      return new Response(sample.archive);
+    }) as typeof fetch,
+    import: signed,
+  };
+  const install = async (name: string) => {
+    const home = join(root, name);
+    mkdirSync(home, { mode: 0o700 });
+    return installGoogleAcp({ home, consent: 'explicit' }, dependencies);
+  };
+  assert.equal((await install('first')).reason, 'imported');
+  assert.equal(downloads, 1);
+  const kept = join(cache, `google-acp-${sample.release.sha256}.zip`);
+  assert.deepEqual(readFileSync(kept), sample.archive);
+  assert.equal(statSync(cache).mode & 0o777, 0o700);
+  assert.equal(statSync(kept).mode & 0o777, 0o600);
+  // A new home reuses the copy and still runs both signature checks on what it unpacks.
+  const second = await install('second');
+  assert.equal(second.reason, 'imported');
+  assert.equal(downloads, 1);
+  // A copy that fails the hash is removed and the install downloads again.
+  const tampered = Buffer.from(sample.archive);
+  tampered[40] ^= 1;
+  chmodSync(kept, 0o600);
+  writeFileSync(kept, tampered);
+  assert.equal((await install('third')).reason, 'imported');
+  assert.equal(downloads, 2);
+  assert.deepEqual(readFileSync(kept), sample.archive);
+  // A copy others can read is refused the same way.
+  chmodSync(kept, 0o644);
+  assert.equal((await install('fourth')).reason, 'imported');
+  assert.equal(downloads, 3);
+  assert.equal(statSync(kept).mode & 0o777, 0o600);
+  // The cache sits outside the home and the home keeps no archive.
+  for (const name of ['first', 'second', 'third', 'fourth'])
+    assert.deepEqual(readdirSync(join(root, name, 'imports')), []);
+});
+
+test('the cache folder is the per-user cache directory', () => {
+  assert.equal(
+    googleAcpCacheDirectory({}, '/Users/someone', 'darwin'),
+    '/Users/someone/Library/Caches/CrewKite',
+  );
+  assert.equal(
+    googleAcpCacheDirectory({ XDG_CACHE_HOME: '/var/cache/someone' }, '/home/someone', 'linux'),
+    '/var/cache/someone/crewkite',
+  );
+  assert.equal(
+    googleAcpCacheDirectory({}, '/home/someone', 'linux'),
+    '/home/someone/.cache/crewkite',
+  );
 });
