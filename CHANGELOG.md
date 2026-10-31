@@ -63,3 +63,5 @@ Sprint 2
 - I removed the 100,000-file cap on a thread's scratch copy and check free disk space before the copy instead.
 - I made the Local search cover every file and say how many were too large to search, and let it read lines of a file of any size.
 - I made pasted text longer than one message go in as a file.
+- I removed the shipped Anthropic model list: the picker shows the client's rows, then model IDs this home ran turns on.
+- I let effort levels be any name a client reports, so a new level needs no release.

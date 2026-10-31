@@ -451,3 +451,10 @@ These tests protect the change that replaced the 100,000-file cap with a free sp
 - `apps/desktop/src/main/grants.test.ts` expects main to take a clipboard text request only as a positive whole length with no other field, so the page can never name the bytes main saves. Main saves the clipboard text only when its length matches what the page pasted.
 
 The tests cannot show how long a copy of a large real repository takes on a Mac with clone support. The container numbers are in the ADR amendment; the Mac run is a release check. The composer's switch from pasted text to a file chip past 65,536 characters is a Mac check too.
+
+## Model lists without shipped names (2026-10-31)
+
+- `apps/controller/src/chat/catalog.test.ts` builds the Anthropic list from a real SQLite table of turns: with no client rows and no turns it is empty; with turns only it lists each model a finished turn used, newest first, with the efforts those turns used; with client rows it lists the rows first and the used models the rows leave out after them. A failed turn adds nothing, and a client effort name CrewKite has never seen passes through.
+- `apps/controller/src/providers/openai/model-catalog.test.ts` expects an empty Anthropic list before any read, where it used to expect four shipped names.
+
+What the Anthropic client's picker rows hold on a real account, and whether a typed older model ID runs on a subscription plan, is a Mac check.
