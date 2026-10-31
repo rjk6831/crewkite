@@ -73,6 +73,7 @@ export function PromptsCard({
               </div>
               <div className="st-controls">
                 <button
+                  className="button secondary"
                   type="button"
                   onClick={() => {
                     setName(prompt.name);
@@ -82,6 +83,7 @@ export function PromptsCard({
                   Edit
                 </button>
                 <button
+                  className="button secondary"
                   type="button"
                   onClick={() => void change(() => deletePrompt(source, prompt.name), 'Deleted.')}
                 >
@@ -130,10 +132,15 @@ export function PromptsCard({
             />
           </div>
           <div className="st-controls">
-            <button type="submit" disabled={!valid}>
+            <button className="button primary" type="submit" disabled={!valid}>
               Save prompt
             </button>
-            <button type="button" disabled={prompts.length === 0} onClick={() => void exportFile()}>
+            <button
+              className="button secondary"
+              type="button"
+              disabled={prompts.length === 0}
+              onClick={() => void exportFile()}
+            >
               Export JSON
             </button>
           </div>

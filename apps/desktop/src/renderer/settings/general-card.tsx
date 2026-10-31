@@ -373,6 +373,7 @@ export function GeneralCard({
           <div className="st-controls">
             <button
               type="button"
+              className="button secondary"
               onClick={() => void runExport(source, threadId).then(setExportNote)}
             >
               Export diagnostics

@@ -80,7 +80,11 @@ function SettingsSlot({ source, slot }: { source: ExtensionSource; slot: Extensi
         <SlotOutput outcome={outcome} />
       </div>
       <div className="st-controls">
-        <button type="button" onClick={async () => setOutcome(await runSlot(source, slot))}>
+        <button
+          className="button secondary"
+          type="button"
+          onClick={async () => setOutcome(await runSlot(source, slot))}
+        >
           Run
         </button>
       </div>
@@ -158,20 +162,36 @@ export function ExtensionsCard({ source }: { source: ExtensionSource | undefined
               </div>
               <div className="st-controls">
                 {listing.state === 'refused' ? null : on ? (
-                  <button type="button" onClick={() => void toggle(listing, false)}>
+                  <button
+                    className="button secondary"
+                    type="button"
+                    onClick={() => void toggle(listing, false)}
+                  >
                     Turn off
                   </button>
                 ) : asking === listing.folder ? (
                   <span className="st-actions">
-                    <button type="button" onClick={() => void toggle(listing, true)}>
+                    <button
+                      className="button secondary"
+                      type="button"
+                      onClick={() => void toggle(listing, true)}
+                    >
                       Run its code and turn on
                     </button>
-                    <button type="button" onClick={() => setAsking(null)}>
+                    <button
+                      className="button secondary"
+                      type="button"
+                      onClick={() => setAsking(null)}
+                    >
                       Cancel
                     </button>
                   </span>
                 ) : (
-                  <button type="button" onClick={() => setAsking(listing.folder)}>
+                  <button
+                    className="button secondary"
+                    type="button"
+                    onClick={() => setAsking(listing.folder)}
+                  >
                     Turn on
                   </button>
                 )}
