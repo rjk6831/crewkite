@@ -9,11 +9,23 @@ CrewKite is a local workspace for the coding agents you already pay for. It runs
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
+## Why CrewKite
+
+- Use the plans you already pay for. CrewKite runs each provider's own signed-in client, sets no API key and adds no plan of its own.
+- Keep working when a limit hits. A thread moves to another provider mid task with its messages and edited files, by hand or by the handoff rule you pick.
+- See every allowance in one place. The rail shows the five-hour and weekly windows each provider reports, and Local shows no limit.
+- Split large work across providers. An orchestrator proposes up to 8 slices, the controller assigns each one by allowance and difficulty, and a reviewer, fixer and challenger check the result.
+- Review before anything lands. Each thread works in its own copy of the repository. You read the diff, accept or discard each hunk, and Accept makes a new local branch while your checkout stays as it was.
+- Approve what runs. Commands, edits and tool calls ask first unless your policy allows them, and subagents a provider starts show under the step that started them.
+- Run a local model beside the cloud ones. An LM Studio model takes the easy slices that fit its context, at no cost beyond your hardware.
+- Work on large repositories. A thread's copy has no file count cap and checks free disk space before it starts.
+- Keep your work on your computer. CrewKite has no account, sends no telemetry and hosts nothing. It is Apache 2.0.
+
 ## Status
 
 CrewKite is a prerelease, version 0.1.0. I ran all four families, OpenAI, Anthropic, Google and Local, live through development. The release build gets a final check on macOS before it ships.
 
-![The thread view: a streamed reply, a thinking card, tool cards with a diff and an inline permission prompt.](docs/images/thread.png)
+![The thread view with all four providers in the rail: subagents under the step that started them, an edit with its diff, an inline permission prompt and a queued message.](docs/images/thread.png)
 
 A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan, assigns each slice by allowance and difficulty, and runs it. Builders on any family run the slices, and any model can read what another did through read-only thread tools. Local takes the easy slices that fit its context.
 
