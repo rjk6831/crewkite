@@ -37,3 +37,12 @@ The Changes list held at most 2,000 entries, and Accept refused when more files 
 - A comment on a hunk or on lines of it is sent through `SendChatMessage` as a message that names the file and the lines and quotes the hunk lines. A running turn queues it like any message.
 
 The listing stays optional in the command for older clients. Every client in this repository sends it.
+
+## Amendment, 2026-10-31: no file count cap on a scratch copy
+
+A scratch copy refused a base with more than 100,000 files. That number named no limit of the disk, of Git or of a provider, so it was a size ceiling of the kind this record rules out, and it kept large repositories from starting a thread at all. I remove it.
+
+- A thread copies a base of any file count. The tree listing may print up to 1 GiB, about a million paths.
+- Before it writes, the copy checks free space on the disk that holds the CrewKite home. A copy that writes every byte needs the base's size plus 1 GiB free. A copy that may clone from the checkout needs the 1 GiB up front, since a clone takes no new space, and checks again every 256 MiB it writes. A refusal names both numbers.
+- The writer path for tasks keeps its 10,000 file limit.
+- In the container (2 CPUs, no clone support) a 250,000-file base planned in 4 s, copied in 21 s, listed Changes in 11 to 13 s and built the Accept tree in 9 s, with the controller at about 870 MB. These runs block the controller while they work; moving them off the main thread is later work.

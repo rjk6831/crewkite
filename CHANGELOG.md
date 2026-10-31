@@ -60,3 +60,6 @@ Sprint 2
 - I let chat accept a range of client builds within the tested major version, and named the found version on each provider card.
 - I added a Linux preview from source for OpenAI, Anthropic and Local, with Linux CI.
 - I moved the `--json` lines to `v: 3`, because this sprint added fields to the thread, turn and event shapes they embed.
+- I removed the 100,000-file cap on a thread's scratch copy and check free disk space before the copy instead.
+- I made the Local search cover every file and say how many were too large to search, and let it read lines of a file of any size.
+- I made pasted text longer than one message go in as a file.
