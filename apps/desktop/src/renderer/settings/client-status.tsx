@@ -2,6 +2,7 @@ import type { WorkspaceState } from '@crewkite/contracts';
 import { RefreshCw } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Fact } from '../components.tsx';
+import { formatLocalTime } from '../format-time.ts';
 import type { Workspace } from '../source.ts';
 import { nativeUsageClients } from '../usage-presentation.ts';
 import type { ProviderActions } from './provider-actions.ts';
@@ -123,7 +124,7 @@ export function QuotaRefresh({
         reader.readReason === 'observed' && <p role="status">Latest quota read successful.</p>}
       <p className="st-note">
         Reader status: {reader?.reason ?? 'unavailable'}. Updated:{' '}
-        {reader?.lastObservedAt ?? 'Not observed'}.
+        {formatLocalTime(reader?.lastObservedAt) ?? 'Not observed'}.
       </p>
       {reader?.readState && (
         <p className="st-note">

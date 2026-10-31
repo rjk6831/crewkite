@@ -1,4 +1,5 @@
 import { RefreshCw } from 'lucide-react';
+import { formatLocalTime } from '../format-time.ts';
 import { usageCards } from '../thread/usage-cards.ts';
 import { anthropicReadReason, readAgo } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
@@ -66,7 +67,8 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
           )}
           {connection?.observedAt && (
             <p className="st-note">
-              Last checked: {connection.observedAt}. Billing and task qualification remain unknown.
+              Last checked: {formatLocalTime(connection.observedAt) ?? 'unknown'}. Billing and task
+              qualification remain unknown.
             </p>
           )}
           <div className="st-actions">
