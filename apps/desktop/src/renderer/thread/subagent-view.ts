@@ -25,12 +25,15 @@ export type TurnChip = {
   effort: TurnIdentity['effort'] | null;
 };
 
-export function turnChip(identity: TurnIdentity): TurnChip {
+export function turnChip(
+  identity: TurnIdentity,
+  label: (family: string, model: string) => string = (_family, model) => model,
+): TurnChip {
   return {
     role: chipRoles[identity.role],
     family: identity.family,
     familyName: familyName(identity.family),
-    model: identity.model,
+    model: label(identity.family, identity.model),
     effort: identity.effort === 'default' ? null : identity.effort,
   };
 }

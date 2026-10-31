@@ -56,6 +56,7 @@ import { modelLine } from './message-list.tsx';
 import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
+import { useModelLabel } from './model-labels.ts';
 import { SubagentSwitch } from './subagent-switch.tsx';
 
 export type InspectorTab = 'changes' | 'usage' | 'analytics' | 'crew' | 'thread' | `ext:${string}`;
@@ -330,6 +331,7 @@ function turnGroups(turns: readonly ChatTurn[], messages: readonly ChatMessage[]
 
 // The effort the client reported on the reply beats the one the thread asked for.
 function TurnRow({ turn, reply }: { turn: ChatTurn; reply: ChatMessage | undefined }) {
+  const label = useModelLabel();
   const state = turnState(turn);
   const effort = reply?.author.kind === 'assistant' ? reply.author.effort : undefined;
   return (
@@ -337,7 +339,7 @@ function TurnRow({ turn, reply }: { turn: ChatTurn; reply: ChatMessage | undefin
       <div className="th-turn-line">
         <FamilyMark family={turn.selection.family} />
         <span className="th-turn-model" title={turn.selection.model}>
-          {modelLine({ ...turn.selection, effort: effort ?? turn.selection.effort })}
+          {modelLine({ ...turn.selection, effort: effort ?? turn.selection.effort }, label)}
         </span>
         <span className={`th-turn-state is-${state.tone}`}>{state.label}</span>
       </div>
@@ -540,6 +542,7 @@ function CrewTab({
   // Read once when the tab opens and again when a model read ends. A preset only needs to know
   // which families are connected, and every extra catalog read waits in the controller's queue.
   const { catalog } = useCatalog(source, null);
+  const label = useModelLabel();
   const [note, setNote] = useState<string | null>(null);
   const crew = thread?.crew ?? null;
   const mode = flightModes.find(({ id }) => id === thread?.flightMode) ?? flightModes[0];
@@ -644,7 +647,7 @@ function CrewTab({
               ) : member ? (
                 <span className="th-session" title={member.selection.model}>
                   <FamilyMark family={member.selection.family} />
-                  <span className="th-crew-model">{modelLine(member.selection)}</span>
+                  <span className="th-crew-model">{modelLine(member.selection, label)}</span>
                 </span>
               ) : (
                 <span className="th-muted">{fallback ?? 'Not in this crew'}</span>

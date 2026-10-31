@@ -1065,23 +1065,33 @@ test('the model read sends one initialize request and no prompt, keeps the picke
   ];
   const live = await read(
     answer([
-      { value: 'default', resolvedModel: 'claude-sonnet-5-5', displayName: 'Default' },
+      // The rows as Claude Code 2.1 sends them: the version sits in the description's lead.
+      {
+        value: 'default',
+        resolvedModel: 'claude-sonnet-5-5',
+        displayName: 'Default (recommended)',
+        description: 'Sonnet 5.5 · Efficient for routine tasks',
+      },
       {
         value: 'opus',
         resolvedModel: 'claude-opus-5-5',
-        displayName: 'Opus 5.5',
+        displayName: 'Opus',
+        description: 'Opus 5.5 · Best for everyday, complex tasks',
         supportsEffort: true,
         supportedEffortLevels: ['low', 'high', 'max'],
       },
       // A row without a value cannot be passed to --model, so it drops out.
       { displayName: 'Broken' },
       { value: 'haiku', supportsEffort: false, supportedEffortLevels: ['low'] },
+      // A description that leads with no version keeps the display name.
+      { value: 'fable', displayName: 'Fable', description: 'Most capable for long tasks' },
     ]),
   );
   assert.deepEqual(live.models, [
-    { value: 'default', model: 'claude-sonnet-5-5', label: 'Default', efforts: [] },
+    { value: 'default', model: 'claude-sonnet-5-5', label: 'Default (recommended)', efforts: [] },
     { value: 'opus', model: 'claude-opus-5-5', label: 'Opus 5.5', efforts: ['low', 'high', 'max'] },
     { value: 'haiku', model: 'haiku', label: 'haiku', efforts: [] },
+    { value: 'fable', model: 'fable', label: 'Fable', efforts: [] },
   ]);
   assert.deepEqual(
     live.sent.map((line) => JSON.parse(line)),

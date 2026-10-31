@@ -20,6 +20,7 @@ const row = z.object({
   value: z.string().min(1).max(200),
   resolvedModel: z.string().min(1).max(200).optional().catch(undefined),
   displayName: z.string().min(1).max(200).optional().catch(undefined),
+  description: z.string().max(500).optional().catch(undefined),
   supportsEffort: z.boolean().optional().catch(undefined),
   supportedEffortLevels: z.array(z.string().max(32)).max(16).optional().catch(undefined),
 });
@@ -32,6 +33,25 @@ const reply = z.object({
   }),
 });
 const MAX_BYTES = 4 * 1024 * 1024;
+
+/**
+ * The versioned name a row's description leads with, such as "Opus 5.5" from "Opus 5.5 · Best for
+ * everyday, complex tasks". The display name alone says only "Opus". The lead counts only when it
+ * starts with the display name and ends in a version number, so a default row whose description
+ * names another model keeps its own name.
+ */
+export function anthropicModelLabel(displayName: string | undefined, description?: string) {
+  const lead = description?.split(/\s+[·|-]\s+/u)[0]?.trim();
+  if (
+    displayName &&
+    lead &&
+    lead.length <= 40 &&
+    lead.toLowerCase().startsWith(`${displayName.toLowerCase()} `) &&
+    /\d+(?:\.\d+)*$/u.test(lead)
+  )
+    return lead;
+  return displayName;
+}
 
 /**
  * Reads the picker rows the client keeps for this account. The stream-json initialize request
@@ -124,11 +144,17 @@ export function readAnthropicModels(options: {
         for (const raw of parsed.data.response.response.models) {
           const entry = row.safeParse(raw);
           if (!entry.success) continue;
-          const { value: alias, resolvedModel, displayName, supportsEffort } = entry.data;
+          const {
+            value: alias,
+            resolvedModel,
+            displayName,
+            description,
+            supportsEffort,
+          } = entry.data;
           models.push({
             value: alias,
             model: resolvedModel ?? alias,
-            label: displayName ?? resolvedModel ?? alias,
+            label: anthropicModelLabel(displayName, description) ?? resolvedModel ?? alias,
             efforts: supportsEffort ? (entry.data.supportedEffortLevels ?? []) : [],
           });
         }
