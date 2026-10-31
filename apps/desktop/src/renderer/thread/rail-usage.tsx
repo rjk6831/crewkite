@@ -143,7 +143,7 @@ export function RailUsage({
             <span className="rail-usage-reset">
               <span>
                 {row.resetsIn !== null
-                  ? `resets in ${formatSpan(row.resetsIn)}`
+                  ? `resets in ${formatSpan(row.resetsIn, true)}`
                   : row.resetPassed
                     ? 'reset passed'
                     : 'reset unknown'}
