@@ -44,11 +44,45 @@ const edit = `(line) => {
     at(own, { sessionUpdate: 'tool_call_update', toolCallId: 'sub-1', status: 'completed' }),
   ];
 }`;
-const prelude = `const out=process.stdout.write.bind(process.stdout);const edit=${edit};let held='';process.stdout.write=(chunk)=>{held+=chunk;const lines=held.split('\\n');held=lines.pop();for(const line of lines)for(const next of edit(line))out(next+'\\n');return true;};`;
+const prelude = (source: string) =>
+  `const out=process.stdout.write.bind(process.stdout);const edit=${source};let held='';process.stdout.write=(chunk)=>{held+=chunk;const lines=held.split('\\n');held=lines.pop();for(const line of lines)for(const next of edit(line))out(next+'\\n');return true;};`;
+
+// The first read becomes, when `withSubagent`, a running subagent call; then a call from another
+// session and that session's permission request. The prompt's own end is dropped, so the turn
+// ends when the peer reads the answer.
+const asking = (withSubagent: boolean) => `(line) => {
+  const frame = JSON.parse(line);
+  if (frame.result?.stopReason && !globalThis.endDropped) {
+    globalThis.endDropped = true;
+    return [];
+  }
+  const update = frame.params?.update;
+  if (update?.toolCallId !== 'read-1') return [line];
+  if (update.sessionUpdate === 'tool_call_update') return [];
+  const at = (sessionId, value) =>
+    JSON.stringify({ ...frame, params: { sessionId, update: value } });
+  const own = frame.params.sessionId;
+  return [
+    ...(${withSubagent} ? [at(own, { sessionUpdate: 'tool_call', toolCallId: 'sub-1', title: 'invoke_subagent', kind: 'other', status: 'in_progress' })] : []),
+    at('child-1', { sessionUpdate: 'tool_call', toolCallId: 'c-1', title: 'Run ls?', kind: 'execute', status: 'pending', rawInput: { command: 'ls' } }),
+    JSON.stringify({ jsonrpc: '2.0', id: 'perm-1', method: 'session/request_permission', params: { sessionId: 'child-1', toolCall: { toolCallId: 'c-1' }, options: [
+      { optionId: 'once', name: 'Once', kind: 'allow_once' },
+      { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
+    ] } }),
+  ];
+}`;
 
 type Frame = { method?: string; params?: Record<string, unknown> };
 
-async function run(subagents: boolean | undefined) {
+async function run(
+  subagents: boolean | undefined,
+  options: {
+    edit?: string;
+    permissionPolicy?: ChatTurnRequest['permissionPolicy'];
+    /** The person's answer to an ask the policy leaves to them. */
+    choice?: string;
+  } = {},
+) {
   mkdirSync(resolve('internal'), { recursive: true });
   const home = mkdtempSync(resolve('internal/acp-subagents-'));
   const executable = join(home, 'peer');
@@ -57,7 +91,7 @@ async function run(subagents: boolean | undefined) {
   );
   writeFileSync(
     executable,
-    `#!${process.execPath}\nimport {runAcpChatPeer} from ${JSON.stringify(pathToFileURL(peer).href)};${prelude}runAcpChatPeer('chat-stream');\n`,
+    `#!${process.execPath}\nimport {runAcpChatPeer} from ${JSON.stringify(pathToFileURL(peer).href)};${prelude(options.edit ?? edit)}runAcpChatPeer('chat-stream');\n`,
     { mode: 0o500 },
   );
   writeFileSync(join(home, 'localharness_external'), harness, { mode: 0o500 });
@@ -87,13 +121,13 @@ async function run(subagents: boolean | undefined) {
     session: null,
     scratch: { directory: scratch, base: 'a'.repeat(40), projectName: 'demo' },
     work: { directory: work, home },
-    permissionPolicy: 'ask',
+    permissionPolicy: options.permissionPolicy ?? 'ask',
     deadlineMs: 60_000,
     environment: { HOME: userInfo().homedir, PATH: process.env.PATH },
     now: () => Date.parse('2026-10-31T12:00:00.000Z'),
     subagents,
   };
-  const handle = googleChatAdapter({
+  const adapter = googleChatAdapter({
     launch: () => ({
       client: {
         executable,
@@ -110,7 +144,13 @@ async function run(subagents: boolean | undefined) {
       lifecycle: { beforePhase() {}, owned() {}, quiescent: (group) => assert(groupAbsent(group)) },
       spawn,
     }),
-  }).startTurn(request, (event) => events.push(AgentEventSchema.parse(event)));
+  });
+  const handle = adapter.startTurn(request, (event) => {
+    events.push(AgentEventSchema.parse(event));
+    const choice = options.choice;
+    if (event.type === 'permission.requested' && choice)
+      queueMicrotask(() => handle.respondPermission(event.requestId, choice));
+  });
   const result = await handle.result;
   rmSync(home, { recursive: true, force: true });
   return { events, frames, result };
@@ -150,5 +190,50 @@ test('a crew role with subagents off opens the session without the delegation to
     const { frames } = await run(subagents);
     const opened = frames.find((frame) => frame.method === 'session/new');
     assert.deepEqual(opened?.params?._meta, meta, String(subagents));
+  }
+});
+
+test('a permission request from a subagent session takes the parent policy, and one from any other session is declined', async () => {
+  const rows = [
+    {
+      name: 'the person answers',
+      withSubagent: true,
+      policy: 'ask',
+      asked: 1,
+      outcome: { outcome: 'selected', optionId: 'once' },
+    },
+    {
+      name: 'allow all answers',
+      withSubagent: true,
+      policy: 'allow-all',
+      asked: 1,
+      outcome: { outcome: 'selected', optionId: 'once' },
+    },
+    {
+      name: 'no subagent claims the session',
+      withSubagent: false,
+      policy: 'allow-all',
+      asked: 0,
+      outcome: { outcome: 'cancelled' },
+    },
+  ] as const;
+  for (const row of rows) {
+    const { events, frames } = await run(undefined, {
+      edit: asking(row.withSubagent),
+      permissionPolicy: row.policy,
+      choice: 'once',
+    });
+    const asked = events.filter((event) => event.type === 'permission.requested');
+    assert.equal(asked.length, row.asked, row.name);
+    if (row.asked)
+      assert.equal(asked[0].type === 'permission.requested' && asked[0].question, 'Run ls?');
+    const reply = frames.find((frame) => (frame as { id?: unknown }).id === 'perm-1') as
+      | { result?: { outcome?: unknown } }
+      | undefined;
+    assert.deepEqual(reply?.result?.outcome, row.outcome, row.name);
+    if (row.withSubagent) {
+      const last = events.findLast((event) => event.type === 'tool.subagents');
+      assert.equal(last?.type === 'tool.subagents' && last.agents[0].action, 'Run ls?', row.name);
+    }
   }
 });

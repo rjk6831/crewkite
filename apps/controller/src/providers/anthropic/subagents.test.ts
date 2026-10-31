@@ -200,6 +200,39 @@ test('nested frames count under their parent call, keep their text out of the re
         },
       },
     },
+    {
+      name: 'a background spawn whose call returns at once and that never reports finishing',
+      steps: [
+        'read',
+        { out: init },
+        {
+          out: said([
+            {
+              type: 'tool_use',
+              id: 'toolu_bg',
+              name: 'Task',
+              input: { description: 'Watch the build', prompt: 'Watch.', run_in_background: true },
+            },
+          ]),
+        },
+        { out: result('toolu_bg', 'Started in the background.') },
+        { out: nestedCall('toolu_bg', 'toolu_bg1', 'Bash', { command: 'tail build.log' }) },
+        { out: said([{ type: 'text', text: 'It is watching.' }]) },
+        { out: done },
+        'drain',
+      ],
+      reply: 'It is watching.',
+      cards: ['toolu_bg|other|Task Watch the build'],
+      activity: {
+        toolu_bg: {
+          running: 0,
+          finished: 1,
+          agents: [
+            { id: 'toolu_bg', state: 'stopped', action: 'tail build.log', model: 'model-b' },
+          ],
+        },
+      },
+    },
   ];
   for (const row of rows) {
     const turn = run(row.steps);

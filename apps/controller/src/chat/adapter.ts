@@ -67,8 +67,8 @@ export type ChatTurnRequest = Readonly<{
   /** Review and advice turns. The adapter offers no edit or command tool and declines any ask. */
   readOnly?: boolean;
   /**
-   * False when the crew role turned subagents off. The adapter passes the client's own switch.
-   * Absent allows them.
+   * Whether the client may start subagents: the crew role's switch, or the family default when
+   * the role has none. The adapter passes the client's own switch. Absent means the default.
    */
   subagents?: boolean;
   /** Wall-clock budget for the whole turn, in milliseconds. */

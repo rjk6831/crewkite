@@ -1866,7 +1866,7 @@ export class ChatService {
       // A reviewer or advisor reads only, so what the thread allowed does not reach it.
       permissionGrants,
       readOnly: !writer,
-      subagents: turnAllowsSubagents(thread.crew, turn.role),
+      subagents: turnAllowsSubagents(thread.crew, turn.role, turn.selection.family),
       // Decided with the thread tools above: the person's servers a turn starts follow this turn's
       // family and this policy, and never exceed it.
       mcp: this.deps.mcp?.compose({

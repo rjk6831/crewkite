@@ -166,6 +166,11 @@ const passiveKinds = new Set<ChatToolKind>(['read', 'search', 'other']);
 // session, the way the writer keeps it off.
 const SUBAGENT_TOOL = 'invoke_subagent';
 const subagentWords = /subagent/i;
+/** The fields of an update that it sets, so a merge keeps what an earlier update said. */
+const defined = (update: ToolUpdate) =>
+  Object.fromEntries(
+    Object.entries(update).filter(([, value]) => value !== undefined && value !== null),
+  ) as Partial<ToolUpdate>;
 /** The call starts a subagent: its title, kind, name or metadata names one. */
 function startsSubagent(update: ToolUpdate) {
   const meta = fields(update._meta);
@@ -669,6 +674,27 @@ export function googleChatAdapter(deps: {
         { rpc: RpcId; callId: string; options: Map<string, ChatPermissionOption['kind']> }
       >();
       const subagents = new SubagentTracker(turnId, (event) => send(event));
+      // Sessions of this turn's subagents, each mapped to the call that started it. A session is
+      // claimed by the newest running subagent that has none yet, on its first frame.
+      const childSessions = new Map<string, string>();
+      // Child calls that opened a card through a permission request, so their updates reach it.
+      const childCards = new Set<string>();
+      // What each subagent session said about its calls, so its permission request is judged on
+      // the same kind, title and paths a parent call would be. Bounded like the trace.
+      const childCalls = new Map<string, ToolUpdate>();
+      function subagentFor(session: unknown): string | null {
+        if (typeof session !== 'string' || session === '' || session === sessionId) return null;
+        const known = childSessions.get(session);
+        if (known) return known;
+        const claimed = new Set(childSessions.values());
+        const free = subagents
+          .running()
+          .filter((id) => !claimed.has(id))
+          .at(-1);
+        if (!free || childSessions.size >= 64) return null;
+        childSessions.set(session, free);
+        return free;
+      }
       // A tool call frame without an ID this file can read still gets a card under its own ID.
       let unnamedCalls = 0;
 
@@ -979,20 +1005,29 @@ export function googleChatAdapter(deps: {
        * other session reaches the reply or opens a card.
        */
       function otherSession(params: Record<string, unknown>) {
-        const newest = subagents.running().at(-1);
         const raw = fields(params.update);
         if (
           phase !== 'turn' ||
-          !newest ||
           (raw.sessionUpdate !== 'tool_call' && raw.sessionUpdate !== 'tool_call_update')
         )
           return;
+        const owner = subagentFor(params.sessionId);
+        if (!owner) return;
         const parsed = toolUpdate.safeParse(raw);
         if (!parsed.success) return;
+        const known = childCalls.get(parsed.data.toolCallId);
+        if (known || childCalls.size < 4096)
+          childCalls.set(parsed.data.toolCallId, {
+            ...known,
+            ...defined(parsed.data),
+            toolCallId: parsed.data.toolCallId,
+          });
+        // A call the person was asked about has a card, and its result belongs on it.
+        if (childCards.has(parsed.data.toolCallId)) tool(raw, false);
         const kind = toolKind(parsed.data.kind);
         const action =
           cardTitle(kind, null, parsed.data.rawInput) || parsed.data.title?.trim() || null;
-        if (action) subagents.update(newest, newest, { action });
+        if (action) subagents.update(owner, owner, { action });
       }
       function update(params: Record<string, unknown>) {
         if (params.sessionId !== sessionId) return otherSession(params);
@@ -1034,11 +1069,17 @@ export function googleChatAdapter(deps: {
         if (!live) return;
         if (method !== 'session/request_permission') return live.respond(id, {});
         const parsed = permissionRequest.safeParse(params);
+        // A subagent of this turn asks under its own session and gets the parent's policy. Any
+        // other session is declined.
+        const child =
+          parsed.success && phase === 'turn' && parsed.data.sessionId !== sessionId
+            ? subagentFor(parsed.data.sessionId)
+            : null;
         if (
           !parsed.success ||
           phase !== 'turn' ||
           cancelled ||
-          parsed.data.sessionId !== sessionId
+          (parsed.data.sessionId !== sessionId && !child)
         ) {
           if (phase === 'turn' && !cancelled)
             unreadable('The Google client sent a permission request this app could not read.');
@@ -1067,7 +1108,20 @@ export function googleChatAdapter(deps: {
           unreadable('The Google client sent a permission request with no usable choices.');
           return reply(live, id, declined);
         }
-        const call = upsert(parsed.data.toolCall);
+        const asked = parsed.data.toolCall;
+        const call = upsert(
+          child
+            ? {
+                ...childCalls.get(asked.toolCallId),
+                ...defined(asked),
+                toolCallId: asked.toolCallId,
+              }
+            : asked,
+        );
+        if (child) {
+          childCards.add(call.id);
+          if (call.title) subagents.update(child, child, { action: call.title });
+        }
         const allow =
           options.find((option) => option.kind === 'allow-once') ??
           options.find((option) => option.kind === 'allow-thread');
@@ -1345,8 +1399,8 @@ export function googleChatAdapter(deps: {
           phase = 'done';
           stage = 'finish';
           closeItem();
-          // The agent answered the prompt, so the subagents it started have finished.
-          closeTools('done');
+          // A subagent the agent never reported finished did not finish.
+          closeTools('stopped');
           const reason = reply.success ? reply.data.stopReason : 'unreadable';
           if (reason === 'cancelled') terminal = { stopReason: 'stopped', failure: null };
           else if (reason === 'refusal')

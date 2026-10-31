@@ -121,8 +121,9 @@ function nativeChatArguments(directory: string, request: ChatTurnRequest): strin
     'features.apps': false,
     'features.hooks': false,
     // The client's own switch for subagents. The process lives for one turn, so the crew role's
-    // choice holds for exactly this turn.
-    'features.multi_agent': request.subagents !== false,
+    // choice holds for exactly this turn. It stays off unless the role turned it on, since child
+    // approvals rely on the client passing this turn's approval policy to each child.
+    'features.multi_agent': request.subagents === true,
     log_dir: join(directory, 'logs'),
   };
   return [
@@ -382,6 +383,17 @@ const tokenUsage = z.object({
     modelContextWindow: maybe(z.number().int().positive()),
   }),
 });
+// What one model request spent. Every field is read on its own.
+const spent = z.object({
+  tokenUsage: z.object({
+    last: z.object({
+      inputTokens: maybe(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)),
+      outputTokens: maybe(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)),
+    }),
+  }),
+});
+// A subagent's items CrewKite keeps for its approvals, the same facts it keeps for the parent's.
+const MAX_CHILD_ITEMS = 4096;
 const notice = z.object({
   message: maybe(z.string()),
   summary: maybe(z.string()),
@@ -489,6 +501,12 @@ class OpenAiChatTurn {
   private readonly lines: string[] = [];
   private readonly trace: ReturnType<typeof frameTrace>;
   private usage: ChatTurnResult['usage'] = null;
+  // Tokens every model request of the turn spent, the subagents' included. Null until one reports.
+  private tokensIn: number | null = null;
+  private tokensOut: number | null = null;
+  private childSpent = false;
+  private childItems = 0;
+  private readonly startedAt: number;
   private readonly finish: (result: ChatTurnResult) => void;
   private readonly schedule: Schedule;
 
@@ -500,6 +518,7 @@ class OpenAiChatTurn {
     this.threadTools = request.threadTools === false ? null : (deps.threadTools?.(request) ?? null);
     this.trace = frameTrace(request.now ?? Date.now, TRACE_LIMITS);
     this.subagents = new SubagentTracker(request.turnId, (event) => this.send(event));
+    this.startedAt = (request.now ?? Date.now)();
     let finish: (result: ChatTurnResult) => void = () => {};
     const result = new Promise<ChatTurnResult>((resolve) => {
       finish = resolve;
@@ -1067,6 +1086,7 @@ class OpenAiChatTurn {
         return;
       }
       case 'thread/tokenUsage/updated': {
+        this.spend(params);
         const value = tokenUsage.safeParse(params).data?.tokenUsage;
         if (!value) return;
         this.usage = {
@@ -1197,8 +1217,11 @@ class OpenAiChatTurn {
         ...Object.keys(states),
       ].filter((value): value is string => typeof value === 'string' && value !== ''),
     );
+    // An item that names no thread counts as one subagent of its own while it runs, and once it
+    // completes still naming none. Once real threads arrive, that stand-in goes.
     const own = ids.size === 0;
     if (own) ids.add(callId);
+    else if (this.subagents.parentOf(callId) === callId) this.subagents.remove(callId);
     const item = agentState(work?.status);
     for (const id of ids) {
       const state =
@@ -1218,6 +1241,11 @@ class OpenAiChatTurn {
    */
   private childNotification(threadId: string, method: string, params: unknown) {
     if (!this.subagents.parentOf(threadId)) return;
+    // The subagent spends the same allowance, so its requests count in the turn's tokens.
+    if (method === 'thread/tokenUsage/updated') {
+      if (this.spend(params)) this.childSpent = true;
+      return;
+    }
     if (method === 'turn/completed') {
       const status = turnDone.safeParse(params).data?.turn.status;
       return this.subagents.update(threadId, threadId, {
@@ -1228,6 +1256,24 @@ class OpenAiChatTurn {
     const raw = itemFrame.safeParse(params).data?.item;
     const head = itemHead.safeParse(raw).data;
     if (!head || CONTENT_ITEMS.has(head.type)) return;
+    // Its approvals name the item, so they need its command, paths and delete mark as a parent
+    // item's do. The record is bounded, and an item past the bound asks with what its request says.
+    if (!this.tools.has(head.id) && this.childItems < MAX_CHILD_ITEMS) {
+      this.childItems += 1;
+      if (head.type === 'commandExecution')
+        this.tools.set(head.id, commandItem.safeParse(raw).data?.command?.trim() ?? '');
+      else if (head.type === 'fileChange') {
+        const entries = this.paths(raw);
+        this.edits.set(head.id, entries);
+        this.tools.set(head.id, entries.map((entry) => entry.path).join('\n'));
+        if (
+          (changeItem.safeParse(raw).data?.changes ?? []).some(
+            (change) => change.kind?.type === 'delete',
+          )
+        )
+          this.deleting.add(head.id);
+      }
+    }
     const action =
       head.type === 'commandExecution'
         ? commandItem.safeParse(raw).data?.command?.trim() || 'Run a command'
@@ -1541,10 +1587,38 @@ class OpenAiChatTurn {
     });
   }
 
+  /** Adds one model request's tokens to the turn. True when the frame carried any. */
+  private spend(params: unknown) {
+    const last = spent.safeParse(params).data?.tokenUsage.last;
+    if (last?.inputTokens != null) this.tokensIn = (this.tokensIn ?? 0) + last.inputTokens;
+    if (last?.outputTokens != null) this.tokensOut = (this.tokensOut ?? 0) + last.outputTokens;
+    return last?.inputTokens != null || last?.outputTokens != null;
+  }
+
   private end(outcome: Outcome) {
     if (this.outcome) return;
-    // A finished turn finished its subagents with it. Any other ending leaves them unfinished.
-    this.subagents.close(outcome.stopReason === 'done' ? 'done' : 'stopped');
+    // A subagent the client never reported finished did not finish, whatever the turn did.
+    this.subagents.close('stopped');
+    // shortcut: a turn reports its tokens only when a subagent spent some, so the parent-only
+    // turns keep the stats they had. The sum takes one usage frame per model request. Upgrade:
+    // report the stats on every turn once a live run confirms that frame count.
+    if (this.childSpent) {
+      const now = (this.request.now ?? Date.now)();
+      this.send({
+        type: 'turn.stats',
+        turnId: this.request.turnId,
+        stats: {
+          tokensIn: this.tokensIn,
+          tokensOut: this.tokensOut,
+          tokensPerSecond: null,
+          firstTokenMs: null,
+          turnMs: Math.max(0, Math.round(now - this.startedAt)),
+          contextUsed: this.usage?.usedTokens ?? null,
+          contextCapacity: this.usage?.capacityTokens ?? null,
+          summaries: 0,
+        },
+      });
+    }
     this.outcome = outcome;
     try {
       this.emit({ type: 'turn.completed', turnId: this.request.turnId, ...outcome });

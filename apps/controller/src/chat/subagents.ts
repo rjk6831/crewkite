@@ -2,6 +2,7 @@ import {
   type AgentEvent,
   allowsSubagents,
   type ChatCrew,
+  type ChatFamily,
   type ChatRole,
   MAX_SUBAGENTS,
   type Subagent,
@@ -14,10 +15,14 @@ import {
 
 /**
  * Whether the crew lets this turn's client start subagents. A builder turn reads the builder's
- * switch, and a fix with no fixer in the crew runs as the builder, as the chain does. A turn
- * outside a crew has no switch and allows them.
+ * switch, and a fix with no fixer in the crew runs as the builder, as the chain does. A role saved
+ * without the switch, and a turn outside a crew, take the family default.
  */
-export function turnAllowsSubagents(crew: ChatCrew | null | undefined, role: ChatRole): boolean {
+export function turnAllowsSubagents(
+  crew: ChatCrew | null | undefined,
+  role: ChatRole,
+  family: ChatFamily,
+): boolean {
   const members = crew?.members ?? [];
   const find = (name: string) => members.find((member) => member.role === name);
   const member =
@@ -26,7 +31,7 @@ export function turnAllowsSubagents(crew: ChatCrew | null | undefined, role: Cha
       : role === 'fixer'
         ? (find('fixer') ?? find('builder'))
         : find(role);
-  return allowsSubagents(member);
+  return allowsSubagents(member, family);
 }
 
 // One turn tracks at most this many subagents. A client that reports more keeps its cards and
@@ -102,6 +107,18 @@ export class SubagentTracker {
     if (change.state) agent.state = change.state;
     if (change.action !== undefined) agent.action = words(change.action, ACTION) ?? agent.action;
     if (change.model !== undefined) agent.model = words(change.model, ID) ?? agent.model;
+    this.flush(entry.parent);
+  }
+
+  /** Forgets a subagent, as when a stand-in gives way to the threads the client named. */
+  remove(id: string) {
+    const entry = this.agents.get(id);
+    if (!entry) return;
+    this.agents.delete(id);
+    this.parents.set(
+      entry.parent,
+      (this.parents.get(entry.parent) ?? []).filter((value) => value !== id),
+    );
     this.flush(entry.parent);
   }
 

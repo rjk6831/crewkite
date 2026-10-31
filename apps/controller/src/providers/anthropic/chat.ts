@@ -778,6 +778,9 @@ function startTurn(
   const texts: string[] = [];
   const timers: Array<() => void> = [];
   const subagents = new SubagentTracker(turnId, send);
+  // Spawns that run in the background. Their call returns at once, so its result does not
+  // finish them; one still running at the end of the turn is stopped.
+  const background = new Set<string>();
   let resolveResult!: (value: ChatTurnResult) => void;
   const outcomePromise = new Promise<ChatTurnResult>((resolve) => {
     resolveResult = resolve;
@@ -926,6 +929,7 @@ function startTurn(
       ...(small ? { input } : {}),
     });
     // The subagent starts with the call. Its frames name this call as their parent.
+    if (SUBAGENT_TOOLS.has(name) && input.run_in_background === true) background.add(callId);
     if (SUBAGENT_TOOLS.has(name))
       subagents.update(callId, callId, {
         model: typeof input.model === 'string' ? input.model : null,
@@ -1090,7 +1094,7 @@ function startTurn(
       if (!parsedBlock.success || parsedBlock.data.type !== 'tool_result') continue;
       const { tool_use_id: callId, content: output, is_error: failed } = parsedBlock.data;
       // A subagent finishes when its parent call's result arrives.
-      if (callId && subagents.parentOf(callId) === callId)
+      if (callId && !background.has(callId) && subagents.parentOf(callId) === callId)
         subagents.settle(callId, failed ? 'failed' : 'done');
       const tool = callId ? tools.get(callId) : undefined;
       if (!callId || !tool || tool.done) continue;

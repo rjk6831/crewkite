@@ -19,9 +19,25 @@ test('each turn reads the switch of the crew role it runs as', () => {
     name: string;
     crew: ChatCrew | null;
     role: Parameters<typeof turnAllowsSubagents>[1];
+    family?: Parameters<typeof turnAllowsSubagents>[2];
     allow: boolean;
   }[] = [
     { name: 'no crew', crew: null, role: 'assistant', allow: true },
+    { name: 'no crew on OpenAI', crew: null, role: 'assistant', family: 'openai', allow: false },
+    {
+      name: 'builder left out on OpenAI',
+      crew: crew({ builder: undefined }),
+      role: 'assistant',
+      family: 'openai',
+      allow: false,
+    },
+    {
+      name: 'builder turned on for OpenAI',
+      crew: crew({ builder: true }),
+      role: 'assistant',
+      family: 'openai',
+      allow: true,
+    },
     { name: 'builder off', crew: crew({ builder: false }), role: 'assistant', allow: false },
     {
       name: 'builder left out',
@@ -55,7 +71,11 @@ test('each turn reads the switch of the crew role it runs as', () => {
     },
   ];
   for (const row of rows)
-    assert.equal(turnAllowsSubagents(row.crew, row.role), row.allow, row.name);
+    assert.equal(
+      turnAllowsSubagents(row.crew, row.role, row.family ?? 'anthropic'),
+      row.allow,
+      row.name,
+    );
 });
 
 test('a client type reads as words', () => {
@@ -82,6 +102,17 @@ test('the tracker sends one event per change, keeps a subagent under its first p
       ['spawn', { id: 'a', state: 'done', action: 'Read src/app.ts', model: 'model-b' }],
     ],
   );
+  // A stand-in gives way to the subagents the client names later.
+  tracker.update('spawn', 'spawn');
+  tracker.remove('spawn');
+  assert.deepEqual(events.at(-1)?.type === 'tool.subagents' && events.at(-1), {
+    type: 'tool.subagents',
+    turnId: 'trn_00000000000000000000000001',
+    callId: 'spawn',
+    running: 0,
+    finished: 1,
+    agents: [{ id: 'a', state: 'done', action: 'Read src/app.ts', model: 'model-b' }],
+  });
   for (let index = 0; index < MAX_SUBAGENTS + 3; index++) tracker.update('many', `agent-${index}`);
   tracker.close('stopped');
   const last = events.at(-1);

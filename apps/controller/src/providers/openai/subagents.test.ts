@@ -23,7 +23,8 @@ import { openAiChatAdapter } from './chat.ts';
 // after turn/start. A "wait" entry holds until CrewKite answers a request.
 const peer = String.raw`
 const { createInterface } = require('node:readline');
-const frames = JSON.parse(process.argv[2]);
+// $SCRATCH stands for the scratch copy, which is this process's working directory.
+const frames = JSON.parse(process.argv[2].replaceAll('$SCRATCH', process.cwd()));
 const send = (value) => process.stdout.write(JSON.stringify(value) + '\n');
 const running = { id: 'turn-1', status: 'inProgress', items: [], error: null };
 const replies = {
@@ -69,7 +70,8 @@ const finished: Frame = [
   { threadId: 'thread-1', turn: { id: 'turn-1', status: 'completed' } },
 ];
 
-function turn(frames: Frame[], patch: Partial<ChatTurnRequest> = {}) {
+/** `choice` is the person's answer to an ask the adapter leaves to them. */
+function turn(frames: Frame[], patch: Partial<ChatTurnRequest> = {}, choice = 'allow-once') {
   const home = mkdtempSync(join(root, 'turn-'));
   const scratch = join(home, 'scratch');
   const work = join(home, 'work');
@@ -105,8 +107,9 @@ function turn(frames: Frame[], patch: Partial<ChatTurnRequest> = {}) {
     },
     (event) => {
       events.push(AgentEventSchema.parse(event));
+      // The person answers a tick later, so an answer the adapter gives itself comes first.
       if (event.type === 'permission.requested')
-        handle.respondPermission(event.requestId, 'allow-once');
+        queueMicrotask(() => handle.respondPermission(event.requestId, choice));
     },
   );
   return { handle, events, args: () => args };
@@ -219,6 +222,36 @@ test('an item type CrewKite has no reader for shows as a card, and agent items c
       reply: 'Both reported.',
     },
     {
+      name: 'a spawn that names its thread only when it completes',
+      frames: [
+        item('item/started', {
+          id: 'collab-5',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          receiverThreadIds: [],
+        }),
+        item('item/completed', {
+          id: 'collab-5',
+          type: 'collabAgentToolCall',
+          tool: 'spawnAgent',
+          status: 'completed',
+          receiverThreadIds: ['thread-5'],
+          agentsStates: { 'thread-5': { status: 'running' } },
+        }),
+        ['turn/completed', { threadId: 'thread-5', turn: { id: 't', status: 'completed' } }],
+        finished,
+      ],
+      cards: ['collab-5|other|Collab agent tool call: spawn agent', 'collab-5|ok'],
+      activity: {
+        'collab-5': {
+          running: 0,
+          finished: 1,
+          agents: [{ id: 'thread-5', state: 'done', action: null, model: null }],
+        },
+      },
+      reply: '',
+    },
+    {
       name: 'an agent item of a shape CrewKite does not know',
       frames: [
         item('item/started', { id: 'agent-9', type: 'futureAgentThing', status: 42 }),
@@ -243,11 +276,11 @@ test('an item type CrewKite has no reader for shows as a card, and agent items c
           finished: 1,
           agents: [{ id: 'agent-9', state: 'done', action: null, model: null }],
         },
-        // The turn finished, so a subagent the client never closed finished with it.
+        // The client never said it finished, so the end of the turn stops it.
         'activity-1': {
           running: 0,
           finished: 1,
-          agents: [{ id: 'thread-7', state: 'done', action: null, model: null }],
+          agents: [{ id: 'thread-7', state: 'stopped', action: null, model: null }],
         },
       },
       reply: '',
@@ -294,7 +327,7 @@ test('a command approval from a subagent thread still comes to the person', asyn
 
 test('the launch turns the client multi agent feature on or off with the crew role', async () => {
   for (const [subagents, value] of [
-    [undefined, 'true'],
+    [undefined, 'false'],
     [true, 'true'],
     [false, 'false'],
   ] as const) {
@@ -302,4 +335,104 @@ test('the launch turns the client multi agent feature on or off with the crew ro
     await run.handle.result;
     assert(run.args().includes(`features.multi_agent=${value}`), String(subagents));
   }
+});
+
+test('a subagent command or edit inside the scratch copy is answered by the policy as a parent one is', async () => {
+  const frames: Frame[] = [
+    item('item/started', {
+      id: 'collab-1',
+      type: 'collabAgentToolCall',
+      tool: 'spawnAgent',
+      receiverThreadIds: ['thread-2'],
+    }),
+    item(
+      'item/started',
+      {
+        id: 'e-1',
+        type: 'fileChange',
+        changes: [
+          { path: '$SCRATCH/a.ts', kind: { type: 'update' } },
+          { path: '$SCRATCH/old.ts', kind: { type: 'delete' } },
+        ],
+      },
+      'thread-2',
+    ),
+    {
+      id: 7,
+      method: 'item/fileChange/requestApproval',
+      params: { threadId: 'thread-2', turnId: 't', itemId: 'e-1', grantRoot: null },
+    },
+    'wait',
+    item(
+      'item/started',
+      { id: 'c-1', type: 'commandExecution', command: 'npm test', cwd: '$SCRATCH' },
+      'thread-2',
+    ),
+    {
+      id: 8,
+      method: 'item/commandExecution/requestApproval',
+      params: { threadId: 'thread-2', turnId: 't', itemId: 'c-1', cwd: '$SCRATCH' },
+    },
+    'wait',
+    finished,
+  ];
+  const rows = [
+    { policy: 'allow-edits', edit: 'allow-once', command: 'deny' },
+    { policy: 'allow-all', edit: 'allow-once', command: 'allow-once' },
+  ] as const;
+  for (const row of rows) {
+    const run = turn(frames, { permissionPolicy: row.policy, subagents: true }, 'deny');
+    assert.equal((await run.handle.result).stopReason, 'done', row.policy);
+    const asked = run.events.filter((event) => event.type === 'permission.requested');
+    // The edit's ask names its paths and its delete mark, as a parent edit's does.
+    assert.equal(asked[0]?.question, 'Apply these file changes?');
+    assert.match(asked[0]?.detail ?? '', /a\.ts\nold\.ts/);
+    assert.equal(asked[0]?.deletes, true);
+    assert.match(asked[1]?.detail ?? '', /npm test/);
+    assert.deepEqual(
+      run.events.flatMap((event) => (event.type === 'permission.resolved' ? [event.choice] : [])),
+      [row.edit, row.command],
+      row.policy,
+    );
+  }
+});
+
+test('the turn reports the tokens its subagents spent with its own', async () => {
+  const usage = (threadId: string, input: number, output: number, window?: number) =>
+    [
+      'thread/tokenUsage/updated',
+      {
+        threadId,
+        turnId: 't',
+        tokenUsage: {
+          last: { inputTokens: input, outputTokens: output, totalTokens: input + output },
+          ...(window ? { modelContextWindow: window } : {}),
+        },
+      },
+    ] as Frame;
+  const spawn = item('item/started', {
+    id: 'collab-1',
+    type: 'collabAgentToolCall',
+    tool: 'spawnAgent',
+    receiverThreadIds: ['thread-2'],
+  });
+  const run = turn([spawn, usage('thread-2', 100, 20), usage('thread-1', 50, 5, 1000), finished], {
+    subagents: true,
+  });
+  await run.handle.result;
+  const stats = run.events.find((event) => event.type === 'turn.stats');
+  assert.deepEqual(stats?.type === 'turn.stats' && stats.stats, {
+    tokensIn: 150,
+    tokensOut: 25,
+    tokensPerSecond: null,
+    firstTokenMs: null,
+    turnMs: 0,
+    contextUsed: 55,
+    contextCapacity: 1000,
+    summaries: 0,
+  });
+  // A turn whose subagents spent nothing keeps the stats it had, which is none.
+  const plain = turn([usage('thread-1', 50, 5, 1000), finished]);
+  await plain.handle.result;
+  assert(!plain.events.some((event) => event.type === 'turn.stats'));
 });
