@@ -184,7 +184,7 @@ export function ChecksSettings({
         <ul>
           {items.map((item) => (
             <li key={item.id}>
-              <label>
+              <label className="th-toggle">
                 <input
                   type="checkbox"
                   checked={item.enabled}
