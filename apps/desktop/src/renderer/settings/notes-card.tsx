@@ -122,6 +122,7 @@ export function NotesCard({
               </div>
               <div className="st-controls">
                 <button
+                  className="button secondary"
                   type="button"
                   onClick={() => {
                     setEditing(entry.id);
@@ -131,6 +132,7 @@ export function NotesCard({
                   Edit
                 </button>
                 <button
+                  className="button secondary"
                   type="button"
                   onClick={() =>
                     void change(() => removeNote(source, projectId, entry.id), 'Deleted.').then(
@@ -183,11 +185,12 @@ export function NotesCard({
               </small>
             </div>
             <div className="st-controls">
-              <button type="submit" disabled={!valid}>
+              <button className="button primary" type="submit" disabled={!valid}>
                 {editing ? 'Save changes' : 'Add note'}
               </button>
               {editing && (
                 <button
+                  className="button secondary"
                   type="button"
                   onClick={() => {
                     setEditing(null);
@@ -198,6 +201,7 @@ export function NotesCard({
                 </button>
               )}
               <button
+                className="button secondary"
                 type="button"
                 disabled={!read || read.notes.length === 0}
                 onClick={() => void exportFile()}
