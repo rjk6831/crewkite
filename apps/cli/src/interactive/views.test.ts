@@ -300,16 +300,19 @@ test('each interactive view draws a scripted thread in colour and without it und
     );
   }
 
-  // The kite panels and the gauge take the desktop's colours: yellow at 40 percent, red at empty.
+  // The kite panels and the gauge take the desktop's colours: bright green when full, yellow by 60
+  // percent, orange at 40 and deep red at empty.
   const wordmark = renderToString(
     h(views.Wordmark, { columns: 100, colors: palette('dark', true) }),
     { columns: 100 },
   );
   for (const panel of ['#40b0a8', '#e87860', '#4850a8', '#e0b860'])
     assert.ok(wordmark.includes(rgb(panel)));
-  assert.equal(gaugeHex(60), '#cabc21');
-  assert.equal(gaugeHex(40), '#ca8321');
-  assert.equal(gaugeHex(0), '#ca2121');
+  assert.equal(gaugeHex(100), '#21ab38');
+  assert.equal(gaugeHex(85), '#70b620');
+  assert.equal(gaugeHex(60), '#d9b412');
+  assert.equal(gaugeHex(40), '#e9820c');
+  assert.equal(gaugeHex(0), '#8f1414');
   const fresh = renderToString(
     h(views.UsageLine, {
       catalog: { families: [{ ...stale.families[1], readAt: '2026-10-28T11:30:00.000Z' }] },
