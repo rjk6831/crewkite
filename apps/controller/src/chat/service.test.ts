@@ -1046,6 +1046,16 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     ],
   );
   assert.equal(thread.turns[1].userMessageId, thread.turns[0].userMessageId);
+  // Each turn carries CrewKite's reading of its family's tightest window, so the adapter can
+  // tell a client's early usage warning from a low allowance.
+  assert.deepEqual(
+    (['openai', 'google'] as const).map(
+      (family) =>
+        (on.adapters.get(family)?.requests as unknown as ChatTurnRequest[] | undefined)?.[0]
+          ?.allowanceLeft,
+    ),
+    [99, 80],
+  );
   assert.deepEqual(on.settled, [
     ['openai', on.taskId],
     ['google', on.taskId],

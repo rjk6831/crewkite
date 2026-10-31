@@ -26,6 +26,7 @@ import {
   type ChatTurnRequest,
   type ChatTurnResult,
   chatFailure,
+  usageWarningShows,
 } from '../../chat/adapter.ts';
 import { ChatClientRefused } from '../../chat/clients.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
@@ -1117,7 +1118,11 @@ class OpenAiChatTurn {
       case 'configWarning': {
         const value = notice.safeParse(params).data;
         const text = [value?.message ?? value?.summary, value?.details].filter(Boolean).join(' ');
-        if (text) this.notice('warning', text, true);
+        // A usage warning shows in the thread only when CrewKite's own reading is low or missing.
+        // Every other client warning, and a usage one while the allowance is not low, goes to the
+        // turn trace.
+        const shown = LIMIT_TEXT.test(text) && usageWarningShows(this.request);
+        if (text) this.notice('warning', text, !shown);
         return;
       }
       case 'error': {
