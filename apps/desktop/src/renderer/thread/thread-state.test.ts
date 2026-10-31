@@ -633,6 +633,14 @@ test('finished reads and searches in a row fold into one line, and anything to a
     options: [{ id: 'once', label: 'Allow once', kind: 'allow-once' }],
     choice: 'once',
   };
+  const ask = (request: string, call: string, choice: string | null = null): Block => ({
+    ...asked,
+    id: `permission:${request}`,
+    requestId: request,
+    callId: call,
+    question: 'Run this command?',
+    choice,
+  });
   // A run shows as its label and any other block as its id.
   const cases: { name: string; blocks: Block[]; ended?: boolean; want: string[] }[] = [
     {
@@ -665,6 +673,29 @@ test('finished reads and searches in a row fold into one line, and anything to a
       name: 'a read that asked first stands alone',
       blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('r3', 'read'), asked],
       want: ['Read 2 files', 'tool:r3', 'permission:p1'],
+    },
+    {
+      // One state per request: the command waits in its request card alone.
+      name: 'a call waiting on its request shows only the request',
+      blocks: [tool('c1', 'command', { status: 'running' }), ask('p2', 'c1')],
+      ended: false,
+      want: ['permission:p2'],
+    },
+    {
+      name: 'a request the turn ended before an answer shows once, without a stopped card',
+      blocks: [tool('c1', 'command', { status: 'stopped' }), ask('p2', 'c1'), ask('p3', 'c2')],
+      want: ['permission:p2', 'permission:p3'],
+    },
+    {
+      name: 'a request asked again for the same call shows the newest one',
+      blocks: [tool('c1', 'command', { status: 'running' }), ask('p2', 'c1'), ask('p3', 'c1')],
+      ended: false,
+      want: ['permission:p3'],
+    },
+    {
+      name: 'an answered request keeps the card of the call it allowed',
+      blocks: [tool('c1', 'command'), ask('p2', 'c1', 'once')],
+      want: ['tool:c1', 'permission:p2'],
     },
     {
       name: 'a thought that ended with no text draws nothing and keeps the run',
