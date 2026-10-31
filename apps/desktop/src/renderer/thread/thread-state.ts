@@ -18,7 +18,7 @@ import {
   applyEvent,
   blankTurn,
   isStop,
-  roleLabels,
+  replyLabel,
   type TurnIdentity,
   type TurnStatus,
   type TurnView,
@@ -410,7 +410,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     const base = record?.view ?? blankTurn(id);
     // The effort the client reported on the stored reply beats the one the thread asked for.
     const reported = reply?.author.kind === 'assistant' ? reply.author.effort : undefined;
-    const identity: TurnIdentity | null =
+    const found: TurnIdentity | null =
       base.identity ??
       (meta
         ? { ...meta.selection, effort: reported ?? meta.selection.effort, role: meta.role }
@@ -422,6 +422,8 @@ export function threadItems(state: ThreadState): ThreadItem[] {
               role: reply.author.role,
             }
           : null);
+    // The live event names no slice. The stored turn does, once the thread read brings it.
+    const identity = found && meta?.slice !== undefined ? { ...found, slice: meta.slice } : found;
     const stopped = isStop(meta?.failure);
     const status: TurnStatus = stopped
       ? 'stopped'
@@ -653,7 +655,7 @@ export function liveSignals(items: readonly ThreadItem[]): LiveSignals {
     newest = turn.id;
     if (!turn.ended) live.add(turn.id);
     else if (turn.status === 'done' && turn.blocks.some((block) => block.kind === 'text'))
-      finished.set(turn.id, roleLabels[turn.identity?.role ?? 'assistant']);
+      finished.set(turn.id, replyLabel(turn.identity));
     if (!turn.ended)
       for (const block of turn.blocks)
         if (block.kind === 'permission' && block.choice === null)

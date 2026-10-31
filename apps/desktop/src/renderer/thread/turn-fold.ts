@@ -77,7 +77,24 @@ export type TurnIdentity = {
   model: string;
   effort: ChatEffort;
   role: ChatRole;
+  /** The plan slice whose lane opened the turn, from the stored turn. */
+  slice?: number;
 };
+
+/**
+ * The role a turn shows. A read-only plan slice runs in the ask role so every adapter keeps it
+ * read only, and it still does a builder's work for its slice, so it reads as the builder.
+ */
+export const shownRole = (identity: Pick<TurnIdentity, 'role' | 'slice'>): ChatRole =>
+  identity.slice !== undefined && identity.role === 'ask' ? 'assistant' : identity.role;
+
+/** The badge a turn's reply shows: the role's, with the slice it ran for. */
+export function replyLabel(identity: TurnIdentity | null): string | null {
+  if (!identity) return null;
+  const role = roleLabels[shownRole(identity)];
+  if (identity.slice === undefined) return role;
+  return role ? `Slice ${identity.slice} ${role.toLowerCase()}` : `Slice ${identity.slice}`;
+}
 
 export type TurnView = {
   id: string;

@@ -10,7 +10,7 @@ import {
   turnChip,
   unlistedLine,
 } from './subagent-view.ts';
-import { applyEvent, blankTurn, type SubagentActivity } from './turn-fold.ts';
+import { applyEvent, blankTurn, replyLabel, type SubagentActivity } from './turn-fold.ts';
 
 const turnId = 'trn_00000000000000000000000001';
 const agent = (id: string, state: 'running' | 'done' | 'failed' | 'stopped', action?: string) => ({
@@ -29,17 +29,37 @@ test('the chip names the role, family, model and an effort the person picked', (
   const rows = [
     {
       identity: { family: 'openai', model: 'model-a', effort: 'medium', role: 'assistant' },
-      chip: { role: 'Builder', familyName: 'OpenAI', model: 'model-a', effort: 'medium' },
+      chip: {
+        role: 'Builder',
+        slice: null,
+        familyName: 'OpenAI',
+        model: 'model-a',
+        effort: 'medium',
+      },
     },
     {
       identity: { family: 'local', model: 'model-b', effort: 'default', role: 'reviewer' },
-      chip: { role: 'Reviewer', familyName: 'Local', model: 'model-b', effort: null },
+      chip: { role: 'Reviewer', slice: null, familyName: 'Local', model: 'model-b', effort: null },
     },
   ] as const;
   for (const row of rows) {
     const { family: _family, ...chip } = turnChip(row.identity);
     assert.deepEqual(chip, row.chip);
   }
+});
+
+test('a plan slice turn names its slice, and a read-only slice reads as the builder', () => {
+  const base = { family: 'openai', model: 'model-a', effort: 'default' } as const;
+  const read = turnChip({ ...base, role: 'ask', slice: 2 });
+  assert.equal(read.role, 'Builder');
+  assert.equal(read.slice, 'Slice 2');
+  assert.equal(turnChip({ ...base, role: 'reviewer', slice: 3 }).role, 'Reviewer');
+  assert.equal(turnChip({ ...base, role: 'ask' }).role, 'Ask');
+  assert.equal(turnChip({ ...base, role: 'ask' }).slice, null);
+  assert.equal(replyLabel({ ...base, role: 'ask', slice: 2 }), 'Slice 2');
+  assert.equal(replyLabel({ ...base, role: 'reviewer', slice: 2 }), 'Slice 2 reviewer');
+  assert.equal(replyLabel({ ...base, role: 'assistant', slice: 1 }), 'Slice 1');
+  assert.equal(replyLabel({ ...base, role: 'ask' }), 'Ask');
 });
 
 test('the chip shows the picker label for a listed model and the ID for one it does not list', () => {

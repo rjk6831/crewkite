@@ -857,6 +857,14 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
     // The live events are gone after a reload; the turn row still carries the stats line.
     assert.deepEqual(turnOf(threadItems(state)).stats, stats, role);
   }
+  // A plan slice's turn keeps its slice, so its chip names the slice and its builder role.
+  const plain = read('reviewer');
+  const sliced: ChatThreadRead = {
+    ...plain,
+    turns: plain.turns.map((value) => ({ ...value, role: 'ask' as const, slice: 2 })),
+  };
+  const state = reduceThread(initialThreadState(task), { type: 'loaded', read: sliced });
+  assert.equal(turnOf(threadItems(state)).identity?.slice, 2);
 });
 
 test('events that a thread read or a stored turn read already covers apply once', () => {
