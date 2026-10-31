@@ -12,13 +12,13 @@ import {
 import { familyName } from '../components.tsx';
 import { AttachmentChips, chipOf, FileChips } from './attach.tsx';
 import { FailureLine, PermissionCard, ThinkingCard, ToolCard, ToolRunCard } from './cards.tsx';
-import { FamilyMark } from './family-mark.tsx';
 import { Markdown } from './markdown.tsx';
 import { effortLabel } from './model-picker.tsx';
 import { ReplyMenu } from './reply-menu.tsx';
 import { markMatches } from './reveal-dom.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
-import { replySource, roleLabels, viewBlocks } from './turn-fold.ts';
+import { TurnChip } from './turn-chip.tsx';
+import { replySource, viewBlocks } from './turn-fold.ts';
 import { TurnStats } from './turn-stats.tsx';
 import { layoutRows, mountPlan, rowTop, rowWindow } from './virtual-window.ts';
 
@@ -62,7 +62,6 @@ const TurnRow = memo(function TurnRow({
   onOpenChanges,
 }: { turn: TurnView } & TurnHandlers) {
   const identity = turn.identity;
-  const role = identity ? roleLabels[identity.role] : null;
   const source = turn.ended && turn.status === 'done' ? replySource(turn.blocks) : '';
   const copyable = source !== '';
   return (
@@ -71,13 +70,7 @@ const TurnRow = memo(function TurnRow({
       aria-busy={!turn.ended}
       data-turn-id={turn.id}
     >
-      {identity && (
-        <header className="th-turn-head">
-          <FamilyMark family={identity.family} />
-          <span>{modelLine(identity)}</span>
-          {role && <span className="th-role">{role}</span>}
-        </header>
-      )}
+      <TurnChip turn={turn} />
       {viewBlocks(turn.blocks, turn.ended).map((block): ReactNode => {
         // A client note is not part of the reply. It waits in the trace below.
         if (block.kind === 'notice' && block.trace) return null;
@@ -93,7 +86,14 @@ const TurnRow = memo(function TurnRow({
           case 'thinking':
             return <ThinkingCard key={block.id} block={block} ended={turn.ended} />;
           case 'tool':
-            return <ToolCard key={block.id} block={block} onOpenChanges={onOpenChanges} />;
+            return (
+              <ToolCard
+                key={block.id}
+                block={block}
+                ended={turn.ended}
+                onOpenChanges={onOpenChanges}
+              />
+            );
           case 'permission':
             return (
               <PermissionCard

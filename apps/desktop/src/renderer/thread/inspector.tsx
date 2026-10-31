@@ -1,4 +1,5 @@
 import {
+  allowsSubagents,
   type ChatCrewChain,
   ChatCrewRoleSchema,
   type ChatFlightMode,
@@ -55,6 +56,7 @@ import { modelLine } from './message-list.tsx';
 import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
+import { SubagentSwitch } from './subagent-switch.tsx';
 
 export type InspectorTab = 'changes' | 'usage' | 'analytics' | 'crew' | 'thread' | `ext:${string}`;
 const tabs: { id: InspectorTab; label: string }[] = [
@@ -557,6 +559,20 @@ function CrewTab({
       ...(role === 'builder' ? { selection } : {}),
     });
   }
+  // A role left on keeps no field, so a crew that never turned subagents off keeps its shape.
+  function allowSubagents(role: string, on: boolean) {
+    if (!crew) return;
+    onConfigure({
+      crew: {
+        ...crew,
+        members: crew.members.map((member) => {
+          if (member.role !== role) return member;
+          const { allowSubagents: _was, ...rest } = member;
+          return on ? rest : { ...rest, allowSubagents: false };
+        }),
+      },
+    });
+  }
   // The orchestrator starts on the builder's model, and the row's select changes it. Removing it
   // goes back to one builder turn per message.
   function setOrchestrator(on: boolean) {
@@ -618,6 +634,13 @@ function CrewTab({
                     choices={choices}
                     value={member.selection}
                     onChange={(selection) => assign(role, selection)}
+                  />
+                  <SubagentSwitch
+                    id={`${idBase}-${role}-subagents`}
+                    role={crewRoleNames[role]}
+                    family={member.selection.family}
+                    checked={allowsSubagents(member)}
+                    onChange={(on) => allowSubagents(role, on)}
                   />
                 </span>
               ) : member ? (

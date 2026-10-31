@@ -1,0 +1,247 @@
+/* The turn chip: one capsule split into role, model and effort, with the subagent badge beside
+   it. It uses the shared tokens only; the family class supplies --family and --family-fill. */
+.sa-head {
+  flex-wrap: wrap;
+  row-gap: 4px;
+  min-width: 0;
+}
+.sa-chip {
+  display: inline-flex;
+  align-items: stretch;
+  min-width: 0;
+  max-width: 100%;
+  height: 22px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1;
+}
+.sa-seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  white-space: nowrap;
+}
+.sa-seg + .sa-seg {
+  border-left: 1px solid var(--border);
+}
+/* The role is the one coloured word: the family's text tint, which reads at 4.5:1 on the card. */
+.sa-role {
+  padding-left: 3px;
+  color: var(--family);
+  font-weight: 600;
+}
+.sa-role .family-mark {
+  width: 15px;
+  height: 15px;
+  font-size: 9px;
+}
+/* The model ID is the part that gives way when the row is narrow. */
+.sa-model {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 10.5px;
+  line-height: 20px;
+  text-overflow: ellipsis;
+}
+.sa-effort {
+  color: var(--text-muted);
+}
+
+.sa-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 22px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 11px;
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+.sa-badge.is-running {
+  border-color: color-mix(in srgb, var(--blue) 55%, transparent);
+  background: color-mix(in srgb, var(--blue) 10%, transparent);
+  color: var(--text);
+}
+.sa-badge.is-failed {
+  border-color: color-mix(in srgb, var(--amber) 55%, transparent);
+  color: var(--amber);
+}
+.sa-pulse {
+  position: relative;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--blue);
+}
+.sa-pulse::after {
+  content: "";
+  position: absolute;
+  inset: -3px;
+  border-radius: 50%;
+  border: 1px solid var(--blue);
+  animation: sa-ring 1.6s ease-out infinite;
+}
+@keyframes sa-ring {
+  from {
+    opacity: 0.9;
+    transform: scale(0.6);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.5);
+  }
+}
+
+/* A spawn card lists each subagent with its state and latest action. */
+.sa-list {
+  display: grid;
+  gap: 2px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.sa-row {
+  display: grid;
+  grid-template-columns: 14px minmax(0, auto) minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 5px 2px;
+  font-size: 12px;
+}
+.sa-row + .sa-row {
+  border-top: 1px solid var(--border);
+}
+.sa-row-name {
+  color: var(--text);
+  white-space: nowrap;
+}
+.sa-row-action {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-muted);
+  font-family: "JetBrains Mono", monospace;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sa-row-model {
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.sa-row-state {
+  display: inline-grid;
+  place-items: center;
+}
+.sa-row.is-running .sa-row-state {
+  color: var(--blue);
+}
+.sa-row.is-done .sa-row-state {
+  color: var(--green);
+}
+.sa-row.is-failed .sa-row-state {
+  color: var(--red);
+}
+.sa-row.is-stopped .sa-row-state {
+  color: var(--amber);
+}
+
+/* At narrow widths the model drops under the action so the action keeps its room. */
+@media (max-width: 860px) {
+  .sa-row {
+    grid-template-columns: 14px minmax(0, 1fr);
+    row-gap: 2px;
+  }
+  .sa-row-action,
+  .sa-row-model {
+    grid-column: 2;
+  }
+  .sa-chip .sa-effort {
+    padding: 0 6px;
+  }
+}
+
+/* A crew role's subagent switch: a small track that fills with the accent when on. */
+.sa-switch-row {
+  display: flex;
+  flex-wrap: wrap;
+  flex-basis: 100%;
+  align-items: center;
+  gap: 4px 10px;
+}
+/* The shared label stacks its input above the text; the switch sits beside its words. */
+.sa-switch {
+  display: inline-flex;
+  flex-direction: row;
+  align-items: center;
+  gap: 7px;
+  color: var(--text-muted);
+  font-size: 12px;
+  cursor: pointer;
+}
+.sa-switch input {
+  position: relative;
+  flex-shrink: 0;
+  width: 26px;
+  height: 15px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+  background: var(--surface-raised);
+  appearance: none;
+  cursor: inherit;
+  transition: background-color 0.15s ease;
+}
+.sa-switch input::before {
+  content: "";
+  position: absolute;
+  top: 2px;
+  left: 2px;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  transition: transform 0.15s ease;
+}
+.sa-switch input:checked {
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.sa-switch input:checked::before {
+  background: var(--accent-ink);
+  transform: translateX(11px);
+}
+.sa-switch input:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.sa-switch:has(input:disabled) {
+  cursor: default;
+  opacity: 0.6;
+}
+.sa-switch-note {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sa-pulse::after {
+    animation: none;
+    opacity: 0.6;
+  }
+  .sa-switch input,
+  .sa-switch input::before {
+    transition: none;
+  }
+}

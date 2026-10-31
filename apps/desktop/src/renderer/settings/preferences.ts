@@ -225,6 +225,9 @@ export function withThreadDefaults<Input, Result extends { outcome: string; enti
 // Crew presets keep only the roles the person pinned to a model and effort. Every other role is
 // picked when a thread starts from the preset, so a preset still works after a family disconnects.
 const presetKey = 'crewkite-crew-presets-v1';
+// The roles a preset keeps subagents off for, saved apart so the pin file keeps its shape for the
+// CLI. Every role left out allows them.
+const subagentsKey = 'crewkite-crew-subagents-v1';
 
 export const crewRoleNames: Record<ChatCrewRole, string> = {
   builder: 'Builder',
@@ -243,20 +246,30 @@ export const crewPresetNames = Object.keys(presetRoles) as CrewPresetName[];
 export type CrewPreset = {
   name: CrewPresetName;
   /** Null picks the role's model and effort when a thread starts from the preset. */
-  members: { role: ChatCrewRole; selection: ChatModelSelection | null }[];
+  /** allowSubagents is false when the person turned the role's subagents off. */
+  members: { role: ChatCrewRole; selection: ChatModelSelection | null; allowSubagents?: boolean }[];
 };
 
 export function readCrewPresets(store: Store | null = browserStore()): CrewPreset[] {
-  let saved: Record<string, Record<string, unknown> | undefined> | null = null;
-  try {
-    const raw = store?.getItem(presetKey);
-    saved = raw ? JSON.parse(raw) : null;
-  } catch {}
+  const read = (key: string): Record<string, Record<string, unknown> | undefined> | null => {
+    try {
+      const raw = store?.getItem(key);
+      return raw ? JSON.parse(raw) : null;
+    } catch {
+      return null;
+    }
+  };
+  const saved = read(presetKey);
+  const off = read(subagentsKey);
   return crewPresetNames.map((name) => ({
     name,
     members: presetRoles[name].map((role) => {
       const pinned = ChatModelSelectionSchema.safeParse(saved?.[name]?.[role]);
-      return { role, selection: pinned.success ? pinned.data : null };
+      return {
+        role,
+        selection: pinned.success ? pinned.data : null,
+        allowSubagents: off?.[name]?.[role] !== false,
+      };
     }),
   }));
 }
@@ -270,8 +283,19 @@ export function writeCrewPresets(presets: CrewPreset[], store: Store | null = br
       ),
     ]),
   );
+  const off = Object.fromEntries(
+    presets.map((preset) => [
+      preset.name,
+      Object.fromEntries(
+        preset.members.flatMap(({ role, allowSubagents }) =>
+          allowSubagents === false ? [[role, false]] : [],
+        ),
+      ),
+    ]),
+  );
   try {
     store?.setItem(presetKey, JSON.stringify(pins));
+    store?.setItem(subagentsKey, JSON.stringify(off));
   } catch {}
 }
 
@@ -328,7 +352,7 @@ export function crewFromPreset(
   // The challenger takes a family the reviewer left free when there is one.
   const taken: ChatFamily[] = [builder.family];
   const members: ChatCrew['members'] = [];
-  for (const { role } of preset.members) {
+  for (const { role, allowSubagents } of preset.members) {
     const selection =
       role === 'builder'
         ? builder
@@ -337,7 +361,7 @@ export function crewFromPreset(
             ? builder
             : (best(taken) ?? best([builder.family]) ?? builder)));
     if (role !== 'fixer' && role !== 'orchestrator') taken.push(selection.family);
-    members.push({ role, selection });
+    members.push({ role, selection, ...(allowSubagents === false ? { allowSubagents } : {}) });
   }
   return { name: preset.name, members };
 }

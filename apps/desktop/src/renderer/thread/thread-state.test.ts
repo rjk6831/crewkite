@@ -606,6 +606,7 @@ test('finished reads and searches in a row fold into one line, and anything to a
       status: 'ok',
       diff: null,
       summary: null,
+      subagents: null,
       ...more,
     }) satisfies ToolBlock;
   const thought = (item: string, text: string, done = true): Block => ({

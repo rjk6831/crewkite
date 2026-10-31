@@ -16,6 +16,7 @@ import {
   writeThreadDefaults,
 } from './preferences.ts';
 import '../thread/crew.css';
+import { SubagentSwitch } from '../thread/subagent-switch.tsx';
 
 const auto = 'auto';
 const saved_ = 'saved';
@@ -177,13 +178,17 @@ export function GeneralCard({
     writeThreadDefaults(next);
   };
   const [presets, setPresets] = useState<CrewPreset[]>(() => readCrewPresets());
-  const pin = (name: CrewPreset['name'], role: string, selection: ChatModelSelection | null) => {
+  const pin = (
+    name: CrewPreset['name'],
+    role: string,
+    change: Partial<Pick<CrewPreset['members'][number], 'selection' | 'allowSubagents'>>,
+  ) => {
     const next = presets.map((preset) =>
       preset.name === name
         ? {
             ...preset,
             members: preset.members.map((member) =>
-              member.role === role ? { ...member, selection } : member,
+              member.role === role ? { ...member, ...change } : member,
             ),
           }
         : preset,
@@ -294,7 +299,16 @@ export function GeneralCard({
                       choices={choices}
                       value={member.selection}
                       autoText={autoLabel(member.role)}
-                      onChange={(selection) => pin(preset.name, member.role, selection)}
+                      onChange={(selection) => pin(preset.name, member.role, { selection })}
+                    />
+                    <SubagentSwitch
+                      id={`settings-${presetId(preset.name)}-${member.role}-subagents`}
+                      role={`${preset.name} ${crewRoleNames[member.role]}`}
+                      family={member.selection?.family ?? null}
+                      checked={member.allowSubagents !== false}
+                      onChange={(allowSubagents) =>
+                        pin(preset.name, member.role, { allowSubagents })
+                      }
                     />
                   </span>
                 </div>

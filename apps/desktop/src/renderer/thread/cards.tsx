@@ -19,6 +19,8 @@ import { familyName } from '../components.tsx';
 import { formatSpan } from '../usage-gauges.tsx';
 import type { TryWithChoice } from './file-fit.ts';
 import { ModelPicker } from './model-picker.tsx';
+import { subagentBadge, subagentRows, unlistedLine } from './subagent-view.ts';
+import { SubagentBadge } from './turn-chip.tsx';
 import {
   type PermissionBlock,
   runLabel,
@@ -102,17 +104,55 @@ export const lineClass = (line: string) =>
         ? 'is-hunk'
         : '';
 
+/** The subagents a spawn card started, one row each with its latest action. */
+function SubagentList({ block, ended }: { block: ToolBlock; ended: boolean }) {
+  if (!block.subagents) return null;
+  const more = unlistedLine(block.subagents);
+  return (
+    <>
+      <ul className="sa-list" aria-label="Subagents">
+        {subagentRows(block.subagents, ended).map((row) => (
+          <li key={row.key} className={`sa-row is-${row.state}`}>
+            <span className="sa-row-state">
+              {row.state === 'running' ? (
+                <LoaderCircle size={12} className="th-spin" aria-label={row.stateText} />
+              ) : row.state === 'done' ? (
+                <Check size={12} aria-label={row.stateText} />
+              ) : (
+                <CircleX size={12} aria-label={row.stateText} />
+              )}
+            </span>
+            <span className="sa-row-name">{row.name}</span>
+            <span className="sa-row-action" title={row.action}>
+              {row.action}
+            </span>
+            {row.model && <span className="sa-row-model">{row.model}</span>}
+          </li>
+        ))}
+      </ul>
+      {more && <p className="th-muted">{more}</p>}
+    </>
+  );
+}
+
 export function ToolCard({
   block,
+  ended = false,
   onOpenChanges,
 }: {
   block: ToolBlock;
+  /** The turn ended, so a subagent still marked running shows as stopped. */
+  ended?: boolean;
   onOpenChanges: (path: string) => void;
 }) {
   const Icon = toolIcons[block.toolKind];
   const [override, setOverride] = useState<boolean | null>(null);
-  const hasBody = block.output !== '' || block.summary !== null;
-  const open = override ?? (block.status === 'running' && block.output !== '');
+  const badge = block.subagents ? subagentBadge([block.subagents], ended) : null;
+  const hasBody = block.output !== '' || block.summary !== null || badge !== null;
+  // A spawn card stays open while its subagents run, so their latest actions are in view.
+  const open =
+    override ??
+    ((block.status === 'running' && block.output !== '') || (badge?.tone === 'running' && !ended));
   return (
     <div className={`th-card th-tool is-${block.status}`}>
       <button
@@ -125,6 +165,7 @@ export function ToolCard({
         <span className="th-card-title" title={block.title}>
           {block.title}
         </span>
+        {badge && <SubagentBadge badge={badge} />}
         <span className="th-tool-status">
           <StatusMark status={block.status} />
         </span>
@@ -144,6 +185,7 @@ export function ToolCard({
       )}
       {open && (
         <div className="th-tool-body">
+          <SubagentList block={block} ended={ended} />
           {block.summary && <p>{block.summary}</p>}
           {block.output && <pre>{block.output}</pre>}
           {block.truncated && <p className="th-muted">Output was cut at the provider limit.</p>}

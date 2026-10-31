@@ -161,6 +161,26 @@ export function openingEvents(turnId: string, selection: ChatModelSelection): Ag
         "export function netMinor() {\n  throw new Error('netMinor is not implemented.');\n}\n",
     },
     { type: 'tool.completed', turnId: t, callId: 'c1', status: 'ok' },
+    // A spawn whose subagents are still at work, so the chip and the card show their live count.
+    {
+      type: 'tool.started',
+      turnId: t,
+      callId: 'c-spawn',
+      kind: 'other',
+      title: 'Task Find every caller of netMinor',
+    },
+    {
+      type: 'tool.subagents',
+      turnId: t,
+      callId: 'c-spawn',
+      running: 2,
+      finished: 1,
+      agents: [
+        { id: 'sa-1', state: 'done', action: 'src/cart.mjs', model: 'small-2' },
+        { id: 'sa-2', state: 'running', action: 'netMinor(', model: 'small-2' },
+        { id: 'sa-3', state: 'running', action: null, model: null },
+      ],
+    },
     {
       type: 'text.delta',
       turnId: t,
