@@ -6,7 +6,7 @@ import { familyModel, onFamilyDefaults } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
 import { useCatalog } from '../settings/use-catalog.ts';
 import { formatSpan } from '../usage-gauges.tsx';
-import { gaugeColor, railFamilies } from '../usage-presentation.ts';
+import { railFamilies } from '../usage-presentation.ts';
 import type { ThreadSource } from './commands.ts';
 import { FamilyMark } from './family-mark.tsx';
 
@@ -123,10 +123,7 @@ export function RailUsage({
                 <span className="rail-usage-bar" aria-hidden="true">
                   <span
                     className={`family-${row.family}`}
-                    style={{
-                      width: `${bar.percent ?? 0}%`,
-                      ...(bar.percent === null ? {} : { background: gaugeColor(bar.percent) }),
-                    }}
+                    style={{ width: `${bar.percent ?? 0}%` }}
                   />
                 </span>
                 <span
