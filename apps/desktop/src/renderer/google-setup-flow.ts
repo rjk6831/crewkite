@@ -213,8 +213,8 @@ export function googleSetupProgress(
       const amount = `${formatSize(progress.bytes)} of ${formatSize(progress.totalBytes)}`;
       detail =
         progress.step === 'download'
-          ? `Downloading the official client: ${Math.floor(fraction * 100)} percent, ${amount}.`
-          : `Unpacking the client: ${Math.floor(fraction * 100)} percent, ${amount}.`;
+          ? `Downloading the official client: ${Math.floor(fraction * 100)}%, ${amount}.`
+          : `Unpacking the client: ${Math.floor(fraction * 100)}%, ${amount}.`;
     } else
       detail = progress
         ? 'Checking the Google signatures on the client.'
