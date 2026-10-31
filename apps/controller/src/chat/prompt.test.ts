@@ -235,6 +235,18 @@ test('a read-only brief lets the OpenAI client read through read-only commands a
   assert.match(readOnlyRules('openai', 'answer'), /to answer: run read-only commands/);
 });
 
+test('the orchestrator brief names the slices as the parallel workers and keeps the JSON out of the summary', () => {
+  const brief = orchestratorContext('demo', '/s', 'openai');
+  assert.match(brief, /Slices whose dependencies are done start together/);
+  assert.match(brief, /The slices are the parallel workers/);
+  assert.match(
+    brief,
+    /asks for a number of agents or subagents, split the work into that many slices/,
+  );
+  assert.match(brief, /does not repeat its JSON/);
+  assert.doesNotMatch(brief, /one at a time in dependency order/);
+});
+
 test('a read-only slice brief asks for reads and searches', () => {
   const plan = { planId: 'p1', goal: 'Find the bug.', slices: [{}] };
   const slice = {

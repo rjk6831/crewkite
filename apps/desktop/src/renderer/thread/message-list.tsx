@@ -14,6 +14,7 @@ import { AttachmentChips, chipOf, FileChips } from './attach.tsx';
 import { FailureLine, PermissionCard, ThinkingCard, ToolCard, ToolRunCard } from './cards.tsx';
 import { Markdown } from './markdown.tsx';
 import { effortLabel } from './model-picker.tsx';
+import { planlessText } from './plan-card.ts';
 import { ReplyMenu } from './reply-menu.tsx';
 import { markMatches } from './reveal-dom.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
@@ -67,6 +68,9 @@ const TurnRow = memo(function TurnRow({
   const identity = turn.identity;
   const source = turn.ended && turn.status === 'done' ? replySource(turn.blocks) : '';
   const copyable = source !== '';
+  // The plan card shows the orchestrator's plan, so its reply leaves the plan block out.
+  const shownText = (text: string) =>
+    identity?.role === 'orchestrator' ? planlessText(text) : text;
   return (
     <article
       className={`th-row th-assistant${identity?.role === 'ask' ? ' is-side' : ''}`}
@@ -78,12 +82,15 @@ const TurnRow = memo(function TurnRow({
         // A client note is not part of the reply. It waits in the trace below.
         if (block.kind === 'notice' && block.trace) return null;
         switch (block.kind) {
-          case 'text':
+          case 'text': {
+            const text = shownText(block.text);
+            if (text === '') return null;
             return (
               <div key={block.id} className={block.done || turn.ended ? '' : 'is-streaming'}>
-                <Markdown text={block.text} />
+                <Markdown text={text} />
               </div>
             );
+          }
           case 'run':
             return <ToolRunCard key={block.id} run={block} onOpenChanges={onOpenChanges} />;
           case 'thinking':
