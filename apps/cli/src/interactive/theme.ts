@@ -1,5 +1,5 @@
 import type { ChatFamily } from '@crewkite/contracts';
-import { gaugeHue } from '../../../desktop/src/renderer/usage-presentation.ts';
+import { gaugeTone } from '../../../desktop/src/renderer/usage-presentation.ts';
 
 // The desktop's colour tokens in terminal form. The four kite panels keep their family colours:
 // teal for OpenAI, coral for Anthropic, indigo for Google and gold for Local. With NO_COLOR every
@@ -93,14 +93,15 @@ export const familyNames: Record<ChatFamily, string> = {
 };
 
 /**
- * The gauge colour for a percent remaining, from the desktop's one rule: green near full, yellow by
- * 60 percent, orange by 40 and red near empty. The desktop draws `hsl(h 72% 46%)`; this is the same colour in
- * hex, since a terminal takes hex.
+ * The gauge colour for a percent remaining, from the desktop's one rule: bright green when full,
+ * through yellow and orange to deep red when empty. The desktop draws it as `hsl()`; this is the
+ * same colour in hex, since a terminal takes hex.
  */
 export function gaugeHex(percentRemaining: number): string {
-  const hue = gaugeHue(percentRemaining);
-  const s = 0.72;
-  const l = 0.46;
+  const tone = gaugeTone(percentRemaining);
+  const hue = Math.round(tone.hue);
+  const s = Math.round(tone.saturation) / 100;
+  const l = Math.round(tone.lightness) / 100;
   const a = s * Math.min(l, 1 - l);
   const channel = (n: number) => {
     const k = (n + hue / 30) % 12;

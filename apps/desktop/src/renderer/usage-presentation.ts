@@ -335,29 +335,46 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
   };
 }
 
-// Percent remaining and hue, from full to empty. Green holds near the top, yellow arrives by
-// 60 percent, orange by 40 and red near empty, linear between stops.
-const hueStops: readonly (readonly [number, number])[] = [
-  [100, 120],
-  [80, 100],
-  [60, 55],
-  [40, 35],
-  [20, 15],
-  [0, 0],
+// Percent remaining and the colour at that point, from full to empty: bright green, greenish
+// yellow, yellow, orange yellow, orange, orange red, red and deep red. Hue, saturation and
+// lightness all move between stops, so readings 10 to 15 points apart look different.
+const toneStops: readonly (readonly [number, GaugeTone])[] = [
+  [100, { hue: 130, saturation: 68, lightness: 40 }],
+  [85, { hue: 88, saturation: 70, lightness: 42 }],
+  [70, { hue: 58, saturation: 80, lightness: 44 }],
+  [55, { hue: 44, saturation: 88, lightness: 47 }],
+  [40, { hue: 32, saturation: 90, lightness: 48 }],
+  [25, { hue: 18, saturation: 85, lightness: 47 }],
+  [10, { hue: 4, saturation: 78, lightness: 44 }],
+  [0, { hue: 0, saturation: 75, lightness: 32 }],
 ];
 
-/** The ring color's hue for a percent remaining, one rule for every family. Age never changes it. */
-export function gaugeHue(percentRemaining: number): number {
+export type GaugeTone = { hue: number; saturation: number; lightness: number };
+
+/**
+ * The fill colour for a percent remaining as hue, saturation and lightness, linear between stops.
+ * One rule for every family, in the desktop and the terminal. Age never changes it.
+ */
+export function gaugeTone(percentRemaining: number): GaugeTone {
   const percent = Math.min(100, Math.max(0, percentRemaining));
-  for (let i = 1; i < hueStops.length; i++) {
-    const [low, lowHue] = hueStops[i];
-    const [high, highHue] = hueStops[i - 1];
-    if (percent >= low) return lowHue + ((percent - low) * (highHue - lowHue)) / (high - low);
+  for (let i = 1; i < toneStops.length; i++) {
+    const [low, lowTone] = toneStops[i];
+    const [high, highTone] = toneStops[i - 1];
+    if (percent >= low) {
+      const share = (percent - low) / (high - low);
+      const mix = (key: keyof GaugeTone) => lowTone[key] + share * (highTone[key] - lowTone[key]);
+      return { hue: mix('hue'), saturation: mix('saturation'), lightness: mix('lightness') };
+    }
   }
-  return 0;
+  return toneStops[toneStops.length - 1][1];
 }
-export const gaugeColor = (percentRemaining: number) =>
-  `hsl(${Math.round(gaugeHue(percentRemaining))} 72% 46%)`;
+
+/** The hue of `gaugeTone`. */
+export const gaugeHue = (percentRemaining: number) => gaugeTone(percentRemaining).hue;
+export function gaugeColor(percentRemaining: number) {
+  const { hue, saturation, lightness } = gaugeTone(percentRemaining);
+  return `hsl(${Math.round(hue)} ${Math.round(saturation)}% ${Math.round(lightness)}%)`;
+}
 
 /** A ring past this many minutes without a read is drawn dotted. */
 export const GAUGE_DOTTED_AFTER_MIN = 60;
