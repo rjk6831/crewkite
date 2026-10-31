@@ -113,7 +113,17 @@ export function UsageLine({
     ...rows.map((row) => {
       const entry = catalog?.families.find((value) => value.family === row.family);
       const { dotted } = gaugeAge(entry?.readAt ?? null, nowMs);
-      const bar = row.bars[0] ?? null;
+      // The window with the least left decides the bar, as it decides when work stops.
+      const bar =
+        row.bars
+          .filter((value) => value.percent !== null)
+          .reduce<(typeof row.bars)[number] | null>(
+            (low, value) =>
+              low === null || (value.percent ?? 100) < (low.percent ?? 100) ? value : low,
+            null,
+          ) ??
+        row.bars[0] ??
+        null;
       const percent = bar?.percent ?? null;
       const cells = gaugeBar(percent, dotted, 8);
       return h(
@@ -121,7 +131,7 @@ export function UsageLine({
         { key: row.family, gap: 1 },
         FamilyMark({ family: row.family, colors }),
         row.unlimited
-          ? h(Text, { color: colors.muted }, 'on this computer')
+          ? h(Text, { color: colors.muted }, '∞ No limits')
           : row.setUp
             ? h(Text, { color: colors.muted }, 'set up')
             : row.needsConnect

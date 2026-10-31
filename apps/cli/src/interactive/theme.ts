@@ -93,8 +93,8 @@ export const familyNames: Record<ChatFamily, string> = {
 };
 
 /**
- * The gauge colour for a percent remaining, from the desktop's one rule: green down to 40 percent,
- * yellow at 40 and red at empty. The desktop draws `hsl(h 72% 46%)`; this is the same colour in
+ * The gauge colour for a percent remaining, from the desktop's one rule: green near full, yellow by
+ * 60 percent, orange by 40 and red near empty. The desktop draws `hsl(h 72% 46%)`; this is the same colour in
  * hex, since a terminal takes hex.
  */
 export function gaugeHex(percentRemaining: number): string {

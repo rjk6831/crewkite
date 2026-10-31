@@ -221,9 +221,10 @@ test('native usage gauges show the remaining percent without inventing freshness
   const hues: [number, number][] = [
     [100, 120],
     [97, 117],
-    [70, 90],
-    [40, 60],
-    [14, 21],
+    [80, 100],
+    [60, 55],
+    [40, 35],
+    [14, 10.5],
     [0, 0],
   ];
   for (const [percent, hue] of hues) assert.equal(gaugeHue(percent), hue, `${percent} percent`);
