@@ -33,12 +33,33 @@ const setupLabels: Record<string, string> = {
 // Refusal codes the controller sends when setup cannot start, in the words the card shows.
 const refusalText: Record<string, string> = {
   'google-operation-active':
-    'Google setup is already running, often still installing the client. This card follows it until it ends.',
+    'Another Google step is running, such as the quota read or a coding turn. Try again when it ends.',
   'google-ownership-unknown':
-    'CrewKite cannot tell which process owns the Google setup. Open Advanced repair controls to clear it.',
+    'CrewKite cannot prove the last Google step ended, so Google setup is paused. Press Clear and try again.',
+  'google-install-active': 'The official client is still installing. This card follows it.',
+  'google-install-ownership-unknown':
+    'CrewKite cannot prove the last install check ended. Refresh status in a minute.',
+  'acp-setup-timeout': 'The Google client did not answer in time. Press Try again.',
+  'acp-setup-failed': 'The Google client stopped before the step finished. Press Try again.',
+  'acp-setup-stopped': 'The step was stopped before it finished.',
+  'acp-proof-unavailable': 'The saved setup no longer matches the client. Press Try again.',
+  'acp-setup-not-current': 'The setup moved on since this card read it. Review the status above.',
+  'response-timeout': 'The controller has not answered yet. The step may still be running.',
+};
+
+// Why the coding setup is not ready, from the Google profile, in plain words.
+const profileText: Record<string, string> = {
+  'client-unavailable': 'The official client is not installed.',
+  'client-build-mismatch': 'The installed client does not match the reviewed build.',
+  'unsupported-platform': 'Google coding setup needs a Mac with Apple silicon.',
+  'native-home-unavailable': 'The client cannot read your home folder from this controller.',
+  'auth-method-mismatch': 'The client does not offer personal Google sign-in.',
+  'authentication-required': 'Google sign-in has not finished.',
+  'qualification-pending': 'Setup is complete. The route still needs qualification.',
 };
 
 const stageLabels: Record<GoogleSetupStage, string> = {
+  clear: 'Clearing the stuck setup step',
   install: 'Installing and verifying the official client',
   initialize: 'Initializing Google ACP',
   authenticate: 'Waiting for Google account sign-in',
@@ -70,10 +91,12 @@ export function GoogleSetup({
   const generation = useRef(0);
   const mounted = useRef(true);
   const connected = workspace.connection === 'connected' && !workspace.preview;
-  const active = !!setup?.operationId;
+  // A step whose ownership is unknown runs nothing this card can follow. It waits for Clear.
+  const active = !!setup?.operationId && setup.state !== 'unknown';
   const installing = !!installation?.operationId;
   const installed = installation?.state === 'installed' || !!setup?.client;
-  const unknown = setup?.state === 'unknown' || installation?.state === 'unknown';
+  const installUnknown = installation?.state === 'unknown';
+  const unknown = setup?.state === 'unknown' || installUnknown;
   const needsRepair = unknown || setup?.state === 'blocked' || installation?.state === 'blocked';
   const ready = setup?.state === 'ready';
   const working = !!requested || active || installing || cancelBusy;
@@ -139,7 +162,7 @@ export function GoogleSetup({
   }
 
   async function connectGoogle() {
-    if (!connected || working || unknown || !termsAccepted) return;
+    if (!connected || working || installUnknown || !termsAccepted) return;
     stopPolling();
     const currentGeneration = generation.current;
     setMessage(null);
@@ -159,7 +182,13 @@ export function GoogleSetup({
         setMessage('Google coding setup is ready. Quota reporting remains a separate status.');
       } else if (result.kind === 'blocked') {
         const reason = result.result?.reason;
-        const known = reason ? refusalText[reason] : undefined;
+        // A refused clear names the process that still runs in its next step.
+        const known =
+          result.result?.next && reason === 'google-ownership-unknown'
+            ? result.result.next
+            : reason
+              ? refusalText[reason]
+              : undefined;
         setMessage(
           known ??
             (reason
@@ -229,7 +258,21 @@ export function GoogleSetup({
   }
 
   const primaryLabel =
-    setup?.state === 'authentication-required' ? 'Sign in with Google' : 'Connect Google';
+    setup?.state === 'unknown'
+      ? 'Clear and try again'
+      : setup?.state === 'blocked' || installation?.state === 'blocked'
+        ? 'Try again'
+        : setup?.state === 'authentication-required'
+          ? 'Sign in with Google'
+          : 'Connect Google';
+  const profileReason =
+    profile && !profile.available && 'reason' in profile
+      ? profile.reason === 'acp-capability-missing'
+        ? setup?.proofId
+          ? 'The client did not report the model choices or review mode CrewKite needs.'
+          : 'The client is installed and has not finished initializing.'
+        : profileText[profile.reason]
+      : undefined;
   const googleAccount =
     setup?.auth.status === 'authenticated'
       ? 'Signed in'
@@ -302,7 +345,7 @@ export function GoogleSetup({
         <Fact label="Quota available" value={quotaAvailable} />
       </div>
       <div className="dialog-footer">
-        {!ready && !working && !needsRepair && (
+        {!ready && !working && !installUnknown && (
           <button
             className="button primary"
             type="button"
@@ -332,8 +375,11 @@ export function GoogleSetup({
       )}
       {installation?.reason && (
         <p className="muted small">
-          {installation.reason}. {installation.next}
+          {refusalText[installation.reason] ?? `${installation.reason}.`} {installation.next}
         </p>
+      )}
+      {installed && !codingReady && !working && profileReason && (
+        <p className="muted small">{profileReason}</p>
       )}
       <p className="muted small">
         Discovery choices establish configuration facts. A verified review mapping and route
@@ -349,8 +395,8 @@ export function GoogleSetup({
         <details>
           <summary>Advanced repair controls</summary>
           <p className="muted small">
-            Setup needs a fresh status check before another action. Automatic setup is paused to
-            avoid repeating an operation with uncertain ownership.
+            Automatic setup is paused so no step runs twice. {primaryLabel} clears a step whose
+            process has ended and starts it again. Refresh status reads the setup again.
           </p>
           <button
             className="button secondary"
