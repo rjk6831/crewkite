@@ -248,8 +248,6 @@ export async function upgradePackage({ source, target, confirm }, dependencies =
   target = rootPath(target);
   if (inside(source, target) || inside(target, source))
     fail('Select separate old and new package folders.');
-  if (Buffer.byteLength(join(target, 'state/home/control.sock')) > 100)
-    fail('The installed path exceeds the controller socket bound.');
   const beforeRoot = lstatSync(target);
   const candidate = readManifest(source),
     previous = readManifest(target);

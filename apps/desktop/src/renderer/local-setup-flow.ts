@@ -89,7 +89,7 @@ export function statusLine({
   quiet,
   held,
 }: {
-  setup: Pick<LocalSetup, 'reason'> | null | undefined;
+  setup: Pick<LocalSetup, 'reason' | 'notice'> | null | undefined;
   message: string | null;
   lost: string | null;
   confirmed: boolean;
@@ -100,6 +100,7 @@ export function statusLine({
   if (message) return message;
   if (confirmed) return 'Model selection confirmed';
   if (!setup) return 'Local setup is unavailable. Reconnect to recover current status.';
+  if (setup.notice) return setup.notice;
   if (!setup.reason) return 'Inspect the saved connection and model state.';
   if (quiet && setup.reason === 'discovery-active' && held) return held;
   return setupReasons[setup.reason];
@@ -198,13 +199,13 @@ export async function connectInPlace({
     if (now.operation?.state === 'unknown')
       return {
         kind: 'blocked',
-        message: now.reason ? setupReasons[now.reason] : 'Local did not connect.',
+        message: now.notice ?? (now.reason ? setupReasons[now.reason] : 'Local did not connect.'),
       };
     if (now.operation) continue;
     if (!now.connected)
       return {
         kind: 'blocked',
-        message: now.reason ? setupReasons[now.reason] : 'Local did not connect.',
+        message: now.notice ?? (now.reason ? setupReasons[now.reason] : 'Local did not connect.'),
       };
     if (now.observation && !now.observationStale && (discovered || !setup.connected))
       return {

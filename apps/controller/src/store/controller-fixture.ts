@@ -7,6 +7,8 @@ import type { TestContext } from 'node:test';
 import {
   AnthropicNativeProfileSchema,
   type Approval,
+  CommandSchema,
+  GOOGLE_TERMS_VERSION,
   GoogleNativeProfileSchema,
   NativeRepositoryProfileSchema,
   ProjectSchema,
@@ -533,6 +535,9 @@ async function nativeSetup(
     `${mode}/${targetPath}/setup`,
     Promise.resolve().then(() => setup(t, nativeOptions, close)),
   );
+  // A Google writer row prepares a Google run, which the terms gate holds until the person
+  // acknowledges the current text. These rows protect the writer, so the person has done that.
+  if (google) await acknowledgeGoogleTerms(context);
   if (targetPath !== 'net.mjs') {
     const files = [
       { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },
@@ -669,4 +674,18 @@ async function nativeSetup(
   };
 }
 
-export { binding, fixtureClientHash, nativeSetup, nativeWait, setup };
+/** The person has read and acknowledged the current Google terms, so connection steps may run. */
+async function acknowledgeGoogleTerms(context: {
+  controller: Controller;
+  command: (name: string, payload: unknown, revision?: number) => unknown;
+}) {
+  const result = await context.controller.execute(
+    CommandSchema.parse(
+      context.command('AcknowledgeGoogleTerms', { textVersion: GOOGLE_TERMS_VERSION }, 0),
+    ),
+    'local-owner',
+  );
+  assert.equal(result.outcome, 'applied');
+}
+
+export { acknowledgeGoogleTerms, binding, fixtureClientHash, nativeSetup, nativeWait, setup };

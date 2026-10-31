@@ -10,6 +10,7 @@ import {
   type ReadClock,
   reduceThread,
   retryRead,
+  THREAD_PAGE_SIZE,
   type ThreadEvent,
   TRY_AGAIN_AFTER_MS,
   threadItems,
@@ -27,6 +28,8 @@ const message = (failure: unknown) =>
   failure instanceof Error ? failure.message : 'The thread could not be loaded.';
 // 64 pages of 512 KiB. A turn past that shows what was read, and its stored reply.
 const MAX_EVENT_PAGES = 64;
+// 20 pages of 200 messages is 4,000 messages, past the 2,000 turn threads the view is sized for.
+const MAX_REACH_PAGES = 20;
 
 // Loads the thread once, then applies the live stream on top. Events are held until the read
 // returns and then applied on top of it, and the reducer drops the ones the read already covers. A
@@ -167,8 +170,31 @@ export function useThread(
     }
   }, [source, taskId, state]);
 
+  // Pages older messages in until the one at `target` is loaded, for a search result that points
+  // into history. It stops at the first page when the thread has no more, and at a page cap.
+  const latest = useRef(state);
+  latest.current = state;
+  const reach = useCallback(
+    async (target: string) => {
+      const goal = BigInt(target);
+      let oldest = latest.current.messages[0]?.cursor ?? null;
+      let more = latest.current.older.more;
+      for (let page = 0; page < MAX_REACH_PAGES && more && oldest !== null; page++) {
+        if (BigInt(oldest) <= goal) return;
+        const read = await readThread(source, taskId, oldest);
+        dispatch({ type: 'earlier', read });
+        const next = read.messages[0]?.cursor;
+        if (next === undefined || next === oldest) return;
+        oldest = next;
+        more = read.more ?? read.messages.length >= THREAD_PAGE_SIZE;
+      }
+    },
+    [source, taskId],
+  );
+
   const items = useMemo(() => threadItems(state), [state]);
   return {
+    reach,
     state,
     items,
     dispatch,

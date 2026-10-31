@@ -10,17 +10,13 @@ import {
   type LocalSetup,
   type Observation,
 } from '@crewkite/contracts';
-import {
-  anthropicChatAccepts,
-  anthropicChatEfforts,
-  anthropicChatModels,
-  anthropicDefaultChatModel,
-} from '../providers/anthropic/chat.ts';
+import { anthropicChatAccepts } from '../providers/anthropic/chat.ts';
 import type { AnthropicLiveModel } from '../providers/anthropic/models.ts';
 import type { GooglePromptCapabilities } from '../providers/google/chat.ts';
 import { LOCAL_TEXT_TYPES } from '../providers/local/chat.ts';
-import type { NativeProfileResolution } from '../providers/openai/profile.ts';
+import type { ChatClientResolution, NativeProfileResolution } from '../providers/openai/profile.ts';
 import { windowState } from '../usage/index.ts';
+import { chatClientReason } from './clients.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 type Model = Entry['models'][number];
@@ -37,6 +33,11 @@ type ObservedModel = {
 
 export type ChatCatalogInput = {
   profiles: readonly NativeProfileResolution['facts'][];
+  /**
+   * The client each chat family launches, found by version range. A family listed here takes its
+   * connection state from it; the writer profiles no longer decide.
+   */
+  clients?: Partial<Record<'openai' | 'anthropic', ChatClientResolution>>;
   /** The newest OpenAI model list observed with the client resolved now, or null. */
   openAiModels: readonly ObservedModel[] | null;
   /** The model the Anthropic client named in its last usage read, or null. */
@@ -84,9 +85,22 @@ const unlisted: Record<ChatFamily, 'path' | 'none'> = {
   local: 'none',
 };
 
+/** The chat client's facts when the controller resolved one, else the writer profiles. */
+function chatFacts(input: ChatCatalogInput, family: 'openai' | 'anthropic') {
+  const writers = input.profiles.filter((profile) => profile.family === family);
+  const chat = input.clients?.[family];
+  if (!chat)
+    return {
+      writers,
+      ready: writers.find((profile) => profile.available),
+      reason: writers[0]?.reason,
+    };
+  const ready = chat.profile?.facts.available ? chat.profile.facts : undefined;
+  return { writers, ready, reason: chatClientReason(chat) ?? undefined, client: chat.status };
+}
+
 function openai(input: ChatCatalogInput): Entry {
-  const profiles = input.profiles.filter((profile) => profile.family === 'openai');
-  const ready = profiles.find((profile) => profile.available);
+  const { ready, reason, client } = chatFacts(input, 'openai');
   const models = (input.openAiModels ?? []).map((value) =>
     chatModel(value.model, value.efforts, value.defaultEffort, {
       hidden: value.hidden,
@@ -106,7 +120,8 @@ function openai(input: ChatCatalogInput): Entry {
   // before the read kept modalities reports nothing.
   const modalities = input.openAiModels?.find((value) => value.model === fallback)?.inputModalities;
   return {
-    ...entry(input, 'openai', !!ready, profiles[0]?.reason, models, fallback),
+    ...entry(input, 'openai', !!ready, reason, models, fallback),
+    ...(client ? { client } : {}),
     accepts: modalities
       ? [
           ...(modalities.includes('image') ? ['image/*'] : []),
@@ -117,29 +132,31 @@ function openai(input: ChatCatalogInput): Entry {
 }
 
 function anthropic(input: ChatCatalogInput): Entry {
-  const profiles = input.profiles.filter((profile) => profile.family === 'anthropic');
-  const ready = profiles.find((profile) => profile.available);
-  // The pinned profiles say whether the client is here. A chat turn can use every model the
+  const { writers, ready, reason, client } = chatFacts(input, 'anthropic');
+  const present = writers.length > 0 || !!ready;
+  // The chat client says whether the client is here. A chat turn can use every model the
   // client offers, which is more than the profiles pin. The client's own picker rows come first.
-  // The shipped list stands in only while no read has succeeded, and it is marked known.
+  // The picker holds one row per model line, so a model ID this account ran a turn on, such as an
+  // older one typed in, follows them. CrewKite ships no model names: before the first read and
+  // turn the list is empty and the picker takes a typed ID.
   const rows = input.anthropicModels ?? [];
   // The default row repeats the model one of the alias rows resolves to.
   const live = rows.filter(
     (row) =>
       row.value !== 'default' || !rows.some((other) => other !== row && other.model === row.model),
   );
-  const models = !profiles.length
-    ? []
-    : live.length
-      ? live.map((row) =>
-          chatModel(row.model, row.efforts.length ? ['default', ...row.efforts] : [], 'default', {
-            label: row.label,
-            source: 'live',
-          }),
-        )
-      : anthropicChatModels.map((model) =>
-          chatModel(model, anthropicChatEfforts, 'default', { source: 'known' }),
-        );
+  const listed = live.map((row) =>
+    chatModel(row.model, row.efforts.length ? ['default', ...row.efforts] : [], 'default', {
+      label: row.label,
+      source: 'live',
+    }),
+  );
+  const used = usedModels(input, 'anthropic')
+    .filter((value) => !listed.some((model) => model.model === value.model))
+    .map((value) =>
+      chatModel(value.model, ['default', ...value.efforts], 'default', { source: 'used' }),
+    );
+  const models = present ? [...listed, ...used].slice(0, 64) : [];
   const reported = models.find((model) => model.model === input.anthropicModel)?.model;
   const standard = rows.find((row) => row.value === 'default')?.model;
   return {
@@ -147,15 +164,16 @@ function anthropic(input: ChatCatalogInput): Entry {
       input,
       'anthropic',
       !!ready,
-      profiles[0]?.reason,
+      reason,
       models,
       reported ??
         (models.some((model) => model.model === standard) ? standard : undefined) ??
-        (live.length ? models[0]?.model : anthropicDefaultChatModel),
+        models[0]?.model,
     ),
+    ...(client ? { client } : {}),
     // The client's input protocol fixes these types for every model, so they hold wherever the
     // client is installed.
-    accepts: profiles.length ? [...anthropicChatAccepts] : null,
+    accepts: present ? [...anthropicChatAccepts] : null,
   };
 }
 
@@ -347,6 +365,43 @@ function readAt(input: ChatCatalogInput, family: ChatFamily): string | null {
 }
 
 /** The stats of the newest turn on the family that has them. A row it cannot read counts as none. */
+// The model ID shape the picker takes when one is typed (desktop model-groups.ts).
+const MODEL_ID = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,199}$/;
+
+/**
+ * Model IDs this home finished a turn on for one family, newest first, with the efforts those
+ * turns used. A model the client's list leaves out, such as an older one typed in, stays offered.
+ */
+function usedModels(
+  input: ChatCatalogInput,
+  family: ChatFamily,
+): { model: string; efforts: string[] }[] {
+  if (!input.turns) return [];
+  try {
+    const rows = input.turns
+      .prepare(
+        "SELECT json_extract(body,'$.selection.model') AS model, json_group_array(DISTINCT json_extract(body,'$.selection.effort')) AS efforts, MAX(json_extract(body,'$.startedAt')) AS at FROM chat_turns WHERE json_extract(body,'$.selection.family')=? AND json_extract(body,'$.state')='done' GROUP BY model ORDER BY at DESC LIMIT 32",
+      )
+      .all(family) as { model?: unknown; efforts?: unknown }[];
+    return rows.flatMap((row) => {
+      if (typeof row.model !== 'string' || !MODEL_ID.test(row.model)) return [];
+      const efforts = (
+        typeof row.efforts === 'string' ? (JSON.parse(row.efforts) as unknown[]) : []
+      )
+        .filter(
+          (value): value is string =>
+            typeof value === 'string' &&
+            value !== 'default' &&
+            ChatEffortSchema.safeParse(value).success,
+        )
+        .slice(0, 7);
+      return [{ model: row.model, efforts }];
+    });
+  } catch {
+    return [];
+  }
+}
+
 function lastTurnStats(input: ChatCatalogInput, family: ChatFamily): ChatTurnStats | null {
   if (!input.turns) return null;
   try {

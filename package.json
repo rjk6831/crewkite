@@ -1,5 +1,6 @@
 {
   "name": "crewkite",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "packageManager": "pnpm@12.11.2",
@@ -15,9 +16,11 @@
     "test": "node scripts/test.mjs",
     "build": "pnpm --filter @crewkite/desktop build",
     "verify": "pnpm policy && pnpm lint && pnpm types && pnpm test && pnpm build && pnpm test:desktop",
+    "bench": "node packages/bench/src/cli.ts",
     "crewkite": "node apps/cli/src/main.ts",
     "controller": "node apps/controller/src/main.ts",
     "desktop:install": "pnpm --filter @crewkite/desktop exec install-electron",
+    "desktop": "pnpm build && node scripts/desktop.ts",
     "demo": "pnpm build && node scripts/demo.ts",
     "demo:controller": "node scripts/demo-controller.ts",
     "test:desktop": "playwright test e2e/thread.spec.ts --workers=1 --reporter=line --output=internal/test-results",

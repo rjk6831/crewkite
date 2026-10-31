@@ -343,6 +343,7 @@ test('Local secret input returns one current private result after helper cleanup
     [legacyConfiguration, capability],
     [{ ...legacyConfiguration, authMode: 'none' }, capability],
     [selection, { ...capability, platform: 'linux' }],
+    [selection, { ...capability, platform: 'win32' }],
     [selection, { ...capability, arch: 'x64' }],
     [{ ...selection, token: secret }, capability],
     [{ ...selection, endpoint: 'ws://localhost:1234' }, capability],

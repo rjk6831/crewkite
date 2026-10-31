@@ -136,7 +136,7 @@ export function RailUsage({
               </span>
             ))
           )}
-          {!row.unlimited && !row.setUp && (
+          {!row.unlimited && !row.setUp && row.bars.length > 0 && (
             <span className="rail-usage-reset">
               <span>
                 {row.resetsIn !== null

@@ -4,7 +4,7 @@ import { createHash } from 'node:crypto';
 import { once } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
-import { join, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import {
@@ -20,7 +20,12 @@ import {
 } from '@crewkite/contracts';
 import { checkOwner } from '../../../apps/controller/src/host/check-ownership.ts';
 import { encodeFrame, FrameDecoder, ProtocolError } from './index.ts';
-import { connectController } from './node.ts';
+import {
+  connectController,
+  controllerSocketPath,
+  ownSocketDirectory,
+  publishControllerSocket,
+} from './node.ts';
 
 const token = 'a'.repeat(64);
 const actor = { id: 'terminal', kind: 'cli' as const };
@@ -77,11 +82,15 @@ async function serve(
   const owner = checkOwner();
   const directory = owner?.stateRoot ?? resolve(common, '..', 'internal');
   mkdirSync(directory, { recursive: true });
-  const home = mkdtempSync(join(directory, 'client-'));
+  // The home is at least 120 characters deep: the control socket lives in the per-user temporary
+  // folder, so a deep home still serves the client.
+  const base = mkdtempSync(join(directory, 'client-'));
+  const home = join(base, 'h'.repeat(100));
+  assert.ok(home.length >= 120);
+  mkdirSync(home, { mode: 0o700 });
   writeFileSync(join(home, 'token'), token, { mode: 0o600 });
-  const socketPath = join(home, 'control.sock');
-  if (owner && Buffer.byteLength(socketPath) > 100)
-    throw Error('The verification client socket path exceeds its bound.');
+  const socketPath = controllerSocketPath(home);
+  ownSocketDirectory(dirname(socketPath));
   const sockets = new Set<Socket>();
   let connection = 0;
   const server = createServer((socket) => {
@@ -97,8 +106,9 @@ async function serve(
   try {
     server.listen(socketPath);
     await once(server, 'listening');
+    publishControllerSocket(home, socketPath);
   } catch (error) {
-    rmSync(home, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true });
     throw error;
   }
   return {
@@ -107,10 +117,19 @@ async function serve(
     async close() {
       for (const socket of sockets) socket.destroy();
       await new Promise<void>((done) => server.close(() => done()));
-      rmSync(home, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
     },
   };
 }
+
+// The CLI exits 2 when its arguments do not parse or name a malformed ID, and 1 for other refused
+// input.
+const parseFailure = (errors: string) =>
+  /^(?:Unknown option|Option '|Unexpected argument|That is not a (?:thread|project) ID)/m.test(
+    errors,
+  )
+    ? 2
+    : 1;
 
 test('framing preserves fragmented messages and rejects oversized or incomplete input', () => {
   const message: TransportMessage = { type: 'welcome', protocol: 1, cursor: '7' };
@@ -623,6 +642,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     client: { version: '1.4.0', sha256: 'a'.repeat(64), signerTeamId: 'TESTTEAM' },
     auth: { method: 'oauth-personal', status: 'authenticated' },
     reason: 'qualification-pending',
+    googleTerms: null,
   };
   const acpCases = [
     'show',
@@ -864,7 +884,8 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     for (const read of conversationCommands.filter((command) => command.command === 'GetSnapshot'))
       assert.deepEqual(read.payload, { taskId: task.id });
     if (!row.command) {
-      assert.equal(result.code, 1, row.args.join(' '));
+      // An option value that does not parse did nothing; the CLI's exit table gives it 2.
+      assert.equal(result.code, row.args.includes('-1') ? 2 : 1, row.args.join(' '));
       assert(
         conversationCommands.every((command) =>
           ['GetSnapshot', 'GetTaskConversationState'].includes(command.command),
@@ -996,7 +1017,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
   ]) {
     lifecycleCommands.length = 0;
     const result = await executeLifecycle(args);
-    assert.equal(result.code, 1, args.join(' '));
+    assert.equal(result.code, parseFailure(result.errors), args.join(' '));
     assert(lifecycleCommands.every((command) => command.command === 'GetSnapshot'));
   }
   lifecycleTask = { ...task };
@@ -1317,7 +1338,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     combinedState = row.state ?? 'stopped';
     combinedCandidates = row.candidates ?? [candidate];
     const result = await executeCombined(row.args ?? combinedEvaluationArgs);
-    assert.equal(result.code, 1, JSON.stringify(row));
+    assert.equal(result.code, parseFailure(result.errors), JSON.stringify(row));
     assert.deepEqual(
       combinedCommands.map((command) => command.command),
       ['GetSnapshot'],
@@ -1623,7 +1644,11 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     ['local', 'disconnect', '--consent'],
   ]) {
     const result = await executeLocal(args);
-    assert.equal(result.code, 1, args.join(' '));
+    // An option the parser does not know did nothing; the CLI's exit table gives it 2.
+    const unknown = ['--setup-receipt', '--token', '--helper-path'].some((flag) =>
+      args.includes(flag),
+    );
+    assert.equal(result.code, unknown ? 2 : 1, args.join(' '));
     assert.deepEqual(localCommands, []);
   }
   for (const args of [
@@ -1718,7 +1743,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       '--source-consent',
       ...flags,
     ]);
-    assert.equal(result.code, 1, flags.join(' '));
+    assert.equal(result.code, parseFailure(result.errors), flags.join(' '));
     assert.deepEqual(
       localCommands.map((value) => value.command),
       ['GetSnapshot'],
@@ -2792,7 +2817,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     }
     if (usageCase) {
       if (usageCase.invalid) {
-        assert.equal(result.code, 1, scenario);
+        assert.equal(result.code, parseFailure(result.errors), scenario);
         assert(result.errors.length > 0, scenario);
         assert.deepEqual(received, [], scenario);
       } else if (usageCase.name === 'show') {
@@ -2840,7 +2865,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     }
     if (creationCase) {
       if (creationCase.invalid) {
-        assert.equal(result.code, 1, scenario);
+        assert.equal(result.code, parseFailure(result.errors), scenario);
         assert(result.errors.length > 0, scenario);
         assert.deepEqual(received, [], scenario);
         continue;
@@ -2903,7 +2928,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'handoff-start-blocked',
       ].includes(scenario);
       if (rejected) {
-        assert.equal(result.code, 1, result.errors);
+        assert.equal(result.code, parseFailure(result.errors), result.errors);
         assert.equal(
           received.some((command) => command.command !== 'GetSnapshot'),
           false,
@@ -3026,7 +3051,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           ['GetSnapshot', 'PrepareNativeRun'],
         );
       } else {
-        assert.equal(result.code, 1, scenario);
+        assert.equal(result.code, parseFailure(result.errors), scenario);
         assert.equal(
           received.some((value) => value.command !== 'GetSnapshot'),
           false,
@@ -3066,7 +3091,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           ['GetSnapshot', 'PrepareNativeRun'],
         );
       } else {
-        assert.equal(result.code, 1, scenario);
+        assert.equal(result.code, parseFailure(result.errors), scenario);
         assert.equal(
           received.some((value) => value.command !== 'GetSnapshot'),
           false,
@@ -3104,7 +3129,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
           ['GetSnapshot', 'PrepareNativeRun'],
         );
       } else {
-        assert.equal(result.code, 1, scenario);
+        assert.equal(result.code, parseFailure(result.errors), scenario);
         assert.equal(
           received.some((value) => value.command !== 'GetSnapshot'),
           false,
@@ -3126,7 +3151,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         'evaluation-recipe-other-command',
       ].includes(scenario)
     ) {
-      assert.equal(result.code, 1, scenario);
+      assert.equal(result.code, parseFailure(result.errors), scenario);
       assert.deepEqual(received, [], scenario);
       continue;
     }
@@ -3135,7 +3160,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
         scenario,
       )
     ) {
-      assert.equal(result.code, 1);
+      assert.equal(result.code, parseFailure(result.errors));
       const receipt = JSON.parse(result.output);
       assert.deepEqual(receipt.result.entity, pendingTask);
       assert.equal(receipt.nextCommand, undefined);
@@ -3154,7 +3179,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     }
     if (scenario.startsWith('accept-')) {
       if (scenario === 'accept-invalid-ref') {
-        assert.equal(result.code, 1);
+        assert.equal(result.code, parseFailure(result.errors));
         assert.equal(
           received.some((value) => value.command === 'AcceptCandidate'),
           false,
@@ -3209,7 +3234,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       continue;
     }
     if (['evaluation-partial-consent', 'evaluation-invalid-grants'].includes(scenario)) {
-      assert.equal(result.code, 1, result.errors);
+      assert.equal(result.code, parseFailure(result.errors), result.errors);
       assert.equal(
         received.some((command) => command.command === 'PrepareCandidateEvaluation'),
         false,
@@ -3311,7 +3336,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
       continue;
     }
     if (['unavailable', 'partial-consent'].includes(scenario)) {
-      assert.equal(result.code, 1, scenario);
+      assert.equal(result.code, parseFailure(result.errors), scenario);
       assert.equal(
         received.some((command) => command.command === 'PrepareNativeRun'),
         false,

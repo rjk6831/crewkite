@@ -72,3 +72,6 @@ export function adjacentThread(
 /** Whether Command is the primary key. A browser preview without a platform reads as not a Mac. */
 export const isMacPlatform = () =>
   typeof navigator !== 'undefined' && /mac/i.test(navigator.platform || navigator.userAgent);
+
+/** The search shortcut as the person's keyboard labels it: Command K on a Mac, Ctrl K elsewhere. */
+export const searchHint = (mac: boolean) => (mac ? '⌘ K' : 'Ctrl K');

@@ -8,7 +8,7 @@
 // its own read-only list.
 //
 // Client to server, ids counted from 1 per process:
-//   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.0.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
+//   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.1.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
 //   {"method":"initialized"}
 //   {"id":2,"method":"account/read","params":{"refreshToken":false}}
 //   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}
@@ -55,7 +55,15 @@
 
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { after, test } from 'node:test';
 import {
@@ -67,10 +75,12 @@ import {
   type ChatToolKind,
 } from '@crewkite/contracts';
 import type { ChatTurnRequest } from '../../chat/adapter.ts';
+import { turnNotesBlock } from '../../chat/prompt.ts';
 import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { findClient } from '../client-versions.ts';
 import { type OpenAiChatDeps, openAiChatAdapter } from './chat.ts';
 import type { OpenAiUsage } from './discovery.ts';
 
@@ -165,6 +175,8 @@ input.on('line', (line) => {
   const value = JSON.parse(line);
   if (value.method === 'turn/start' && scenario === 'refuse')
     return send({ id: value.id, error: { code: -32602, message: 'Invalid params: thread not loaded\nretry later' } });
+  if (value.method === 'thread/resume' && given.lostThread)
+    return send({ id: value.id, error: { code: -32600, message: 'no rollout found for thread' } });
   if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : 'approved');
   if (value.id === undefined) return;
   // A hung client never answers the interrupt.
@@ -234,13 +246,19 @@ function turn(
       modalities?: string[];
       /** The servers config/read reports as configured. */
       mcp?: Record<string, unknown>;
+      /** A client that no longer has the thread, so thread/resume answers with an error. */
+      lostThread?: boolean;
     };
+    /** The message, when a test needs more than the default. */
+    prompt?: string;
     threadTools?: OpenAiChatDeps['threadTools'];
     readOnly?: boolean;
     files?: File[];
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
     schedule?: Schedule;
+    /** The client the turn launches, when a test resolved its own. */
+    client?: { executable: string; sha256: string; version?: string };
   } = {},
 ) {
   const home = mkdtempSync(join(root, `${scenario}-`));
@@ -255,11 +273,18 @@ function turn(
   const usage: OpenAiUsage[] = [];
   const environment = { HOME: home, PATH: process.env.PATH };
   let args: string[] = [];
+  let launchEnvironment: NodeJS.ProcessEnv = {};
   const adapter = openAiChatAdapter({
-    launch: () => ({ executable, sha256, directory: work, repositoryRoot: home, environment }),
+    launch: () => ({
+      ...(options.client ?? { executable, sha256 }),
+      directory: work,
+      repositoryRoot: home,
+      environment,
+    }),
     onUsage: (value) => usage.push(value),
     spawn: (path, clientArgs, spawnOptions) => {
       args = clientArgs;
+      launchEnvironment = spawnOptions.env;
       const input = JSON.stringify(options.detail ?? null);
       return spawn(process.execPath, [path, scenario, frames, input], spawnOptions);
     },
@@ -271,7 +296,7 @@ function turn(
     taskId: 'tsk_01M51M322B2AEBXD9MA74CBCFM',
     role: 'assistant',
     selection: { family: 'openai', model: 'gpt-6.1-sol', effort: options.effort ?? 'low' },
-    prompt,
+    prompt: options.prompt ?? prompt,
     systemContext,
     history: [],
     session: options.session ?? null,
@@ -296,6 +321,7 @@ function turn(
     scratch,
     work,
     args: () => args,
+    launchEnvironment: () => launchEnvironment,
     frames: () =>
       readFileSync(frames, 'utf8')
         .trimEnd()
@@ -351,6 +377,35 @@ test('streamed thinking and text reach the thread in the order the client sends 
     usage: { usedTokens: 300, capacityTokens: 400_000 },
     changedPaths: [],
   });
+});
+
+test('a Codex build newer than the tested one, found by version range, launches a chat turn', async () => {
+  // One file answers --version as the client would and plays the app-server peer otherwise.
+  const bin = join(root, 'newer-bin');
+  mkdirSync(bin);
+  const script = join(root, 'codex-newer.cjs');
+  writeFileSync(
+    script,
+    `#!/usr/bin/env node\nif (process.argv[2] === '--version') { console.log('codex-cli 0.170.2'); process.exit(0); }\n${peer}`,
+    { mode: 0o755 },
+  );
+  symlinkSync(script, join(bin, 'codex'));
+  const found = findClient('openai', {
+    directories: [bin],
+    home: root,
+    path: dirname(process.execPath),
+    cache: new Map(),
+  });
+  assert.equal(found.status.state, 'newer');
+  assert.equal(
+    found.status.message,
+    'Codex 0.170.2 found. Tested with 0.163.0; newer builds usually work.',
+  );
+  assert(found.client);
+  const run = turn('reply', { client: found.client });
+  const result = await run.settled();
+  assert.equal(result.stopReason, 'done');
+  assert.equal(result.assistantText, 'Hello.');
 });
 
 test('a command approval holds the turn until respondPermission answers it', async () => {
@@ -693,6 +748,32 @@ test('an image or audio file goes as a local input only to a model that takes it
   }
 });
 
+test('a thread the client lost starts again with the notes once, in the system context', async () => {
+  const first = turn('reply');
+  const { session } = await first.settled();
+  assert(session);
+  const notes = ['Use pnpm, not npm.'];
+  const block = turnNotesBlock(notes, undefined);
+  // Rows: a resumed thread gets the block in front of the message. A lost thread starts again with
+  // the notes in its system context, so the block must not ride in the message a second time.
+  const rows = [
+    { name: 'a resumed thread keeps the block', lost: false, text: `${block}\n\n${prompt}` },
+    { name: 'a lost thread drops the block', lost: true, text: `${systemContext}\n\n${prompt}` },
+  ];
+  for (const row of rows) {
+    const run = turn('reply', {
+      session,
+      prompt: `${block}\n\n${prompt}`,
+      detail: row.lost ? { lostThread: true } : undefined,
+    });
+    await run.settled();
+    const sent = run.frames().find((frame) => frame.method === 'turn/start');
+    assert(sent);
+    const text = (sent.params.input as { text: string }[]).at(-1)?.text ?? '';
+    assert.equal(text, row.text, row.name);
+  }
+});
+
 test('the next turn resumes the thread with its own approval policy and effort and sends only the prompt', async () => {
   // A default turn sends no effort and runs at the level the thread reply names.
   const first = turn('reply', { effort: 'default' });
@@ -875,4 +956,28 @@ test('a client that fails before its turn runs leaves its error output and last 
     const { nextAction: _nextAction, resetsAt: _resetsAt, ...kept } = failure ?? {};
     assert.deepEqual(kept, row.failure, row.scenario);
   }
+  // A newer build that closes before it starts names its version and the tested one. The tested
+  // build and an older one keep the plain exit line.
+  for (const [version, message] of [
+    [
+      '0.170.2',
+      'Codex 0.170.2 closed before it started, and CrewKite was tested with 0.163.0. A newer build can refuse a setting CrewKite passes; install 0.163.0 or update CrewKite.',
+    ],
+    ['0.163.0', 'Codex exited with code 1 before the turn finished.'],
+  ] as const) {
+    const { failure } = await turn('crash', {
+      client: { executable, sha256, version },
+    }).settled();
+    assert.equal(failure?.message, message, version);
+    assert.equal(failure?.providerMessage, 'Error: invalid configuration', version);
+  }
+});
+
+test('the client starts with Git held to the scratch copy', async () => {
+  const run = turn('stream');
+  await run.settled();
+  assert.equal(
+    run.launchEnvironment().GIT_CEILING_DIRECTORIES,
+    realpathSync.native(dirname(run.scratch)),
+  );
 });

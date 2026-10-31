@@ -1,0 +1,47 @@
+name: Feature request
+description: Ask for something CrewKite does not do yet
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the work you want to get done. Never paste a token, a key or a password into this form.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do
+      description: The task you could not finish, or finished with too much effort.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What you would like CrewKite to do
+      description: The behavior you have in mind, in plain steps.
+    validations:
+      required: true
+  - type: dropdown
+    id: family
+    attributes:
+      label: Family
+      description: The family this affects, if one.
+      options:
+        - OpenAI
+        - Anthropic
+        - Google
+        - Local
+        - All of them
+        - Not tied to a family
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: CrewKite version
+      description: Run `crewkite --version` and paste the output.
+      placeholder: "0.1.0"
+  - type: textarea
+    id: workaround
+    attributes:
+      label: What you do today
+      description: Any workaround you use now, and what it costs you.

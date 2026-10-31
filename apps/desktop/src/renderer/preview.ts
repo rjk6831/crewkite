@@ -1,7 +1,9 @@
+import { foldersOf, rankMentions } from '@crewkite/client';
 import {
   type CommandResult,
   canonicalJson,
   type Event,
+  PROJECT_NOTES_BYTES,
   type ProjectPageRequest,
   type Task,
   type TaskPageRequest,
@@ -54,6 +56,99 @@ export function createPreviewSource(): DesktopSource {
     'ReadChatBranchStatus',
     'SteerChatMessage',
   ]);
+  // The composer commands answer from a small scripted project and an in-memory prompt list.
+  const sampleFiles = ['net.mjs', 'test/net.test.mjs', 'docs/usage.md', 'AGENTS.md'];
+  const sampleEntries = [
+    ...sampleFiles.map((path) => ({ path, kind: 'file' as const })),
+    ...foldersOf(sampleFiles).map((path) => ({ path, kind: 'folder' as const })),
+  ];
+  const prompts = new Map<string, string>();
+  const promptList = () => ({
+    kind: 'chat-prompts',
+    prompts: [...prompts]
+      .map(([name, body]) => ({ name, body }))
+      .sort((a, b) => (a.name < b.name ? -1 : 1)),
+  });
+  const notes = new Map<string, { id: string; text: string; createdAt: string }[]>();
+  const noteList = (projectId: string) => {
+    const rows = notes.get(projectId) ?? [];
+    return {
+      kind: 'project-notes',
+      projectId,
+      projectName: state.projects.find(({ id }) => id === projectId)?.name ?? 'Project',
+      notes: rows,
+      bytes: rows.reduce((total, row) => total + row.text.length + 3, 0),
+      capBytes: PROJECT_NOTES_BYTES,
+    };
+  };
+  function noteCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
+    if (
+      !['ReadProjectNotes', 'AddProjectNote', 'EditProjectNote', 'RemoveProjectNote'].includes(name)
+    )
+      return null;
+    const projectId = String(payload.projectId);
+    const rows = notes.get(projectId) ?? [];
+    if (name === 'AddProjectNote')
+      rows.push({
+        id: `not_${String(rows.length + 1).padStart(26, '0')}`,
+        text: String(payload.text),
+        createdAt: new Date(0).toISOString(),
+      });
+    if (name === 'EditProjectNote')
+      for (const row of rows) if (row.id === payload.noteId) row.text = String(payload.text);
+    if (name === 'RemoveProjectNote')
+      notes.set(
+        projectId,
+        rows.filter((row) => row.id !== payload.noteId),
+      );
+    else notes.set(projectId, rows);
+    const now = noteList(projectId);
+    // A read answers with the list. A change answers with the small record the controller sends.
+    return {
+      outcome: 'applied',
+      data:
+        name === 'ReadProjectNotes'
+          ? now
+          : { kind: 'project-notes-changed', projectId, bytes: now.bytes },
+    } as CommandResult;
+  }
+  function composerCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
+    const applied = (data: unknown) => ({ outcome: 'applied', data }) as CommandResult;
+    const noted = noteCommand(name, payload);
+    if (noted) return noted;
+    const taskId = typeof payload.taskId === 'string' ? payload.taskId : fixtures.task.id;
+    if (name === 'CompleteChatMention')
+      return applied({
+        kind: 'chat-mentions',
+        taskId,
+        mentions: rankMentions(
+          sampleEntries,
+          String(payload.query ?? ''),
+          Number(payload.limit ?? 8),
+        ),
+      });
+    if (name === 'ReadChatInstructions') {
+      const wanted = payload.name === 'AGENTS.md';
+      return applied({
+        kind: 'chat-instructions',
+        taskId,
+        files: ['AGENTS.md'],
+        name: wanted ? 'AGENTS.md' : null,
+        text: wanted ? 'Keep changes small and run the tests.\n' : null,
+        truncated: false,
+      });
+    }
+    if (name === 'ReadChatPrompts') return applied(promptList());
+    if (name === 'SaveChatPrompt') {
+      prompts.set(String(payload.name), String(payload.body));
+      return applied(promptList());
+    }
+    if (name === 'DeleteChatPrompt') {
+      prompts.delete(String(payload.name));
+      return applied(promptList());
+    }
+    return null;
+  }
   const scripts = new Map<string, ReturnType<typeof createThreadScript>>();
   function chatCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
     if (!chatCommands.has(name)) return null;
@@ -82,6 +177,11 @@ export function createPreviewSource(): DesktopSource {
     return script.command(name, payload);
   }
   async function command(input: DesktopCommand): Promise<CommandResult> {
+    const composer = composerCommand(
+      (input as { command: string }).command,
+      input.payload as Record<string, unknown>,
+    );
+    if (composer) return composer;
     const chat = chatCommand(
       (input as { command: string }).command,
       input.payload as Record<string, unknown>,

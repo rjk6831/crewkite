@@ -1,0 +1,30 @@
+{
+  "id": "control-socket-per-user-folder",
+  "title": "Move the control socket to the per-user temp folder",
+  "repository": "self",
+  "base": "d99e9e269787f0d95478e23744b05a1e90557b30",
+  "solution": "d515be909cb021f14383d0299db144f9f8ac6743",
+  "text": "A controller home deeper than the Unix socket path limit cannot bind or serve the desktop and the CLI, because the control socket is a file named control.sock inside the home. Put the socket beside the thread tools socket instead, named from a hash of the home, and compute the path in one shared function. In packages/client/src/node.ts export homeSocketPath(home, kind, temporary = tmpdir()) where kind is control or thread-tools. It hashes the absolute home with sha256, keeps the first 12 hex characters, and names the file <hash>-control.sock for control or <hash>.sock for thread-tools, inside a folder named crewkite-<uid> (user in place of the uid when there is none) under the temporary directory. When that path is longer than 100 bytes it uses /tmp with the same folder and name. Export controllerSocketPath(home, temporary) as the control case, and ownSocketDirectory(path), which creates the folder with mode 0700 if it is absent, refuses with the error The socket directory is occupied. when the path is not a directory or belongs to another user, and sets mode 0700 on an existing folder of the current user. readControllerEndpoint(home) must answer the new socket path with the token file still read from the home. Make the controller server bind the control socket at that path after it has made the folder, unlinking a leftover socket file from a crashed run, and expose it as socketPath. Make the thread tools broker use the shared function for its path, and update the desktop runtime to use the same function. A home that is 120 characters deep must serve both the client and the CLI.",
+  "hidden": ["apps/cli/src/main.test.ts"],
+  "checks": [
+    {
+      "name": "cli-main",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=CLI lists traverse empty pages and preserve incomplete output",
+        "apps/cli/src/main.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["controller", "client", "sockets", "cli"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:25:46.561Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["cli-main"],
+    "baseFailure": "missing-module",
+    "passedOnSolution": ["cli-main"]
+  }
+}

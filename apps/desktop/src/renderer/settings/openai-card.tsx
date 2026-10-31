@@ -24,6 +24,7 @@ export function OpenAiCard({
     <ProviderCard
       family="openai"
       entry={entry}
+      onCheck={() => void actions.checkClient('openai')}
       detail="Signs in through its own client"
       main={
         <ClientStatus family="openai" header={header} now={now}>

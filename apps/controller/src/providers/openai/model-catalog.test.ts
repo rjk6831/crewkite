@@ -234,12 +234,8 @@ test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged 
     ]);
     assert.deepEqual(
       models('anthropic', catalog(null))?.map((entry) => [entry.model, entry.source]),
-      [
-        ['claude-fable-5-1', 'known'],
-        ['claude-opus-5-5', 'known'],
-        ['claude-sonnet-5-5', 'known'],
-        ['claude-haiku-5-5', 'known'],
-      ],
+      // CrewKite ships no Anthropic model names, so before a read and a turn the list is empty.
+      [],
     );
     const rows = [
       { value: 'default', model: 'claude-sonnet-5-5', label: 'Default', efforts: [] },

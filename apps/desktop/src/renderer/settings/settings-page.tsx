@@ -3,10 +3,15 @@ import { useEffect } from 'react';
 import type { Workspace } from '../source.ts';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { AnthropicCard } from './anthropic-card.tsx';
+import { ExtensionsCard } from './extensions-card.tsx';
 import { GeneralCard } from './general-card.tsx';
 import { GoogleCard } from './google-card.tsx';
 import { LocalCard } from './local-card.tsx';
+import { McpCard } from './mcp-card.tsx';
+import { NotesCard } from './notes-card.tsx';
 import { OpenAiCard } from './openai-card.tsx';
+import { ProjectUsageCard } from './project-usage-card.tsx';
+import { PromptsCard } from './prompts-card.tsx';
 import { useProviderActions } from './provider-actions.ts';
 import { useCatalog, useClock } from './use-catalog.ts';
 import './settings.css';
@@ -20,11 +25,16 @@ export function SettingsPage({
   header,
   theme,
   onTheme,
+  onShowWelcome,
+  threadId,
 }: {
   workspace: Workspace;
   header: WorkspaceState;
   theme: string;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
+  onShowWelcome?: () => void;
+  /** The open thread, whose last events the diagnostics export carries. */
+  threadId?: string;
 }) {
   const { catalog, error, modelRead } = useCatalog(workspace.source, header);
   const actions = useProviderActions(workspace);
@@ -57,11 +67,25 @@ export function SettingsPage({
             {error} Model lists and connection state are unavailable until it reads again.
           </p>
         )}
-        <GeneralCard catalog={catalog} theme={theme} onTheme={onTheme} />
+        <GeneralCard
+          catalog={catalog}
+          theme={theme}
+          onTheme={onTheme}
+          onShowWelcome={onShowWelcome}
+          source={workspace.source}
+          threadId={threadId}
+        />
         <OpenAiCard {...card} entry={entry('openai')} modelRead={modelRead} />
         <AnthropicCard {...card} entry={entry('anthropic')} />
         <GoogleCard {...card} entry={entry('google')} />
         <LocalCard {...card} entry={entry('local')} />
+        <McpCard />
+        <ExtensionsCard source={workspace.source} />
+        {workspace.source && <PromptsCard source={workspace.source} />}
+        {workspace.source && <NotesCard source={workspace.source} projects={workspace.projects} />}
+        {workspace.source && (
+          <ProjectUsageCard source={workspace.source} projects={workspace.projects} />
+        )}
       </div>
     </main>
   );

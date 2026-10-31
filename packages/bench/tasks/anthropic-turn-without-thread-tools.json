@@ -1,0 +1,30 @@
+{
+  "id": "anthropic-turn-without-thread-tools",
+  "title": "Let the controller turn the thread tools off for one Anthropic turn",
+  "repository": "self",
+  "base": "24e2e0953bc12c214160c7cd5f2f891e4104a07d",
+  "solution": "d99e9e269787f0d95478e23744b05a1e90557b30",
+  "text": "A chat turn request may now carry threadTools: false, which is the controller's answer that this turn has no thread tools. The Anthropic chat adapter in apps/controller/src/providers/anthropic/chat.ts asks its threadTools source for a server to mint for each turn. When the request says false, it must not ask the source at all, even when one is wired, so no token is minted and no server starts. The turn then launches exactly as a turn without a source does: the MCP configuration passed to the client is the strict empty one (--strict-mcp-config with an object that has no servers) and no thread tool is added to the allowed tools, so no argument names a crewkite MCP tool. A request that leaves the field unset or true keeps today's behavior and still gets the minted server. Apply the same rule to the Google and OpenAI adapters, and in the Local and OpenAI adapters remove the line from the prompt that names the thread tools when a turn has none.",
+  "hidden": ["apps/controller/src/providers/anthropic/chat.test.ts"],
+  "checks": [
+    {
+      "name": "anthropic-chat",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=a new session gets the framing, a saved one is resumed with the prompt alone",
+        "apps/controller/src/providers/anthropic/chat.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["anthropic", "chat", "thread-tools", "adapter"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:23:50.932Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["anthropic-chat"],
+    "baseFailure": "assertion",
+    "passedOnSolution": ["anthropic-chat"]
+  }
+}

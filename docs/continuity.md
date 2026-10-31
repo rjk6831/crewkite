@@ -79,4 +79,4 @@ Reopening a task shows what is known, what is uncertain and the safe next action
 
 ## Durability
 
-SQLite runs in WAL mode on local disk with full synchronous writes for control records. Artifacts are written, hashed and published before their references commit. A consistent backup includes the referenced artifacts. Disk-full and corrupt-evidence conditions keep the last valid state and surface an explicit blocker.
+SQLite runs in WAL mode on local disk with full synchronous writes for control records. Before a migration changes an existing database, the controller writes a consistent copy beside it. It keeps that copy and the newest earlier copy from a different version. Artifacts are written, hashed and published before their references commit. A consistent backup includes the referenced artifacts. Disk-full and corrupt-evidence conditions keep the last valid state and surface an explicit blocker.

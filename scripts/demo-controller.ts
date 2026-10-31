@@ -127,6 +127,11 @@ export async function startDemoController(
         : () => configuredIdentity(directory),
     ...(options.chatScript && {
       nativeProfiles: () => [unavailableNativeProfile(), scriptedProfile],
+      // The scripted adapter takes any model. These rows stand in for the client's picker.
+      anthropicModels: [
+        { value: 'model-a', model: 'model-a', label: 'Scripted model A', efforts: ['low', 'high'] },
+        { value: 'model-b', model: 'model-b', label: 'Scripted model B', efforts: [] },
+      ],
       nativeSpawn: () => {
         throw new Error('The scripted chat does not start a provider client.');
       },
@@ -186,8 +191,11 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     };
     process.once('SIGINT', () => void close());
     process.once('SIGTERM', () => void close());
-  } catch {
-    console.error('The demo controller could not start. Its home may have another owner.');
+  } catch (error) {
+    console.error(
+      'The demo controller needs CREWKITE_HOME set to a directory you own, with mode 0700, inside the repository internal folder.',
+    );
+    console.error(error instanceof Error ? error.message : String(error));
     process.exitCode = 1;
   }
 }

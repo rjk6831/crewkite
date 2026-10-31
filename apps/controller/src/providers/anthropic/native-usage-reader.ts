@@ -35,6 +35,13 @@ export type AnthropicUsageReaderContext = Readonly<{
   operationId: string;
   executable: string;
   executableSha256: string;
+  /** The version the client reported for these bytes. */
+  clientVersion: string;
+  /**
+   * The person's PATH. A client installed as a script starts with `#!/usr/bin/env node` and finds
+   * node on it. The digest binds the client file, so PATH stays out of the scope hash.
+   */
+  path?: string;
   sessionId: string;
   directory: string;
   home: string;
@@ -67,6 +74,7 @@ function detail(reply: string, errors: Buffer) {
 export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
   const plan = anthropicUsageReaderPlan({
     clientSha256: input.executableSha256,
+    clientVersion: input.clientVersion,
     sessionId: input.sessionId,
   });
   if (
@@ -85,6 +93,7 @@ export function anthropicUsageReaderScope(input: AnthropicUsageReaderContext) {
           operationId: input.operationId,
           executable: input.executable,
           executableSha256: plan.clientSha256,
+          clientVersion: plan.clientVersion,
           sessionId: plan.sessionId,
           directory: input.directory,
           home: input.home,
@@ -113,6 +122,8 @@ export function startAnthropicUsageReader(
     operationId: input.operationId,
     executable: input.executable,
     executableSha256: input.executableSha256,
+    clientVersion: input.clientVersion,
+    ...(input.path ? { path: input.path } : {}),
     sessionId: input.sessionId,
     directory: input.directory,
     home: input.home,
@@ -125,6 +136,7 @@ export function startAnthropicUsageReader(
     throw new UsageReaderError('native-trust-required');
   const plan = anthropicUsageReaderPlan({
     clientSha256: context.executableSha256,
+    clientVersion: context.clientVersion,
     sessionId: context.sessionId,
   });
   const now = options.now ?? (() => performance.now());
@@ -146,7 +158,7 @@ export function startAnthropicUsageReader(
       USER: userInfo().username,
       LOGNAME: userInfo().username,
       TMPDIR: context.temporary,
-      PATH: '/usr/bin:/bin',
+      PATH: context.path || '/usr/bin:/bin',
       LANG: 'C',
       NO_COLOR: '1',
     },

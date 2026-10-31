@@ -1,0 +1,16 @@
+{
+  "name": "@crewkite/bench",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "dependencies": {
+    "@crewkite/client": "workspace:*",
+    "@crewkite/contracts": "workspace:*",
+    "@crewkite/controller": "workspace:*",
+    "@crewkite/testkit": "workspace:*",
+    "zod": "4.6.7"
+  }
+}

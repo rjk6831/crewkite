@@ -2,10 +2,13 @@ import type { DesktopSource, LocalTokenStatus } from '@crewkite/client';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
+  ChatExportSchema,
   CommandResultSchema,
   DesktopNoticeSchema,
   EventSchema,
+  McpStateSchema,
   ProjectPageSchema,
+  ReadChatAnalyticsPayloadSchema,
   SnapshotSchema,
   TaskPageSchema,
   WorkspaceStateSchema,
@@ -75,6 +78,8 @@ const pathOf = (file: File) => {
 // reads the clipboard image for it.
 const attachFiles: NonNullable<DesktopSource['attachFiles']> = async (input) => {
   if (input.from === 'picker') return findFiles({ from: 'picker' });
+  if (input.from === 'paste-text')
+    return findFiles({ from: 'clipboard-text', length: input.length });
   const files: unknown[] = [...input.files].slice(0, MAX_ATTACH_FILES);
   const paths = droppedPaths(files, pathOf);
   const found = paths.length > 0 ? await findFiles({ from: 'paths', paths }) : [];
@@ -150,6 +155,69 @@ const bridge: DesktopSource = {
       throw plain(failure);
     }
   },
+  savePrompts: async () => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-prompts');
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  exportDiagnostics: async (input) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:export-diagnostics', input);
+      return value === 'saved' ? 'saved' : 'cancelled';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  saveNotes: async (projectId) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-notes', projectId);
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  saveAnalytics: async (input) => {
+    const payload = ReadChatAnalyticsPayloadSchema.safeParse(input);
+    if (!payload.success) throw new Error('The usage request is invalid.');
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-analytics', payload.data);
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  previewShare: async (taskId) => {
+    try {
+      const shared = ChatExportSchema.parse(
+        await ipcRenderer.invoke('crewkite:export-preview', String(taskId)),
+      );
+      return {
+        html: shared.content,
+        filename: shared.filename,
+        turns: shared.turns,
+        omitted: shared.omitted,
+      };
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  dismissCrash: async () => {
+    await ipcRenderer.invoke('crewkite:dismiss-crash');
+  },
+  saveExport: async (input) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:export-save', {
+        taskId: String(input.taskId),
+        format: input.format,
+      });
+      return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
     await ipcRenderer.invoke('crewkite:reconnect');
@@ -163,6 +231,23 @@ const bridge: DesktopSource = {
   localTokenStatus: () => tokenStatus('crewkite:local-token-status'),
   rememberLocalToken: () => tokenStatus('crewkite:local-token-remember'),
   forgetLocalToken: () => tokenStatus('crewkite:local-token-forget'),
+  mcp: {
+    state: async () => McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-state')),
+    save: async (server) =>
+      McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-save', server)),
+    remove: async (name) =>
+      McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-remove', { name })),
+    setThread: async (taskId, name, policy) =>
+      McpStateSchema.parse(
+        await ipcRenderer.invoke('crewkite:mcp-thread', { taskId, name, policy }),
+      ),
+  },
+  onboarding: {
+    finished: async () => (await ipcRenderer.invoke('crewkite:onboarding-read')) === true,
+    setFinished: async (finished) => {
+      await ipcRenderer.invoke('crewkite:onboarding-write', finished === true);
+    },
+  },
   onOpenThread(listener) {
     openThread.add(listener);
     return () => {

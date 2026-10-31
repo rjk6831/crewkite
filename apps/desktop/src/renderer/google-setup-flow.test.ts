@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { WorkspaceState } from '@crewkite/contracts';
+import { GOOGLE_TERMS_VERSION, type WorkspaceState } from '@crewkite/contracts';
 import { pollGoogleSetupStatus, runGoogleSetupFlow } from './google-setup-flow.ts';
 
 type GoogleState = Pick<WorkspaceState, 'googleAcpInstall' | 'googleAcpSetup'>;
@@ -18,6 +18,7 @@ const setup = (
   client: null,
   auth: { method: null, status: 'unknown' },
   reason: null,
+  googleTerms: { version: GOOGLE_TERMS_VERSION, at: '2026-10-28T00:00:00.000Z' },
   ...change,
 });
 
@@ -77,6 +78,22 @@ test('Google setup uses each saved revision and proof once', async () => {
   });
   assert.deepEqual(result, { kind: 'ready' });
   assert.deepEqual(stages, ['install', 'initialize', 'authenticate', 'discover']);
+  // A setup that was ready before the gate still asks for the acknowledgement first.
+  const readyStates: GoogleState[] = [
+    { googleAcpInstall: null, googleAcpSetup: setup(6, 'ready', { client, googleTerms: null }) },
+    { googleAcpInstall: null, googleAcpSetup: setup(6, 'ready', { client }) },
+  ];
+  const sent: string[] = [];
+  const again = await runGoogleSetupFlow({
+    read: async () => readyStates.shift() as GoogleState,
+    active: () => true,
+    onStage: () => {},
+    command: async (input) => {
+      sent.push(input.command);
+      return { outcome: 'applied' };
+    },
+  });
+  assert.deepEqual([again, sent], [{ kind: 'ready' }, ['AcknowledgeGoogleTerms']]);
   assert.deepEqual(commands, [
     { command: 'InstallGoogleAcp', revision: 0 },
     { command: 'InitializeGoogleAcp', revision: 0 },

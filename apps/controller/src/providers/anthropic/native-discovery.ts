@@ -135,7 +135,9 @@ export function nativeAuthEnvironment(
   return {
     HOME: source.HOME,
     USER: userInfo().username,
-    PATH: '/usr/bin:/bin',
+    // A client installed as a script (`#!/usr/bin/env node`) finds node on the person's PATH, as
+    // in chatEnvironment. The digest check still binds the client file itself.
+    PATH: source.PATH || '/usr/bin:/bin',
     LANG: 'C',
     TMPDIR: temporary,
     DISABLE_UPDATES: '1',

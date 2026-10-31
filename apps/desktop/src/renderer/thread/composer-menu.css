@@ -1,0 +1,103 @@
+.th-complete {
+  position: relative;
+}
+.th-complete-list {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 100%;
+  z-index: 5;
+  display: grid;
+  max-height: 260px;
+  margin: 0 0 6px;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 12px;
+  background: var(--surface);
+  box-shadow: 0 6px 24px #0003;
+  list-style: none;
+}
+.th-complete-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  padding: 6px 10px;
+  border-radius: 8px;
+  color: var(--text);
+  font-size: 13px;
+  cursor: pointer;
+}
+.th-complete-item[aria-selected="true"] {
+  background: var(--surface-hover);
+}
+.th-complete-item small {
+  color: var(--text-dim);
+  font-size: 11px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.th-complete-label {
+  font-family: var(--mono, ui-monospace, monospace);
+  white-space: nowrap;
+}
+.th-instructions {
+  margin: 0 0 8px;
+}
+.th-instructions-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 13px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.th-instructions-chip:hover,
+.th-instructions-chip[aria-expanded="true"] {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.th-instructions-view {
+  margin: 8px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+}
+.th-instructions-view nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.th-instructions-view pre {
+  max-height: 220px;
+  margin: 0;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.th-note-lines {
+  white-space: pre-line;
+}
+
+.th-chip-row {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0 6px;
+}
+.th-notes-list {
+  max-height: 220px;
+  margin: 0 0 6px;
+  padding-left: 18px;
+  overflow: auto;
+  font-size: 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}

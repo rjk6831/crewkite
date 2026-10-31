@@ -1,10 +1,15 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { test } from 'node:test';
 import { encodeFrame, FrameDecoder } from '@crewkite/client';
+import {
+  controllerSocketPath,
+  ownSocketDirectory,
+  publishControllerSocket,
+} from '@crewkite/client/node';
 import {
   type Command,
   type CommandResult,
@@ -12,10 +17,15 @@ import {
   type TaskPage,
   type WorkspaceState,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { runCli } from './main.ts';
 
 test('CLI lists traverse empty pages and preserve incomplete output', async (context) => {
-  const home = mkdtempSync('/tmp/crewkite-cli-');
+  // A home 120 characters deep still serves the CLI, since the control socket is not inside it.
+  const base = mkdtempSync('/tmp/crewkite-cli-');
+  const home = join(base, 'deep'.repeat(25));
+  assert.ok(home.length >= 120);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
   writeFileSync(join(home, 'token'), 'a'.repeat(64), { mode: 0o600 });
   const stamp = { epoch: 'a'.repeat(32), revision: '1' };
   const header: WorkspaceState = {
@@ -110,10 +120,12 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
   context.after(async () => {
     for (const socket of sockets) socket.destroy();
     await new Promise<void>((done) => server.close(() => done()));
-    rmSync(home, { recursive: true, force: true });
+    rmSync(base, { recursive: true, force: true });
   });
-  server.listen(join(home, 'control.sock'));
+  ownSocketDirectory(dirname(controllerSocketPath(home)));
+  server.listen(controllerSocketPath(home));
   await once(server, 'listening');
+  publishControllerSocket(home, controllerSocketPath(home));
   const execute = async (args: string[]) => {
     let out = '',
       err = '';
@@ -128,6 +140,38 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
     });
     return { code, out, err };
   };
+  // These answer from the arguments alone, so the controller sees no command.
+  const helpText = (await execute(['--help'])).out;
+  const matches = (actual: string, expected: string | RegExp) =>
+    expected instanceof RegExp ? expected.test(actual) : actual === expected;
+  const version = `${CREWKITE_VERSION}\n`;
+  const rows: [string[], number, string | RegExp, string | RegExp][] = [
+    [['--version'], 0, version, ''],
+    [['-v'], 0, version, ''],
+    [['version'], 0, version, ''],
+    [['-v', 'extra'], 2, '', /^Use crewkite --version alone/],
+    [['--version', 'extra'], 2, '', /^Use crewkite --version alone/],
+    [['version', 'extra'], 2, '', /^Use crewkite --version alone/],
+    [['help'], 0, helpText, ''],
+    [['usage'], 0, /^ {7}crewkite usage show[\s\S]*usage stop/, ''],
+    [['task', 'show', 'tsk_nope'], 2, '', /^That is not a thread ID\.[^\n]*\n$/],
+    [['task', 'changes', 'prj_01ARZ3NDEKTSV4RRFFQ69G5FAV'], 2, '', /^That is not a thread ID/],
+    [
+      ['task', 'create', 'prj_nope', '--title', 'a', '--outcome', 'b', '--criterion', 'c'],
+      2,
+      '',
+      /^That is not a project ID\.[^\n]*\n$/,
+    ],
+  ];
+  for (const [args, code, out, err] of rows) {
+    const result = await execute(args);
+    assert.equal(result.code, code, args.join(' '));
+    assert.ok(matches(result.out, out), `${args.join(' ')}: ${result.out}`);
+    assert.ok(matches(result.err, err), `${args.join(' ')}: ${result.err}`);
+    assert.deepEqual(commands, [], args.join(' '));
+  }
+  for (const flag of ['--register', '--permission-policy', '--file', ':effort'])
+    assert.ok(helpText.includes(flag), flag);
   for (const args of [
     ['usage', 'show'],
     ['local', 'status'],
@@ -296,8 +340,10 @@ test('CLI operation actions keep exact review bindings and bounded continuation'
     await new Promise<void>((done) => server.close(() => done()));
     rmSync(home, { recursive: true, force: true });
   });
-  server.listen(join(home, 'control.sock'));
+  ownSocketDirectory(dirname(controllerSocketPath(home)));
+  server.listen(controllerSocketPath(home));
   await once(server, 'listening');
+  publishControllerSocket(home, controllerSocketPath(home));
   const execute = async (args: string[]) => {
     let out = '',
       err = '';

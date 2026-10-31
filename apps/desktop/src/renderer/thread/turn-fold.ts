@@ -20,6 +20,11 @@ export type TurnStatus = 'running' | 'waiting-permission' | 'done' | 'stopped' |
 
 export type TextBlock = { kind: 'text'; id: string; text: string; done: boolean };
 export type ThinkingBlock = { kind: 'thinking'; id: string; text: string; done: boolean };
+/** The subagents a tool call started, as the client last reported them. */
+export type SubagentActivity = Omit<
+  Extract<AgentEvent, { type: 'tool.subagents' }>,
+  'type' | 'turnId' | 'callId'
+>;
 export type ToolBlock = {
   kind: 'tool';
   id: string;
@@ -31,6 +36,7 @@ export type ToolBlock = {
   status: ToolStatus;
   diff: FileDiff | null;
   summary: string | null;
+  subagents: SubagentActivity | null;
 };
 export type PermissionBlock = {
   kind: 'permission';
@@ -254,6 +260,7 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
     }
     case 'tool.started':
     case 'tool.output':
+    case 'tool.subagents':
     case 'tool.completed': {
       const id = `tool:${event.callId}`;
       return withBlocks(
@@ -273,9 +280,16 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
                   status: 'running',
                   diff: null,
                   summary: null,
+                  subagents: null,
                 };
           if (event.type === 'tool.started')
             return { ...tool, toolKind: event.kind, title: event.title, input: event.input };
+          // Each report is the whole picture for the call, so the newest replaces the last.
+          if (event.type === 'tool.subagents')
+            return {
+              ...tool,
+              subagents: { running: event.running, finished: event.finished, agents: event.agents },
+            };
           if (event.type === 'tool.output')
             return {
               ...tool,

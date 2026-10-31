@@ -1,0 +1,86 @@
+/* Hunks of one file in the Changes tab: a header with the three controls, then the lines. */
+.th-hunks {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 6px 0;
+  border-top: 1px solid var(--border);
+}
+.th-hunk-note {
+  margin: 0;
+  padding: 0 10px;
+  font-size: 12px;
+}
+.th-hunk {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 0 8px;
+  overflow: hidden;
+}
+.th-hunk.is-accepted {
+  border-color: color-mix(in srgb, var(--green) 55%, var(--border));
+}
+.th-hunk-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 8px;
+  background: var(--surface);
+  font-size: 12px;
+}
+.th-hunk-head code {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text-dim);
+  overflow-wrap: anywhere;
+}
+.th-hunk-head .th-button[aria-pressed="true"] {
+  color: var(--diff-add-text);
+}
+.th-hunk-lines {
+  border-radius: 0;
+}
+.th-patch .th-hunk-line {
+  display: block;
+  width: 100%;
+  min-width: max-content;
+  padding: 0 10px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  white-space: pre;
+  cursor: pointer;
+}
+.th-patch .th-hunk-line.is-add {
+  background: color-mix(in srgb, var(--green) 11%, transparent);
+  color: var(--diff-add-text);
+}
+.th-patch .th-hunk-line.is-del {
+  background: color-mix(in srgb, var(--red) 11%, transparent);
+  color: var(--diff-del-text);
+}
+.th-patch .th-hunk-line.is-picked {
+  box-shadow: inset 3px 0 0 var(--accent, var(--text));
+}
+.th-patch .th-hunk-line:focus-visible {
+  outline-offset: -2px;
+}
+.th-hunk-comment {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 7px 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+.th-hunk-comment label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.th-hunk-comment p {
+  margin: 0;
+}

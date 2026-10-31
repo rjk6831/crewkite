@@ -10,10 +10,13 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, extname, relative, sep } from 'node:path';
+import { analyticsToCsv, promptsToJson } from '@crewkite/client';
 import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
+  ChatAnalyticsReadSchema,
+  ChatExportSchema,
   type Command,
   type CommandResult,
   CommandResultSchema,
@@ -24,6 +27,11 @@ import {
   type Event,
   EventSchema,
   MAX_FRAME_BYTES,
+  type McpServerInput,
+  type McpState,
+  projectNotesMarkdown,
+  ReadChatAnalyticsPayloadSchema,
+  ReadProjectNotesPayloadSchema,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
@@ -31,6 +39,8 @@ import { type BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electro
 import { attachRequest } from '../shared/attach.ts';
 import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
+import { installDiagnostics } from './diagnostics.ts';
+import { ExportStage } from './export.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
 import {
   controllerPort,
@@ -38,8 +48,10 @@ import {
   RememberedLocalToken,
   type SecretStorage,
 } from './local-token.ts';
+import { McpVault, supplyMcp } from './mcp-vault.ts';
 import { CommandReceipts, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
+import { saveTextFile } from './save-file.ts';
 import { assertSender, openExternalLink } from './security.ts';
 
 const verifications = new WeakMap<BrowserWindow, { requestId: string; abort: AbortController }>();
@@ -184,11 +196,22 @@ export async function installBridge(
     'open-link',
     'attach',
     'open-attachment',
+    'save-notes',
     'local-token-status',
     'local-token-remember',
     'local-token-forget',
+    'export-diagnostics',
+    'dismiss-crash',
+    'export-preview',
+    'export-save',
   ];
   for (const channel of handlers) ipcMain.removeHandler(`crewkite:${channel}`);
+  const diagnostics = installDiagnostics({
+    window,
+    home: controller.paths.home,
+    send,
+    notice,
+  });
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
     assertSender(event, window);
     if (
@@ -271,9 +294,21 @@ export async function installBridge(
         'GetArtifactRange',
         'GetTaskOperations',
         'ReadChatThread',
+        'SearchChatHistory',
         'ReadChatTurnEvents',
         'ReadChatChanges',
         'ReadChatCatalog',
+        'ReadChatAnalytics',
+        'ReadExtensions',
+        'CompleteChatMention',
+        'ReadChatInstructions',
+        'ReadChatPrompts',
+        'SaveChatPrompt',
+        'DeleteChatPrompt',
+        'ReadProjectNotes',
+        'AddProjectNote',
+        'EditProjectNote',
+        'RemoveProjectNote',
         'RefreshChatModels',
         'ReadChatBranchStatus',
         'PushChatBranch',
@@ -287,6 +322,7 @@ export async function installBridge(
         'RefreshAnthropicUsage',
         'StopAnthropicUsage',
         'CheckNativeConnection',
+        'CheckProviderClient',
         'RefreshTaskModelCatalog',
         'InstallGoogleAcp',
         'StopGoogleAcpInstall',
@@ -480,6 +516,38 @@ export async function installBridge(
       );
     },
   );
+  // The person's MCP servers. Main keeps the secrets and the renderer gets the view only. Every
+  // change goes to the controller in memory, so a thread's next turn sees it.
+  const mcp = new McpVault(controller.paths.profile, storage);
+  const handOver = async () => {
+    if (client)
+      await supplyMcp(
+        mcp,
+        (value) => client?.command(value) ?? Promise.resolve(null),
+        desktopActor,
+      );
+  };
+  const mcpCall = (name: string, run: (input: Record<string, unknown>) => McpState) => {
+    ipcMain.handle(`crewkite:mcp-${name}`, async (event, input: unknown) => {
+      assertSender(event, window);
+      const state = run((input ?? {}) as Record<string, unknown>);
+      await handOver().catch(() => {});
+      return state;
+    });
+  };
+  ipcMain.handle('crewkite:mcp-state', (event) => {
+    assertSender(event, window);
+    return mcp.state();
+  });
+  mcpCall('save', (input) => mcp.save(input as McpServerInput));
+  mcpCall('remove', (input) => mcp.remove(String(input.name)));
+  mcpCall('thread', (input) =>
+    mcp.setThread(
+      String(input.taskId),
+      String(input.name),
+      (input.policy as string | null) ?? null,
+    ),
+  );
   ipcMain.handle('crewkite:local-token-status', async (event) => {
     assertSender(event, window);
     return tokens.status();
@@ -543,11 +611,167 @@ export async function installBridge(
     }
     return 'done';
   });
+  // The saved prompts are the controller's. Main reads them, so the page never supplies the bytes,
+  // and the person picks where the file goes.
+  ipcMain.handle('crewkite:save-prompts', async (event) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const read = await send(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'ReadChatPrompts',
+        payload: {},
+      }),
+    );
+    if (!applied(read) || read.data?.kind !== 'chat-prompts')
+      throw new Error('The saved prompts could not be read.');
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Save prompts',
+      defaultPath: 'crewkite-prompts.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      const file = openSync(
+        choice.filePath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(file, promptsToJson(read.data.prompts));
+        fsyncSync(file);
+      } finally {
+        closeSync(file);
+      }
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return 'saved';
+  });
+  // A project's notes are the controller's. Main reads them, so the page never supplies the text,
+  // and the person picks where the Markdown file goes.
+  ipcMain.handle('crewkite:save-notes', async (event, projectId: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const payload = ReadProjectNotesPayloadSchema.safeParse({ projectId });
+    if (!payload.success) throw new Error('Choose a project to export.');
+    const read = await send(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'ReadProjectNotes',
+        payload: payload.data,
+      }),
+    );
+    if (!applied(read) || read.data?.kind !== 'project-notes')
+      throw new Error('The notes could not be read.');
+    const { projectName, notes } = read.data;
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Export project notes',
+      defaultPath: `${projectName.replace(/[^A-Za-z0-9._-]+/g, '-').slice(0, 80) || 'project'}-notes.md`,
+      filters: [{ name: 'Markdown', extensions: ['md'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      const file = openSync(
+        choice.filePath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC | constants.O_NOFOLLOW,
+        0o600,
+      );
+      try {
+        writeFileSync(file, projectNotesMarkdown(projectName, notes));
+        fsyncSync(file);
+      } finally {
+        closeSync(file);
+      }
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return 'saved';
+  });
+  // The usage numbers are the controller's. Main reads them for the thread or project the page
+  // names, so the page never supplies the bytes, and the person picks where the file goes.
+  ipcMain.handle('crewkite:save-analytics', async (event, input: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const payload = ReadChatAnalyticsPayloadSchema.parse(input);
+    const read = await send(
+      CommandSchema.parse({
+        protocol: 1,
+        key: createCommandKey(),
+        actor: desktopActor,
+        command: 'ReadChatAnalytics',
+        payload,
+      }),
+    );
+    if (!applied(read) || read.data?.kind !== 'chat-analytics')
+      throw new Error('The usage numbers could not be read.');
+    const { kind: _kind, ...rest } = read.data;
+    const analytics = ChatAnalyticsReadSchema.parse(rest);
+    const slug = analytics.name
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-|-$/g, '')
+      .slice(0, 40);
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Save usage',
+      defaultPath: `crewkite-usage-${slug || analytics.scope}.csv`,
+      filters: [{ name: 'CSV', extensions: ['csv'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      saveTextFile(choice.filePath, analyticsToCsv(analytics));
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return 'saved';
+  });
+  // The controller renders an export and main holds the text, so the page never supplies the
+  // bytes of a file. The share page saves as previewed, and the person picks where it goes.
+  const exports = new ExportStage({
+    read: async (taskId, format) => {
+      const read = await send(
+        CommandSchema.parse({
+          protocol: 1,
+          key: createCommandKey(),
+          actor: desktopActor,
+          command: 'ExportChatThread',
+          payload: { taskId, format },
+        }),
+      );
+      if (!applied(read) || read.data?.kind !== 'chat-export')
+        throw new Error(read.next ?? 'The thread could not be exported.');
+      const { kind: _kind, ...rest } = read.data;
+      return ChatExportSchema.parse(rest);
+    },
+    choose: (options) => dialog.showSaveDialog(window, options),
+  });
+  ipcMain.handle('crewkite:export-preview', async (event, taskId: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const shared = await exports.preview(taskId);
+    assertSender(event, window);
+    return shared;
+  });
+  ipcMain.handle('crewkite:export-save', async (event, input: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const saved = await exports.save(input);
+    assertSender(event, window);
+    return saved;
+  });
   ipcMain.handle('crewkite:events', (event) => {
     assertSender(event, window);
     listening = true;
     notice(connection);
     notice({ kind: 'retry', available: receipts.commands.length > 0 });
+    diagnostics.announce();
     if (droppedThrough !== '0') notice({ kind: 'history-gap', after: droppedThrough });
     for (const row of events) window.webContents.send('crewkite:event', row);
   });
@@ -569,6 +793,7 @@ export async function installBridge(
     try {
       receipts.load();
       client = await controller.connect();
+      await handOver().catch(() => {});
       client.onConnection((state) => {
         connection = { kind: 'connection', state, reconnectAvailable: state === 'offline' };
         notice(connection);

@@ -26,6 +26,7 @@ import {
   enrollCheckRoot,
   spawnCheckChild as spawn,
 } from './check-ownership.ts';
+import { gitCeiling } from './git-ceiling.ts';
 
 export function groupAbsent(group: number | null): boolean {
   if (group === null || !Number.isSafeInteger(group) || group <= 0) return false;
@@ -55,6 +56,7 @@ const commandEnvironmentNames = new Set([
   'GH_HOST',
   'GH_PAGER',
   'GH_PROMPT_DISABLED',
+  'GIT_CEILING_DIRECTORIES',
   'HOME',
   'LANG',
   'LC_ALL',
@@ -428,6 +430,8 @@ export class OwnedCommand {
           PATH: process.env.PATH,
           LANG: 'C',
           HOME: options.environmentHome,
+          // The evaluated copy has no .git of its own, so Git must not search above it.
+          GIT_CEILING_DIRECTORIES: gitCeiling(options.directory),
         },
       });
     }

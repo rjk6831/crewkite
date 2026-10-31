@@ -5,6 +5,7 @@ import fs, {
   mkdirSync,
   mkdtempSync,
   readFileSync,
+  realpathSync,
   rmSync,
   symlinkSync,
   truncateSync,
@@ -15,7 +16,7 @@ import { userInfo } from 'node:os';
 import { basename, dirname, join, resolve } from 'node:path';
 import { mock, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { type ApprovalBinding, CommandSchema } from '@crewkite/contracts';
+import { type ApprovalBinding, CommandSchema, GOOGLE_TERMS_VERSION } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { createTestClock, createTestIds } from '../../../../../../packages/testkit/src/fixtures.ts';
 import type { AcpPeerCase } from '../../../../../../packages/testkit/src/providers/acp-peer.ts';
@@ -267,7 +268,9 @@ function writer(
   });
 }
 
-test('the acp writer binds an imported client and observed configuration before one prompt', async () => {
+test('the acp writer binds an imported client and observed configuration before one prompt', {
+  skip: process.platform !== 'darwin' && 'the ACP client bundle is the signed macOS arm64 build',
+}, async () => {
   const large = fixture('complete');
   try {
     const staged = join(large.home, 'imports/google-acp-v1');
@@ -1009,9 +1012,21 @@ test('the acp writer binds an imported client and observed configuration before 
 test('fresh acp writers keep broad editors disabled without an mcp server', async () => {
   const f = fixture('fresh-no-mcp');
   try {
-    const completion = await writer(f, { mcpServer: undefined }).result;
+    const launched: NodeJS.ProcessEnv[] = [];
+    const completion = await writer(f, {
+      mcpServer: undefined,
+      spawn: (program, args, options) => {
+        launched.push(options.env);
+        return spawnCheckChild(program, args, options);
+      },
+    }).result;
     assert.equal(completion.reason, null);
     assert.equal(completion.metadata?.stopReason, 'end_turn');
+    // The writer works in the scratch copy, which has no .git of its own.
+    assert.deepEqual(
+      launched.map((env) => env.GIT_CEILING_DIRECTORIES),
+      [realpathSync.native(dirname(f.scratch))],
+    );
   } finally {
     f.dispose();
   }
@@ -2262,6 +2277,7 @@ setInterval(() => {}, 1000);
 
 test('a controller that registers the Google client sets it up at launch and leaves the sign-in to the person', async () => {
   const f = fixture('complete');
+  const started: string[] = [];
   const clock = createTestClock();
   const id = createTestIds();
   const client = { HOME: userInfo().homedir, PATH: process.env.PATH };
@@ -2274,7 +2290,10 @@ test('a controller that registers the Google client sets it up at launch and lea
       googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
       googleAcp: {
         reviewMappings: [f.mapping],
-        spawn: spawnCheckChild as AcpSpawn,
+        spawn: ((...args: Parameters<AcpSpawn>) => {
+          started.push('spawn');
+          return spawnCheckChild(...args);
+        }) as AcpSpawn,
         resolve: (proof) => ({
           ...resolveGoogleAcpProfile({ home: f.home, proof, environment: client }),
           client: f.client,
@@ -2286,10 +2305,31 @@ test('a controller that registers the Google client sets it up at launch and lea
     controller.store.googleMetadataOperations().map((row) => `${row.kind} ${row.state}`);
   let controller = open();
   try {
-    // A fresh client initializes on its own and stops before the browser sign-in.
+    // Before the acknowledgement the client does not start at all.
     await controller.googleAcpPreparation;
     let setup = controller.store.googleAcpSetup();
+    assert.equal(setup.state, 'uninitialized');
+    assert.deepEqual(started, []);
+    assert.deepEqual(steps(controller), []);
+
+    // Acknowledging Google's terms runs the launch steps at once. A fresh client initializes on
+    // its own and stops before the browser sign-in, which is the person's choice.
+    const acknowledged = await controller.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: id('cmd'),
+        actor: { id: 'terminal', kind: 'cli' },
+        command: 'AcknowledgeGoogleTerms',
+        expectedRevision: setup.revision,
+        payload: { textVersion: GOOGLE_TERMS_VERSION },
+      }),
+      'local-owner',
+    );
+    assert.equal(acknowledged.outcome, 'applied');
+    await controller.googleAcpPreparation;
+    setup = controller.store.googleAcpSetup();
     assert.equal(setup.state, 'authentication-required');
+    assert.ok(started.length > 0);
     assert.deepEqual(steps(controller), ['acp-initialize quiescent']);
 
     const signIn = await controller.execute(

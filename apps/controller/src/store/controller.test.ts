@@ -17,6 +17,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -48,6 +49,7 @@ import {
   TaskSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { type createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
 import { syntheticCheckDefinition, writeChallengeSolution } from '@crewkite/testkit/repository';
 import { fakeWorkerPath } from '@crewkite/testkit/worker';
@@ -69,6 +71,7 @@ import {
   verificationStages,
 } from '../evidence/toolchain-definition.ts';
 import { type VerificationExecution, verificationCommand } from '../evidence/toolchain-verify.ts';
+import { biomePackageName } from '../host/biome-package.ts';
 import {
   checkOwner,
   enrollCheckRoot,
@@ -97,6 +100,7 @@ import {
 import { fixture, fixtureContent, fixtureModel } from '../providers/openai/replacement-fixture.ts';
 import { serve as serveController } from '../server/index.ts';
 import {
+  acknowledgeGoogleTerms,
   binding,
   fixtureClientHash,
   nativeSetup,
@@ -140,15 +144,81 @@ function crashBeforeSettlement(controller: Controller, attemptId: string) {
   });
 }
 
+// The verify recipe and its formatter pin the macOS arm64 toolchain.
+const macosToolchainOnly =
+  process.platform !== 'darwin' && 'the verify recipe pins the macOS arm64 toolchain';
+const linuxOwnershipUnqualified =
+  process.platform !== 'darwin' &&
+  'Linux process ownership is unqualified: a group is not yet gone when its streams close, and an orphan that init never reaps keeps the group present';
+
+// The native client check refuses an executable owned by another user, and these fixtures use the
+// test runtime as the client.
+const runtimeOwnedByAnotherUser =
+  process.getuid?.() !== statSync(process.execPath).uid &&
+  'the native client check requires a runtime owned by the user running the tests';
+
 function installedBiome() {
   const manifest = createRequire(resolve('package.json')).resolve('@biomejs/biome/package.json');
+  const platformPackage = biomePackageName();
+  if (!platformPackage) throw new Error('No Biome build exists for this computer.');
   return {
     version: JSON.parse(readFileSync(manifest, 'utf8')).version as string,
     binary: join(
-      dirname(createRequire(manifest).resolve('@biomejs/cli-darwin-arm64/package.json')),
+      dirname(createRequire(manifest).resolve(`${platformPackage}/package.json`)),
       'biome',
     ),
   };
+}
+
+// Returns the database to the shape a fresh database has at user_version 4, whatever later
+// migrations added. The expected shape comes from the first four migration files applied to a
+// temp database, so a new migration needs no edit here. Triggers go first, then indexes, then
+// virtual tables (which take their shadow tables along), then plain tables with the tables that
+// reference others dropped before the tables they reference. Foreign keys stay off meanwhile.
+function dropBeyondVersionFour(db: DatabaseSync, migrationsDirectory: string) {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-version-four-'));
+  const fresh = new DatabaseSync(join(directory, 'state.sqlite'));
+  try {
+    for (const file of readdirSync(migrationsDirectory)
+      .filter((name) => /^\d{3}-[a-z0-9-]+\.sql$/.test(name) && Number(name.slice(0, 3)) <= 4)
+      .sort())
+      fresh.exec(readFileSync(join(migrationsDirectory, file), 'utf8'));
+    const objects = (database: DatabaseSync) =>
+      database
+        .prepare(
+          "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%'",
+        )
+        .all() as { type: string; name: string; sql: string }[];
+    const kept = new Set(objects(fresh).map((object) => `${object.type}:${object.name}`));
+    const extra = (type: string) =>
+      objects(db).filter((object) => object.type === type && !kept.has(`${type}:${object.name}`));
+    const foreignKeys = db.prepare('PRAGMA foreign_keys').get()?.foreign_keys;
+    db.exec('PRAGMA foreign_keys=OFF');
+    for (const trigger of extra('trigger')) db.exec(`DROP TRIGGER "${trigger.name}"`);
+    for (const index of extra('index')) db.exec(`DROP INDEX "${index.name}"`);
+    for (const table of extra('table').filter((object) => /^CREATE VIRTUAL/i.test(object.sql)))
+      db.exec(`DROP TABLE "${table.name}"`);
+    const tables = extra('table').map((object) => object.name);
+    const parents = new Map(
+      tables.map((name) => [
+        name,
+        (db.prepare(`PRAGMA foreign_key_list("${name}")`).all() as { table: string }[]).map(
+          (key) => key.table,
+        ),
+      ]),
+    );
+    while (tables.length) {
+      const next = tables.findIndex(
+        (name) => !tables.some((other) => other !== name && parents.get(other)?.includes(name)),
+      );
+      db.exec(`DROP TABLE "${tables.splice(next < 0 ? 0 : next, 1)[0]}"`);
+    }
+    db.exec(`PRAGMA foreign_keys=${foreignKeys ? 'ON' : 'OFF'}`);
+    db.exec('PRAGMA user_version=4');
+  } finally {
+    fresh.close();
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 // Tabs differ from the layout the fixture writers produce, so their bytes carry a layout defect.
@@ -764,7 +834,7 @@ test('a stale task revision leaves the current task and event cursor intact', as
   await controller.execute(command('GetUsage', {}), 'local-owner');
   assert.deepEqual(await controller.execute(command('GetHealth', {}), 'local-owner'), {
     outcome: 'applied',
-    data: { kind: 'health', status: 'ready', version: '0.0.0', blockers: [] },
+    data: { kind: 'health', status: 'ready', version: CREWKITE_VERSION, blockers: [] },
   });
   assert.equal(
     controller.store.db.prepare('SELECT COUNT(*) AS count FROM receipts').get()?.count,
@@ -1267,7 +1337,9 @@ test('a committed launch intent survives restart without another launch', async 
   }
 });
 
-test('a retained descendant blocks sealing and transfer after its leader exits', async (t) => {
+test('a retained descendant blocks sealing and transfer after its leader exits', {
+  skip: linuxOwnershipUnqualified,
+}, async (t) => {
   for (const first of ['close', 'deadline', 'cancel'] as const) {
     const closed = Promise.withResolvers<void>();
     const boundary = Promise.withResolvers<void>();
@@ -2465,167 +2537,190 @@ fixtureTest('attached fixture keeps the admitted stage group', async () => {
   metadata.set(proofReference.id, { ...proofReference, hash: fixtureClientHash });
   assert.equal(evidence.verificationMatches(historicalInput), false);
 
-  // Capture formats changed files with the committed configuration before the hash exists.
-  const biome = installedBiome();
-  const authored = mkdtempSync(join(directory, 'authored-'));
-  writeFileSync(join(authored, 'net.mjs'), '');
-  writeChallengeSolution(authored);
-  const authoredBytes = readFileSync(join(authored, 'net.mjs'));
-  const formatRun = async (configuration: string) => {
-    const formatting = await setup(t);
-    commitFormatting(formatting.source.directory, configuration);
-    const drafted = TaskSchema.parse(
-      (await formatting.controller.execute(formatting.draft, 'local-owner')).entity,
-    );
-    const formattingPolicy = {
-      ...formatting.fixtures.policy,
-      quality: 'quick',
-      methods: [],
-      effects: [
-        ...formatting.fixtures.policy.effects.map((grant) => ({ ...grant, taskId: drafted.id })),
-        {
-          taskId: drafted.id,
-          action: 'run-review',
-          target: 'keep-it-simple/cycle-1',
-          expiresAt: formatting.fixtures.policy.effects[0].expiresAt,
-          revoked: false,
-          usesRemaining: 1,
-        },
-      ],
-    };
-    const scheduled = await formatting.controller.execute(
-      formatting.command(
-        'PrepareRun',
-        { taskId: drafted.id, policy: formattingPolicy, roles: quickRoles(formatting.fixtures) },
-        0,
-      ),
-      'local-owner',
-    );
-    const formattingRun = RunSchema.parse(scheduled.entity);
-    const finished = new Promise<void>((resolve) => {
-      const off = formatting.controller.subscribe((event) => {
-        if (event.type === 'task.updated' && event.payload.state === 'ready') {
-          off();
-          resolve();
-        }
-      });
-    });
-    await formatting.controller.execute(
-      formatting.command(
-        'StartRun',
-        { taskId: drafted.id, runId: formattingRun.id },
-        scheduled.revision,
-      ),
-      'local-owner',
-    );
-    await finished;
-    const { controller: owner } = formatting;
-    const attemptId = owner.store
-      .intents()
-      .find((intent) => intent.run_id === formattingRun.id)?.attempt_id;
-    const artifact = owner.store.receipt(`formatting:${attemptId}`)?.result.entity;
-    return {
-      snapshot: owner.snapshot(),
-      base: formattingRun.source.base,
-      source: formatting.source.directory,
-      scratch: join(owner.home, 'scratch', formattingRun.id),
-      receipt:
-        artifact && 'hash' in artifact
-          ? JSON.parse(
-              new ArtifactFiles(join(owner.home, 'artifacts')).read(artifact.hash).toString('utf8'),
-            )
-          : undefined,
-    };
-  };
-  const hashOf = (base: string, files: ReturnType<typeof readFiles>) =>
-    new CandidateEvidence({
-      home: directory,
-      artifacts: artifactFiles,
-      id,
-      getArtifact: () => {
-        throw Error('The hash needs no artifacts.');
-      },
-    }).hash(base, files);
-  const layout = await formatRun(tabConfiguration);
-  const failure = await formatRun('{');
-  await t.test('a candidate whose only defect is layout passes biome check after capture', () => {
-    const check = spawnSync(biome.binary, ['check', 'net.mjs'], {
-      cwd: layout.scratch,
-      encoding: 'utf8',
-    });
-    assert.equal(check.status, 0, check.stdout + check.stderr);
-    assert.equal(layout.receipt?.status, 'formatted');
-    assert.equal(layout.receipt.formatter.version, biome.version);
-    assert.equal(
-      layout.receipt.formatter.sha256,
-      createHash('sha256').update(readFileSync(biome.binary)).digest('hex'),
-    );
-    assert.deepEqual(
-      layout.receipt.files.map((file: { path: string }) => file.path),
-      ['net.mjs'],
-    );
-  });
-  await t.test('a formatter failure leaves the bytes unchanged and is recorded', () => {
-    assert.deepEqual(readFileSync(join(failure.scratch, 'net.mjs')), authoredBytes);
-    assert.equal(failure.receipt?.status, 'failed');
-    assert.match(failure.receipt.reason, /exited/);
-    assert.deepEqual(failure.receipt.files, []);
-    assert.equal(
-      failure.snapshot.candidates[0].hash,
-      hashOf(failure.base, readFiles(failure.scratch)),
-    );
-  });
-  await t.test('the candidate hash equals the formatted bytes', () => {
-    const formatted = spawnSync(biome.binary, ['format', '--stdin-file-path=net.mjs'], {
-      cwd: layout.scratch,
-      input: authoredBytes,
-    });
-    assert.equal(formatted.status, 0);
-    assert.notDeepEqual(formatted.stdout, authoredBytes);
-    const sealed = readFiles(layout.scratch);
-    assert.deepEqual(sealed.find((file) => file.path === 'net.mjs')?.content, formatted.stdout);
-    assert.equal(layout.snapshot.candidates[0].hash, hashOf(layout.base, sealed));
-    assert.equal(layout.snapshot.evidence[0].candidateHash, layout.snapshot.candidates[0].hash);
-    assert.deepEqual(layout.receipt?.files, [
-      {
-        path: 'net.mjs',
-        before: createHash('sha256').update(authoredBytes).digest('hex'),
-        after: createHash('sha256').update(formatted.stdout).digest('hex'),
-      },
-    ]);
-  });
   await t.test(
-    'a candidate configuration cannot replace the committed formatter policy',
-    async () => {
-      const candidateConfiguration = Buffer.from(
-        '{"formatter":{"indentStyle":"space"},"linter":{"enabled":false}}\n',
-      );
-      const files = committedFiles(layout.source, layout.base).map((file) =>
-        file.path === 'biome.json'
-          ? {
-              ...file,
-              content: candidateConfiguration,
-              bytes: candidateConfiguration.length,
-              hash: createHash('sha256').update(candidateConfiguration).digest('hex'),
+    'capture formats changed files with the pinned formatter',
+    { skip: macosToolchainOnly },
+    async (t) => {
+      // Capture formats changed files with the committed configuration before the hash exists.
+      const biome = installedBiome();
+      const authored = mkdtempSync(join(directory, 'authored-'));
+      writeFileSync(join(authored, 'net.mjs'), '');
+      writeChallengeSolution(authored);
+      const authoredBytes = readFileSync(join(authored, 'net.mjs'));
+      const formatRun = async (configuration: string) => {
+        const formatting = await setup(t);
+        commitFormatting(formatting.source.directory, configuration);
+        const drafted = TaskSchema.parse(
+          (await formatting.controller.execute(formatting.draft, 'local-owner')).entity,
+        );
+        const formattingPolicy = {
+          ...formatting.fixtures.policy,
+          quality: 'quick',
+          methods: [],
+          effects: [
+            ...formatting.fixtures.policy.effects.map((grant) => ({
+              ...grant,
+              taskId: drafted.id,
+            })),
+            {
+              taskId: drafted.id,
+              action: 'run-review',
+              target: 'keep-it-simple/cycle-1',
+              expiresAt: formatting.fixtures.policy.effects[0].expiresAt,
+              revoked: false,
+              usesRemaining: 1,
+            },
+          ],
+        };
+        const scheduled = await formatting.controller.execute(
+          formatting.command(
+            'PrepareRun',
+            {
+              taskId: drafted.id,
+              policy: formattingPolicy,
+              roles: quickRoles(formatting.fixtures),
+            },
+            0,
+          ),
+          'local-owner',
+        );
+        const formattingRun = RunSchema.parse(scheduled.entity);
+        const finished = new Promise<void>((resolve) => {
+          const off = formatting.controller.subscribe((event) => {
+            if (event.type === 'task.updated' && event.payload.state === 'ready') {
+              off();
+              resolve();
             }
-          : file,
+          });
+        });
+        await formatting.controller.execute(
+          formatting.command(
+            'StartRun',
+            { taskId: drafted.id, runId: formattingRun.id },
+            scheduled.revision,
+          ),
+          'local-owner',
+        );
+        await finished;
+        const { controller: owner } = formatting;
+        const attemptId = owner.store
+          .intents()
+          .find((intent) => intent.run_id === formattingRun.id)?.attempt_id;
+        const artifact = owner.store.receipt(`formatting:${attemptId}`)?.result.entity;
+        return {
+          snapshot: owner.snapshot(),
+          base: formattingRun.source.base,
+          source: formatting.source.directory,
+          scratch: join(owner.home, 'scratch', formattingRun.id),
+          receipt:
+            artifact && 'hash' in artifact
+              ? JSON.parse(
+                  new ArtifactFiles(join(owner.home, 'artifacts'))
+                    .read(artifact.hash)
+                    .toString('utf8'),
+                )
+              : undefined,
+        };
+      };
+      const hashOf = (base: string, files: ReturnType<typeof readFiles>) =>
+        new CandidateEvidence({
+          home: directory,
+          artifacts: artifactFiles,
+          id,
+          getArtifact: () => {
+            throw Error('The hash needs no artifacts.');
+          },
+        }).hash(base, files);
+      const layout = await formatRun(tabConfiguration);
+      const failure = await formatRun('{');
+      await t.test(
+        'a candidate whose only defect is layout passes biome check after capture',
+        () => {
+          const check = spawnSync(biome.binary, ['check', 'net.mjs'], {
+            cwd: layout.scratch,
+            encoding: 'utf8',
+          });
+          assert.equal(check.status, 0, check.stdout + check.stderr);
+          assert.equal(layout.receipt?.status, 'formatted');
+          assert.equal(layout.receipt.formatter.version, biome.version);
+          assert.equal(
+            layout.receipt.formatter.sha256,
+            createHash('sha256').update(readFileSync(biome.binary)).digest('hex'),
+          );
+          assert.deepEqual(
+            layout.receipt.files.map((file: { path: string }) => file.path),
+            ['net.mjs'],
+          );
+        },
       );
-      const planned = await planFormatting({
-        runtime: resolve('.'),
-        project: layout.source,
-        base: layout.base,
-        files,
-        work: mkdtempSync(join(directory, 'format-policy-')),
-        maximumBytes: 1024 * 1024,
+      await t.test('a formatter failure leaves the bytes unchanged and is recorded', () => {
+        assert.deepEqual(readFileSync(join(failure.scratch, 'net.mjs')), authoredBytes);
+        assert.equal(failure.receipt?.status, 'failed');
+        assert.match(failure.receipt.reason, /exited/);
+        assert.deepEqual(failure.receipt.files, []);
+        assert.equal(
+          failure.snapshot.candidates[0].hash,
+          hashOf(failure.base, readFiles(failure.scratch)),
+        );
       });
-      assert.equal(planned.receipt.status, 'skipped');
-      assert.equal(planned.receipt.reason, 'The candidate changes the formatting configuration.');
-      assert.deepEqual(planned.outputs, []);
+      await t.test('the candidate hash equals the formatted bytes', () => {
+        const formatted = spawnSync(biome.binary, ['format', '--stdin-file-path=net.mjs'], {
+          cwd: layout.scratch,
+          input: authoredBytes,
+        });
+        assert.equal(formatted.status, 0);
+        assert.notDeepEqual(formatted.stdout, authoredBytes);
+        const sealed = readFiles(layout.scratch);
+        assert.deepEqual(sealed.find((file) => file.path === 'net.mjs')?.content, formatted.stdout);
+        assert.equal(layout.snapshot.candidates[0].hash, hashOf(layout.base, sealed));
+        assert.equal(layout.snapshot.evidence[0].candidateHash, layout.snapshot.candidates[0].hash);
+        assert.deepEqual(layout.receipt?.files, [
+          {
+            path: 'net.mjs',
+            before: createHash('sha256').update(authoredBytes).digest('hex'),
+            after: createHash('sha256').update(formatted.stdout).digest('hex'),
+          },
+        ]);
+      });
+      await t.test(
+        'a candidate configuration cannot replace the committed formatter policy',
+        async () => {
+          const candidateConfiguration = Buffer.from(
+            '{"formatter":{"indentStyle":"space"},"linter":{"enabled":false}}\n',
+          );
+          const files = committedFiles(layout.source, layout.base).map((file) =>
+            file.path === 'biome.json'
+              ? {
+                  ...file,
+                  content: candidateConfiguration,
+                  bytes: candidateConfiguration.length,
+                  hash: createHash('sha256').update(candidateConfiguration).digest('hex'),
+                }
+              : file,
+          );
+          const planned = await planFormatting({
+            runtime: resolve('.'),
+            project: layout.source,
+            base: layout.base,
+            files,
+            work: mkdtempSync(join(directory, 'format-policy-')),
+            maximumBytes: 1024 * 1024,
+          });
+          assert.equal(planned.receipt.status, 'skipped');
+          assert.equal(
+            planned.receipt.reason,
+            'The candidate changes the formatting configuration.',
+          );
+          assert.deepEqual(planned.outputs, []);
+        },
+      );
     },
   );
 });
 
-test('acceptance creates one checked branch and preserves the original source', async (t) => {
+test('acceptance creates one checked branch and preserves the original source', {
+  skip: runtimeOwnedByAnotherUser,
+}, async (t) => {
   for (const transfer of ['reserve', 'manual'] as const)
     await acceptsTransferredCandidate(t, transfer);
   await acceptsNativeCandidate(t);
@@ -4358,6 +4453,7 @@ test('an appointed native proposal is retained and applied once after every phas
   await nativeWait('Local formatted writer', formattedLocal.terminal);
   await t.test(
     'a formatted Local candidate still traces to its completed replacement',
+    { skip: macosToolchainOnly },
     async () => {
       const formattedCandidate = formattedLocal.controller
         .snapshot()
@@ -4972,8 +5068,10 @@ test('an appointed native proposal is retained and applied once after every phas
           'utf8',
         ),
       );
-      controller.store.db.exec(
-        'INSERT INTO native_processes SELECT * FROM native_processes_saved; DROP TABLE native_processes_saved; DROP TABLE chat_turns; DROP TABLE chat_threads; DROP TABLE task_operations; DROP TABLE activity_output; DROP TABLE combined_ref_intents; DROP TABLE combined_dispatches; DROP TABLE combined_members; DROP TABLE combined_groups; DROP TABLE conversation_entries; DROP TABLE task_conversations; DROP TABLE run_purposes; DROP TABLE local_control; DROP TABLE google_metadata_operations; DROP TABLE google_usage_reader; DROP TABLE native_profile_bindings; DROP TABLE google_acp_setup; DROP INDEX events_task_cursor; DROP INDEX entities_kind_id; DROP INDEX task_project_id; DROP INDEX entities_task_id; DROP INDEX entities_run_id; PRAGMA user_version=4',
+      controller.store.db.exec('INSERT INTO native_processes SELECT * FROM native_processes_saved');
+      dropBeyondVersionFour(
+        controller.store.db,
+        new URL('../../migrations/', import.meta.url).pathname,
       );
       controller.store.applyMigrations(new URL('../../migrations/', import.meta.url).pathname);
       assert.deepEqual(controller.store.nativeProcesses(attempt.attempt_id), previous);
@@ -7833,6 +7931,8 @@ test('google quota authority survives retries and restart while sharing one oper
   const context = await setup(t, options, () => controller.close());
   controller = context.controller;
   t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
+  // These rows protect quota authority. The gate has its own claim in google-terms.test.ts.
+  await acknowledgeGoogleTerms(context);
   const refresh = () => context.command('ObserveUsage', { family: 'google' }, 0);
   assert.equal(controller.snapshot().usageReaders[0]?.available, true);
   assert.equal('enabled' in controller.snapshot().usageReaders[0], false);
@@ -8294,6 +8394,7 @@ test('google quota authority survives retries and restart while sharing one oper
     now: context.clock.now,
     id: context.id,
   });
+  await acknowledgeGoogleTerms({ controller, command: context.command });
   const interrupted = refresh();
   controller.store.transaction(() => {
     controller.store.beginGoogleMetadata(
@@ -8845,7 +8946,9 @@ test('a catalog read with no stored model list starts one model read and the pic
   assert.deepEqual(phases, ['features', 'app-server']);
 });
 
-test('an acp scratch permission binds one live action and crash recovery cannot invent completion', async (t) => {
+test('an acp scratch permission binds one live action and crash recovery cannot invent completion', {
+  skip: runtimeOwnedByAnotherUser,
+}, async (t) => {
   for (const row of [
     'approved',
     'hunk-approved',
@@ -9077,6 +9180,7 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
       },
     };
     const context = await setup(t, options);
+    await acknowledgeGoogleTerms(context);
     let controller = context.controller;
     liveController = controller;
     const { command, source, fixtures, clock, id } = context;
@@ -10333,6 +10437,7 @@ test('official installation can stop and recover without blocking project work',
   let controller: Controller;
   const context = await setup(t, options, () => controller.close());
   controller = context.controller;
+  await acknowledgeGoogleTerms(context);
   const input = context.command(
     'InstallGoogleAcp',
     { profileId: 'google-acp-v1', consent: 'explicit' },

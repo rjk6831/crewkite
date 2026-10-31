@@ -1,4 +1,5 @@
 import {
+  allowsSubagents,
   type ChatCrewChain,
   ChatCrewRoleSchema,
   type ChatFlightMode,
@@ -23,9 +24,17 @@ import {
   useRef,
   useState,
 } from 'react';
+import { AnalyticsView } from '../analytics-view.tsx';
 import { familyName } from '../components.tsx';
+import {
+  ExtensionInspectorTab,
+  extensionTabId,
+  slotsOf,
+  useExtensions,
+} from '../extension-slots.tsx';
 import { clientFor } from '../settings/client-status.tsx';
 import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
+import { McpThreadMenu } from '../settings/mcp-card.tsx';
 import {
   crewFromPreset,
   crewPresetNames,
@@ -40,17 +49,20 @@ import { useCatalog } from '../settings/use-catalog.ts';
 import { UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
-import type { ThreadSource } from './commands.ts';
+import { ChecksSettings } from './checks-card.tsx';
+import { configureThread, type ThreadSource } from './commands.ts';
 import { FamilyMark } from './family-mark.tsx';
 import { modelLine } from './message-list.tsx';
 import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
+import { SubagentSwitch } from './subagent-switch.tsx';
 
-export type InspectorTab = 'changes' | 'usage' | 'crew' | 'thread';
+export type InspectorTab = 'changes' | 'usage' | 'analytics' | 'crew' | 'thread' | `ext:${string}`;
 const tabs: { id: InspectorTab; label: string }[] = [
   { id: 'changes', label: 'Changes' },
   { id: 'usage', label: 'Usage' },
+  { id: 'analytics', label: 'Analytics' },
   { id: 'crew', label: 'Crew' },
   { id: 'thread', label: 'Thread' },
 ];
@@ -442,6 +454,7 @@ function ThreadTab({
           ))}
         </select>
       </label>
+      <McpThreadMenu taskId={taskId} permissionPolicy={thread?.permissionPolicy ?? 'ask'} />
       <div className="th-handoff">
         <AutoHandoff thread={thread} onConfigure={onConfigure} />
         {/* The limit offer and the picker rank by the mode too, so it stays open with the box off. */}
@@ -546,6 +559,18 @@ function CrewTab({
       ...(role === 'builder' ? { selection } : {}),
     });
   }
+  // The person's choice is saved as set, since a role with no choice takes its family default.
+  function allowSubagents(role: string, on: boolean) {
+    if (!crew) return;
+    onConfigure({
+      crew: {
+        ...crew,
+        members: crew.members.map((member) =>
+          member.role === role ? { ...member, allowSubagents: on } : member,
+        ),
+      },
+    });
+  }
   // The orchestrator starts on the builder's model, and the row's select changes it. Removing it
   // goes back to one builder turn per message.
   function setOrchestrator(on: boolean) {
@@ -607,6 +632,13 @@ function CrewTab({
                     choices={choices}
                     value={member.selection}
                     onChange={(selection) => assign(role, selection)}
+                  />
+                  <SubagentSwitch
+                    id={`${idBase}-${role}-subagents`}
+                    role={crewRoleNames[role]}
+                    family={member.selection.family}
+                    checked={allowsSubagents(member, member.selection.family)}
+                    onChange={(on) => allowSubagents(role, on)}
                   />
                 </span>
               ) : member ? (
@@ -673,6 +705,14 @@ function CrewTab({
         {crew ? mode.title : 'Start from a preset to run the crew in Balanced or Glide.'}
       </p>
       <AutoHandoff thread={thread} onConfigure={onConfigure} />
+      <ChecksSettings
+        thread={thread}
+        onEdit={(checks) =>
+          thread
+            ? configureThread(source, { taskId: thread.taskId, checks }).then(() => {})
+            : Promise.resolve()
+        }
+      />
       {note && (
         <p className="th-note" role="status">
           {note}
@@ -717,6 +757,16 @@ export function Inspector({
 }) {
   const panel = useRef<HTMLElement>(null);
   const size = useInspectorWidth(panel);
+  const extensionRead = useExtensions(source).read;
+  const extensionTabs = slotsOf(extensionRead, 'inspector-tab');
+  // An extension tab whose extension turned off falls back to Changes once the read is in.
+  const missingTab =
+    tab.startsWith('ext:') &&
+    extensionRead !== null &&
+    !extensionTabs.some((slot) => extensionTabId(slot) === tab);
+  useEffect(() => {
+    if (missingTab) onTab('changes');
+  }, [missingTab, onTab]);
   // Escape closes the panel unless a picker or field inside it already took the key, or a dialog
   // such as search is open and owns it.
   useEffect(() => {
@@ -744,7 +794,10 @@ export function Inspector({
       />
       <div className="th-inspector-head">
         <div role="tablist" aria-label="Inspector sections">
-          {tabs.map((item) => (
+          {[
+            ...tabs,
+            ...extensionTabs.map((slot) => ({ id: extensionTabId(slot), label: slot.title })),
+          ].map((item) => (
             <button
               key={item.id}
               type="button"
@@ -785,6 +838,13 @@ export function Inspector({
           />
         )}
         {tab === 'usage' && <UsageTab source={source} header={header} preview={preview} />}
+        {tab === 'analytics' && (
+          <AnalyticsView
+            source={source}
+            input={{ scope: 'thread', taskId }}
+            refreshKey={`${turns.length}:${turns.at(-1)?.state ?? ''}`}
+          />
+        )}
         {tab === 'crew' && <CrewTab source={source} thread={thread} onConfigure={onConfigure} />}
         {tab === 'thread' && (
           <ThreadTab
@@ -796,6 +856,11 @@ export function Inspector({
             onConfigure={onConfigure}
           />
         )}
+        {extensionTabs
+          .filter((slot) => tab === extensionTabId(slot))
+          .map((slot) => (
+            <ExtensionInspectorTab key={tab} source={source} taskId={taskId} slot={slot} />
+          ))}
       </div>
     </aside>
   );

@@ -32,7 +32,7 @@
 //   session/prompt error       {code:-32603, message}
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -40,7 +40,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { type AgentEvent, AgentEventSchema } from '@crewkite/contracts';
 import type { AcpChatPeerCase } from '../../../../../packages/testkit/src/providers/acp-peer.ts';
 import type { ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
-import { byteSize } from '../../chat/prompt.ts';
+import { byteSize, turnNotesBlock } from '../../chat/prompt.ts';
 import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
 import { spawnCheckChild } from '../../host/check-ownership.ts';
@@ -147,8 +147,10 @@ async function run(
 ) {
   const events: AgentEvent[] = [];
   const frames: Frame[] = [];
+  let launched: NodeJS.ProcessEnv = {};
   const spawn: AcpSpawn = (executable, args, options) => {
     assert.equal(options.env.SECRET_TOKEN, undefined);
+    launched = options.env;
     const child = spawnCheckChild(executable, args, options);
     const write = child.stdin.write.bind(child.stdin);
     child.stdin.write = ((chunk: string | Uint8Array, ...rest: unknown[]) => {
@@ -182,7 +184,7 @@ async function run(
   const last = events.at(-1);
   assert.equal(last?.type, 'turn.completed');
   assert.equal(events[0]?.type, 'turn.started');
-  return { events, frames, result, handle, capabilities };
+  return { events, frames, result, handle, capabilities, launched };
 }
 
 /** A file stored the way the controller stores one, under the rig's home. */
@@ -368,6 +370,23 @@ test('a turn streams thinking, tools and text in order, and the next turn resume
       'You are working in a scratch copy of demo.\n\nEarlier in this conversation:\n\nUser: earlier question\n\nAssistant: earlier answer\n\nWhat does this project do?',
     );
     assert.equal(lost.result.stopReason, 'done');
+
+    // The controller puts a notes block in front of a message for a resumed session. When the
+    // session is lost, the new one reads the notes in its system context, so the block goes.
+    const block = turnNotesBlock(['Use pnpm, not npm.'], undefined);
+    const lostWithNotes = await run(
+      g,
+      request(g, {
+        session: first.result.session,
+        prompt: `${block}\n\nWhat does this project do?`,
+      }),
+    );
+    assert.equal(
+      promptText(lostWithNotes.frames).includes('CrewKite attaches'),
+      false,
+      'a lost session does not get the resumed block',
+    );
+    assert.ok(promptText(lostWithNotes.frames).endsWith('\n\nWhat does this project do?'));
 
     // With the thread tools, session/new and session/load each carry the one server, read-only
     // turns included, and each turn has its own token.
@@ -1084,6 +1103,16 @@ test('an unknown update or method goes to the frame trace and never the thread, 
     ]);
     assert.equal(turn.result.stopReason, 'done');
     assert.equal(turn.result.assistantText, 'still here');
+  } finally {
+    f.dispose();
+  }
+});
+
+test('the client starts with Git held to the scratch copy', async () => {
+  const f = rig('chat-stream');
+  try {
+    const turn = await run(f, request(f));
+    assert.equal(turn.launched.GIT_CEILING_DIRECTORIES, realpathSync.native(f.home));
   } finally {
     f.dispose();
   }

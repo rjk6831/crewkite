@@ -18,25 +18,31 @@ import {
   Sun,
   X,
 } from 'lucide-react';
-import {
-  type ReactNode,
-  useCallback,
-  useEffect,
-  useId,
-  useLayoutEffect,
-  useRef,
-  useState,
-} from 'react';
+import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from 'react';
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
+import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
+import { SUGGESTED_FIRST_MESSAGE } from './onboarding/flow.ts';
+import { Onboarding } from './onboarding/onboarding.tsx';
+import { useOnboarding } from './onboarding/use-onboarding.ts';
+import {
+  buildPaletteCommands,
+  FuzzyText,
+  type PaletteCommand,
+  rankCommands,
+} from './palette/commands.tsx';
+import { focusSection } from './palette/focus-section.ts';
+import { selectedOption } from './palette/select.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
+import { RailSearch } from './rail-search.tsx';
 import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
-import { adjacentThread, isMacPlatform, shortcutFor } from './thread/composer-rules.ts';
+import { adjacentThread, isMacPlatform, searchHint, shortcutFor } from './thread/composer-rules.ts';
+import type { HistoryFind } from './thread/history-reveal.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { OpeningThread, ThreadView } from './thread/thread-view.tsx';
@@ -78,15 +84,6 @@ function useSystemTheme() {
   return dark ? 'dark' : 'light';
 }
 
-type PaletteCommand = {
-  id: string;
-  label: string;
-  icon: ReactNode;
-  run: () => void;
-  disabled?: boolean;
-  // Commands with consequences are never highlighted for you, so Enter after typing cannot run them.
-  explicit?: boolean;
-};
 type TextMatch = { index: number; length: number };
 const paletteTaskPageSize = 5;
 
@@ -203,10 +200,8 @@ function CommandPalette({
     ? new RegExp(trimmed.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&'), 'iu')
     : null;
   const projectNames = new Map(projects.map((project) => [project.id, project.name]));
-  const commandResults = commands.flatMap((command) => {
-    const match = findMatch(pattern, command.label);
-    return !pattern || match ? [{ command, match }] : [];
-  });
+  // Commands match by fuzzy subsequence, so "chg" finds Show changes.
+  const commandResults = rankCommands(commands, trimmed);
   const taskResults = (search.query === trimmed ? search.rows : []).map((task) => {
     const field = task.match;
     const label =
@@ -249,10 +244,7 @@ function CommandPalette({
     })),
   ];
   const enabled = options.filter((option) => !option.disabled);
-  const current =
-    enabled.find((option) => option.key === active) ??
-    enabled.find((option) => !option.explicit) ??
-    null;
+  const current = selectedOption(enabled, active);
   const optionId = (key: string) => `${id}-${key}`;
   const activeId = current ? optionId(current.key) : undefined;
   useEffect(() => {
@@ -382,8 +374,9 @@ function CommandPalette({
                   </span>
                   <span className="palette-option-text">
                     <span className="palette-option-title">
-                      <Highlight text={command.label} match={match} />
+                      <FuzzyText text={command.label} match={match} />
                     </span>
+                    {command.hint && <span className="palette-option-meta">{command.hint}</span>}
                   </span>
                   <ArrowRight size={14} aria-hidden="true" />
                 </button>
@@ -517,6 +510,8 @@ export function App() {
         : titleCase(connection);
   const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
+  const onboarding = useOnboarding(workspace);
+  const [prefill, setPrefill] = useState<string | null>(null);
   // Threads deleted here leave the rail at once, before the workspace read catches up.
   const [removed, setRemoved] = useState<ReadonlySet<string>>(() => new Set());
   const [deleting, setDeleting] = useState<{ id: string; title: string } | null>(null);
@@ -547,6 +542,7 @@ export function App() {
   const [palette, setPalette] = useState(false);
   const paletteOpener = useRef<HTMLElement | null>(null);
   const searchButton = useRef<HTMLButtonElement>(null);
+  const newThreadButton = useRef<HTMLButtonElement>(null);
   const [about, setAbout] = useState(false);
   const task = newThread === null ? snapshot?.tasks.find(({ id }) => id === selected) : undefined;
   const selectedProjectId = task?.projectId;
@@ -572,10 +568,26 @@ export function App() {
     setAddedProject(project.data.id);
     startThread(project.data.id);
   }
+  // The last welcome step opens a new thread in the project with the suggested message in the box.
+  function finishWelcome(projectId: string) {
+    onboarding.finish();
+    setPrefill(SUGGESTED_FIRST_MESSAGE);
+    setAddedProject(projectId);
+    startThread(projectId);
+  }
+  // A history search result the open thread scrolls to. Opening a thread any other way clears it.
+  const [find, setFind] = useState<HistoryFind | null>(null);
   function openThread(id: string) {
+    // A thread in view means the person is under way, so the welcome ends.
+    if (onboarding.view.visible) onboarding.finish();
+    setFind(null);
     setNewThread(null);
     setSelected(id);
     setPage('tasks');
+  }
+  function openFind(next: HistoryFind) {
+    openThread(next.taskId);
+    setFind(next);
   }
   const titles = new Map(
     Object.values(taskPages).flatMap((page) => page.tasks.map((row) => [row.id, row.title])),
@@ -727,6 +739,7 @@ export function App() {
           </button>
         </div>
         <button
+          ref={newThreadButton}
           type="button"
           className="nav-item"
           onClick={() => startThread()}
@@ -748,8 +761,9 @@ export function App() {
         >
           <Search size={14} aria-hidden="true" />
           <span className="nav-text">Search</span>
-          <kbd>⌘ K</kbd>
+          <kbd>{searchHint(isMacPlatform())}</kbd>
         </button>
+        {threadSource && !collapsed && <RailSearch source={threadSource} onOpen={openFind} />}
         {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
         <div className="nav-scroll" hidden={collapsed}>
           <div className="nav-label">PROJECTS</div>
@@ -938,6 +952,7 @@ export function App() {
             </button>
           </div>
         )}
+        <CrashBanner source={workspace.source} taskId={task?.id} />
         {workspaceError && (
           <div className="error-banner" role="alert">
             <AlertTriangle size={16} />
@@ -980,6 +995,28 @@ export function App() {
             header={header}
             theme={themeMode}
             onTheme={setThemeMode}
+            threadId={task?.id}
+            onShowWelcome={() => {
+              onboarding.restart();
+              setNewThread(null);
+              setPage('tasks');
+            }}
+          />
+        ) : onboarding.view.visible && newThread === null ? (
+          <Onboarding
+            workspace={workspace}
+            header={header}
+            catalog={onboarding.catalog}
+            modelRead={onboarding.modelRead}
+            view={onboarding.view}
+            onContinue={onboarding.next}
+            onBack={onboarding.back}
+            onSkip={() => {
+              onboarding.finish();
+              // The welcome unmounts with the button that was pressed, so focus goes to the rail.
+              requestAnimationFrame(() => newThreadButton.current?.focus());
+            }}
+            onFinish={finishWelcome}
           />
         ) : !threadSource ? (
           <div className="loading-workspace" role="alert">
@@ -996,6 +1033,8 @@ export function App() {
             onOpenSettings={() => setPage('settings')}
             onAddProject={workspace.canPickProject ? () => void addProject() : null}
             focusComposer={addedProject === newThread}
+            prefill={prefill}
+            onPrefilled={() => setPrefill(null)}
             localSetup={header?.localSetup}
             refresh={workspace.refresh}
             blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
@@ -1007,11 +1046,15 @@ export function App() {
             key={task.id}
             source={threadSource}
             task={task}
+            projectId={task.projectId}
             projectName={projects.find(({ id }) => id === task.projectId)?.name ?? 'Project'}
             header={header}
             preview={preview}
             connection={connection}
             refresh={workspace.refresh}
+            find={find?.taskId === task.id ? find : null}
+            onNewThread={() => startThread()}
+            onOpenSettings={() => setPage('settings')}
           />
         ) : (
           <WorkspaceEmpty
@@ -1028,7 +1071,7 @@ export function App() {
             {connectionLabel}
           </span>
           <span>
-            Search<kbd>⌘ K</kbd>
+            Search<kbd>{searchHint(isMacPlatform())}</kbd>
           </span>
         </footer>
       </div>
@@ -1045,26 +1088,26 @@ export function App() {
       {palette && (
         <Dialog title="Search threads and commands" onClose={() => setPalette(false)}>
           <CommandPalette
-            commands={[
-              {
-                id: 'new-thread',
-                label: 'New thread',
-                icon: <SquarePen size={17} />,
-                run: () => startThread(),
+            commands={buildPaletteCommands({
+              newThread: () => startThread(),
+              openSettings: () => setPage('settings'),
+              openSettingsSection: (id) => {
+                setPage('settings');
+                focusSection(id);
               },
-              {
-                id: 'settings',
-                label: 'Open settings',
-                icon: <Settings size={17} />,
-                run: () => setPage('settings'),
+              about: () => setAbout(true),
+              switchThread: (step) => {
+                const next = adjacentThread(keys.current.order, keys.current.current, step);
+                if (next && next !== keys.current.current) openThread(next);
               },
-              {
-                id: 'about',
-                label: 'About and acknowledgments',
-                icon: <Info size={17} />,
-                run: () => setAbout(true),
-              },
-            ]}
+              addProject: workspace.canPickProject ? () => void addProject() : null,
+              reconnect:
+                !preview && connection !== 'connected' ? () => void workspace.reconnect() : null,
+              theme,
+              toggleTheme: () => setThemeMode(theme === 'dark' ? 'light' : 'dark'),
+              sidebarCollapsed: collapsed,
+              toggleSidebar: () => setCollapsed(!collapsed),
+            })}
             workspace={workspace}
             projects={projects}
             onOpenTask={(id) => {

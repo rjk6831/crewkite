@@ -1,13 +1,14 @@
 {
   "name": "@crewkite/testkit",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "private": true,
   "type": "module",
   "exports": {
     ".": "./src/index.ts",
     "./chat-adapter": "./src/chat-adapter.ts",
     "./repository": "./src/repository.ts",
-    "./worker": "./src/worker.ts"
+    "./worker": "./src/worker.ts",
+    "./extensions": "./src/extensions.ts"
   },
   "dependencies": {
     "@crewkite/contracts": "workspace:*"

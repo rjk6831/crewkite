@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
   chmodSync,
+  copyFileSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -13,6 +14,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
+import { createOwnedProjectCommandRunner } from './owned-runner.ts';
 import {
   type OwnedProjectCommandExecution,
   type OwnedProjectCommandLifecycle,
@@ -85,6 +87,11 @@ test('project command definitions stay bound to their source, scratch, executabl
   const { root, definition } = fixture(t);
   const linked = join(root, 'linked');
   const dotted = join(definition.scratchRoot, '..cache');
+  // The shell row needs a regular file named like a shell. /bin/sh is a link on Linux, which the
+  // identity check refuses before the shell check runs.
+  const shell = join(root, 'sh');
+  copyFileSync('/bin/sh', shell);
+  chmodSync(shell, 0o755);
   symlinkSync(definition.cwd, linked);
   mkdirSync(dotted);
   const cases: Array<{ name: string; value: ProjectCommandDefinition; message: RegExp }> = [
@@ -112,8 +119,8 @@ test('project command definitions stay bound to their source, scratch, executabl
       name: 'shell executable',
       value: {
         ...definition,
-        executable: '/bin/sh',
-        executableSha256: createHash('sha256').update(readFileSync('/bin/sh')).digest('hex'),
+        executable: shell,
+        executableSha256: createHash('sha256').update(readFileSync(shell)).digest('hex'),
       },
       message: /shell authority/,
     },
@@ -246,4 +253,62 @@ test('project commands retain streamed output and classify success, failure and 
   assert.equal(failed.status, 'failed');
   assert.equal(failed.reason, 'output');
   assert.equal(stops, 1);
+});
+
+test('a project command runs with Git held to the folder that holds the scratch copy', (t) => {
+  const { root, definition } = fixture(t);
+  const launched: NodeJS.ProcessEnv[] = [];
+  const execution: OwnedProjectCommandExecution = {
+    stdout: asyncBytes([]),
+    stderr: asyncBytes([]),
+    terminal: Promise.resolve({ code: 0, signal: null, quiescent: true, reason: 'exit' }),
+    stop() {},
+  };
+  // The command may start in a folder of the copy, and the ceiling still sits above the whole copy.
+  for (const cwd of [definition.scratchRoot, definition.cwd]) {
+    startProjectCommand(
+      { ...definition, cwd },
+      {
+        lifecycle: lifecycle(),
+        publishStream,
+        runner: {
+          launch(request) {
+            launched.push(request.environment);
+            return execution;
+          },
+        },
+      },
+    );
+  }
+  assert.deepEqual(
+    launched.map((environment) => environment.GIT_CEILING_DIRECTORIES),
+    [root, root],
+  );
+  assert.equal(launched[0].HOME, definition.environment.HOME);
+});
+
+test('the owned runner passes the ceiling to the program it starts', async (t) => {
+  const { root, definition } = fixture(t);
+  const executable = realpathSync(process.execPath);
+  const published: Buffer[] = [];
+  const operation = startProjectCommand(
+    {
+      ...definition,
+      executable,
+      executableSha256: createHash('sha256').update(readFileSync(executable)).digest('hex'),
+      argv: ['-e', 'process.stdout.write(process.env.GIT_CEILING_DIRECTORIES ?? "none")'],
+      environment: { ...definition.environment, PATH: process.env.PATH ?? '' },
+    },
+    {
+      lifecycle: lifecycle(),
+      runner: createOwnedProjectCommandRunner({ deadlineMs: 20_000 }),
+      publishStream: async (source) => {
+        for await (const chunk of source) published.push(Buffer.from(chunk));
+        return { hash: '0'.repeat(64), bytes: 0 };
+      },
+    },
+  );
+  const outcome = await operation.result;
+  assert.equal(outcome.status, 'succeeded');
+  assert.equal(Buffer.concat(published).toString('utf8'), root);
 });

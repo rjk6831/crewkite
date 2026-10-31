@@ -2,7 +2,7 @@
 
 I want useful changes in my hands every day or so. I will keep D2b as one milestone and release D2b.1, D2b.2 and subsequent slices independently. Each slice gets its own review, green CI and runnable UAT package. D2c remains available for corrections that need a separate stabilization round. D3 still needs my explicit approval.
 
-D2b.1 has released provider connection and project-selection recovery corrections. Large-project handling and GitHub/CI work follow that usable baseline. Practical multi-file changes and project commands follow. Recovery has to hold throughout, and gets a separate acceptance pass before I claim coding parity. Instant History and Optimized Storage stay in scope after the coding workflow.
+D2b.1 has released provider connection and project-selection recovery corrections. Large-project handling and GitHub/CI work follow that usable baseline. Practical multi-file changes and project commands follow. Recovery has to hold throughout, and gets a separate acceptance pass before I claim coding parity. Instant History is in the 0.1.0 prerelease, and Optimized Storage stays in scope after the coding workflow.
 
 ## Start here
 
@@ -74,8 +74,24 @@ A day is a target for the next usable increment. It includes review and release 
 | D2b.8 | Publish a checked branch and open or update its PR | D2b.4, D2b.7 | Planned | None |
 | D2b.9 | Recover work and verification across restart and application updates | D2b.8 | Planned | None |
 | D2b.10 | Pass the representative daily-work suite and close its observed gaps | D2b.9 | Planned | None |
-| D2b.11 | Open and scroll retained local history quickly | D2b.10 | Planned | None |
+| D2b.11 | Open and scroll retained local history quickly | D2b.10 | In the 0.1.0 prerelease; not yet tagged | A history index with search in the rail and `crewkite search`, paged thread reads and a view that mounts only the rows near the screen. Claims in [testing](testing.md#thread-history-search-and-the-long-thread). The timings on the reference Mac come with the final macOS check |
 | D2b.12 | Compress older history without losing access or integrity | D2b.11 | Planned | None |
+| rc-05+ L0 | Thread tools named only on turns that have them; control socket found through a record in the home | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Commits `d99e9e2`, `d515be9`, `f5b547d`; claims in [testing](testing.md#thread-tools-agreement-and-the-control-socket); the release build gets its final macOS check |
+| rc-05+ L1 | Interactive `crewkite` terminal mode with slash commands, mentions and print mode | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Merged in `792573f`; claims in [testing](testing.md#cli); the release build gets its final macOS check |
+| rc-05+ L2 | Independent plan slices run side by side in their own copies, with a file-level replay and Blocked slices | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Merged in `69b1612`; [ADR 0045](adr/0045-the-orchestrator-proposes-and-the-controller-assigns.md) amendment; claims in [testing](testing.md#parallel-plan-slices); the release build gets its final macOS check |
+| rc-05+ L3 | Scratch copies clone where the volume allows; Changes, Discard and Accept compare by object ID | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Merged in `5d3c378`; claims in [testing](testing.md#scratch-copy-clones); the release build gets its final macOS check |
+| rc-05+ L4 | The person's MCP servers, off for every thread and turned on per thread | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Merged in `02c3f74`; [ADR 0046](adr/0046-the-persons-servers-join-a-thread-only-by-the-controllers-config.md); claims in [testing](testing.md#the-persons-mcp-servers); the release build gets its final macOS check |
+| rc-05+ L5 | Composer @ mentions, slash commands, the instruction chip and saved prompts | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Merged in `ed242f9`; claims in [testing](testing.md#composer-parity); the release build gets its final macOS check |
+| rc-05+ L6 | Project checks in the crew chain, each run after asking the thread's permission | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Merged in `efb255e`; claims in [testing](testing.md#project-checks-in-the-loop); the release build gets its final macOS check |
+| rc-05+ L8 | Extension seam with a versioned contract, off by default | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Merged in `69e1cfb`; [ADR 0047](adr/0047-extensions-attach-through-one-versioned-seam.md); claims in [testing](testing.md#extension-seam); the release build gets its final macOS check |
+| Sprint 2 S1 | Changes in pages with no file cap, Accept and Discard per hunk, and review comments that quote hunk lines | rc-05 base | In the 0.1.0 prerelease; not yet tagged | [ADR 0027](adr/0027-page-large-data-without-project-size-ceilings.md) amendment; claims in [testing](testing.md#changes-pages-hunks-and-review-comments) |
+| Sprint 2 S2 | Project notes that the controller sends with every turn | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Claims in [testing](testing.md#project-notes) |
+| Sprint 2 S3 | Usage analytics for a thread and a project, with CSV export | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Claims in [testing](testing.md#usage-analytics) |
+| Sprint 2 S4 | Command palette, Markdown export and a read-only share page | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Claims in [testing](testing.md#command-palette-export-and-share-page) |
+| Sprint 2 S5 | Diagnostics bundle and crash records, with secrets, home paths and email addresses removed | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Claims in [testing](testing.md#diagnostics-bundle-and-crash-records) |
+| Sprint 2 S6 | First-run welcome that ends with a project and a suggested first message | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Claims in [testing](testing.md#first-run-welcome) |
+| Sprint 2 S7 | Controller safety, the message queue, plan slice review fixes and CLI rough edges | rc-05 base | In the 0.1.0 prerelease; not yet tagged | Claims in [testing](testing.md#controller-safety-and-queue), [testing](testing.md#plan-slice-review-leftovers) and [testing](testing.md#cli-rough-edges-in-sprint-2) |
+| Sprint 2 S8 | A benchmark harness with 30 tasks from the repository history | rc-05 base | In the 0.1.0 prerelease; not yet tagged | [Benchmark harness](bench.md); claims in [testing](testing.md#benchmark-harness) |
 
 D2b.3 and D2b.4 can be developed alongside each other after their read contract is stable. D2b.6 can also proceed once the output path is available, so project commands need not wait for every context improvement. Land shared contracts and migrations through one integration owner. Do not create competing command owners. Ship the earliest ready slice without waiting for another lane. History work cannot delay the first usable coding releases.
 

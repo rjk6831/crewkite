@@ -4,8 +4,10 @@ import type {
   CommandResult,
   DesktopNotice,
   Event,
+  McpBridge,
   ProjectPage,
   ProjectPageRequest,
+  ReadChatAnalyticsPayload,
   Snapshot,
   SnapshotScope,
   TaskPage,
@@ -22,6 +24,8 @@ export type DesktopCommand = Command extends infer Item
     : never
   : never;
 export type ConnectionState = 'connecting' | 'connected' | 'offline';
+/** The share page main rendered for a preview. */
+export type DesktopShare = { html: string; filename: string; turns: number; omitted: number };
 /**
  * A file main found for the composer. The renderer sends the path on to the controller and never
  * opens it. `thumbnail` is a small PNG data URL, present only for an image main could decode.
@@ -29,7 +33,12 @@ export type ConnectionState = 'connecting' | 'connected' | 'offline';
 export type DesktopFile = { path: string; name: string; bytes: number; thumbnail: string | null };
 export type DesktopAttachInput =
   | { from: 'picker' }
-  | { from: 'drop' | 'paste'; files: readonly File[] };
+  | { from: 'drop' | 'paste'; files: readonly File[] }
+  /**
+   * Clipboard text too long for a message, with the length the page saw. Main reads the clipboard
+   * itself, saves it only when the length matches, and the page never sends the text.
+   */
+  | { from: 'paste-text'; length: number };
 /** A stored attachment, named by thread, hash and name. The page never names a path. */
 export type DesktopAttachmentTarget = {
   action: 'preview' | 'reveal' | 'save';
@@ -54,6 +63,26 @@ export interface DesktopSource {
   attachFiles?(input: DesktopAttachInput): Promise<DesktopFile[]>;
   /** Preview, reveal or save a file the controller stored for a thread. Main builds the path. */
   openAttachment?(target: DesktopAttachmentTarget): Promise<'done' | 'cancelled'>;
+  /** Save the controller's saved prompts as a JSON file. Main reads them and shows the dialog. */
+  savePrompts?(): Promise<'saved' | 'cancelled'>;
+  /** List what the diagnostics bundle holds, then save it as a folder the person names. */
+  exportDiagnostics?(input: { taskId?: string }): Promise<'saved' | 'cancelled'>;
+  /** Hide the line about the last unexpected close. */
+  dismissCrash?(): Promise<void>;
+  /** Save one project's notes as a Markdown file. Main reads them and shows the dialog. */
+  saveNotes?(projectId: string): Promise<'saved' | 'cancelled'>;
+  /** Save the usage numbers of a thread or project as CSV. Main reads them and shows the dialog. */
+  saveAnalytics?(input: ReadChatAnalyticsPayload): Promise<'saved' | 'cancelled'>;
+  /**
+   * Render the thread's share page for the person to look at. Main keeps the text it returned, and
+   * saveExport writes that text and nothing the page supplies.
+   */
+  previewShare?(taskId: string): Promise<DesktopShare>;
+  /** Save the previewed share page, or the thread as Markdown, through the system save dialog. */
+  saveExport?(input: {
+    taskId: string;
+    format: 'markdown' | 'html';
+  }): Promise<'saved' | 'cancelled'>;
   pickProject?(): Promise<CommandResult | null>;
   reconnect?(): Promise<void>;
   retryCommand?(expected?: DesktopCommand): Promise<CommandResult | null>;
@@ -68,6 +97,13 @@ export interface DesktopSource {
   rememberLocalToken?(): Promise<LocalTokenStatus>;
   /** Delete the kept token and clear the controller's copy. */
   forgetLocalToken?(): Promise<LocalTokenStatus>;
+  /** The person's MCP servers. The page sees names and counts, never a secret. */
+  mcp?: McpBridge;
+  /** Whether the first-run welcome has ended. Main keeps the one flag in the desktop profile. */
+  onboarding?: {
+    finished(): Promise<boolean>;
+    setFinished(finished: boolean): Promise<void>;
+  };
 }
 export type LocalTokenStatus = { available: boolean; reason?: string; remembered: boolean };
 export type ThreadAttentionInput = {
@@ -172,3 +208,8 @@ export class FrameDecoder {
       throw new ProtocolError('invalid-frame');
   }
 }
+
+export * from './analytics-csv.ts';
+export * from './analytics-format.ts';
+export * from './mentions.ts';
+export * from './slash-commands.ts';

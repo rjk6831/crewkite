@@ -1,0 +1,26 @@
+{
+  "id": "local-thread-read-room",
+  "title": "Size a Local thread read from the room the prompt leaves",
+  "repository": "self",
+  "base": "17e541151f28f7971fdea82379765691dbe0f0a4",
+  "solution": "b3da0d11a82231104d9bc3cb0376d16df63eac32",
+  "text": "Local chat turns cut a thread read to a fixed quarter of the prompt room, which ignores how much the built prompt already uses. I want the cut to follow the room the prompt leaves. Add an exported function localThreadReadBytes(contextLength, promptTokens, capBytes) to apps/controller/src/providers/local/budget.ts. It returns how many bytes one thread read may take. Start from the prompt room for that context length (localPromptRoom), subtract the prompt tokens already used, never go below zero, and treat a negative token count as zero. Convert the remaining tokens to bytes at three bytes per token and never return more than capBytes. A prompt that fills the room or passes it leaves nothing, so the result is 0. A fuller prompt never gives a larger read. Use the function in the Local chat adapter once the prompt is built, in place of the fixed share.",
+  "hidden": ["apps/controller/src/providers/local/budget.test.ts"],
+  "checks": [
+    {
+      "name": "budget",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/providers/local/budget.test.ts"]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["local", "budget", "pure-function"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:10.169Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["budget"],
+    "baseFailure": "missing-module",
+    "passedOnSolution": ["budget"]
+  }
+}

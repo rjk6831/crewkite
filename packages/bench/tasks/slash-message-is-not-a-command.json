@@ -1,0 +1,26 @@
+{
+  "id": "slash-message-is-not-a-command",
+  "title": "Treat a message that starts with a command word as a message",
+  "repository": "self",
+  "base": "0adc0c59c0c0e08a119059a606ac26574120aefe",
+  "solution": "7a08c18f53b1480387d02672626c3ce6e9874b4b",
+  "text": "In packages/client/src/slash-commands.ts, parseSlash treats any text that starts with a known command name as that command, so a message such as \"/new endpoint returns 500\" is cleared and run as /new. A command that takes no argument must match only when it is typed alone, so \"/new endpoint returns 500\" and \"/help me fix the build\" are messages and parseSlash returns null for them, while \"/new\" alone is the new command. Commands that do take an argument keep matching with their argument. completeSlash must also put an exact name first, so completing \"/pr\" offers pr before provider and prompt, with the other matches after it in their usual order.",
+  "hidden": ["apps/controller/src/chat/saved-prompts.test.ts"],
+  "checks": [
+    {
+      "name": "saved-prompts",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/chat/saved-prompts.test.ts"]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["composer", "client", "pure-function"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:37.438Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["saved-prompts"],
+    "baseFailure": "assertion",
+    "passedOnSolution": ["saved-prompts"]
+  }
+}

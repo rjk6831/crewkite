@@ -13,14 +13,22 @@ import { join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { RuntimeManifestSchema } from '@crewkite/contracts';
 import { Controller, type ControllerOptions } from './commands/controller.ts';
+import { installCrashCapture } from './diagnostics/crash.ts';
+import { appendControllerLog } from './diagnostics/log.ts';
 import { configuredIdentity } from './host/publication.ts';
 import {
+  resolveAnthropicChatClient,
   resolveAnthropicCompactNativeProfile,
   resolveAnthropicNativeProfile,
 } from './providers/anthropic/profile.ts';
 import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
 import { refreshAvailableMemory, startGpuProbe } from './providers/local/hardware.ts';
-import { resolveNativeProfile, resolveRepositoryProfile } from './providers/openai/profile.ts';
+import {
+  resolveNativeProfile,
+  resolveOpenAiChatClient,
+  resolveOpenAiUsageClient,
+  resolveRepositoryProfile,
+} from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
 
 function runtimeBytes(path: string, maximum: number) {
@@ -94,7 +102,18 @@ export function resolvePackagedLocalInput(root: string) {
 export async function startController(options: ControllerOptions) {
   const configuration = {
     openAiUsageClient:
-      !options.nativeProfile && !options.nativeProfiles ? resolveNativeProfile : undefined,
+      !options.nativeProfile && !options.nativeProfiles
+        ? (resolution?: { cachedOnly?: boolean }) =>
+            resolveOpenAiUsageClient(process.env, resolution)
+        : undefined,
+    // Chat finds each client by version range. The writer profiles below keep their exact pins.
+    chatClients:
+      !options.nativeProfile && !options.nativeProfiles
+        ? {
+            openai: () => resolveOpenAiChatClient(),
+            anthropic: () => resolveAnthropicChatClient(),
+          }
+        : undefined,
     registerGoogleAcp: !options.nativeProfile && !options.nativeProfiles,
     nativeProfiles: options.nativeProfile
       ? undefined
@@ -122,12 +141,13 @@ export async function startController(options: ControllerOptions) {
         const completion = Promise.withResolvers<void>();
         closing = completion.promise;
         try {
-          const stopped = controller.close();
+          // The socket closes first, so the next controller on this home cannot start while this
+          // one still owns the socket path.
           void (async () => {
             try {
               await server.close();
             } finally {
-              await stopped;
+              await controller.close();
             }
           })().then(completion.resolve, completion.reject);
         } catch (error) {
@@ -144,6 +164,7 @@ export async function startController(options: ControllerOptions) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const home = process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite');
+  installCrashCapture(home);
   try {
     // The GPU report takes a moment, so it starts with the process and the first workspace read
     // after it lands carries the core count.
@@ -152,10 +173,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
     void refreshAvailableMemory();
     const runtime = await startController({ home, identity: () => configuredIdentity(home) });
     console.log(`Controller ready at ${runtime.socketPath}`);
+    appendControllerLog(home, 'controller ready');
     let closing = false;
     const close = async () => {
       if (closing) return;
       closing = true;
+      appendControllerLog(home, 'controller stopping');
       await runtime.close();
       process.exit(0);
     };
@@ -166,6 +189,7 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       void close();
     });
   } catch {
+    appendControllerLog(home, 'controller could not start');
     console.error('Controller could not start. Check its private home and existing owner.');
     process.exitCode = 1;
   }

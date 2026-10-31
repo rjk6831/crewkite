@@ -1,5 +1,8 @@
 import {
   AcceptChatChangesPayloadSchema,
+  AddProjectNotePayloadSchema,
+  type ChatAnalyticsRead,
+  ChatAnalyticsReadSchema,
   type ChatAttachment,
   ChatAttachmentSchema,
   type ChatBranchStatus,
@@ -8,27 +11,52 @@ import {
   ChatCatalogReadSchema,
   type ChatChangesRead,
   ChatChangesReadSchema,
+  type ChatInstructionsRead,
+  ChatInstructionsReadSchema,
+  type ChatMentionsRead,
+  ChatMentionsReadSchema,
+  type ChatSearchResult,
+  ChatSearchResultSchema,
   type ChatThreadRead,
   ChatThreadReadSchema,
   type ChatTurnEventsRead,
   ChatTurnEventsReadSchema,
   type CommandResult,
+  CommentChatChangePayloadSchema,
+  CompleteChatMentionPayloadSchema,
   ConfigureChatThreadPayloadSchema,
+  DecideChatHunkPayloadSchema,
+  DeleteChatPromptPayloadSchema,
   DeleteChatThreadPayloadSchema,
   DiscardChatChangePayloadSchema,
+  DiscardChatHunkPayloadSchema,
+  EditProjectNotePayloadSchema,
   HandoffChatThreadPayloadSchema,
   ImportChatAttachmentPayloadSchema,
+  normalizeNoteText,
   OpenChatPullRequestPayloadSchema,
+  type ProjectNotesRead,
+  ProjectNotesReadSchema,
   PushChatBranchPayloadSchema,
+  type ReadChatAnalyticsPayload,
+  ReadChatAnalyticsPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
   ReadChatChangesPayloadSchema,
+  ReadChatInstructionsPayloadSchema,
+  ReadChatPromptsPayloadSchema,
   ReadChatThreadPayloadSchema,
   ReadChatTurnEventsPayloadSchema,
+  ReadProjectNotesPayloadSchema,
   RefreshChatModelsPayloadSchema,
+  RemoveProjectNotePayloadSchema,
   RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   RetryChatTurnPayloadSchema,
+  SaveChatPromptPayloadSchema,
+  type SavedPrompts,
+  SavedPromptsSchema,
+  SearchChatHistoryPayloadSchema,
   SendChatMessagePayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -38,7 +66,10 @@ import { THREAD_PAGE_SIZE } from './thread-state.ts';
 
 // The chat commands are listed in CommandSchema. The cast stays in this one file so the thread
 // view never spells a command name anywhere else.
-export type ThreadSource = Pick<DesktopSource, 'command' | 'subscribe' | 'attachFiles'>;
+export type ThreadSource = Pick<
+  DesktopSource,
+  'command' | 'subscribe' | 'attachFiles' | 'previewShare' | 'saveExport'
+>;
 // Mutations carry a revision by contract. The controller does not race chat commands on it, so
 // the thread sends zero and never has to chase the task revision while events stream.
 const CHAT_REVISION = 0;
@@ -49,7 +80,11 @@ const dispatch = (source: ThreadSource, command: string, payload: unknown) =>
   source.command({
     command,
     payload,
-    ...(command.startsWith('Read') ? {} : { expectedRevision: CHAT_REVISION }),
+    ...(command.startsWith('Read') ||
+    command === 'CompleteChatMention' ||
+    command === 'SearchChatHistory'
+      ? {}
+      : { expectedRevision: CHAT_REVISION }),
   } as unknown as DesktopCommand);
 
 async function run(
@@ -89,6 +124,14 @@ export const readThread = (
     ReadChatThreadPayloadSchema.parse({ taskId, limit: THREAD_PAGE_SIZE, beforeCursor }),
     ChatThreadReadSchema,
   );
+/** Search over every thread's titles, messages, tool cards and file paths. */
+export const searchHistory = (source: ThreadSource, query: string): Promise<ChatSearchResult> =>
+  read(
+    source,
+    'SearchChatHistory',
+    SearchChatHistoryPayloadSchema.parse({ query }),
+    ChatSearchResultSchema,
+  );
 /** One page of a finished turn's stored events. Pass `nextAfterCursor` back to read on. */
 export const readTurnEvents = (
   source: ThreadSource,
@@ -100,12 +143,28 @@ export const readTurnEvents = (
     ReadChatTurnEventsPayloadSchema.parse(input),
     ChatTurnEventsReadSchema,
   );
-export const readChanges = (source: ThreadSource, taskId: string): Promise<ChatChangesRead> =>
+/** One page of the Changes list. Pass the first page's `listing` and the last `next` to read on. */
+export const readChanges = (
+  source: ThreadSource,
+  taskId: string,
+  page: { after?: string; listing?: string } = {},
+): Promise<ChatChangesRead> =>
   read(
     source,
     'ReadChatChanges',
-    ReadChatChangesPayloadSchema.parse({ taskId }),
+    ReadChatChangesPayloadSchema.parse({ taskId, ...page }),
     ChatChangesReadSchema,
+  );
+/** Turns, tokens, allowance, wall time, checks and branches of one thread or one project. */
+export const readAnalytics = (
+  source: ThreadSource,
+  input: ReadChatAnalyticsPayload,
+): Promise<ChatAnalyticsRead> =>
+  read(
+    source,
+    'ReadChatAnalytics',
+    ReadChatAnalyticsPayloadSchema.parse(input),
+    ChatAnalyticsReadSchema,
   );
 export const readCatalog = (source: ThreadSource, taskId?: string): Promise<ChatCatalogRead> =>
   read(
@@ -118,6 +177,96 @@ export const readCatalog = (source: ThreadSource, taskId?: string): Promise<Chat
 // A read can take 20 seconds and its refusal names the next step, so the result comes back as is.
 export const refreshModels = (source: ThreadSource) =>
   dispatch(source, 'RefreshChatModels', RefreshChatModelsPayloadSchema.parse({ family: 'openai' }));
+
+/** Ranked files and folders of the thread's scratch copy for the text after an at sign. */
+export const completeMention = (
+  source: ThreadSource,
+  taskId: string,
+  query: string,
+  limit = 8,
+): Promise<ChatMentionsRead> =>
+  read(
+    source,
+    'CompleteChatMention',
+    CompleteChatMentionPayloadSchema.parse({ taskId, query, limit }),
+    ChatMentionsReadSchema,
+  );
+/** The instruction files at the copy root, and the text of `name` when it is given. */
+export const readInstructions = (
+  source: ThreadSource,
+  taskId: string,
+  name?: string,
+): Promise<ChatInstructionsRead> =>
+  read(
+    source,
+    'ReadChatInstructions',
+    ReadChatInstructionsPayloadSchema.parse({ taskId, name }),
+    ChatInstructionsReadSchema,
+  );
+export const readPrompts = (source: ThreadSource): Promise<SavedPrompts> =>
+  read(source, 'ReadChatPrompts', ReadChatPromptsPayloadSchema.parse({}), SavedPromptsSchema);
+export const savePrompt = (
+  source: ThreadSource,
+  input: { name: string; body: string },
+): Promise<SavedPrompts> =>
+  promptList(source, 'SaveChatPrompt', SaveChatPromptPayloadSchema.parse(input));
+export const deletePrompt = (source: ThreadSource, name: string): Promise<SavedPrompts> =>
+  promptList(source, 'DeleteChatPrompt', DeleteChatPromptPayloadSchema.parse({ name }));
+async function promptList(source: ThreadSource, command: string, payload: unknown) {
+  const { data } = await run(source, command, payload);
+  const { kind: _kind, ...rest } = (data ?? {}) as Record<string, unknown>;
+  return SavedPromptsSchema.parse(rest);
+}
+
+/**
+ * A project's notes. A change answers with a small record, so each change reads the list again and
+ * the view never patches its own copy. The text is cleaned the way the CLI cleans it, and the
+ * controller checks it again.
+ */
+export const readNotes = (source: ThreadSource, projectId: string): Promise<ProjectNotesRead> =>
+  read(
+    source,
+    'ReadProjectNotes',
+    ReadProjectNotesPayloadSchema.parse({ projectId }),
+    ProjectNotesReadSchema,
+  );
+export const addNote = async (
+  source: ThreadSource,
+  projectId: string,
+  text: string,
+): Promise<ProjectNotesRead> => {
+  await run(
+    source,
+    'AddProjectNote',
+    AddProjectNotePayloadSchema.parse({ projectId, text: normalizeNoteText(text) }),
+  );
+  return readNotes(source, projectId);
+};
+export const editNote = async (
+  source: ThreadSource,
+  projectId: string,
+  noteId: string,
+  text: string,
+): Promise<ProjectNotesRead> => {
+  await run(
+    source,
+    'EditProjectNote',
+    EditProjectNotePayloadSchema.parse({ projectId, noteId, text: normalizeNoteText(text) }),
+  );
+  return readNotes(source, projectId);
+};
+export const removeNote = async (
+  source: ThreadSource,
+  projectId: string,
+  noteId: string,
+): Promise<ProjectNotesRead> => {
+  await run(
+    source,
+    'RemoveProjectNote',
+    RemoveProjectNotePayloadSchema.parse({ projectId, noteId }),
+  );
+  return readNotes(source, projectId);
+};
 
 export const sendMessage = (
   source: ThreadSource,
@@ -225,6 +374,30 @@ export async function discardChange(
   if (result.outcome === 'applied') return { discarded: true };
   return { discarded: false, reason: result.reason ?? 'not-discarded', next: result.next ?? null };
 }
+
+/** The hunk commands answer applied or a refusal with the next step, like Discard. */
+export type HunkStep = { done: true } | { done: false; next: string };
+async function hunkStep(source: ThreadSource, command: string, payload: unknown) {
+  const result = await dispatch(source, command, payload);
+  if (result.outcome === 'applied') return { done: true } as const;
+  return { done: false, next: result.next ?? 'The change did not apply.' } as const;
+}
+export const decideHunk = (
+  source: ThreadSource,
+  input: Input<typeof DecideChatHunkPayloadSchema>,
+): Promise<HunkStep> =>
+  hunkStep(source, 'DecideChatHunk', DecideChatHunkPayloadSchema.parse(input));
+export const discardHunk = (
+  source: ThreadSource,
+  input: Input<typeof DiscardChatHunkPayloadSchema>,
+): Promise<HunkStep> =>
+  hunkStep(source, 'DiscardChatHunk', DiscardChatHunkPayloadSchema.parse(input));
+/** The controller quotes the hunk and sends the comment as a message, queued while a turn runs. */
+export const commentChange = (
+  source: ThreadSource,
+  input: Input<typeof CommentChatChangePayloadSchema>,
+): Promise<HunkStep> =>
+  hunkStep(source, 'CommentChatChange', CommentChatChangePayloadSchema.parse(input));
 
 export type GitStep =
   | { done: true; url: string | null; via: 'gh' | 'compare-link' | null }

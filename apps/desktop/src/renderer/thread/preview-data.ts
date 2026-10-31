@@ -107,11 +107,14 @@ export function catalog(): ChatCatalogRead {
       },
       {
         family: 'google',
-        connected: false,
-        reason: 'Sign in to the Google client to use it.',
-        models: [],
-        defaultModel: null,
-        remaining: [],
+        connected: true,
+        reason: null,
+        models: fill(pair('large-3', 'fast-3')),
+        defaultModel: 'large-3',
+        remaining: [
+          reading('five-hour', 'Five-hour', 85, 240),
+          reading('weekly', 'Weekly', 65, 4320),
+        ],
         accepts: null,
       },
       {
@@ -161,6 +164,26 @@ export function openingEvents(turnId: string, selection: ChatModelSelection): Ag
         "export function netMinor() {\n  throw new Error('netMinor is not implemented.');\n}\n",
     },
     { type: 'tool.completed', turnId: t, callId: 'c1', status: 'ok' },
+    // A spawn whose subagents are still at work, so the chip and the card show their live count.
+    {
+      type: 'tool.started',
+      turnId: t,
+      callId: 'c-spawn',
+      kind: 'other',
+      title: 'Task Find every caller of netMinor',
+    },
+    {
+      type: 'tool.subagents',
+      turnId: t,
+      callId: 'c-spawn',
+      running: 2,
+      finished: 1,
+      agents: [
+        { id: 'sa-1', state: 'done', action: 'src/cart.mjs', model: 'small-2' },
+        { id: 'sa-2', state: 'running', action: 'netMinor(', model: 'small-2' },
+        { id: 'sa-3', state: 'running', action: null, model: null },
+      ],
+    },
     {
       type: 'text.delta',
       turnId: t,

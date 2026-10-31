@@ -2,6 +2,9 @@ import { join } from 'node:path';
 import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
 import { installThreadAttention } from './attention.ts';
 import { installBridge } from './bridge.ts';
+import { watchRendererCrashes } from './diagnostics.ts';
+import { installOnboarding } from './onboarding-ipc.ts';
+import { OnboardingStore } from './onboarding-store.ts';
 import { DesktopController, prepareStateDirectory, resolveRuntime } from './runtime.ts';
 import { rendererURL, secureSession, secureWindow } from './security.ts';
 import { BoundsStore, clampBounds, MINIMUM_SIZE } from './window-bounds.ts';
@@ -66,6 +69,7 @@ async function start() {
       },
     });
     secureWindow(window);
+    watchRendererCrashes(window, paths.home);
     // Move and resize fire many times a second, so the file is written once the window settles.
     let settle: NodeJS.Timeout | undefined;
     const remember = (target: BrowserWindow) => {
@@ -82,6 +86,7 @@ async function start() {
     });
     await installBridge(window, controller);
     installThreadAttention(window);
+    installOnboarding(window, new OnboardingStore(paths.profile));
     if (closing || window.isDestroyed()) return;
     await window.loadURL(rendererURL);
     window.show();

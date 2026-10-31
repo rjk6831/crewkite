@@ -1,0 +1,26 @@
+{
+  "id": "mention-skips-backtick-paths",
+  "title": "Never offer a path that holds a backtick as a mention",
+  "repository": "self",
+  "base": "0adc0c59c0c0e08a119059a606ac26574120aefe",
+  "solution": "7a08c18f53b1480387d02672626c3ce6e9874b4b",
+  "text": "A mention is written as one token, and a path containing a backtick cannot be written that way. rankMentions in packages/client/src/mentions.ts must never offer such a path, for any query. Add an exported helper isMentionable(path) that says whether a path can be offered and use it when ranking. mentionText keeps wrapping a path that has whitespace in backticks, and no longer needs to strip backticks from a path, since such a path is never offered.",
+  "hidden": ["packages/client/src/mentions.test.ts"],
+  "checks": [
+    {
+      "name": "mentions",
+      "command": "node",
+      "args": ["--test", "packages/client/src/mentions.test.ts"]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["composer", "client", "pure-function"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:18.094Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["mentions"],
+    "baseFailure": "assertion",
+    "passedOnSolution": ["mentions"]
+  }
+}

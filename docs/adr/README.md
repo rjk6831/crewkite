@@ -16,7 +16,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0010](0010-independent-authority-quality-effects.md) | Separate authority, quality and effects in task policy | Accepted |
 | [0011](0011-finite-review-methods.md) | Run review methods as finite jobs with credit | Accepted |
 | [0012](0012-milestones-d0-to-d3.md) | Deliver in milestones D0 through D3 with a minimum core | Accepted |
-| [0013](0013-macos-first-local-optional.md) | Start on Apple Silicon macOS with local inference optional | Accepted |
+| [0013](0013-macos-first-local-optional.md) | Start on Apple Silicon macOS with local inference optional | Accepted, amended 2026-10-31 for the Linux preview |
 | [0014](0014-stable-build-controls-candidate.md) | Develop CrewKite with a stable build that controls a candidate build | Accepted |
 | [0015](0015-neutral-public-history.md) | Keep public history neutral and the working record private | Accepted |
 | [0016](0016-reuse-with-provenance.md) | Reuse open source only with recorded provenance | Accepted |
@@ -42,6 +42,8 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0043](0043-remember-the-local-token-on-this-device.md) | Remember the Local token on this device | Accepted |
 | [0044](0044-thread-tools-over-one-controller-owned-mcp-server.md) | Thread tools over one controller-owned MCP server | Proposed |
 | [0045](0045-the-orchestrator-proposes-and-the-controller-assigns.md) | The orchestrator proposes and the controller assigns | Proposed |
+| [0046](0046-the-persons-servers-join-a-thread-only-by-the-controllers-config.md) | The person's servers join a thread only by the controller's config | Proposed |
+| [0047](0047-extensions-attach-through-one-versioned-seam.md) | Extensions attach through one versioned seam and receive no authority by default | Proposed |
 
 ## Writing a new record
 

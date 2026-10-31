@@ -1,0 +1,30 @@
+{
+  "id": "successor-handoff-context",
+  "title": "Carry the sealed handoff packet to a successor worker",
+  "repository": "self",
+  "base": "f8d9a3f6c8efe55f13c6e78f170247839a85f900",
+  "solution": "dde9f4a74f1fc52b87750c85ebf14e2ac44e531c",
+  "text": "A successor worker currently learns only an outcome string, which loses the original criteria, denials and candidate identity. Let the scripted worker's start input carry the sealed handoff packet. In the contracts, add an optional handoff field to the start member of FakeWorkerInputSchema, using SealedHandoffPacketSchema, so a start with generation 0 and no handoff stays valid, and a handoff with a bad checksum, an unknown field, a negative packet generation or an unknown field inside the packet source is refused. In the fixture worker under packages/testkit/src/providers/worker.ts, refuse a start with a generation above 0 that has no handoff (the error reads A successor requires sealed handoff context.). When a handoff is present, verify it before the worker is ready: the seal must verify (verifyHandoff), the packet generation plus one must equal the start generation, the packet attempt must differ from the start attempt, the packet outcome must equal the start outcome, the packet needs a candidate whose task matches the packet task and whose hash equals the hash of its listed artifact, the policy hash must equal the canonical hash of the policy, every effect grant in the policy must belong to the packet task, and the worker's route (CREWKITE_FAKE_ROUTE_ID) must be among the allowed routes. Otherwise throw Successor handoff context is invalid. After the ready event, emit one stdout output line holding JSON with the fixture handoff-context, the checksum, the run id and the candidate id. The controller still owns admission and retained byte checks.",
+  "hidden": ["packages/contracts/src/contracts.test.ts"],
+  "checks": [
+    {
+      "name": "contracts",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=process boundaries reject unknown fields and invalid command identity",
+        "packages/contracts/src/contracts.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["contracts", "worker", "handoff"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:39.045Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["contracts"],
+    "baseFailure": "assertion",
+    "passedOnSolution": ["contracts"]
+  }
+}

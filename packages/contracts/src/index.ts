@@ -1,4 +1,12 @@
 import { z } from 'zod';
+import { ChatAnalyticsReadSchema, ReadChatAnalyticsPayloadSchema } from './analytics.ts';
+import {
+  ChatChangesReadSchema,
+  CommentChatChangePayloadSchema,
+  DecideChatHunkPayloadSchema,
+  DiscardChatHunkPayloadSchema,
+  ReadChatChangesPayloadSchema,
+} from './changes.ts';
 import {
   AcceptChatChangesPayloadSchema,
   AgentEventSchema,
@@ -8,7 +16,6 @@ import {
   ChatBranchStatusSchema,
   ChatCatalogChangeSchema,
   ChatCatalogReadSchema,
-  ChatChangesReadSchema,
   ChatEffortSchema,
   ChatFamilySchema,
   ChatPullRequestResultSchema,
@@ -29,7 +36,6 @@ import {
   PushChatBranchPayloadSchema,
   ReadChatBranchStatusPayloadSchema,
   ReadChatCatalogPayloadSchema,
-  ReadChatChangesPayloadSchema,
   ReadChatThreadPayloadSchema,
   ReadChatTurnEventsPayloadSchema,
   RefreshChatModelsPayloadSchema,
@@ -41,6 +47,38 @@ import {
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
+import { CheckProviderClientPayloadSchema, ClientVersionStatusSchema } from './client-versions.ts';
+import {
+  ChatInstructionsReadSchema,
+  ChatMentionsReadSchema,
+  CompleteChatMentionPayloadSchema,
+  DeleteChatPromptPayloadSchema,
+  ReadChatInstructionsPayloadSchema,
+  ReadChatPromptsPayloadSchema,
+  SaveChatPromptPayloadSchema,
+  SavedPromptsSchema,
+} from './composer.ts';
+import { DiagnosticsReadSchema, ReadDiagnosticsPayloadSchema } from './diagnostics.ts';
+import { ChatExportSchema, ExportChatThreadPayloadSchema } from './export.ts';
+import {
+  ConfigureExtensionPayloadSchema,
+  ExtensionCommandResultSchema,
+  ExtensionEventSchema,
+  ExtensionsReadSchema,
+  ReadExtensionsPayloadSchema,
+  RunExtensionCommandPayloadSchema,
+} from './extensions.ts';
+import { AcknowledgeGoogleTermsPayloadSchema, GoogleTermsSchema } from './google-terms.ts';
+import { ChatSearchResultSchema, SearchChatHistoryPayloadSchema } from './history-search.ts';
+import { McpSupplySchema } from './mcp.ts';
+import {
+  AddProjectNotePayloadSchema,
+  EditProjectNotePayloadSchema,
+  ProjectNotesChangedSchema,
+  ProjectNotesReadSchema,
+  ReadProjectNotesPayloadSchema,
+  RemoveProjectNotePayloadSchema,
+} from './notes.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -424,6 +462,11 @@ export const LocalSetupSchema = z
     /** Memory the system reported available at the same read. Null when it could not be read. */
     availableMemoryBytes: RevisionSchema.nullable().optional(),
     selection: LocalModelSelectionSchema.nullable(),
+    /**
+     * One plain line from the controller that the view shows in place of the generic line for
+     * the reason, when this computer or the runtime needs the person to do something specific.
+     */
+    notice: z.string().min(1).max(512).optional(),
     reason: z
       .enum([
         'unconfigured',
@@ -704,6 +747,7 @@ export const GoogleAcpSetupSchema = z
       status: z.enum(['unknown', 'required', 'authenticated']),
     }),
     reason: GoogleAcpReasonSchema.nullable(),
+    googleTerms: GoogleTermsSchema.nullable().default(null),
   })
   .refine(
     (setup) =>
@@ -1056,7 +1100,12 @@ export const UsageReaderSchema = z
       'client-build-mismatch',
       'not-configured',
       'configuration-location-unsupported',
+      'client-version-unsupported',
+      'client-version-unreadable',
+      'client-untrusted',
     ]),
+    /** The installed client against the tested build, for readers that accept a range. */
+    client: ClientVersionStatusSchema.optional(),
     readState: z.enum(['idle', 'intent', 'owned', 'quiescent', 'unknown']).optional(),
     readReason: label.nullable().optional(),
     lastRequest: label.nullable().optional(),
@@ -1466,6 +1515,8 @@ export const DesktopNoticeSchema = z.discriminatedUnion('kind', [
     artifactId: ArtifactIdSchema,
     outcome: z.enum(['saved', 'cancelled', 'failed']),
   }),
+  /** The time of the crash record the last run left, or null once the person dismissed it. */
+  z.strictObject({ kind: z.literal('crash'), at: TimestampSchema.nullable() }),
 ]);
 export type DesktopNotice = z.infer<typeof DesktopNoticeSchema>;
 export const RuntimeManifestSchema = z.strictObject({
@@ -2485,6 +2536,20 @@ export const CommandSchema = z.discriminatedUnion('command', [
   read('ReadChatThread', ReadChatThreadPayloadSchema),
   read('ReadChatChanges', ReadChatChangesPayloadSchema),
   read('ReadChatCatalog', ReadChatCatalogPayloadSchema),
+  read('CheckProviderClient', CheckProviderClientPayloadSchema),
+  read('ReadChatAnalytics', ReadChatAnalyticsPayloadSchema),
+  read('CompleteChatMention', CompleteChatMentionPayloadSchema),
+  read('ReadChatInstructions', ReadChatInstructionsPayloadSchema),
+  read('ReadChatPrompts', ReadChatPromptsPayloadSchema),
+  read('ReadDiagnostics', ReadDiagnosticsPayloadSchema),
+  read('SearchChatHistory', SearchChatHistoryPayloadSchema),
+  read('ExportChatThread', ExportChatThreadPayloadSchema),
+  mutate('SaveChatPrompt', SaveChatPromptPayloadSchema),
+  mutate('DeleteChatPrompt', DeleteChatPromptPayloadSchema),
+  read('ReadProjectNotes', ReadProjectNotesPayloadSchema),
+  mutate('AddProjectNote', AddProjectNotePayloadSchema),
+  mutate('EditProjectNote', EditProjectNotePayloadSchema),
+  mutate('RemoveProjectNote', RemoveProjectNotePayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
   mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
@@ -2494,11 +2559,18 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('RetryChatTurn', RetryChatTurnPayloadSchema),
   read('ReadChatTurnEvents', ReadChatTurnEventsPayloadSchema),
   mutate('DiscardChatChange', DiscardChatChangePayloadSchema),
+  mutate('DecideChatHunk', DecideChatHunkPayloadSchema),
+  mutate('DiscardChatHunk', DiscardChatHunkPayloadSchema),
+  mutate('CommentChatChange', CommentChatChangePayloadSchema),
   mutate('RenameChatThread', RenameChatThreadPayloadSchema),
   mutate('DeleteChatThread', DeleteChatThreadPayloadSchema),
   mutate('AskChatFamily', AskChatFamilyPayloadSchema),
   mutate('RunChatPlan', RunChatPlanPayloadSchema),
   mutate('CancelChatPlan', CancelChatPlanPayloadSchema),
+  read('ReadExtensions', ReadExtensionsPayloadSchema),
+  mutate('ConfigureExtension', ConfigureExtensionPayloadSchema),
+  mutate('RunExtensionCommand', RunExtensionCommandPayloadSchema),
+  mutate('AcknowledgeGoogleTerms', AcknowledgeGoogleTermsPayloadSchema),
   mutate(
     'ConfigureLocal',
     z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
@@ -2512,6 +2584,8 @@ export const CommandSchema = z.discriminatedUnion('command', [
   // revision, so no desktop or controller record of a command ever holds the value.
   read('SupplyLocalToken', z.strictObject({ token: LocalTokenSchema })),
   read('ReadLocalToken', empty),
+  // The person's MCP servers travel on this command only, and no receipt holds them.
+  read('SupplyMcpServers', McpSupplySchema),
   read('GetTaskConversationState', z.strictObject({ taskId: TaskIdSchema })),
   read(
     'GetTaskConversation',
@@ -3548,6 +3622,16 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatThreadReadSchema.extend({ kind: z.literal('chat-thread') }),
   ChatChangesReadSchema.extend({ kind: z.literal('chat-changes') }),
   ChatCatalogReadSchema.extend({ kind: z.literal('chat-catalog') }),
+  ChatAnalyticsReadSchema.extend({ kind: z.literal('chat-analytics') }),
+  ChatMentionsReadSchema.extend({ kind: z.literal('chat-mentions') }),
+  ChatInstructionsReadSchema.extend({ kind: z.literal('chat-instructions') }),
+  SavedPromptsSchema.extend({ kind: z.literal('chat-prompts') }),
+  DiagnosticsReadSchema.safeExtend({ kind: z.literal('diagnostic-files') }),
+  // The byte check on the page stays with the kind tag.
+  ChatSearchResultSchema.safeExtend({ kind: z.literal('chat-search') }),
+  ProjectNotesReadSchema.extend({ kind: z.literal('project-notes') }),
+  ProjectNotesChangedSchema.extend({ kind: z.literal('project-notes-changed') }),
+  ChatExportSchema.extend({ kind: z.literal('chat-export') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
@@ -3559,6 +3643,8 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatPullRequestResultSchema.extend({ kind: z.literal('chat-pull-request') }),
   ChatBranchStatusSchema.extend({ kind: z.literal('chat-branch-status') }),
   ChatAttachmentSchema.extend({ kind: z.literal('chat-attachment') }),
+  ExtensionsReadSchema.extend({ kind: z.literal('extensions') }),
+  ExtensionCommandResultSchema.extend({ kind: z.literal('extension-result') }),
   // The byte check on the page stays with the kind tag.
   ChatTurnEventsReadSchema.safeExtend({ kind: z.literal('chat-turn-events') }),
   /** What a stop took out of the thread's queue, so the composer can give the text back. */
@@ -3681,6 +3767,7 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('chat.turn', ChatTurnSchema),
   event('chat.thread', ChatThreadSchema),
   event('chat.catalog', ChatCatalogChangeSchema),
+  event('extension.event', ExtensionEventSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   // A deleted thread's task is gone. Views drop it from the rail.
@@ -3813,8 +3900,23 @@ export type SealedHandoffPacket = z.infer<typeof SealedHandoffPacketSchema>;
 export type Event = z.infer<typeof EventSchema>;
 export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
+export * from './analytics.ts';
 export { canonicalJson } from './canonical.ts';
+export * from './changes.ts';
 export * from './chat.ts';
+export * from './checks.ts';
+export * from './cli.ts';
+export * from './client-versions.ts';
+export * from './composer.ts';
+export * from './diagnostics.ts';
+export * from './export.ts';
+export * from './extensions.ts';
+export * from './google-terms.ts';
+export * from './history-search.ts';
+export * from './mcp.ts';
+export * from './notes.ts';
+export * from './plan-lanes.ts';
+export * from './subagents.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

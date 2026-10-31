@@ -1,0 +1,26 @@
+{
+  "id": "mention-index-and-instruction-chip",
+  "title": "Complete @file and @folder mentions from the scratch copy",
+  "repository": "self",
+  "base": "cc1711b19ed938aef48ffbf7924012a01e0745bb",
+  "solution": "7eaaff1869b073f6d8a40914de45d7eb98d1dd8e",
+  "text": "Typing an at sign in the composer should offer the files and folders of the thread's scratch copy. Add apps/controller/src/chat/mentions.ts. createMentionIndex(now) returns an object with complete(scratch, environment, query, limit) that answers ChatMention entries of kind file or folder, ranked by rankMentions from the shared client package. Candidates come from the same listing the Local tools use (listFiles in local-tools.ts), so ignored files, links and anything under .git never show. A folder is a candidate only when it holds a listed file (foldersOf from the client package gives them). Entries that do not satisfy ChatMentionSchema are dropped, and a query that climbs out of the copy, such as ../, finds nothing. The listing runs git, so keep it for 3000 milliseconds per scratch copy, measured with the injected now, and refresh it when the time has passed or went backwards. Also export instructionFilesAt(scratch), which names the instruction files that exist as plain files at the root of the copy in the order of instructionFileNames, and readInstructions(taskId, scratch, name), which answers the ChatInstructionsRead shape: the file list, and for a listed name its text cut to INSTRUCTION_VIEW_BYTES with a truncated flag. A link to a file outside the copy is not an instruction file, a name that is not listed (such as src/app.ts) gives no text, and a copy with no instruction file gives an empty list. Put the literal instruction file names in apps/controller/src/providers/instruction-files.ts as an exported instructionFileNames list that covers the shared repository instructions file, the two client-specific files the providers already name, and one editor rules file that is listed for display only.",
+  "hidden": ["apps/controller/src/chat/mentions.test.ts"],
+  "checks": [
+    {
+      "name": "mentions",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/chat/mentions.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["controller", "chat", "mentions"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:17.170Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["mentions"],
+    "baseFailure": "missing-module",
+    "passedOnSolution": ["mentions"]
+  }
+}

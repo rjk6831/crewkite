@@ -21,10 +21,12 @@ import { createRequire } from 'node:module';
 import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
+import { biomePackageName } from '../apps/controller/src/host/biome-package.ts';
 import {
   copyInstalledDependencies,
   inspectInstalledDependencies,
 } from '../apps/controller/src/host/toolchain.ts';
+import { stageCliRuntime } from './cli-runtime.ts';
 import { copyRuntimePackages } from './runtime-packages.ts';
 
 const helperSourcePath = 'apps/controller/src/providers/local/secure-input.m';
@@ -272,8 +274,6 @@ export async function packageDesktop() {
 
   const stage = join(primary, 'internal/packages/d0', values.id);
   const build = join(primary, 'internal/package-build', values.id);
-  if (Buffer.byteLength(join(stage, 'state/home/control.sock')) > 100)
-    throw new Error('Choose a shorter build name for the packaged controller socket.');
   if (existsSync(stage) || existsSync(build))
     throw new Error('Build or package directory already exists. Choose an unused --id.');
   if (git('status', '--porcelain', '--untracked-files=no'))
@@ -482,7 +482,12 @@ export async function packageDesktop() {
       if (
         !(name.startsWith('@crewkite/') && version === 'workspace:*') &&
         name !== 'zod' &&
-        !(path === 'apps/controller' && name === '@lmstudio/sdk' && version === '2.1.0')
+        !(path === 'apps/controller' && name === '@lmstudio/sdk' && version === '2.1.0') &&
+        // The CLI's terminal interface ships in its own store, staged by stageCliRuntime below.
+        !(
+          path === 'apps/cli' &&
+          ((name === 'ink' && version === '8.0.0') || (name === 'react' && version === '19.3.1'))
+        )
       )
         throw new Error(`Unqualified runtime dependency: ${name}.`);
     copy(join(from, 'package.json'), join(runtime, path, 'package.json'));
@@ -501,8 +506,12 @@ export async function packageDesktop() {
   const rootPackages = createRequire(join(checkout, 'package.json'));
   const biome = dirname(rootPackages.resolve('@biomejs/biome/package.json'));
   const biomeManifest = json(join(biome, 'package.json'));
+  // The package is for macOS arm64 today. The Biome platform package comes from the same table as
+  // the controller's trusted build, so a later Linux package needs no second list.
+  const biomePlatformPackage = biomePackageName();
+  if (!biomePlatformPackage) throw new Error('No Biome build exists for this computer.');
   const biomeBinary = dirname(
-    createRequire(join(biome, 'package.json')).resolve('@biomejs/cli-darwin-arm64/package.json'),
+    createRequire(join(biome, 'package.json')).resolve(`${biomePlatformPackage}/package.json`),
   );
   const biomeBinaryManifest = json(join(biomeBinary, 'package.json'));
   if (
@@ -513,7 +522,7 @@ export async function packageDesktop() {
     throw new Error('The installed Biome payload differs from the frozen root manifest.');
   mkdirSync(join(runtime, 'node_modules/@biomejs'), { recursive: true });
   copyPackagePayload(biome, join(runtime, 'node_modules/@biomejs/biome'), ['node_modules']);
-  copyPackagePayload(biomeBinary, join(runtime, 'node_modules/@biomejs/cli-darwin-arm64'));
+  copyPackagePayload(biomeBinary, join(runtime, 'node_modules', biomePlatformPackage));
   const runtimePackages = await copyRuntimePackages({
     source: checkout,
     from: 'apps/controller/package.json',
@@ -551,6 +560,8 @@ export async function packageDesktop() {
     ],
     budget: copyBudget,
   });
+  // Ink, React and the renderer modules the interactive CLI imports, in a store under apps/cli.
+  const cliRuntime = await stageCliRuntime({ source: checkout, runtime, budget: copyBudget });
   for (const entry of verificationFiles) {
     const from = join(checkout, entry.path);
     const to = join(runtime, entry.path);
@@ -584,7 +595,7 @@ export async function packageDesktop() {
     copy(from, join(stage, destination));
     notices.push({ name, version, license: destination, sha256: hash(from) });
   }
-  for (const item of runtimePackages)
+  for (const item of [...runtimePackages, ...cliRuntime.packages])
     notice(
       item.name,
       item.version,

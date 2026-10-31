@@ -606,6 +606,7 @@ test('finished reads and searches in a row fold into one line, and anything to a
       status: 'ok',
       diff: null,
       summary: null,
+      subagents: null,
       ...more,
     }) satisfies ToolBlock;
   const thought = (item: string, text: string, done = true): Block => ({
@@ -1649,6 +1650,12 @@ test('the plan card offers what the flight mode allows and sends only the picks 
       { runPlan: true, cancel: false, stop: false, run: [true, false], picker: [false, false] },
     ],
     [
+      'a blocked slice of a stopped plan can run again from a fresh copy',
+      plan('stopped', [slice(1, 'done'), slice(2, 'blocked', [1])]),
+      'glide',
+      { runPlan: true, cancel: false, stop: false, run: [false, true], picker: [false, false] },
+    ],
+    [
       'a finished plan offers nothing',
       plan('finished', [slice(1, 'done'), slice(2, 'done', [1])]),
       'manual',
@@ -1660,6 +1667,17 @@ test('the plan card offers what the flight mode allows and sends only the picks 
 
   const waits = planCard(plan('proposed', queued), 'manual').rows[1];
   assert.equal(waits?.waitsOn, 'Runs after slice 1');
+  // Each row names what it waits on, met or not, and a blocked row names its conflicts.
+  const merged = planCard(
+    plan('running', [
+      slice(1, 'done'),
+      { ...slice(2, 'blocked', [1]), conflicts: ['src/net.mjs', 'README.md'] },
+    ]),
+    'glide',
+  ).rows[1];
+  assert.equal(merged?.waitsOn, 'Runs after slice 1, done');
+  assert.equal(merged?.statusLabel, 'Blocked');
+  assert.equal(merged?.conflicts, 'Conflicts in the thread copy: src/net.mjs, README.md');
   assert.equal(
     planCard(plan('running', [slice(1, 'running')]), 'glide').summary,
     'Running: 0 of 1 slices done.',

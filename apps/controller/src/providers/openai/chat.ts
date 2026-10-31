@@ -13,11 +13,12 @@ import {
 import { extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   type AgentEvent,
-  ChatEffortSchema,
   type ChatFailure,
   type ChatPermissionOption,
+  ChatSetEffortSchema,
   type ChatToolKind,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { z } from 'zod';
 import {
   type ChatAdapter,
@@ -26,11 +27,21 @@ import {
   type ChatTurnResult,
   chatFailure,
 } from '../../chat/adapter.ts';
+import { ChatClientRefused } from '../../chat/clients.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
-import { attachedLine, attachedSection } from '../../chat/prompt.ts';
+import {
+  attachedLine,
+  attachedSection,
+  stripTurnNotes,
+  withoutThreadToolsLine,
+} from '../../chat/prompt.ts';
+import { readableType, SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
+import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
+import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { CLIENT_VERSIONS, clientVersionState } from '../client-versions.ts';
 import {
   type OpenAiUsageHook,
   type OpenAiUsageWindow,
@@ -56,7 +67,8 @@ type Spawn = (
 ) => ChildProcessWithoutNullStreams;
 
 export type OpenAiChatDeps = Readonly<{
-  launch: (request: ChatTurnRequest) => NativeLaunch;
+  /** The client to run. Its version, when known, names the build in a failure. */
+  launch: (request: ChatTurnRequest) => NativeLaunch & { version?: string };
   onUsage?: OpenAiUsageHook;
   /** Tests replace the client with a scripted peer. */
   spawn?: Spawn;
@@ -69,7 +81,11 @@ export type OpenAiChatDeps = Readonly<{
 export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
   return {
     family: 'openai',
-    startTurn: (request, emit) => new OpenAiChatTurn(deps, request, emit).handle,
+    startTurn: (request, emit) => {
+      const turn = turnTools(deps.threadTools, request, emit);
+      return new OpenAiChatTurn({ ...deps, threadTools: () => turn.server }, turn.request, emit)
+        .handle;
+    },
   };
 }
 
@@ -104,7 +120,10 @@ function nativeChatArguments(directory: string, request: ChatTurnRequest): strin
     'features.remote_plugin': false,
     'features.apps': false,
     'features.hooks': false,
-    'features.multi_agent': false,
+    // The client's own switch for subagents. The process lives for one turn, so the crew role's
+    // choice holds for exactly this turn. It stays off unless the role turned it on, since child
+    // approvals rely on the client passing this turn's approval policy to each child.
+    'features.multi_agent': request.subagents === true,
     log_dir: join(directory, 'logs'),
   };
   return [
@@ -275,7 +294,7 @@ const limitsReply = z.object({ ordinaryUsageAllowed: maybe(z.boolean()) });
 const threadReply = z.object({
   thread: z.object({ id: z.string().min(1).max(512) }),
   approvalPolicy: z.unknown().optional(),
-  reasoningEffort: ChatEffortSchema.exclude(['default']).optional().catch(undefined),
+  reasoningEffort: ChatSetEffortSchema.optional().catch(undefined),
 });
 const turnReply = z.object({ turn: z.object({ id }) });
 const scope = z.object({ threadId: z.string() });
@@ -312,6 +331,45 @@ const mcpNames = z.object({
 });
 const mcpStatus = z.object({ name: z.string(), status: z.string() });
 const searchItem = z.object({ query: maybe(z.string()) });
+// Items that carry the reply, its reasoning, the person's message or the client's bookkeeping.
+// Every other item is work the model did, and one CrewKite has no reader for still gets a card.
+const CONTENT_ITEMS = new Set([
+  'agentMessage',
+  'userMessage',
+  'reasoning',
+  'plan',
+  'contextCompaction',
+]);
+// An item whose type names an agent reports subagents. Every field is read on its own, so a
+// shape this file does not know still shows its card.
+const AGENT_ITEM = /agent/i;
+const agentStatus = z
+  .object({ status: maybe(z.string()) })
+  .nullish()
+  .catch(null);
+const agentWork = z.object({
+  tool: maybe(z.string()),
+  kind: maybe(z.string()),
+  status: maybe(z.string()),
+  model: maybe(z.string()),
+  receiverThreadIds: maybe(z.array(z.string()).max(64)),
+  agentThreadId: maybe(z.string()),
+  newThreadId: maybe(z.string()),
+  agentsStates: maybe(z.record(z.string(), agentStatus)),
+});
+/** A status word as a subagent state, or undefined when the word says nothing CrewKite reads. */
+const agentState = (status: string | null | undefined) =>
+  !status
+    ? undefined
+    : /error|fail/i.test(status)
+      ? ('failed' as const)
+      : /interrupt|cancel|abort/i.test(status)
+        ? ('stopped' as const)
+        : /complet|done|finish|shut|clos/i.test(status)
+          ? ('done' as const)
+          : /run|progress|pend|init|start|wait/i.test(status)
+            ? ('running' as const)
+            : undefined;
 const toolEnd = z.object({
   status: maybe(z.string()),
   exitCode: maybe(z.number().int()),
@@ -325,6 +383,17 @@ const tokenUsage = z.object({
     modelContextWindow: maybe(z.number().int().positive()),
   }),
 });
+// What one model request spent. Every field is read on its own.
+const spent = z.object({
+  tokenUsage: z.object({
+    last: z.object({
+      inputTokens: maybe(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)),
+      outputTokens: maybe(z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER)),
+    }),
+  }),
+});
+// A subagent's items CrewKite keeps for its approvals, the same facts it keeps for the parent's.
+const MAX_CHILD_ITEMS = 4096;
 const notice = z.object({
   message: maybe(z.string()),
   summary: maybe(z.string()),
@@ -384,6 +453,10 @@ class OpenAiChatTurn {
   private readonly roots: string[];
   private child: ChildProcessWithoutNullStreams | null = null;
   private group = 0;
+  /** The version of the client this turn runs, when the launch named one. */
+  private version: string | undefined;
+  /** True once the client answered initialize, so it accepted the settings it was started with. */
+  private initialized = false;
   private nextId = 1;
   private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
   private threadId: string | null = null;
@@ -415,6 +488,7 @@ class OpenAiChatTurn {
   private readonly output = new Map<string, number>();
   private readonly changed = new Set<string>();
   private readonly approvals = new Map<string, RpcId>();
+  private readonly subagents: SubagentTracker;
   private approvalCount = 0;
   private reported = false;
   private readonly windows = new Map<string, OpenAiUsageWindow>();
@@ -427,6 +501,12 @@ class OpenAiChatTurn {
   private readonly lines: string[] = [];
   private readonly trace: ReturnType<typeof frameTrace>;
   private usage: ChatTurnResult['usage'] = null;
+  // Tokens every model request of the turn spent, the subagents' included. Null until one reports.
+  private tokensIn: number | null = null;
+  private tokensOut: number | null = null;
+  private childSpent = false;
+  private childItems = 0;
+  private readonly startedAt: number;
   private readonly finish: (result: ChatTurnResult) => void;
   private readonly schedule: Schedule;
 
@@ -435,8 +515,10 @@ class OpenAiChatTurn {
     this.emit = emit;
     this.schedule = deps.schedule ?? defaultSchedule;
     this.reportUsage = openAiUsageReporter(deps.onUsage);
-    this.threadTools = deps.threadTools?.(request) ?? null;
+    this.threadTools = request.threadTools === false ? null : (deps.threadTools?.(request) ?? null);
     this.trace = frameTrace(request.now ?? Date.now, TRACE_LIMITS);
+    this.subagents = new SubagentTracker(request.turnId, (event) => this.send(event));
+    this.startedAt = (request.now ?? Date.now)();
     let finish: (result: ChatTurnResult) => void = () => {};
     const result = new Promise<ChatTurnResult>((resolve) => {
       finish = resolve;
@@ -481,10 +563,14 @@ class OpenAiChatTurn {
     let step: 'client' | 'storage' | 'spawn' = 'client';
     try {
       const launch = deps.launch(this.request);
+      this.version = launch.version;
       const executable = verifiedClient(launch);
       step = 'storage';
       const directory = privateStorage(launch);
-      const env = nativeDiscoveryEnvironment(launch.environment);
+      const env = withGitCeiling(
+        nativeDiscoveryEnvironment(launch.environment),
+        this.request.scratch.directory,
+      );
       step = 'spawn';
       const args = nativeChatArguments(directory, this.request);
       const child = (deps.spawn ?? spawn)(executable, args, {
@@ -513,7 +599,9 @@ class OpenAiChatTurn {
       });
       child.on('close', (code, signal) => this.exited(code, signal));
       return null;
-    } catch {
+    } catch (error) {
+      if (error instanceof GitCeilingError)
+        return chatFailure({ stage: 'launch', kind: 'internal', message: error.message });
       if (step === 'storage')
         return chatFailure({
           stage: 'launch',
@@ -524,9 +612,11 @@ class OpenAiChatTurn {
         stage: 'launch',
         kind: 'client-missing',
         message:
-          step === 'client'
-            ? 'Codex is missing or changed since Settings checked it.'
-            : 'Codex could not start.',
+          error instanceof ChatClientRefused
+            ? error.message
+            : step === 'client'
+              ? 'Codex is missing or changed since Settings checked it.'
+              : 'Codex could not start.',
       });
     }
   }
@@ -537,12 +627,13 @@ class OpenAiChatTurn {
     this.call(
       'initialize',
       {
-        clientInfo: { name: 'crewkite', title: 'CrewKite', version: '0.0.0' },
+        clientInfo: { name: 'crewkite', title: 'CrewKite', version: CREWKITE_VERSION },
         capabilities: { experimentalApi: false, explicitGatewayOauth: true },
       },
       (reply) => {
         if ('error' in reply)
           return this.fail(this.providerFailure('session', 'initialize', reply.error));
+        this.initialized = true;
         this.write({ method: 'initialized' });
         this.call('account/read', { refreshToken: false }, (reply) => {
           if ('error' in reply)
@@ -765,7 +856,13 @@ class OpenAiChatTurn {
   }
 
   private startTurn(fresh: boolean, history: boolean) {
-    const { systemContext, prompt, selection } = this.request;
+    const { systemContext, selection } = this.request;
+    // A client that did not list its servers runs this turn without the tools, so the packet
+    // must not name them.
+    // A new thread reads the notes in the system context. When a resume failed, the prompt still
+    // carries the block meant for the resumed thread, which would repeat them.
+    const asked = fresh ? stripTurnNotes(this.request.prompt) : this.request.prompt;
+    const prompt = this.mcpConfig ? asked : withoutThreadToolsLine(asked);
     const transcript = history
       ? this.request.history
           .map((entry) => `${entry.role === 'user' ? 'User' : 'Assistant'}: ${entry.text}`)
@@ -952,7 +1049,8 @@ class OpenAiChatTurn {
 
   private notification(method: string, params: unknown) {
     const thread = scope.safeParse(params);
-    if (thread.success && this.threadId && thread.data.threadId !== this.threadId) return;
+    if (thread.success && this.threadId && thread.data.threadId !== this.threadId)
+      return this.childNotification(thread.data.threadId, method, params);
     const turnId = this.request.turnId;
     switch (method) {
       case 'turn/started':
@@ -988,6 +1086,7 @@ class OpenAiChatTurn {
         return;
       }
       case 'thread/tokenUsage/updated': {
+        this.spend(params);
         const value = tokenUsage.safeParse(params).data?.tokenUsage;
         if (!value) return;
         this.usage = {
@@ -1079,7 +1178,16 @@ class OpenAiChatTurn {
       detail = searchItem.safeParse(raw).data?.query?.trim() ?? '';
       title = detail ? `Search the web for ${detail}` : 'Search the web';
       input = { query: detail || null };
-    } else return;
+    } else if (CONTENT_ITEMS.has(head.type)) return;
+    else {
+      const work = AGENT_ITEM.test(head.type) ? agentWork.safeParse(raw).data : undefined;
+      const what = work?.tool ?? work?.kind;
+      title = what
+        ? `${readableType(head.type)}: ${readableType(what).toLowerCase()}`
+        : readableType(head.type);
+      detail = title;
+      input = { type: clip(head.type, 200), ...(what ? { tool: clip(what, 200) } : {}) };
+    }
     this.tools.set(head.id, detail);
     this.send({
       type: 'tool.started',
@@ -1089,6 +1197,98 @@ class OpenAiChatTurn {
       title: clip(title, 1024),
       input,
     });
+    if (AGENT_ITEM.test(head.type)) this.agentWork(head.id, raw, false);
+  }
+
+  /**
+   * The subagents an agent item names: the threads it sent to, the one it reports on and every
+   * thread in its state map. A subagent keeps the card that first named it, so a later wait
+   * updates the call that started it. An item that names no thread counts as one subagent of its
+   * own, finished when the item completes.
+   */
+  private agentWork(callId: string, raw: unknown, completed: boolean) {
+    const work = agentWork.safeParse(raw).data;
+    const states = work?.agentsStates ?? {};
+    const ids = new Set(
+      [
+        ...(work?.receiverThreadIds ?? []),
+        work?.agentThreadId,
+        work?.newThreadId,
+        ...Object.keys(states),
+      ].filter((value): value is string => typeof value === 'string' && value !== ''),
+    );
+    // An item that names no thread counts as one subagent of its own while it runs, and once it
+    // completes still naming none. Once real threads arrive, that stand-in goes.
+    const own = ids.size === 0;
+    if (own) ids.add(callId);
+    else if (this.subagents.parentOf(callId) === callId) this.subagents.remove(callId);
+    const item = agentState(work?.status);
+    for (const id of ids) {
+      const state =
+        agentState(states[id]?.status) ??
+        (work?.agentThreadId === id ? agentState(work?.kind) : undefined) ??
+        (own && completed ? (item === 'failed' ? 'failed' : 'done') : undefined);
+      this.subagents.update(callId, id, {
+        ...(state ? { state } : {}),
+        ...(work?.model ? { model: work.model } : {}),
+      });
+    }
+  }
+
+  /**
+   * A notification from a subagent's own thread. Its items become the subagent's latest action
+   * and its turn ending finishes it. Nothing it says reaches the reply or opens a card.
+   */
+  private childNotification(threadId: string, method: string, params: unknown) {
+    if (!this.subagents.parentOf(threadId)) return;
+    // The subagent spends the same allowance, so its requests count in the turn's tokens.
+    if (method === 'thread/tokenUsage/updated') {
+      if (this.spend(params)) this.childSpent = true;
+      return;
+    }
+    if (method === 'turn/completed') {
+      const status = turnDone.safeParse(params).data?.turn.status;
+      return this.subagents.update(threadId, threadId, {
+        state: status === 'failed' ? 'failed' : status === 'interrupted' ? 'stopped' : 'done',
+      });
+    }
+    if (method !== 'item/started') return;
+    const raw = itemFrame.safeParse(params).data?.item;
+    const head = itemHead.safeParse(raw).data;
+    if (!head || CONTENT_ITEMS.has(head.type)) return;
+    // Its approvals name the item, so they need its command, paths and delete mark as a parent
+    // item's do. The record is bounded, and an item past the bound asks with what its request says.
+    if (!this.tools.has(head.id) && this.childItems < MAX_CHILD_ITEMS) {
+      this.childItems += 1;
+      if (head.type === 'commandExecution')
+        this.tools.set(head.id, commandItem.safeParse(raw).data?.command?.trim() ?? '');
+      else if (head.type === 'fileChange') {
+        const entries = this.paths(raw);
+        this.edits.set(head.id, entries);
+        this.tools.set(head.id, entries.map((entry) => entry.path).join('\n'));
+        if (
+          (changeItem.safeParse(raw).data?.changes ?? []).some(
+            (change) => change.kind?.type === 'delete',
+          )
+        )
+          this.deleting.add(head.id);
+      }
+    }
+    const action =
+      head.type === 'commandExecution'
+        ? commandItem.safeParse(raw).data?.command?.trim() || 'Run a command'
+        : head.type === 'fileChange'
+          ? `Edit ${this.paths(raw)
+              .map((entry) => entry.path)
+              .join(', ')}`.trim()
+          : head.type === 'webSearch'
+            ? 'Search the web'
+            : head.type === 'mcpToolCall'
+              ? [mcpItem.safeParse(raw).data?.server, mcpItem.safeParse(raw).data?.tool]
+                  .filter(Boolean)
+                  .join(': ') || 'Call a tool'
+              : readableType(head.type);
+    this.subagents.update(threadId, threadId, { state: 'running', action });
   }
 
   private completed(raw: unknown) {
@@ -1117,8 +1317,9 @@ class OpenAiChatTurn {
       }
       return this.send({ type: 'thinking.completed', turnId, itemId: head.id });
     }
-    if (!['commandExecution', 'fileChange', 'mcpToolCall', 'webSearch'].includes(head.type)) return;
+    if (CONTENT_ITEMS.has(head.type)) return;
     this.started(raw);
+    if (AGENT_ITEM.test(head.type)) this.agentWork(head.id, raw, true);
     const value = toolEnd.safeParse(raw).data;
     const status =
       value?.status === 'declined'
@@ -1386,8 +1587,38 @@ class OpenAiChatTurn {
     });
   }
 
+  /** Adds one model request's tokens to the turn. True when the frame carried any. */
+  private spend(params: unknown) {
+    const last = spent.safeParse(params).data?.tokenUsage.last;
+    if (last?.inputTokens != null) this.tokensIn = (this.tokensIn ?? 0) + last.inputTokens;
+    if (last?.outputTokens != null) this.tokensOut = (this.tokensOut ?? 0) + last.outputTokens;
+    return last?.inputTokens != null || last?.outputTokens != null;
+  }
+
   private end(outcome: Outcome) {
     if (this.outcome) return;
+    // A subagent the client never reported finished did not finish, whatever the turn did.
+    this.subagents.close('stopped');
+    // shortcut: a turn reports its tokens only when a subagent spent some, so the parent-only
+    // turns keep the stats they had. The sum takes one usage frame per model request. Upgrade:
+    // report the stats on every turn once a live run confirms that frame count.
+    if (this.childSpent) {
+      const now = (this.request.now ?? Date.now)();
+      this.send({
+        type: 'turn.stats',
+        turnId: this.request.turnId,
+        stats: {
+          tokensIn: this.tokensIn,
+          tokensOut: this.tokensOut,
+          tokensPerSecond: null,
+          firstTokenMs: null,
+          turnMs: Math.max(0, Math.round(now - this.startedAt)),
+          contextUsed: this.usage?.usedTokens ?? null,
+          contextCapacity: this.usage?.capacityTokens ?? null,
+          summaries: 0,
+        },
+      });
+    }
     this.outcome = outcome;
     try {
       this.emit({ type: 'turn.completed', turnId: this.request.turnId, ...outcome });
@@ -1415,13 +1646,23 @@ class OpenAiChatTurn {
   private exited(code: number | null, signal: NodeJS.Signals | null) {
     this.closed = true;
     if (this.terminal !== undefined) this.fail(this.providerFailure('stream', null, this.terminal));
+    // A build newer than the tested one that closes before it answers initialize most often
+    // refused a setting passed under --strict-config. Its own words stay in the detail.
+    const tested = CLIENT_VERSIONS.openai.tested;
+    const refusedSettings =
+      !this.initialized &&
+      !signal &&
+      this.version !== undefined &&
+      clientVersionState(this.version, CLIENT_VERSIONS.openai) === 'newer';
     this.fail(
       chatFailure({
         stage: this.threadId ? 'stream' : 'session',
         kind: 'client-exit',
-        message: signal
-          ? `Codex stopped on ${signal} before the turn finished.`
-          : `Codex exited with code ${code} before the turn finished.`,
+        message: refusedSettings
+          ? `Codex ${this.version} closed before it started, and CrewKite was tested with ${tested}. A newer build can refuse a setting CrewKite passes; install ${tested} or update CrewKite.`
+          : signal
+            ? `Codex stopped on ${signal} before the turn finished.`
+            : `Codex exited with code ${code} before the turn finished.`,
       }),
     );
     if (this.group === 0 || groupAbsent(this.group)) this.settle();

@@ -8,6 +8,7 @@ import {
   mkdirSync,
   openSync,
 } from 'node:fs';
+import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import {
@@ -23,6 +24,7 @@ import {
   CommandResultSchema,
   CommandSchema,
   type Event,
+  googleTermsCurrent,
   type ModelCatalogObservation,
   ModelCatalogObservationSchema,
   type Observation,
@@ -37,17 +39,28 @@ import {
   TimestampSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
+import { readAnalytics } from '../chat/analytics.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
+import { ChatClientRefused, type ChatClientResolvers, chatClient } from '../chat/clients.ts';
+import { exportThread } from '../chat/export.ts';
+import { McpRegistry } from '../chat/mcp-servers.ts';
+import { ProjectNotes } from '../chat/project-notes.ts';
+import { notesCommand, notesMutations } from '../chat/project-notes-command.ts';
+import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
+import { readDiagnostics } from '../diagnostics/read.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
 import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
 import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
+import { ExtensionHost } from '../extensions/host.ts';
 import type { GitIdentity } from '../host/publication.ts';
 import { inspectSourceDetails, projectRoot } from '../host/source.ts';
+import { type GitState, gitProblem, gitState } from '../host/vcs-probe.ts';
 import { groupAbsent, type OwnedCommand, type OwnedWorker, type Schedule } from '../host/worker.ts';
 import { anthropicChatAdapter } from '../providers/anthropic/chat.ts';
 import { type AnthropicLiveModel, readAnthropicModels } from '../providers/anthropic/models.ts';
@@ -96,6 +109,7 @@ import { CombinedCommands } from './combined.ts';
 import { CombinedAssemblyCommands } from './combined-assembly.ts';
 import { CombinedEvaluationCommands } from './combined-evaluation.ts';
 import { EvaluationCommands } from './evaluation.ts';
+import { acknowledgeGoogleTerms, googleTermsGate } from './google-terms.ts';
 import { NativeEvidenceCommands } from './native-evidence.ts';
 import { NativeLaunchCommands } from './native-launch.ts';
 import { NativePlanCommands } from './native-plans.ts';
@@ -151,7 +165,7 @@ export type ControllerOptions = {
   anthropicUsageReader?: Parameters<
     typeof import('../providers/anthropic/native-usage-reader.ts').startAnthropicUsageReader
   >[1];
-  openAiUsageClient?: () => NativeProfileResolution;
+  openAiUsageClient?: (options?: { cachedOnly?: boolean }) => NativeProfileResolution;
   openAiUsageSpawn?: Parameters<typeof startNativeSession>[1]['spawn'];
   googleUsageClient?: () => GoogleUsageClientResolution;
   googleUsageSpawn?: Parameters<typeof startGoogleUsage>[0]['spawn'];
@@ -164,12 +178,18 @@ export type ControllerOptions = {
   localInputHelper?: LocalInputHelper;
   localInput?: Parameters<typeof startLocalSecretInput>[2];
   /** True when the runtime at the endpoint answers without a token. Tests pass their own. */
-  localProbe?: (endpoint: string) => Promise<boolean>;
+  localProbe?: (endpoint: string) => Promise<boolean | 'token-required' | 'unavailable' | 'open'>;
   localDiscovery?: Omit<Parameters<typeof startLocalDiscovery>[2], 'lifecycle'>;
   localWriter?: Omit<Parameters<typeof startLocalReplacement>[2], 'lifecycle' | 'onSubmitted'>;
   prepareVerification?: typeof prepareToolchain;
+  /** Whether the tool runs. Tests pass their own. The controller asks the computer once. */
+  gitState?: () => GitState;
   /** Chat adapters by family. A family without one refuses new chat turns. */
   chatAdapters?: ReadonlyMap<ChatFamily, ChatAdapter>;
+  /** The chat client per family, found by version range. Without one, the profiles stand in. */
+  chatClients?: ChatClientResolvers;
+  /** Fixed Anthropic picker rows for a scripted setup, in place of reading the client. */
+  anthropicModels?: readonly AnthropicLiveModel[];
 };
 
 export class Controller {
@@ -270,6 +290,7 @@ export class Controller {
 
   constructor(options: ControllerOptions) {
     this.options = options;
+    this.anthropicModelRows = options.anthropicModels ?? null;
     this.usageResolution = options.googleUsageClient?.() ?? resolveGoogleUsageClient();
     this.profiles = [];
     this.home = options.home;
@@ -368,6 +389,52 @@ export class Controller {
     return this.taskOperationRuntime;
   }
 
+  /** The person's MCP servers as the desktop last supplied them. Memory only. */
+  private readonly mcpServers = new McpRegistry();
+  private extensionRuntime?: ExtensionHost;
+  private extensions(): ExtensionHost {
+    this.extensionRuntime ??= new ExtensionHost({
+      home: this.home,
+      task: (taskId) => this.store.get<Task>('task', taskId),
+      readThread: (taskId) => this.chat().readThread({ taskId, limit: 50 }),
+      emit: (task, payload) => this.event('extension.event', task.id, task.revision, payload),
+    });
+    return this.extensionRuntime;
+  }
+
+  private savedPrompts(
+    command: Extract<
+      Command,
+      { command: 'ReadChatPrompts' | 'SaveChatPrompt' | 'DeleteChatPrompt' }
+    >,
+  ): CommandResult {
+    try {
+      const prompts =
+        command.command === 'SaveChatPrompt'
+          ? savePrompt(this.home, command.payload)
+          : command.command === 'DeleteChatPrompt'
+            ? deletePrompt(this.home, command.payload.name)
+            : readPrompts(this.home);
+      return { outcome: 'applied', data: { kind: 'chat-prompts', ...prompts } };
+    } catch (failure) {
+      if (failure instanceof PromptsRefused)
+        return { outcome: 'blocked', reason: failure.reason, next: failure.next };
+      throw failure;
+    }
+  }
+
+  private notesRuntime?: ProjectNotes;
+  private projectNotes(): ProjectNotes {
+    // shortcut: notes borrow a message ID's time-ordered suffix, like turns do. Upgrade: add
+    // 'not' to IdPrefix and to the testkit ID helper.
+    this.notesRuntime ??= new ProjectNotes(
+      this.store.db,
+      this.now,
+      () => `not_${this.id('msg').slice(4)}`,
+    );
+    return this.notesRuntime;
+  }
+
   private chatRuntime?: ChatService;
   private chat(): ChatService {
     this.chatRuntime ??= new ChatService({
@@ -381,7 +448,9 @@ export class Controller {
       emit: (type, taskId, revision, payload) => this.event(type, taskId, revision, payload),
       adapters: this.options.chatAdapters ?? this.defaultChatAdapters(),
       resolveEnvironment: (family) => this.chatEnvironment(family),
+      googleTermsAcknowledged: () => googleTermsCurrent(this.store.googleAcpSetup().googleTerms),
       projectPath: (projectId) => this.projectPath(projectId),
+      projectNotes: (projectId) => this.projectNotes().texts(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
       catalog: () => this.chatCatalog(),
       localContext: () => this.localContext(),
@@ -391,30 +460,31 @@ export class Controller {
       },
       // The turn's thread tools token dies with the turn.
       onTurnEnded: (turnId) => this.threadToolsRuntime?.broker.end(turnId),
-      threadToolsDown: () => this.threadToolsRuntime?.failed === true,
+      threadToolsDown: () =>
+        this.threadToolsRuntime !== undefined && (!this.threadToolsRuntime.ready || this.closed),
+      mcp: this.mcpServers,
     });
     return this.chatRuntime;
   }
 
   // One broker for the controller's life. Its socket listens once the default adapters exist, and
-  // a turn that starts before it listens, or after listening failed, runs without the tools.
-  // After a failure every cloud turn says so in the thread.
+  // a turn that starts before it listens, or after listening failed, runs without the tools. The
+  // chat service asks once per turn, so the packet, the client's config and the thread notice agree.
   private threadToolsRuntime?: {
     broker: ThreadToolsBroker;
     ready: boolean;
-    failed: boolean;
     started: Promise<void>;
   };
   private threadToolsBroker() {
     if (this.threadToolsRuntime) return this.threadToolsRuntime;
     const broker = new ThreadToolsBroker({ home: this.home });
-    const runtime = { broker, ready: false, failed: false, started: Promise.resolve() };
+    const runtime = { broker, ready: false, started: Promise.resolve() };
     runtime.started = broker.start().then(
       () => {
         runtime.ready = !this.closed;
       },
       () => {
-        runtime.failed = true;
+        // The socket stays closed, and every cloud turn runs without the tools.
       },
     );
     this.threadToolsRuntime = runtime;
@@ -428,7 +498,7 @@ export class Controller {
     return runtime.broker.mint({
       taskId: request.taskId,
       turnId: request.turnId,
-      reader: this.chat().threadReads(request.taskId),
+      reader: this.chat().threadReads(request.taskId, request.scratch.directory),
     });
   }
 
@@ -450,18 +520,15 @@ export class Controller {
   private localVision: { modelKey: string; vision: boolean } | null = null;
 
   // The Anthropic client's picker rows, read in the background. A read that fails leaves the last
-  // rows in place, or none, and the catalog then shows the shipped list as known.
+  // rows in place, or none, and the catalog then lists the model IDs this home ran turns on.
   private anthropicModelRows: readonly AnthropicLiveModel[] | null = null;
   private anthropicModelRead = { at: Number.NEGATIVE_INFINITY, busy: false };
 
   /** Starts a picker read when the last one is old. A catalog read never waits for it. */
   private refreshAnthropicModels(profiles: NativeProfileResolution[]) {
+    if (this.options.anthropicModels) return;
     const read = this.anthropicModelRead;
-    const client = profiles.find(
-      (value) =>
-        ['anthropic-file-v1', 'anthropic-file-compact-v1'].includes(value.facts.id) &&
-        value.facts.available,
-    )?.client;
+    const client = this.chatClientFor('anthropic', profiles).profile?.client;
     const now = Date.parse(this.now());
     // Ten minutes after a read, one minute after a miss.
     if (
@@ -484,7 +551,17 @@ export class Controller {
       schedule: this.options.schedule,
     })
       .then((rows) => {
-        if (rows && !this.closed) this.anthropicModelRows = rows;
+        if (!rows || this.closed) return;
+        this.anthropicModelRows = rows;
+        // CrewKite ships no Anthropic model names, so an open picker reads again when the list
+        // arrives.
+        this.store.transaction(() =>
+          this.event('chat.catalog', null, 0, {
+            family: 'anthropic',
+            models: Math.min(rows.length, 64),
+            reason: null,
+          }),
+        );
       })
       .catch(() => {})
       .finally(() => {
@@ -498,6 +575,12 @@ export class Controller {
     return buildChatCatalog({
       profiles: profiles.map((profile) => profile.facts),
       openAiModels: this.latestOpenAiModels(profiles)?.models ?? null,
+      // A controller built with fixed profiles and no chat resolver lets those profiles decide.
+      clients: Object.fromEntries(
+        (['openai', 'anthropic'] as const)
+          .filter((family) => this.options.chatClients?.[family])
+          .map((family) => [family, this.chatClientFor(family, profiles)]),
+      ),
       anthropicModel: this.anthropicUsage().clientModel(),
       anthropicModels: this.anthropicModelRows,
       googlePrompt: this.googlePrompt,
@@ -533,7 +616,10 @@ export class Controller {
           key === CHAT_MODEL_CATALOG
             ? OpenAiModelCatalogObservationSchema.parse(value)
             : ModelCatalogObservationSchema.parse(value);
-        const profile = profiles.find((value) => value.facts.id === catalog.profileId);
+        // The chat client first, so a list read with the build found by range still counts.
+        const profile = [this.chatOpenAiProfile(profiles), ...profiles].find(
+          (value) => value?.facts.id === catalog.profileId,
+        );
         if (
           !profile?.facts.available ||
           hashCanonical(profile.client) !== hashCanonical(catalog.client) ||
@@ -570,13 +656,16 @@ export class Controller {
     }
   }
 
-  /** The OpenAI profile a chat turn launches with, in the adapter's order of preference. */
-  private chatOpenAiProfile(profiles = this.resolveProfiles()) {
-    for (const id of ['openai-repository-v1', 'openai-file-v1']) {
-      const profile = profiles.find((value) => value.facts.id === id);
-      if (profile?.facts.available && profile.client && profile.environment && profile.locationHash)
-        return profile;
-    }
+  /** The client a chat turn, model read or quota read launches, found by version range. */
+  chatClientFor(family: 'openai' | 'anthropic', profiles?: NativeProfileResolution[]) {
+    return chatClient(family, this.options.chatClients, () => profiles ?? this.resolveProfiles());
+  }
+
+  /** The OpenAI profile a chat turn launches with. */
+  private chatOpenAiProfile(profiles?: NativeProfileResolution[]) {
+    const profile = this.chatClientFor('openai', profiles).profile;
+    if (profile?.facts.available && profile.client && profile.environment && profile.locationHash)
+      return profile;
   }
 
   private chatModelReadRecord() {
@@ -742,7 +831,12 @@ export class Controller {
       google: ['google-acp-v1'],
       local: [],
     };
-    const profiles = this.resolveProfiles();
+    const profiles = [
+      ...(family === 'openai' || family === 'anthropic'
+        ? [this.chatClientFor(family).profile ?? []].flat()
+        : []),
+      ...this.resolveProfiles(),
+    ];
     // Writer profiles trim PATH to the system directories. A chat turn runs the person's own
     // commands through the client, so it keeps the PATH the controller was started with.
     const path = process.env.PATH ? { PATH: process.env.PATH } : {};
@@ -756,20 +850,18 @@ export class Controller {
     );
   }
 
-  /** One adapter per family, each resolving its client from the profiles at launch time. */
+  /** One adapter per family, each resolving its client by version range at launch time. */
   private defaultChatAdapters(): Map<ChatFamily, ChatAdapter> {
     this.threadToolsBroker();
     const threadTools = (request: ChatTurnRequest) => this.threadTools(request);
-    const client = (ids: string[], family: string) => {
-      const profile = this.resolveProfiles().find(
-        (value) => ids.includes(value.facts.id) && value.facts.available && value.client,
-      );
-      if (!profile?.client) throw Error(`The ${family} client is not connected.`);
-      return profile.client;
+    const client = (family: 'openai' | 'anthropic') => {
+      const found = this.chatClientFor(family);
+      if (!found.profile?.client) throw new ChatClientRefused(found.status.message);
+      return found.profile.client;
     };
     const openai = openAiChatAdapter({
       launch: (request: ChatTurnRequest) => ({
-        ...client(['openai-repository-v1', 'openai-file-v1'], 'OpenAI'),
+        ...client('openai'),
         directory: request.work.directory,
         repositoryRoot: this.home,
         environment: request.environment,
@@ -778,7 +870,7 @@ export class Controller {
       threadTools,
     });
     const anthropic = anthropicChatAdapter({
-      launch: () => client(['anthropic-file-v1', 'anthropic-file-compact-v1'], 'Anthropic'),
+      launch: () => client('anthropic'),
       spawn: this.options.nativeSpawn as Parameters<typeof anthropicChatAdapter>[0]['spawn'],
       schedule: this.options.schedule,
       onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),
@@ -840,7 +932,7 @@ export class Controller {
         return { ...connection, connectedWithoutToken: secret === null };
       },
       // Local runs the same five reads as functions in this process. No socket or token.
-      threadReader: (request) => this.chat().threadReads(request.taskId),
+      threadReader: (request) => this.chat().threadReads(request.taskId, request.scratch.directory),
     });
     return new Map<ChatFamily, ChatAdapter>([
       ['openai', openai],
@@ -877,6 +969,13 @@ export class Controller {
       ].includes(command.command)
     )
       return this.taskOperations().execute(command as TaskOperationCommand);
+    // Before any receipt path: a server's secrets must not reach a journal row either.
+    if (command.command === 'SupplyMcpServers') {
+      if (command.actor.kind !== 'desktop')
+        return { outcome: 'denied', reason: 'desktop-actor-only' };
+      this.mcpServers.set(command.payload);
+      return { outcome: 'applied' };
+    }
     // Before any receipt path: the token must not reach a journal row.
     if (command.command === 'SupplyLocalToken' || command.command === 'ReadLocalToken')
       return this.localTokenCommand(command);
@@ -889,6 +988,20 @@ export class Controller {
         this.outputReads.delete(reading);
       }
     }
+    if (command.command === 'AcknowledgeGoogleTerms') {
+      const acknowledged = this.store.transaction(() =>
+        acknowledgeGoogleTerms(this.store, command.payload.textVersion, this.now()),
+      );
+      // The launch-time steps waited for this, so they run now and need no restart.
+      if (acknowledged.outcome === 'applied')
+        this.googleAcpPreparation = this.prepareGoogleAcp().catch(() => {});
+      return acknowledged;
+    }
+    // Reading a client's version changes nothing, so it comes before the Google terms gate.
+    if (command.command === 'CheckProviderClient')
+      return this.checkProviderClient(command.payload.family);
+    const termsRefusal = googleTermsGate(this.store, command, (runId) => this.isPreparedAcp(runId));
+    if (termsRefusal) return termsRefusal;
     if (
       [
         'InitializeGoogleAcp',
@@ -1251,6 +1364,8 @@ export class Controller {
 
   checkRevision(command: Command): CommandResult | undefined {
     if (!('expectedRevision' in command)) return;
+    if (command.command === 'ConfigureExtension' || command.command === 'RunExtensionCommand')
+      return this.extensions().checkRevision(command);
     if (
       command.command === 'ConfigureLocal' ||
       command.command === 'BeginLocalConnectionInput' ||
@@ -1281,6 +1396,12 @@ export class Controller {
         };
       return;
     }
+    // Saved prompts have no task. Their receipts come from the normal journal, so a replayed key
+    // answers from its receipt and an old save cannot overwrite a newer body.
+    if (command.command === 'SaveChatPrompt' || command.command === 'DeleteChatPrompt') return;
+    // Notes belong to a project, not a task. The controller checks the project and the size cap
+    // when it applies the command, and a replayed key answers from its receipt.
+    if (notesMutations.includes(command.command)) return;
     if (
       [
         'SendChatMessage',
@@ -1293,6 +1414,9 @@ export class Controller {
         'ImportChatAttachment',
         'RetryChatTurn',
         'DiscardChatChange',
+        'DecideChatHunk',
+        'DiscardChatHunk',
+        'CommentChatChange',
         'RenameChatThread',
         'DeleteChatThread',
         'AskChatFamily',
@@ -1456,6 +1580,12 @@ export class Controller {
         return this.chat().retryTurn(command.payload, effects);
       case 'DiscardChatChange':
         return this.chat().discardChange(command.payload, command.key);
+      case 'DecideChatHunk':
+        return this.chat().decideHunk(command.payload);
+      case 'DiscardChatHunk':
+        return this.chat().discardHunk(command.payload);
+      case 'CommentChatChange':
+        return this.chat().commentChange(command.payload, effects);
       case 'RenameChatThread':
         return this.chat().renameThread(command.payload);
       case 'DeleteChatThread':
@@ -1468,6 +1598,12 @@ export class Controller {
         return this.chat().cancelPlan(command.payload, effects);
       case 'ReadChatTurnEvents':
         return this.chat().readTurnEvents(command.payload);
+      case 'ReadExtensions':
+        return { outcome: 'applied', data: { kind: 'extensions', ...this.extensions().read() } };
+      case 'ConfigureExtension':
+        return this.extensions().configure(command.payload, effects);
+      case 'RunExtensionCommand':
+        return this.extensions().run(command.payload);
       case 'AcceptChatChanges':
         return this.chat().accept(
           command.payload,
@@ -1476,16 +1612,73 @@ export class Controller {
             : this.options.identity,
         );
       case 'ReadChatThread':
-      case 'ReadChatChanges':
+      case 'ReadChatChanges': {
+        if (!this.store.get<Task>('task', command.payload.taskId))
+          return { outcome: 'blocked', reason: 'task-not-found' };
+        if (command.command === 'ReadChatChanges') {
+          const page = this.chat().readChanges(command.payload);
+          return 'outcome' in page
+            ? page
+            : { outcome: 'applied', data: { kind: 'chat-changes', ...page } };
+        }
+        return {
+          outcome: 'applied',
+          data: { kind: 'chat-thread', ...this.chat().readThread(command.payload) },
+        };
+      }
+      case 'SearchChatHistory':
+        return {
+          outcome: 'applied',
+          data: { kind: 'chat-search', ...this.chat().searchHistory(command.payload) },
+        };
+      case 'CompleteChatMention':
+      case 'ReadChatInstructions':
         if (!this.store.get<Task>('task', command.payload.taskId))
           return { outcome: 'blocked', reason: 'task-not-found' };
         return {
           outcome: 'applied',
           data:
-            command.command === 'ReadChatThread'
-              ? { kind: 'chat-thread', ...this.chat().readThread(command.payload) }
-              : { kind: 'chat-changes', ...this.chat().readChanges(command.payload) },
+            command.command === 'CompleteChatMention'
+              ? { kind: 'chat-mentions', ...this.chat().completeMention(command.payload) }
+              : { kind: 'chat-instructions', ...this.chat().readInstructions(command.payload) },
         };
+      case 'ExportChatThread': {
+        const exported = exportThread(
+          {
+            store: this.store,
+            projectPath: (projectId) => this.projectPath(projectId),
+            scratchDirectory: (taskId) => join(this.home, 'chat', taskId, 'scratch'),
+            homes: [homedir()],
+          },
+          command.payload,
+        );
+        return exported
+          ? { outcome: 'applied', data: { kind: 'chat-export', ...exported } }
+          : { outcome: 'blocked', reason: 'task-not-found' };
+      }
+      case 'ReadChatPrompts':
+      case 'SaveChatPrompt':
+      case 'DeleteChatPrompt':
+        return this.savedPrompts(command);
+      case 'ReadDiagnostics':
+        return readDiagnostics(
+          { home: this.home, store: this.store, profiles: () => this.resolveProfiles() },
+          command.payload,
+        );
+      case 'ReadProjectNotes':
+      case 'AddProjectNote':
+      case 'EditProjectNote':
+      case 'RemoveProjectNote':
+        return notesCommand(this.projectNotes(), command);
+      case 'ReadChatAnalytics': {
+        const analytics = readAnalytics(this.store, command.payload, this.now());
+        return analytics
+          ? { outcome: 'applied', data: { kind: 'chat-analytics', ...analytics } }
+          : {
+              outcome: 'blocked',
+              reason: command.payload.scope === 'thread' ? 'task-not-found' : 'project-not-found',
+            };
+      }
       case 'ReadChatCatalog':
         this.refreshStaleChatModels();
         return {
@@ -1528,6 +1721,13 @@ export class Controller {
         try {
           path = projectRoot(command.payload.path);
         } catch {
+          const problem = gitProblem((this.options.gitState ?? gitState)());
+          if (problem)
+            return {
+              outcome: 'blocked',
+              reason: 'git-unavailable',
+              next: `${problem}. Install it and put it on your PATH. No new project was registered.`,
+            };
           return {
             outcome: 'blocked',
             reason: 'project-folder-unavailable',
@@ -1792,16 +1992,18 @@ export class Controller {
           outcome: 'applied',
           data: { kind: 'usage', windows: this.workspaceState().usage },
         };
-      case 'GetHealth':
+      case 'GetHealth': {
+        const problem = gitProblem((this.options.gitState ?? gitState)());
         return {
           outcome: 'applied',
           data: {
             kind: 'health',
-            status: 'ready',
-            version: '0.0.0',
-            blockers: [],
+            status: problem ? 'degraded' : 'ready',
+            version: CREWKITE_VERSION,
+            blockers: problem ? [problem] : [],
           },
         };
+      }
       default:
         return {
           outcome: 'unsupported',

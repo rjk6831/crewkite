@@ -8,6 +8,20 @@ export const localPromptRoom = (contextLength: number) =>
   Math.max(0, contextLength - LOCAL_REPLY_MARGIN - localReplyFloor(contextLength));
 
 /**
+ * Bytes one thread read may take: the prompt room that `promptTokens` leaves, at three bytes a
+ * token, and never more than `capBytes`. The room is already short of the margin and the smallest
+ * reply, so a read that fills it still leaves the reply its floor. Zero when nothing is left.
+ */
+export function localThreadReadBytes(
+  contextLength: number,
+  promptTokens: number,
+  capBytes: number,
+): number {
+  const left = Math.max(0, localPromptRoom(contextLength) - Math.max(0, promptTokens));
+  return Math.min(Math.max(0, capBytes), left * BYTES_PER_TOKEN);
+}
+
+/**
  * The output cap of a file proposal on an instance with this context. It is the smallest reply
  * the rule allows, which holds for any prompt inside `localPromptRoom`. Null when the context is
  * too small for any prompt to leave that reply.

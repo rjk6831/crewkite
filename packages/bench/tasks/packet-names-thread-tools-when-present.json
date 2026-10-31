@@ -1,0 +1,26 @@
+{
+  "id": "packet-names-thread-tools-when-present",
+  "title": "Name the thread tools in a packet only when the turn has them",
+  "repository": "self",
+  "base": "24e2e0953bc12c214160c7cd5f2f891e4104a07d",
+  "solution": "d99e9e269787f0d95478e23744b05a1e90557b30",
+  "text": "The handoff packet and the delta packet in apps/controller/src/chat/prompt.ts always carry the line THREAD_TOOLS_LINE, even for a turn that runs without the thread tools. Add a required boolean threadTools to the input of handoffPacket and of deltaPacket. The line is part of the packet only when it is true, in the same place as today, and nothing else about either packet changes. Also add and export withoutThreadToolsLine(text), which takes a packet that carries the line and returns the packet without it, so that it equals the packet built with threadTools false. Existing callers of systemContext and the request builders pass the flag through. A request that does not say otherwise should keep the line.",
+  "hidden": ["apps/controller/src/chat/prompt.test.ts"],
+  "checks": [
+    {
+      "name": "prompt",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/chat/prompt.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["prompt", "thread-tools", "pure-function"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:22.472Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["prompt"],
+    "baseFailure": "missing-module",
+    "passedOnSolution": ["prompt"]
+  }
+}

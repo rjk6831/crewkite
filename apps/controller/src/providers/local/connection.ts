@@ -69,6 +69,8 @@ export function resolveLocalConnection(
     }),
     connection: null,
   });
+  // This resolves the Local writer and its profile. The writer stays on macOS arm64: Linux takes
+  // Local chat in the no-authentication loopback mode only (ADR 0013, amendment of 2026-10-31).
   if (capability.platform !== 'darwin' || capability.arch !== 'arm64')
     return unavailable('unsupported-platform');
   if (input === null || input === undefined) return unavailable('not-configured');

@@ -1,7 +1,21 @@
-import { randomBytes } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync } from 'node:fs';
+import { createHash, randomBytes } from 'node:crypto';
+import {
+  closeSync,
+  constants,
+  fstatSync,
+  lstatSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { createConnection, type Socket } from 'node:net';
-import { join } from 'node:path';
+import { tmpdir } from 'node:os';
+import { resolve as absolute, basename, dirname, isAbsolute, join } from 'node:path';
 import {
   ArtifactRangeSchema,
   type Command,
@@ -54,13 +68,147 @@ export function createCommandKey(): string {
   return `cmd_${suffix}`;
 }
 
-export function readControllerEndpoint(home: string): { socketPath: string; token: string } {
+// A Unix socket path holds 104 bytes on macOS and 108 on Linux. Staying within 100 leaves room.
+const SOCKET_PATH_BYTES = 100;
+const SOCKET_RECORD = 'control-socket';
+const mine = () => process.getuid?.();
+
+/**
+ * A short socket path for one controller home: a name from a hash of the home, in this user's own
+ * directory under the temporary directory, so a deep home still binds. macOS gives a long
+ * temporary directory, so a path that would still not fit goes under /tmp. The controller's
+ * control socket and its thread tools socket share the directory and differ by suffix. The hash
+ * covers the real path, so a home reached through a link names the same socket.
+ */
+export function homeSocketPath(
+  home: string,
+  kind: 'control' | 'thread-tools',
+  temporary = tmpdir(),
+): string {
+  let real: string;
+  try {
+    real = realpathSync(home);
+  } catch {
+    real = absolute(home);
+  }
+  const hash = createHash('sha256').update(real).digest('hex').slice(0, 12);
+  const name = kind === 'control' ? `${hash}-control.sock` : `${hash}.sock`;
+  const directory = `crewkite-${mine() ?? 'user'}`;
+  const path = join(temporary, directory, name);
+  return Buffer.byteLength(path) <= SOCKET_PATH_BYTES ? path : join('/tmp', directory, name);
+}
+
+/** Where the controller of a home prefers to bind. Clients read where it did bind from the home. */
+export const controllerSocketPath = (home: string, temporary = tmpdir()): string =>
+  homeSocketPath(home, 'control', temporary);
+
+const privateFolder = (path: string, uid: number | undefined) => {
+  const state = lstatSync(path);
+  if (!state.isDirectory() || state.uid !== uid || (state.mode & 0o777) !== 0o700)
+    throw new Error(
+      'The controller socket folder is not private to you. CrewKite did not connect.',
+    );
+};
+
+/** Create a socket folder as this user's alone, or refuse one that is a link, not private or not theirs. */
+export function ownSocketDirectory(path: string, uid = mine()): void {
+  try {
+    mkdirSync(path, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  privateFolder(path, uid);
+}
+
+/**
+ * Where the controller binds. The per-user folder when this user holds it privately. When a
+ * folder of that name is a link, not private or somebody else's, a fresh private folder beside it.
+ */
+export function controllerSocketPlace(home: string, temporary = tmpdir()): string {
+  const preferred = controllerSocketPath(home, temporary);
+  try {
+    ownSocketDirectory(dirname(preferred));
+    return preferred;
+  } catch {}
+  const name = basename(preferred);
+  const prefix = `crewkite-${mine() ?? 'user'}-`;
+  let base = dirname(dirname(preferred));
+  if (Buffer.byteLength(join(base, `${prefix}XXXXXX`, name)) > SOCKET_PATH_BYTES) base = '/tmp';
+  return join(mkdtempSync(join(base, prefix)), name);
+}
+
+/** The controller records the socket it bound in its home, where its clients read it. */
+export function publishControllerSocket(home: string, socketPath: string): void {
+  const file = join(home, SOCKET_RECORD);
+  const next = `${file}.${process.pid}`;
+  writeFileSync(next, socketPath, { mode: 0o600, flag: 'w' });
+  renameSync(next, file);
+}
+
+/** Remove the record when it still names this socket. */
+export function withdrawControllerSocket(home: string, socketPath: string): void {
+  const file = join(home, SOCKET_RECORD);
+  try {
+    if (readFileSync(file, 'utf8') === socketPath) unlinkSync(file);
+  } catch {}
+}
+
+function readSocketRecord(home: string, uid: number | undefined): string {
+  let file: number;
+  try {
+    file = openSync(
+      join(home, SOCKET_RECORD),
+      constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+    );
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+      throw new Error('The controller is not running.');
+    throw error;
+  }
+  try {
+    const state = fstatSync(file);
+    if (
+      !state.isFile() ||
+      state.nlink !== 1 ||
+      state.size > 512 ||
+      (state.mode & 0o777) !== 0o600 ||
+      state.uid !== uid
+    )
+      throw new Error('The controller socket record must be private to its owner.');
+    const path = readFileSync(file, 'utf8');
+    if (!isAbsolute(path)) throw new Error('The controller socket record is invalid.');
+    return path;
+  } finally {
+    closeSync(file);
+  }
+}
+
+/**
+ * Checks a socket before the token goes to it: its folder is a real folder of this user with
+ * mode 0700, and the socket is a socket of this user.
+ */
+export function checkControllerSocket(path: string, uid = mine()): void {
+  privateFolder(dirname(path), uid);
+  let state: ReturnType<typeof lstatSync>;
+  try {
+    state = lstatSync(path);
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT')
+      throw new Error('The controller socket was removed. Restart CrewKite.');
+    throw error;
+  }
+  if (!state.isSocket() || state.uid !== uid)
+    throw new Error('The controller socket is not yours. CrewKite did not connect.');
+}
+
+/** The token of a controller home, after the checks that the home and the file are private. */
+export function readControllerToken(home: string, uid = mine()): string {
   const directory = lstatSync(home);
   if (
     !directory.isDirectory() ||
     directory.isSymbolicLink() ||
     (directory.mode & 0o777) !== 0o700 ||
-    directory.uid !== process.getuid?.()
+    directory.uid !== uid
   )
     throw new Error('Controller home must be private to its owner.');
   const file = openSync(
@@ -74,15 +222,30 @@ export function readControllerEndpoint(home: string): { socketPath: string; toke
       state.nlink !== 1 ||
       state.size > 65 ||
       (state.mode & 0o777) !== 0o600 ||
-      state.uid !== process.getuid?.()
+      state.uid !== uid
     )
       throw new Error('Controller token must be private to its owner.');
     const token = readFileSync(file, 'utf8').trim();
     if (!/^[a-f0-9]{64}$/.test(token)) throw new Error('Controller token is invalid.');
-    return { socketPath: join(home, 'control.sock'), token };
+    return token;
   } finally {
     closeSync(file);
   }
+}
+
+/**
+ * The socket the controller bound and the token for it. The socket comes from the record in the
+ * home, so a client with another temporary directory finds it, and it is checked before the token
+ * goes anywhere.
+ */
+export function readControllerEndpoint(
+  home: string,
+  uid = mine(),
+): { socketPath: string; token: string } {
+  const token = readControllerToken(home, uid);
+  const socketPath = readSocketRecord(home, uid);
+  checkControllerSocket(socketPath, uid);
+  return { socketPath, token };
 }
 
 export class ControllerClient {
@@ -316,6 +479,7 @@ export class ControllerClient {
                                 : [
                                       'ObserveUsage',
                                       'RefreshChatModels',
+                                      'CheckProviderClient',
                                       'DiscoverGoogleAcp',
                                       'StopGoogleAcpSetup',
                                     ].includes(command.command)
@@ -502,4 +666,5 @@ export async function connectController(options: Options): Promise<ControllerCli
   return client;
 }
 
+export { writeDiagnosticsFolder } from './diagnostics.ts';
 export { transferArtifact } from './output.ts';

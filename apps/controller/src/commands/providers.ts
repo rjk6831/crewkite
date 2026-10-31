@@ -32,7 +32,7 @@ import {
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
 import { startGoogleAcpSetup } from '../providers/google/acp/writer.ts';
-import { probeLocalWithoutToken } from '../providers/local/chat-connect.ts';
+import { type LocalProbe, probeLocal } from '../providers/local/chat-connect.ts';
 import {
   localConfiguredConnectionHash,
   resolveLocalConnection,
@@ -45,7 +45,13 @@ import {
   type NativeProfileResolution,
   unavailableNativeProfile,
 } from '../providers/openai/profile.ts';
+import {
+  LOCAL_SERVER_WANTS_TOKEN,
+  LOCAL_TOKEN_SETUP_NOTICE,
+  localTokenRefusal,
+} from '../providers/platform.ts';
 import type { Controller } from './controller.ts';
+import { googleTermsAcknowledged } from './google-terms.ts';
 import {
   type AcpSetupCommand,
   type LocalControl,
@@ -54,6 +60,10 @@ import {
 } from './schemas.ts';
 
 // Provider setup: ACP install and sign-in, connection checks, the Local connection and profiles.
+// The connection revision at which a no-authentication connect met a runtime that wants a token.
+// Memory only: the next connect probes again.
+const tokenAsked = new WeakMap<object, number>();
+
 export class ProviderCommands {
   executeAcpSetup(
     this: Controller,
@@ -226,12 +236,14 @@ export class ProviderCommands {
    * prompt and open no browser. Authenticate opens a browser, so it waits for a click. The
    * initialize reply names sign-in methods and no sign-in status, so discover runs only on a
    * proof that already records a finished sign-in. Only a controller that registers the real
-   * client prepares it; a harness that drives each step leaves registration off.
+   * client prepares it; a harness that drives each step leaves registration off. Nothing starts
+   * until the current Google terms text is acknowledged, and the acknowledgement runs this again.
    */
   googleAcpPreparationStep(this: Controller): 'initialize' | 'discover' | null {
     if (
       !this.options.registerGoogleAcp ||
       this.closed ||
+      !googleTermsAcknowledged(this.store) ||
       this.acpSetupRuntime ||
       this.acpStart ||
       this.googleInstallationBlocker() ||
@@ -654,7 +666,7 @@ export class ProviderCommands {
       {
         key: command.key,
         requestHash: hash,
-        profile: this.profileFor('anthropic-file-v1'),
+        profile: this.anthropicChatProfile(),
         directory,
         repositoryRoot: this.home,
       },
@@ -772,6 +784,15 @@ export class ProviderCommands {
     );
   }
 
+  /**
+   * The line that refuses Local token mode, or null. The token window and the remembered token
+   * both need the macOS keychain, so any other computer takes the no-authentication loopback mode
+   * only (ADR 0013, amendment of 2026-10-31).
+   */
+  localTokenRefusal(this: Controller) {
+    return localTokenRefusal(this.options.localInput?.platform ?? process.platform);
+  }
+
   localSetup(this: Controller): LocalSetup {
     const control = this.localControl();
     const generation = this.store.localGenerationBlocker();
@@ -792,7 +813,8 @@ export class ProviderCommands {
             : 'discovery-active'
         : !control.endpoint
           ? 'unconfigured'
-          : control.authMode === 'token' && !this.options.localInputHelper
+          : control.authMode === 'token' &&
+              (!this.options.localInputHelper || this.localTokenRefusal())
             ? 'capability-unavailable'
             : control.connectionFailed
               ? 'connection-unavailable'
@@ -811,7 +833,18 @@ export class ProviderCommands {
                           : choice.state !== 'loaded-eligible'
                             ? 'model-incompatible'
                             : 'qualification-pending');
+    // The runtime asked a no-authentication connection for a token, or token mode was saved on a
+    // computer that cannot take one. The view shows these lines in place of the generic reason.
+    const notice =
+      this.localTokenRefusal() && control.endpoint
+        ? control.authMode === 'token'
+          ? LOCAL_TOKEN_SETUP_NOTICE
+          : tokenAsked.get(this) === control.connectionRevision && !connected
+            ? LOCAL_SERVER_WANTS_TOKEN
+            : undefined
+        : undefined;
     return LocalSetupSchema.parse({
+      ...(notice ? { notice } : {}),
       revision: control.revision,
       connectionRevision: control.connectionRevision,
       connectorId: 'local-sdk-v1',
@@ -871,6 +904,8 @@ export class ProviderCommands {
       };
     const { endpoint } = control;
     if (!endpoint) return { outcome: 'blocked', reason: 'local-not-configured' };
+    const refusal = this.localTokenRefusal();
+    if (refusal) return { outcome: 'blocked', reason: 'local-token-needs-macos', next: refusal };
     return this.store.transaction((): CommandResult => {
       const blocker = this.store.localStartBlocker();
       if (blocker || control.operation)
@@ -974,6 +1009,8 @@ export class ProviderCommands {
     if (blocker) return { outcome: 'blocked', reason: blocker };
     if (command.command === 'ConfigureLocal') {
       const authMode = command.payload.authMode ?? 'token';
+      const refusal = authMode === 'token' ? this.localTokenRefusal() : null;
+      if (refusal) return { outcome: 'blocked', reason: 'local-token-needs-macos', next: refusal };
       if (control.endpoint === command.payload.endpoint && control.authMode === authMode)
         return applied();
       this.revokeLocalSecret();
@@ -1022,8 +1059,16 @@ export class ProviderCommands {
       });
       return applied();
     }
-    if (control.authMode === 'token' && !this.options.localInputHelper)
-      return { outcome: 'blocked', reason: 'local-input-unavailable' };
+    // A configured helper does not lift the refusal: token entry needs the macOS keychain.
+    const tokenRefusal = control.authMode === 'token' ? this.localTokenRefusal() : null;
+    if (control.authMode === 'token' && (!this.options.localInputHelper || tokenRefusal)) {
+      const refusal = tokenRefusal;
+      return {
+        outcome: 'blocked',
+        reason: refusal ? 'local-token-needs-macos' : 'local-input-unavailable',
+        ...(refusal ? { next: refusal } : {}),
+      };
+    }
     if (command.command === 'RefreshLocalModels' && !this.localConnected(control))
       return { outcome: 'blocked', reason: 'local-connection-required' };
     const kind = command.command === 'BeginLocalConnectionInput' ? 'input' : 'discovery';
@@ -1326,15 +1371,35 @@ export class ProviderCommands {
         // runtime can miss the first probe, so a miss is tried once more before the window opens.
         const endpoint = control.endpoint;
         if (!endpoint) throw Error('Local endpoint is unavailable.');
-        const probe = this.options.localProbe ?? probeLocalWithoutToken;
+        const injected = this.options.localProbe;
+        const probe: (endpoint: string) => Promise<LocalProbe> = injected
+          ? async (value) => {
+              const found = await injected(value);
+              return found === true ? 'open' : found === false ? 'unavailable' : found;
+            }
+          : probeLocal;
         void (async () => {
-          let open = await probe(endpoint).catch(() => false);
-          if (!open && !runtime.stopped && !this.closed)
-            open = await probe(endpoint).catch(() => false);
-          return open;
-        })().then((open) => {
+          let found = await probe(endpoint).catch((): LocalProbe => 'unavailable');
+          if (found === 'unavailable' && !runtime.stopped && !this.closed)
+            found = await probe(endpoint).catch((): LocalProbe => 'unavailable');
+          return found;
+        })().then((found) => {
+          const open = found === 'open';
+          tokenAsked.delete(this);
           const supplied =
             this.localSecret?.supplied && this.localSecretMatches(this.localControl());
+          if (
+            found === 'token-required' &&
+            !supplied &&
+            this.localTokenRefusal() &&
+            !runtime.stopped &&
+            !this.closed
+          ) {
+            // The runtime asked for a token and this computer cannot take one. No window opens;
+            // the setup says so until the next connect finds the runtime open.
+            tokenAsked.set(this, control.connectionRevision);
+            return finish(null);
+          }
           if (!open && supplied && !runtime.stopped && !this.closed) {
             // The desktop supplied the token for this connect. No window opens.
             if (this.localSecret) this.localSecret.supplied = false;

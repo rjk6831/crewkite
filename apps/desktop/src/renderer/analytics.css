@@ -1,0 +1,73 @@
+/* The usage numbers of a thread or a project: figures and small tables, no chart. */
+.an {
+  display: grid;
+  gap: 12px;
+  font-size: 13px;
+}
+.an-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.an-problem {
+  color: var(--red);
+}
+.an-totals {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
+  gap: 8px 14px;
+  margin: 0;
+}
+.an-totals dt {
+  color: var(--text-dim);
+  font-size: 11.5px;
+}
+.an-totals dd {
+  margin: 2px 0 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+.an-scroll {
+  overflow-x: auto;
+}
+.an-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-variant-numeric: tabular-nums;
+}
+.an-table caption {
+  padding-bottom: 4px;
+  color: var(--text-dim);
+  font-size: 11.5px;
+  text-align: left;
+}
+.an-table th,
+.an-table td {
+  padding: 4px 10px 4px 0;
+  border-bottom: 1px solid var(--border);
+  text-align: left;
+  white-space: nowrap;
+}
+.an-table thead th {
+  color: var(--text-dim);
+  font-size: 11.5px;
+  font-weight: 500;
+}
+.an-table tbody th {
+  max-width: 220px;
+  overflow: hidden;
+  font-weight: 500;
+  text-overflow: ellipsis;
+}
+.an-heading {
+  font-size: 12px;
+  font-weight: 600;
+}
+.an-list {
+  display: grid;
+  gap: 4px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  font-variant-numeric: tabular-nums;
+}

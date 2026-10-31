@@ -384,7 +384,7 @@ export function readAgo(readAt: string | null | undefined, nowMs: number): strin
 export type RailBar = { text: string; percent: number | null };
 export type RailFamily = {
   family: ChatFamily;
-  /** Two bars when the family reports a five-hour and a weekly window, else one. Empty for Local. */
+  /** Two bars when the family reports a five-hour and a weekly window, else one. Empty for Local and for a family not connected that has read nothing. */
   bars: RailBar[];
   /** The family runs on this computer and reports no allowance. */
   unlimited: boolean;
@@ -405,7 +405,8 @@ const percentText = (percent: number | null) =>
   percent === null ? 'unknown' : `${Math.floor(percent)}%`;
 
 /**
- * One row per family the rail shows: connected ones, and ones whose usage reads before Connect.
+ * One row per family, connected or not. A family that is not connected reads its usage when it
+ * can, and shows Connect with no bar when it has read nothing.
  * The catalog labels each window five-hour or weekly when it knows the period. Within a period the
  * window with the least left for the family's model wins, so a weekly pool for another model does
  * not count. The reset line follows the tightest window overall, the same one the picker shows.
@@ -425,57 +426,61 @@ export function railFamilies(
   const entries = catalog.families.some(({ family }) => family === 'local')
     ? catalog.families
     : [...catalog.families, localPlaceholder];
-  return entries
-    .filter((entry) => entry.family === 'local' || entry.connected || entry.needsConnect === true)
-    .map((entry) => {
-      const model = modelFor(entry);
-      const setUp =
-        entry.family === 'local' &&
-        !entry.connected &&
-        (options.localSetup ? options.localSetup.endpoint === null : entry.needsConnect !== true);
-      const unlimited = entry.family === 'local' && entry.remaining.length === 0 && !setUp;
-      const reported = entry.remaining.map((window) => window.windowId);
-      const applies = entry.remaining.filter((window) => windowAppliesTo(window, model, reported));
-      const period = (label: keyof typeof barNames) =>
-        tightestAllowance(
-          { remaining: applies.filter((window) => window.label.toLowerCase() === label) },
-          null,
-        );
-      const both = (['five-hour', 'weekly'] as const).every((label) =>
-        applies.some((window) => window.label.toLowerCase() === label),
+  return entries.map((entry) => {
+    const model = modelFor(entry);
+    const setUp =
+      entry.family === 'local' &&
+      !entry.connected &&
+      (options.localSetup ? options.localSetup.endpoint === null : entry.needsConnect !== true);
+    const unlimited = entry.family === 'local' && entry.remaining.length === 0 && !setUp;
+    const reported = entry.remaining.map((window) => window.windowId);
+    const applies = entry.remaining.filter((window) => windowAppliesTo(window, model, reported));
+    const period = (label: keyof typeof barNames) =>
+      tightestAllowance(
+        { remaining: applies.filter((window) => window.label.toLowerCase() === label) },
+        null,
       );
-      const tightest = tightestAllowance(entry, model);
-      const bars: RailBar[] =
-        unlimited || setUp
-          ? []
-          : both
-            ? (['five-hour', 'weekly'] as const).map((label) => {
-                const { percent } = period(label);
-                return { text: `${barNames[label]} ${percentText(percent)}`, percent };
-              })
-            : [
-                {
-                  text:
-                    tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
-                  percent: tightest.percent,
-                },
-              ];
-      const until = tightest.resetsAt ? Date.parse(tightest.resetsAt) - nowMs : null;
-      return {
-        family: entry.family,
-        bars,
-        unlimited,
-        resetsIn: until !== null && until > 0 ? until : null,
-        resetPassed: until !== null && until <= 0,
-        needsConnect: !entry.connected && !setUp,
-        setUp,
-        read: readAgo(entry.readAt, nowMs),
-        detail:
-          entry.family === 'local'
-            ? localFacts(options.hardware, options.localSetup, entry.lastTurnStats).line
-            : null,
-      };
-    });
+    const both = (['five-hour', 'weekly'] as const).every((label) =>
+      applies.some((window) => window.label.toLowerCase() === label),
+    );
+    const tightest = tightestAllowance(entry, model);
+    // A provider that is not connected and has read nothing keeps its row with Connect, so the
+    // rail shows one gauge per provider. It has no bar to draw yet.
+    const unread =
+      entry.family !== 'local' &&
+      !entry.connected &&
+      !entry.remaining.some((window) => window.percent !== null);
+    const bars: RailBar[] =
+      unlimited || setUp || unread
+        ? []
+        : both
+          ? (['five-hour', 'weekly'] as const).map((label) => {
+              const { percent } = period(label);
+              return { text: `${barNames[label]} ${percentText(percent)}`, percent };
+            })
+          : [
+              {
+                text:
+                  tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
+                percent: tightest.percent,
+              },
+            ];
+    const until = tightest.resetsAt ? Date.parse(tightest.resetsAt) - nowMs : null;
+    return {
+      family: entry.family,
+      bars,
+      unlimited,
+      resetsIn: until !== null && until > 0 ? until : null,
+      resetPassed: until !== null && until <= 0,
+      needsConnect: !entry.connected && !setUp,
+      setUp,
+      read: readAgo(entry.readAt, nowMs),
+      detail:
+        entry.family === 'local'
+          ? localFacts(options.hardware, options.localSetup, entry.lastTurnStats).line
+          : null,
+    };
+  });
 }
 
 // A catalog that predates Local, or one read before it, still gets a Local row.

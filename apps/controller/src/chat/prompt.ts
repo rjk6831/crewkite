@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
@@ -8,7 +9,15 @@ import {
   statSync,
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve, sep } from 'node:path';
-import type { ChatAttachment, ChatFamily, ChatRole } from '@crewkite/contracts';
+import {
+  type ChatAttachment,
+  type ChatFamily,
+  type ChatRole,
+  PROJECT_NOTES_BYTES,
+  PROJECT_NOTES_MAX,
+  projectNotesBytes,
+  renderProjectNotes,
+} from '@crewkite/contracts';
 import { anthropicInstructionFile } from '../providers/anthropic/instructions.ts';
 import { googleInstructionFile } from '../providers/google/instructions.ts';
 import type { ChatHistoryEntry } from './adapter.ts';
@@ -38,18 +47,78 @@ export function handoffReason(reason: HandoffReason): string {
 /**
  * The framing for an assistant or fixer turn. The Anthropic client launches with no setting
  * sources and Local has no instruction loader, so those two get the project's instruction files
- * here. The OpenAI and Google clients read their own files from the working folder.
+ * here. The OpenAI and Google clients read their own files from the working folder. Every family
+ * gets the project's notes. The notes and the instruction files share 64 KiB: the notes come first
+ * with at most 16 KiB, and the instruction files keep the rest.
  */
-export function systemContext(projectName: string, directory: string, family: ChatFamily): string {
+export function systemContext(
+  projectName: string,
+  directory: string,
+  family: ChatFamily,
+  notes: readonly string[] = [],
+): string {
   const framing = [
     `You are working on the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     'Read and edit files only inside that copy. The person reviews every change in Changes before it reaches their repository.',
     'When you change files, say which files you changed and why.',
     'The scratch copy has no `.git` folder and no installed dependencies, so git commands and tests may fail there.',
   ].join('\n');
+  const section = notesSection(notes);
   const instructions =
-    family === 'anthropic' || family === 'local' ? projectInstructions(directory) : [];
-  return [framing, ...instructions].join('\n\n');
+    family === 'anthropic' || family === 'local'
+      ? projectInstructions(directory, INSTRUCTION_BYTES - Buffer.byteLength(section))
+      : [];
+  return [framing, ...(section ? [section] : []), ...instructions].join('\n\n');
+}
+
+/**
+ * The project's notes as a section, or an empty string. The controller holds a project to 16 KiB
+ * and 200 notes. A longer list is cut at a whole note, so the section never outgrows its share.
+ */
+export function notesSection(notes: readonly string[]): string {
+  let kept = notes.slice(0, PROJECT_NOTES_MAX);
+  while (kept.length > 0 && projectNotesBytes(kept) > PROJECT_NOTES_BYTES) kept = kept.slice(0, -1);
+  return renderProjectNotes(kept);
+}
+
+/** A brief for a role that reads only, followed by the project's notes. */
+export function withNotes(brief: string, notes: readonly string[]): string {
+  const section = notesSection(notes);
+  return section ? `${brief}\n\n${section}` : brief;
+}
+
+/** The hash of the notes section a session receives. The session keeps it to see a change. */
+export function notesDigest(notes: readonly string[]): string {
+  return createHash('sha256').update(notesSection(notes)).digest('hex');
+}
+
+const TURN_NOTES_LEAD =
+  'CrewKite attaches the current notes for this project to the message below.';
+const TURN_NOTES_END = 'End of project notes.';
+const NO_NOTES = 'This project has no notes now.';
+
+/**
+ * A resumed session skips the system context, so the notes reach it in front of its message. They
+ * go only when they differ from what the session last received, which `held` is the hash of. A
+ * session that never received notes needs nothing while the project has none. A session that held
+ * notes the project has since dropped is told so. The block is empty when nothing has to be said.
+ * It starts and ends on fixed lines, so an adapter that starts a new session can take it out.
+ */
+export function turnNotesBlock(notes: readonly string[], held: string | undefined): string {
+  const section = notesSection(notes);
+  if (held === notesDigest(notes) || (held === undefined && !section)) return '';
+  return `${TURN_NOTES_LEAD}\n\n${section || NO_NOTES}\n\n${TURN_NOTES_END}`;
+}
+
+/**
+ * The prompt without the block `turnNotesBlock` put in front of it. An adapter calls it when a
+ * resume fails and a new session starts, because that session reads the notes in its system
+ * context and would otherwise see them twice.
+ */
+export function stripTurnNotes(prompt: string): string {
+  if (!prompt.startsWith(`${TURN_NOTES_LEAD}\n\n`)) return prompt;
+  const end = prompt.indexOf(`\n\n${TURN_NOTES_END}\n\n`);
+  return end < 0 ? prompt : prompt.slice(end + TURN_NOTES_END.length + 4);
 }
 
 /** Instruction files at the scratch root, in the order systemContext reads them. */
@@ -65,15 +134,15 @@ export function presentInstructions(directory: string): string[] {
     }
   });
 }
-const INSTRUCTION_BYTES = 64 * 1024;
+export const INSTRUCTION_BYTES = 64 * 1024;
 const INSTRUCTIONS_CUT = '[The project instructions stop here at the 64 KiB limit.]';
 
 /**
  * One section per instruction file at the scratch root, in a fixed order. A link that resolves to a
  * file inside the copy counts once, under the first name that reaches it. Headers and text share
- * 64 KiB, and a cut ends on a whole line.
+ * `budget` bytes, 64 KiB less what the notes take, and a cut ends on a whole line.
  */
-function projectInstructions(directory: string): string[] {
+function projectInstructions(directory: string, budget: number): string[] {
   let root: string;
   try {
     root = realpathSync.native(directory);
@@ -93,7 +162,7 @@ function projectInstructions(directory: string): string[] {
     if (!file.startsWith(`${root}${sep}`) || read.has(file)) continue;
     read.add(file);
     const header = `Project instructions from ${name}:\n\n`;
-    const room = INSTRUCTION_BYTES - used - Buffer.byteLength(header);
+    const room = budget - used - Buffer.byteLength(header);
     const bytes = readFileStart(file, Math.max(room, 0) + 1);
     if (bytes === null || bytes.length === 0) continue;
     if (bytes.length <= room) {
@@ -153,6 +222,8 @@ export function reviewContext(
   base: string,
   files: readonly ReviewFile[] | null,
   statesFindings = false,
+  /** Why the changes could not be read, when the cause was their size. */
+  unreadable?: string,
 ): string {
   const lines = [
     `You are reviewing changes in the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
@@ -165,7 +236,7 @@ export function reviewContext(
         ]
       : []),
   ];
-  if (files === null) return [...lines, 'The changes could not be read.'].join('\n');
+  if (files === null) return [...lines, unreadable ?? 'The changes could not be read.'].join('\n');
   if (files.length === 0)
     return [...lines, 'No files have changed since the base commit.'].join('\n');
   let budget = REVIEW_PATCH_BYTES;
@@ -388,6 +459,8 @@ export function handoffPacket(input: {
   instructions?: readonly string[];
   /** Files from earlier messages that travel with this request. The new message's own files are not here. */
   earlier?: readonly EarlierFile[];
+  /** True when this turn has the thread tools. The packet names them only then. */
+  threadTools: boolean;
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -423,7 +496,7 @@ export function handoffPacket(input: {
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
-    THREAD_TOOLS_LINE,
+    ...(input.threadTools ? [THREAD_TOOLS_LINE] : []),
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
     `Files changed in the scratch copy against the base commit:\n${files}`,
     ...(input.instructions?.length
@@ -457,6 +530,10 @@ export function earlierReach(family: ChatFamily, path: string): string {
 /** The packet names the read-only thread tools, so a model knows it can ask for more. */
 export const THREAD_TOOLS_LINE =
   'Thread tools are available: thread_turns, thread_turn, thread_diff, thread_checks, thread_live.';
+
+/** A packet for a turn that found out late it has no thread tools, with the line taken out. */
+export const withoutThreadToolsLine = (text: string): string =>
+  text.replace(`\n\n${THREAD_TOOLS_LINE}`, '');
 
 /**
  * The message text under its heading. The request carries it once. A message of files alone has
@@ -543,6 +620,8 @@ export function deltaPacket(input: {
   earlier: readonly EarlierFile[];
   prompt: string;
   clip?: number;
+  /** True when this turn has the thread tools. The packet names them only then. */
+  threadTools: boolean;
 }): string {
   const cut = (text: string, characters: number) =>
     text.length > characters ? `${text.slice(0, characters).toWellFormed()} [trimmed]` : text;
@@ -568,7 +647,7 @@ export function deltaPacket(input: {
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
-    THREAD_TOOLS_LINE,
+    ...(input.threadTools ? [THREAD_TOOLS_LINE] : []),
     `Turns since then, oldest first:\n\n${turns.join('\n\n')}`,
     input.changes.join('\n'),
     input.checks.length

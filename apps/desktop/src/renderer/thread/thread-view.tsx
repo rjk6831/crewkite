@@ -2,7 +2,11 @@ import type { ChatCatalogRead, ChatModelSelection, WorkspaceState } from '@crewk
 import { GitBranch, PanelRight } from 'lucide-react';
 import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import { ExtensionThreadActions } from '../extension-slots.tsx';
+import { provide } from '../palette/actions.ts';
+import { ShareDialog } from '../palette/share-dialog.tsx';
 import { OutputLimitControl, RerunControl, TryWith } from './cards.tsx';
+import { ChecksCard } from './checks-card.tsx';
 import {
   cancelPlan,
   configureThread,
@@ -21,10 +25,12 @@ import { FamilyMark } from './family-mark.tsx';
 import { tryWithChoices } from './file-fit.ts';
 import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
+import type { HistoryFind } from './history-reveal.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
 import { MessageList, modelLine } from './message-list.tsx';
 import { outputLimitLine } from './output-limit.ts';
 import { PlanCard } from './plan-card.tsx';
+import { ProjectNotesProvider } from './project-notes.tsx';
 import { QueuedList } from './queued-list.tsx';
 import {
   announcements,
@@ -42,6 +48,7 @@ import {
 } from './thread-state.ts';
 import { ThreadTitle } from './thread-title.tsx';
 import type { TurnView } from './turn-fold.ts';
+import { useReveal } from './use-reveal.ts';
 import { useThread } from './use-thread.ts';
 import './thread.css';
 
@@ -70,7 +77,19 @@ function changeCount(items: ReturnType<typeof useThread>['items']) {
   return count;
 }
 
+/** The thread inside its project's notes, which the chip and Save as note read. */
 export function ThreadView({
+  projectId,
+  ...props
+}: Parameters<typeof ThreadBody>[0] & { projectId?: string }) {
+  return (
+    <ProjectNotesProvider source={props.source} projectId={projectId ?? null}>
+      <ThreadBody {...props} />
+    </ProjectNotesProvider>
+  );
+}
+
+function ThreadBody({
   source,
   task,
   projectName,
@@ -78,6 +97,9 @@ export function ThreadView({
   preview,
   connection,
   refresh,
+  find,
+  onNewThread,
+  onOpenSettings,
 }: {
   source: ThreadSource;
   task: ThreadTask;
@@ -86,8 +108,13 @@ export function ThreadView({
   preview: boolean;
   connection: string;
   refresh?: () => Promise<WorkspaceState>;
+  /** A history search result to open at, scrolled to its turn with the match marked. */
+  find?: HistoryFind | null;
+  onNewThread?: () => void;
+  onOpenSettings?: () => void;
 }) {
   const {
+    reach,
     state,
     items,
     dispatch,
@@ -101,6 +128,7 @@ export function ThreadView({
     reload,
     retry,
   } = useThread(source, task.id, connection);
+  const reveal = useReveal(find, items, state.loaded, reach);
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const [inspector, setInspector] = useState<{
     open: boolean;
@@ -108,6 +136,7 @@ export function ThreadView({
     focus: string | null;
   }>({ open: false, tab: 'changes', focus: null });
   const [notice, setNotice] = useState<string | null>(null);
+  const [sharing, setSharing] = useState(false);
   const counter = useRef(0);
   const composer = useRef<ComposerHandle>(null);
   const toggle = useRef<HTMLButtonElement>(null);
@@ -129,6 +158,29 @@ export function ThreadView({
       setSaid((previous) => ({ count: previous.count + 1, text: lines.join(' ') }));
   }, [state.loaded, signals]);
   const lastMessage = useMemo(() => lastUserMessage(state), [state]);
+  // Export and share are offered to the command palette while this thread is open. Main renders
+  // the file through the controller and the person picks where it goes.
+  const exportMarkdown = useCallback(async () => {
+    if (!source.saveExport) {
+      setNotice('Export needs the desktop app.');
+      return;
+    }
+    try {
+      const done = await source.saveExport({ taskId: task.id, format: 'markdown' });
+      if (done === 'saved')
+        setSaid((previous) => ({
+          count: previous.count + 1,
+          text: 'Saved the thread as Markdown.',
+        }));
+    } catch (failure) {
+      setNotice(failure instanceof Error ? failure.message : 'The file was not saved.');
+    }
+  }, [source, task.id]);
+  useEffect(
+    () =>
+      provide('exporter', { markdown: () => void exportMarkdown(), share: () => setSharing(true) }),
+    [exportMarkdown],
+  );
 
   const queued = thread?.queued;
   // The controller queues a message while the thread is busy. The queued list shows that one, so
@@ -259,6 +311,20 @@ export function ThreadView({
       }}
     />
   );
+  const checked = thread?.checks && (thread.checks.runs.length > 0 || thread.checks.ask) && (
+    <ChecksCard
+      checks={thread.checks}
+      onStop={async () => {
+        const last = newestTurnId(state);
+        if (last) await stopTurn(source, { taskId: task.id, turnId: last });
+      }}
+      onAnswer={async (requestId, choice) => {
+        const last = newestTurnId(state);
+        if (last)
+          await resolvePermission(source, { taskId: task.id, turnId: last, requestId, choice });
+      }}
+    />
+  );
   const replyId = useMemo(
     () => (activeTurn ? null : lastReply(state, items)),
     [activeTurn, state, items],
@@ -365,6 +431,7 @@ export function ThreadView({
           )}
           <ThreadTitle source={source} task={task} />
           <span className="th-project">{projectName}</span>
+          <ExtensionThreadActions source={source} taskId={task.id} />
           <span className="th-badge" title={thread?.base ?? 'No base commit yet'}>
             <GitBranch size={11} aria-hidden="true" />
             {badge}
@@ -385,9 +452,10 @@ export function ThreadView({
           items={items}
           empty={empty}
           footer={
-            (planned || offer) && (
+            (planned || checked || offer) && (
               <>
                 {planned}
+                {checked}
                 {offer && (
                   <LimitOfferCard
                     key={offer.turnId}
@@ -403,6 +471,7 @@ export function ThreadView({
           wantsHistory={wantsHistory}
           onTurnVisible={loadHistory}
           taskId={task.id}
+          reveal={reveal}
           earlier={hasEarlier ? { onLoad: loadEarlier, note: earlierNote } : null}
           onResolve={resolve}
           onOpenChanges={openChanges}
@@ -433,6 +502,9 @@ export function ThreadView({
           onCatalog={setCatalog}
           localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
           lastMessage={lastMessage}
+          onNewThread={onNewThread}
+          onOpenSettings={onOpenSettings}
+          onOpenChanges={() => setInspector({ open: true, tab: 'changes', focus: null })}
         />
         {/* A zero-width mark on alternate lines lets the same sentence be read twice in a row. */}
         <p className="th-sr" role="status" aria-live="polite" aria-atomic="true">
@@ -440,6 +512,9 @@ export function ThreadView({
           {said.count % 2 === 0 ? '' : '\u200b'}
         </p>
       </section>
+      {sharing && (
+        <ShareDialog source={source} taskId={task.id} onClose={() => setSharing(false)} />
+      )}
       {inspector.open && (
         <Inspector
           source={source}

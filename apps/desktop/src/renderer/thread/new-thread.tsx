@@ -83,6 +83,8 @@ export function NewThread({
   onOpenSettings,
   blocked,
   focusComposer = false,
+  prefill,
+  onPrefilled,
   localSetup,
   refresh,
 }: {
@@ -100,6 +102,9 @@ export function NewThread({
   blocked: string | null;
   /** Put the cursor in the message box, as after Add project. */
   focusComposer?: boolean;
+  /** Text to put in the box once, such as the first-run suggestion. It is never sent for the person. */
+  prefill?: string | null;
+  onPrefilled?: () => void;
   localSetup?: LocalSetup | null;
   refresh?: () => Promise<WorkspaceState>;
 }) {
@@ -113,6 +118,11 @@ export function NewThread({
   useEffect(() => {
     if (focusComposer && ready) composer.current?.focus();
   }, [focusComposer, ready]);
+  useEffect(() => {
+    if (!prefill || !ready) return;
+    composer.current?.fill(prefill);
+    onPrefilled?.();
+  }, [prefill, ready, onPrefilled]);
   // Until the catalog is read, nothing says no family is connected, so Send stays open.
   const firstRun = catalog !== null && !catalog.families.some((family) => family.connected);
 

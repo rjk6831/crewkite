@@ -15,6 +15,7 @@ import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import { ControllerClient, readControllerEndpoint } from '@crewkite/client/node';
 import { type RuntimeManifest, RuntimeManifestSchema } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
+import { sourceDesktopState } from '../../../../scripts/desktop-state.ts';
 import {
   checkEnvironment,
   checkOwner,
@@ -73,14 +74,7 @@ export function resolveRuntime(
   const appRoot = realpathSync(appPath);
   const home = environment.CREWKITE_HOME;
   const profile = environment.CREWKITE_PROFILE;
-  if (
-    !home ||
-    !profile ||
-    !isAbsolute(home) ||
-    !isAbsolute(profile) ||
-    home === profile ||
-    Buffer.byteLength(join(home, 'control.sock')) > 100
-  )
+  if (!home || !profile || !isAbsolute(home) || !isAbsolute(profile) || home === profile)
     throw new Error('Choose separate absolute controller home and desktop profile paths.');
   let mode: RuntimeManifest['mode'] = 'demo';
   let stateRoots: string[];
@@ -102,15 +96,23 @@ export function resolveRuntime(
     arch = manifest.node.arch;
   } else {
     root = realpathSync(resolve(appRoot, '../..'));
-    const internal = join(root, 'internal');
-    if (!existsSync(internal)) mkdirSync(internal, { mode: 0o700 });
-    if (lstatSync(internal).isSymbolicLink())
-      throw new Error('The source internal directory cannot be a symlink.');
-    stateRoots = [realpathSync(internal)];
-    const check = checkOwner();
-    if (check) stateRoots.push(check.stateRoot);
-    if (existsSync(join(internal, 'tools')))
-      stateRoots.push(dirname(realpathSync(join(internal, 'tools'))));
+    // `pnpm desktop` names the state root of the person's own CrewKite home and runs the real
+    // controller. Its state never sits in this checkout's internal folder, which the demo uses.
+    const ownState = environment.CREWKITE_SOURCE_STATE_ROOT;
+    if (ownState !== undefined) {
+      mode = 'workspace';
+      stateRoots = [sourceDesktopState(root, ownState, home, profile).root];
+    } else {
+      const internal = join(root, 'internal');
+      if (!existsSync(internal)) mkdirSync(internal, { mode: 0o700 });
+      if (lstatSync(internal).isSymbolicLink())
+        throw new Error('The source internal directory cannot be a symlink.');
+      stateRoots = [realpathSync(internal)];
+      const check = checkOwner();
+      if (check) stateRoots.push(check.stateRoot);
+      if (existsSync(join(internal, 'tools')))
+        stateRoots.push(dirname(realpathSync(join(internal, 'tools'))));
+    }
     if (
       appRoot !== join(root, 'apps/desktop') ||
       !environment.CREWKITE_SOURCE_NODE ||
@@ -211,6 +213,7 @@ export class DesktopController {
           ...checkEnvironment(),
           PATH: process.env.PATH,
           HOME: process.env.HOME,
+          TMPDIR: process.env.TMPDIR,
           CODEX_HOME: process.env.CODEX_HOME,
           CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
           LANG: 'en_US.UTF-8',
@@ -225,9 +228,7 @@ export class DesktopController {
       this.child = child;
       console.log(`Controller PID: ${child.pid ?? 'starting'}`);
       const readyLine =
-        this.paths.mode === 'demo'
-          ? 'CREWKITE_CONTROLLER_READY'
-          : `Controller ready at ${join(this.paths.home, 'control.sock')}`;
+        this.paths.mode === 'demo' ? 'CREWKITE_CONTROLLER_READY' : 'Controller ready at ';
       let output = '';
       let finished = false;
       const finish = (error?: Error) => {
@@ -246,7 +247,15 @@ export class DesktopController {
         output += bytes.toString('utf8');
         if (output.length > 4096)
           finish(new Error('The controller startup output exceeded its bound.'));
-        else if (output.split('\n').includes(readyLine)) finish();
+        else if (
+          output
+            .split('\n')
+            .some(
+              (line) =>
+                line === readyLine || (readyLine.endsWith(' ') && line.startsWith(readyLine)),
+            )
+        )
+          finish();
       });
       child.stderr?.on('data', () => {});
       child.once('error', () => finish(new Error('The standalone controller could not start.')));

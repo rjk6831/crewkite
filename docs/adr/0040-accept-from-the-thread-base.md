@@ -22,7 +22,7 @@ This record amends ADR 0008 and leaves its text as it is.
   - A symlink is written as a link when its target resolves inside the copy. The check follows each target the way the kernel does, through the other links that stay, with `..` taken from where a link leads, names folded for case and normalization, and at most 40 expansions. A link that fails the check is skipped.
   - A submodule (a gitlink, mode 160000) is skipped.
   - A path or a link target that is not UTF-8 is skipped.
-  - A base with more than 100,000 entries fails with a message that names the count. The 64 MiB limit on file bytes stays.
+  - A base with more than 100,000 entries fails with a message that names the count. The 64 MiB limit on file bytes stays. (Both limits are gone: ADR 0027 lifted the byte limit, and its amendment of 2026-10-31 replaced the file count with a free space check.)
 - The thread record lists the first 64 skipped entries with a reason each, and the Changes tab shows "Skipped N entries the scratch copy cannot hold". Accept copies every link and every skipped entry into the new tree from the base, byte for byte, whatever the copy holds at that path. A held link the copy replaced, removed or pointed elsewhere still goes into the branch as the base has it, and Changes lists that path with the reason until I discard it. Accept refuses when the copy added a new link or a special file, or holds a `.git` folder.
 - The writer path for tasks keeps its strict form: no links, no submodules and the 10,000 file limit.
 - Each file in Changes has Discard. It asks first and names the file. It restores that path in the scratch copy to the base: a changed file gets the base bytes and mode, a file the thread added is removed, and a deleted file comes back. On a held link the copy changed, it removes whatever is at that path and makes the base link again, with the same checks the copy uses when it is first written. It refuses a skipped entry, a path that leads outside the copy through a link, a path blocked by another entry and a file that already matches the base. It waits while a turn runs, and it writes one system line. Accept then carries what is left. Discard works on whole files.
@@ -46,7 +46,7 @@ Discard exists because Accept took everything in the copy. A thread with one wro
 - Each thread leaves one ref under `refs/crewkite/threads/` in my repository until I delete the thread. `git for-each-ref refs/crewkite` lists them. If a delete cannot remove a ref, it stays and holds one commit.
 - If the ref write fails, the accepted branch or HEAD holds the base until I delete that branch.
 - A skipped entry is invisible to the model. A submodule has no files in the copy, and the model cannot edit it.
-- A base over 100,000 entries or 64 MiB cannot start a thread.
+- A base over 100,000 entries or 64 MiB cannot start a thread. (Superseded by the ADR 0027 amendment of 2026-10-31: a base of any size starts a thread when the disk has room.)
 - The thread record keeps 64 skipped entries, so a longer list shows as "64 or more". The first turn writes no line about them, and the Changes tab is the only place they appear.
 - Discard on a skipped entry is refused, because Accept takes it from the base whatever the copy holds. A held link the copy changed stays listed in Changes after Accept, since the copy still holds its own version, until I discard it.
 - Hunk-level discard is not covered.

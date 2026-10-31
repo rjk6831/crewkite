@@ -1,0 +1,26 @@
+{
+  "id": "scratch-clone-from-checkout",
+  "title": "Clone checkout files into a thread's scratch copy",
+  "repository": "self",
+  "base": "24e2e0953bc12c214160c7cd5f2f891e4104a07d",
+  "solution": "ae8f5c74df7875b683de78474cc331b3580c74dc",
+  "text": "A thread's scratch copy writes every committed file from git, which is slow for a large project even when the person's checkout already holds the same bytes. Add apps/controller/src/chat/scratch-copy.ts with copyScratch(directory, files, links, options) returning { cloned, written }, and a type CloneFile = (from, to) => void. The default clone is a copy-on-write copy that must fail on a volume that cannot clone (copyFileSync with COPYFILE_FICLONE_FORCE). options.checkout is { root, base }, options.clone replaces the default clone, options.onProgress receives ImportProgress updates and options.name names the copy in them (default repository). Cloning is allowed only when the checkout's HEAD equals the base and git status shows no change to a tracked file; otherwise, or when no checkout is given, every file is written from the committed bytes with mode 0600 and the exclusive create flag. For each file the clone is used only when the checkout path is a regular file (not a link) whose size equals the committed size. Any other file is written. If a clone throws an error with the code EXDEV, ENOTSUP, EOPNOTSUPP, ENOSYS, EINVAL or EPERM, no later file is cloned, and that file is written. Other clone errors write that file only. The rules for paths, links and collisions stay the ones the existing materialize applies, so give materialize an optional fourth argument write(file, target) that puts one file's bytes at its path, defaulting to the current exclusive write with mode 755 or 644, and have copyScratch pass its own. Report progress once for each 4 MiB copied and once at the end with bytes equal to total. Use copyScratch in the chat service where the scratch copy is filled, passing the project checkout and the thread base, and forward progress to onImportProgress without letting a failing callback break the copy. The copy must hold exactly the tree a plain copy holds, including the executable bit and links.",
+  "hidden": ["apps/controller/src/chat/scratch-copy.test.ts"],
+  "checks": [
+    {
+      "name": "scratch-copy",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/chat/scratch-copy.test.ts"]
+    }
+  ],
+  "difficulty": "hard",
+  "tags": ["controller", "chat", "filesystem", "performance"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:35.297Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["scratch-copy"],
+    "baseFailure": "missing-module",
+    "passedOnSolution": ["scratch-copy"]
+  }
+}

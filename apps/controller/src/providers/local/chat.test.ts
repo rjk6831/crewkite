@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -935,6 +935,30 @@ test('files reach a Local turn as images on a vision model and as inlined text, 
       assert.equal(result.failure?.nextAction, 'Try another provider for these files.');
       assert.equal(turn.disposals(), 1);
     }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a command the local model runs holds Git to the scratch copy', async () => {
+  const { root, clock, request } = fixture();
+  try {
+    const { model } = fakeModel(
+      [
+        {
+          steps: [{ call: 'run', args: { command: 'printf "<%s>" "$GIT_CEILING_DIRECTORIES"' } }],
+          stats: {},
+        },
+        { steps: [{ text: 'Seen.' }], stats: {} },
+      ],
+      clock,
+    );
+    const turn = start(model, 8192, request(0));
+    await turn.handle.result;
+    const output = turn.events.flatMap((event) =>
+      event.type === 'tool.output' ? [event.chunk] : [],
+    );
+    assert(output.join('').includes(`<${realpathSync.native(root)}>`), output.join(''));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

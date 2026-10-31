@@ -180,6 +180,13 @@ test('thread tools read through the reader, are cut to the Local room and fail w
     const cut = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 1024);
     assert.match(cut.output, /\[cut to fit the Local context/);
     assert(Buffer.byteLength(cut.output) <= 1024);
+    // No room left gives an empty read, and a room smaller than the notice gets the text alone.
+    const none = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 0);
+    assert.equal(none.status, 'ok');
+    assert.equal(none.output, '');
+    const tiny = await run('thread_turn', { id: 'trn_01J00000000000000000000001' }, 20);
+    assert.equal(Buffer.byteLength(tiny.output), 20);
+    assert.doesNotMatch(tiny.output, /cut to fit/);
     assert.match((await run('thread_diff', {})).output, /cursor "c1"/);
     assert.match((await run('thread_checks', {})).output, /lint ok/);
     assert.equal((await run('thread_live', {})).output, 'No turn is running.');
@@ -189,6 +196,87 @@ test('thread tools read through the reader, are cut to the Local room and fail w
     assert.equal(without.status, 'error');
     assert.match(without.output, /not available/);
     assert.equal(existsSync(scratch), true);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('read_range reads lines of a file past the whole-file limit and gives the same answer as a small one', async () => {
+  const { root, scratch, context } = fixture();
+  try {
+    // Over the 8 MiB whole-file read, with a last line that has no newline.
+    const row = (index: number) => `line ${index} ${'x'.repeat(90)}`;
+    const count = 100_000;
+    const body = `${Array.from({ length: count }, (_, index) => row(index + 1)).join('\n')}`;
+    writeFileSync(join(scratch, 'big.log'), body);
+    writeFileSync(join(scratch, 'small.log'), `${row(1)}\n${row(2)}\n${row(3)}`);
+    const cases: [string, number, number, RegExp][] = [
+      ['big.log', 1, 2, /^big\.log lines 1-2 of 100000\n1: line 1 x+\n2: line 2 x+$/],
+      [
+        'big.log',
+        99_999,
+        100_000,
+        /^big\.log lines 99999-100000 of 100000\n99999: line 99999 x+\n100000: line 100000 x+$/,
+      ],
+      ['small.log', 2, 3, /^small\.log lines 2-3 of 3\n2: line 2 x+\n3: line 3 x+$/],
+    ];
+    for (const [path, start, end, expected] of cases) {
+      const read = await runTool('read_range', { path, start, end }, context);
+      assert.equal(read.status, 'ok', path);
+      assert.match(read.output, expected, `${path} ${start}-${end}`);
+    }
+    const past = await runTool(
+      'read_range',
+      { path: 'big.log', start: 100_001, end: 100_001 },
+      context,
+    );
+    assert.equal(past.status, 'error');
+    assert.match(past.output, /has 100000 lines/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('search covers every file and says how many were too large to search', async () => {
+  const { root, scratch, context } = fixture();
+  try {
+    // More files than the old 20,000-file walk, with the only match sorted last.
+    const many = join(scratch, 'many');
+    mkdirSync(many);
+    for (let index = 0; index < 20_050; index++)
+      writeFileSync(join(many, `f${String(index).padStart(5, '0')}.txt`), 'nothing here\n');
+    writeFileSync(join(many, 'zz-last.txt'), 'needle\n');
+    writeFileSync(join(scratch, 'huge.txt'), `needle\n${'y'.repeat(1024 * 1024)}`);
+    const found = await runTool('search', { pattern: 'needle' }, context);
+    assert.equal(
+      found.output,
+      'many/zz-last.txt:1: needle\n1 file over 1 MiB was not searched. Use read_range or run on them.',
+    );
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('read_range on a large file cuts long lines on a character, keeps CRLF breaks and a last bare CR', async () => {
+  const { root, scratch, context } = fixture();
+  try {
+    // Line 1 is one byte then two-byte characters, so the 2,000 byte keep ends inside one.
+    // Line 2 ends in CRLF. A filler line takes the file past 8 MiB. The last line ends in a bare CR.
+    const body = Buffer.concat([
+      Buffer.from(`a${'é'.repeat(3000)}\n`),
+      Buffer.from('crlf\r\n'),
+      Buffer.from(`${'z'.repeat(9 * 1024 * 1024)}\n`),
+      Buffer.from('end\r'),
+    ]);
+    writeFileSync(join(scratch, 'mixed.log'), body);
+    const read = await runTool('read_range', { path: 'mixed.log', start: 1, end: 4 }, context);
+    assert.equal(read.status, 'ok');
+    const rows = read.output.split('\n');
+    assert.equal(rows[0], 'mixed.log lines 1-4 of 4');
+    assert.equal(rows[1], `1: a${'é'.repeat(499)} [line cut]`);
+    assert.equal(rows[2], '2: crlf');
+    assert.equal(rows[3], `3: ${'z'.repeat(500)} [line cut]`);
+    assert.equal(rows[4], '4: end\r');
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

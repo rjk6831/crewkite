@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import {
   AnthropicUsageReadingSchema,
   ArtifactSchema,
+  type ClientVersionStatus,
   type Command,
   CommandIdSchema,
   type CommandResult,
@@ -19,6 +20,7 @@ import type { ArtifactFiles } from '../../artifacts/index.ts';
 import type { CatalogObservation } from '../../chat/catalog.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import type { Store } from '../../store/index.ts';
+import { clientStatusReason } from '../client-versions.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
 import { anthropicUsageReaderScope, startAnthropicUsageReader } from './native-usage-reader.ts';
 import { maximumDetail } from './usage-reader.ts';
@@ -75,6 +77,8 @@ export class AnthropicUsageRefresh {
     now: () => string;
     artifactId: () => string;
     resolve: () => NativeProfileResolution;
+    /** The installed client against its tested build, when the controller finds it by range. */
+    client?: () => ClientVersionStatus | undefined;
     blocked: () => string | undefined;
     changed: () => void;
     schedule?: Schedule;
@@ -189,6 +193,8 @@ export class AnthropicUsageRefresh {
       operationId: 'usage-trust',
       executable: profile.client.executable,
       executableSha256: profile.client.sha256,
+      clientVersion: profile.client.version,
+      ...(profile.environment.PATH ? { path: profile.environment.PATH } : {}),
       sessionId: '00000000-0000-4000-8000-000000000000',
       directory,
       home: profile.environment.HOME,
@@ -244,12 +250,14 @@ export class AnthropicUsageRefresh {
     } catch {}
     const state = this.state();
     const current = this.current(state);
+    const client = this.client();
     const reader = {
       id: 'anthropic-usage-v1',
       family: 'anthropic',
-      clientVersion: binding?.clientVersion ?? 'unknown',
+      clientVersion: binding?.clientVersion ?? client?.version ?? 'unknown',
       available: !!binding,
-      reason: binding ? 'available' : 'client-unavailable',
+      reason: binding ? 'available' : client ? clientStatusReason(client) : 'client-unavailable',
+      ...(client ? { client } : {}),
       readState: state?.state ?? 'idle',
       // Records from the earlier strict reader say only `protocol`, which tells the person nothing.
       readReason: state?.reason === 'protocol' ? 'unreadable-output' : (state?.reason ?? null),
@@ -274,6 +282,14 @@ export class AnthropicUsageRefresh {
         : {}),
     };
     return UsageReaderSchema.parse({ ...reader, detail: state?.detail ?? null });
+  }
+
+  private client(): ClientVersionStatus | undefined {
+    try {
+      return this.options.client?.();
+    } catch {
+      return undefined;
+    }
   }
 
   /** The model the client named in its last usage read, or null. The chat catalog starts there. */
@@ -351,8 +367,8 @@ export class AnthropicUsageRefresh {
       this.complete(command.key, result);
       return result;
     }
-    const refused = (reason: string): CommandResult => {
-      const result: CommandResult = { outcome: 'blocked', reason };
+    const refused = (reason: string, next?: string): CommandResult => {
+      const result: CommandResult = { outcome: 'blocked', reason, ...(next ? { next } : {}) };
       store.transaction(() => store.saveReceipt(command.key, requestHash, 'local-owner', result));
       return result;
     };
@@ -365,7 +381,13 @@ export class AnthropicUsageRefresh {
     } catch {
       return refused('client-build-mismatch');
     }
-    if (!binding) return refused('client-unavailable');
+    if (!binding) {
+      // The card line says which build was found and what to do about it.
+      const client = this.client();
+      return client && !client.accepted
+        ? refused(clientStatusReason(client), client.message)
+        : refused('client-unavailable');
+    }
     const previous = this.state();
     const attemptedAt = this.options.now();
     if (previous && Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) < 60000)

@@ -1,0 +1,26 @@
+{
+  "id": "google-gate-covers-prepare-start-usage",
+  "title": "Close the Google terms gate on prepare, start and usage reads",
+  "repository": "self",
+  "base": "de54df23eea870d4e036686aaf877bdeabb0f4ea",
+  "solution": "18354712ada3b80b44eb41b649d44e16b2d18af6",
+  "text": "The Google terms gate in apps/controller/src/commands/google-terms.ts misses three paths. Change googleTermsGate to take a third argument, a function from a run id to whether that run is a prepared Google run. Until the current terms text is acknowledged it must also refuse a PrepareNativeRun command whose profile id starts with google-, and a StartRun command for which that function answers true. Every other command, and a StartRun for a run that is not a prepared Google run, passes (the gate returns undefined). The refusal keeps outcome blocked and reason google-terms-not-acknowledged. Export a helper googleTermsAcknowledged(store) from the same module and use it. In the controller, pass the function that asks whether a run is a prepared ACP run. Also refuse an ObserveUsage command for the google family with that same reason, and make controller.refreshGoogleUsage('start') return undefined without starting a read, until the terms are acknowledged.",
+  "hidden": ["apps/controller/src/commands/google-terms.test.ts"],
+  "checks": [
+    {
+      "name": "google-terms",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/commands/google-terms.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["google", "gate", "controller"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:25:55.746Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["google-terms"],
+    "baseFailure": "assertion",
+    "passedOnSolution": ["google-terms"]
+  }
+}

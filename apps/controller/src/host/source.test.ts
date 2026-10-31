@@ -40,6 +40,7 @@ import {
   materialize,
   readCandidateFiles,
   readFiles,
+  scratchPlan,
   treeFromFiles,
 } from './source.ts';
 import {
@@ -483,9 +484,11 @@ test('source inspection bounds file metadata without running filters or reading 
   copyFileSync(process.execPath, bundledNode);
   chmodSync(bundledNode, 0o700);
   const environment = {
-    CREWKITE_HOME: join(runtimeDirectory, 'home'),
+    // A home 120 characters or deeper still resolves, since the control socket is not inside it.
+    CREWKITE_HOME: join(runtimeDirectory, 'home'.repeat(25)),
     CREWKITE_PROFILE: join(runtimeDirectory, 'profile'),
   };
+  assert.ok(environment.CREWKITE_HOME.length >= 120);
   mkdirSync(environment.CREWKITE_HOME, { mode: 0o700 });
   const retained = new Map([
     ['demo-catalog.json', 'historical catalog'],
@@ -1212,19 +1215,16 @@ test('a scratch copy holds links that stay inside, skips what it cannot hold and
     assert.deepEqual(read(), candidate, name);
   }
 
-  // Above the cap the message names the count and the cap.
+  // A base with more than the old 100,000-file cap plans in full: the copy checks disk space.
   const many = git(
     repository,
     ['mktree'],
-    Array.from({ length: 100_001 }, (_, index) => `100644 blob ${rows[0][1][1]}\tf${index}\n`).join(
+    Array.from({ length: 250_001 }, (_, index) => `100644 blob ${rows[0][1][1]}\tf${index}\n`).join(
       '',
     ),
   )
     .toString()
     .trim();
   const large = git(repository, ['commit-tree', many], 'large\n', identity).toString().trim();
-  assert.throws(
-    () => committedFiles(repository, large, { scratch: true }),
-    /has 100,001 files\. A scratch copy holds at most 100,000\./,
-  );
+  assert.equal(scratchPlan(repository, large).files.length, 250_001);
 });

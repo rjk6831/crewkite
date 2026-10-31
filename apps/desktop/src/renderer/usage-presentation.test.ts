@@ -403,18 +403,25 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     for (const [key, value] of Object.entries(expect))
       assert.deepEqual(view[key as keyof typeof view], value, `${claim}: ${key}`);
   }
-  // An unconnected family that reads no usage stays off the rail. Local does not, even when the
-  // catalog has no entry for it.
-  const hidden = entry('google', [], { connected: false });
+  // An unconnected family that has read no usage keeps its row with Connect and no bar, so the
+  // rail shows one gauge per provider. Local also stays when the catalog has no entry for it.
+  const unread = entry('google', [], { connected: false });
+  const unreadRows = railFamilies({ families: [unread] }, nowMs);
   assert.deepEqual(
-    railFamilies({ families: [hidden] }, nowMs).map(({ family }) => family),
-    ['local'],
+    unreadRows.map(({ family, needsConnect, bars }) => [family, needsConnect, bars.length]),
+    [
+      ['google', true, 0],
+      ['local', false, 0],
+    ],
   );
   assert.deepEqual(
-    railFamilies({ families: [hidden] }, nowMs, {
+    railFamilies({ families: [unread] }, nowMs, {
       localSetup: { endpoint: null } as LocalSetup,
     }).map(({ family, setUp }) => [family, setUp]),
-    [['local', true]],
+    [
+      ['google', false],
+      ['local', true],
+    ],
   );
   // One formatter prints every size.
   const sizes: [number, string][] = [

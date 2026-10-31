@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { type Command, CommandSchema } from '@crewkite/contracts';
-import { droppedPaths } from '../shared/attach.ts';
+import { attachRequest, droppedPaths } from '../shared/attach.ts';
 import { attachmentTarget } from '../shared/open-file.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
 
@@ -49,6 +49,11 @@ test('main sends an import by path only for a path it gave the window', () => {
     ['other commands pass', command('RenameChatThread', { taskId, title: 'Plan' }), true],
     ['the window cannot read the Local token', token('ReadLocalToken', {}), false],
     ['the window cannot supply a Local token', token('SupplyLocalToken', { token: 'abc' }), false],
+    [
+      'the window cannot supply MCP servers',
+      token('SupplyMcpServers', { servers: [], threads: {} }),
+      false,
+    ],
   ];
   for (const [claim, value, allowed] of rows)
     assert.equal(grants.refusal(value) === null, allowed, claim);
@@ -91,4 +96,19 @@ test('main sends an import by path only for a path it gave the window', () => {
     ['an extra field is refused', open({ path: secret }), null],
   ];
   for (const [claim, input, want] of opens) assert.equal(resolved(input), want, claim);
+});
+
+test('main takes clipboard text only as a length with no other field', () => {
+  const cases: [unknown, unknown][] = [
+    [
+      { from: 'clipboard-text', length: 70_000 },
+      { from: 'clipboard-text', length: 70_000 },
+    ],
+    [{ from: 'clipboard-text' }, null],
+    [{ from: 'clipboard-text', length: 0 }, null],
+    [{ from: 'clipboard-text', length: 1.5 }, null],
+    [{ from: 'clipboard-text', length: 70_000, text: 'from the page' }, null],
+    [{ from: 'clipboard-text', length: 70_000, paths: ['/etc/passwd'] }, null],
+  ];
+  for (const [input, expected] of cases) assert.deepEqual(attachRequest(input), expected);
 });

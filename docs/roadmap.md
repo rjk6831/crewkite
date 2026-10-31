@@ -32,13 +32,13 @@ I published [D2 UAT 02](https://github.com/rjk6831/crewkite/releases/tag/d2-uat-
 
 ## D2b daily-work acceptance
 
-The current line of work is the chat thread. A thread is a streamed session on one scratch copy of a project, with four provider adapters behind one event contract, permissions answered in the thread and a handoff that moves the thread between providers. [Proposed ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md) records the decision and what it removes. None of the four adapters has a live run on record yet, and [provider routes](providers.md#chat-adapters) says so for each.
+The current line of work is the chat thread. A thread is a streamed session on one scratch copy of a project, with four provider adapters behind one event contract, permissions answered in the thread and a handoff that moves the thread between providers. [Proposed ADR 0036](adr/0036-the-chat-thread-is-the-product-center.md) records the decision and what it removes. I ran all four adapters live through development, and the release build gets a final check on macOS before it ships. [Provider routes](providers.md#chat-adapters) says so for each.
 
 I will ship D2b in small usable releases, beginning after the verified D2 UAT package. [Daily-work slices](daily-work-slices.md) is the implementation entry point and progress record. It names the next slice, actual code gaps, dependencies, acceptance and package release steps.
 
 D2b.1 separates workspace/task status from whole-history reads. D2b.2 streams retained artifacts and output; D2b.3 scales project capture. D2b.4 adds task-linked GitHub PR, Actions status and CI logs. Large diffs and context, project commands and useful multi-file changes follow as separate releases, leading into checked push and PR publication. Restart and cross-version recovery complete the representative daily-work acceptance suite before I claim the stated coding scope.
 
-Instant History and optional older-history compression follow the coding releases. They retain the history CrewKite actually receives, with local indexes, segmented reads and measured cold/warm access. Separate cloud-app history still requires a supported access or import path.
+Instant History is in the 0.1.0 prerelease. It keeps the history CrewKite receives, with a local index that the rail search and `crewkite search` read, paged reads of long threads and a view that mounts only the rows near the screen. The cold and warm open timings on the reference Mac come with the final macOS check. Optional older-history compression is still planned, and it waits for measurements on a large retained home. Separate cloud-app history still requires a supported access or import path.
 
 One usable release every day or so is the target. Three implementation lanes cover project scale, GitHub/CI and commands/multi-file work, with one integration owner and independent QA. Shared contracts freeze first; development can overlap before dependency releases. Recovery and compatibility work start on Day 1. The daily-work coding core has a conditional 3-5 working-day target after D2 shipment and capacity verification. The first two slices establish measured throughput; a slice that grows splits at a usable boundary. An eligible ready feature can ship before an independent lower-numbered slice. History and compression are stretch work for that window. Each release keeps its source, CI and package evidence separate. D2b.1, D2b.2 and subsequent numbers stay under one milestone, so a small delivery does not redefine the D2 exit or create another distribution milestone.
 
@@ -70,7 +70,19 @@ These stay out of the first build. Each one gets its own gates when I enable it:
 - Arbitrary agent swarms and a plugin marketplace
 - A permanent background service and automatic updates
 - A CI helper for user projects: inspect workflows, explain cost and coverage, propose a candidate patch on request
-- Platforms beyond macOS, each with its own writer qualification
+- Platforms beyond macOS, each with its own writer qualification. Linux runs a chat preview in 0.1.0; Windows waits on the port of process groups, the control socket and the file trust checks
+
+## After 0.1.0
+
+The README lists these in rough order. Each gets its own ADR or amendment before it ships.
+
+- Named builders: a crew roster with a provider, model and effort per builder, a live view of slice ownership, and each builder's subagents
+- An API key route per provider, with the full Anthropic model list and a Google route inside Google's terms
+- The Windows port
+- Google, task writers, formatting and verification on Linux, with packaged installers
+- Large repository copy, comparison and acceptance off the controller's main thread; per-hunk review for large files through git's own diff
+- Project notes fetched on demand; routing that weighs context size beside allowance
+- Published bench results per family
 
 ## How I will judge it
 

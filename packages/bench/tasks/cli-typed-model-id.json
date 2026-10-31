@@ -1,0 +1,26 @@
+{
+  "id": "cli-typed-model-id",
+  "title": "Accept a typed model ID for a cloud family in the CLI",
+  "repository": "self",
+  "base": "8f9e8e04a8eb49c278190f73168d5c62c64c1b72",
+  "solution": "57b0abbf356116e69be32d4eb668cca8a249bf7f",
+  "text": "The controller accepts a cloud model ID that its catalog does not list, the way the desktop's typed model does, and the client rejects a wrong one on the first turn. The CLI refuses such an ID in --model and in the saved selection of cli.json, so a person cannot reach a model the list has not caught up with. In chooseSelection in apps/cli/src/chat/scripting.ts, accept an unlisted model ID for the openai, anthropic and google families when it matches ^[A-Za-z0-9][A-Za-z0-9._:[\\]-]{0,199}$. The effort then defaults to default unless the flag names one. A listed model behaves as before. Local still needs a model its catalog lists on this computer, and an ID that does not match the pattern is still refused with the existing usage error.",
+  "hidden": ["apps/cli/src/chat/scripting.test.ts"],
+  "checks": [
+    {
+      "name": "scripting",
+      "command": "node",
+      "args": ["--test", "apps/cli/src/chat/scripting.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["cli", "models"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:25:44.398Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["scripting"],
+    "baseFailure": "assertion",
+    "passedOnSolution": ["scripting"]
+  }
+}

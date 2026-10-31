@@ -1,14 +1,24 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import {
+  chmodSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import test, { type TestContext } from 'node:test';
 import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
 import { createTestClock, createTestIds } from '@crewkite/testkit';
 import type { ArtifactFiles } from '../../artifacts/index.ts';
 import { Controller } from '../../commands/controller.ts';
 import type { StreamingCommandOptions } from '../../host/worker.ts';
-import type { NativeProfileResolution } from '../openai/profile.ts';
+import { clientVersionStatus } from '../client-versions.ts';
+import type { ChatClientResolution, NativeProfileResolution } from '../openai/profile.ts';
 import {
   type AnthropicUsageReaderTrust,
   anthropicUsageReaderScope,
@@ -23,6 +33,7 @@ import {
 const sessionId = '46eb17cd-01e8-480d-99f4-a741f189715d';
 const uuid = '46eb17cd-01e8-480d-99f4-a741f189715f';
 const sha256 = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37';
+const clientVersion = '2.1.302';
 const at = '2026-10-21T01:00:00.000Z';
 // Client 2.1.302 output for the exact plan, with display text, paths and long lists replaced.
 const [init, assistant, terminal] = readFileSync(
@@ -190,7 +201,7 @@ test('a usage read maps each reported limit and ignores what it does not show', 
     assert.equal(reading.observedAt, null, row.name);
     assert.equal(reading.freshness, 'unknown', row.name);
   }
-  const plan = anthropicUsageReaderPlan({ clientSha256: sha256, sessionId });
+  const plan = anthropicUsageReaderPlan({ clientSha256: sha256, clientVersion, sessionId });
   assert.equal(plan.argv.at(-1), '/usage');
   assert.equal(plan.argv.includes('--print'), true);
   assert.equal(plan.argv.includes('--disable-slash-commands'), false);
@@ -200,8 +211,22 @@ test('a usage read maps each reported limit and ignores what it does not show', 
   assert.equal(plan.argv.includes('--restricted'), true);
   assert.equal(plan.argv[plan.argv.indexOf('--settings') + 1], '{"disableAllHooks":true}');
   assert.equal(plan.argv[plan.argv.indexOf('--setting-sources') + 1], '');
+  // Any build in the accepted range reads, whatever its digest; a build outside it never does.
+  for (const [version, accepted] of [
+    ['2.1.302', true],
+    ['2.1.340', true],
+    ['2.1.0', true],
+    ['2.0.99', false],
+    ['3.0.0', false],
+    ['unknown', false],
+  ] as const) {
+    const read = () =>
+      anthropicUsageReaderPlan({ clientSha256: '0'.repeat(64), clientVersion: version, sessionId });
+    if (accepted) assert.equal(read().clientVersion, version);
+    else assert.throws(read, UsageReaderError, version);
+  }
   assert.throws(
-    () => anthropicUsageReaderPlan({ clientSha256: '0'.repeat(64), sessionId }),
+    () => anthropicUsageReaderPlan({ clientSha256: 'not-a-digest', clientVersion, sessionId }),
     UsageReaderError,
   );
 });
@@ -211,6 +236,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
     operationId: 'usage_fixture',
     executable: '/not-opened/native',
     executableSha256: sha256,
+    clientVersion,
     sessionId,
     directory: '/not-opened',
     home: '/not-opened/home',
@@ -261,6 +287,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
     { operationId: 'another_operation' },
     { sessionId: uuid },
     { executable: '/another/native' },
+    { clientVersion: '2.1.340' },
     { directory: '/another/directory' },
     { home: '/another/home' },
     { temporary: '/another/temporary' },
@@ -276,7 +303,8 @@ test('the usage owner bounds output and refuses metadata before physical closure
     );
   }
   for (const changed of [
-    { executableSha256: '0'.repeat(64) },
+    { executableSha256: 'not-a-digest' },
+    { clientVersion: '1.9.0' },
     { sessionId: 'invalid' },
     { operationId: '' },
     { directory: 'relative' },
@@ -345,7 +373,7 @@ test('the usage owner bounds output and refuses metadata before physical closure
       create(launch) {
         assert.deepEqual(
           launch.argv,
-          anthropicUsageReaderPlan({ clientSha256: sha256, sessionId }).argv,
+          anthropicUsageReaderPlan({ clientSha256: sha256, clientVersion, sessionId }).argv,
         );
         assert.equal(launch.environment.ANTHROPIC_API_KEY, undefined);
         assert.equal(launch.input, undefined);
@@ -401,9 +429,60 @@ test('the usage owner bounds output and refuses metadata before physical closure
   }
 });
 
+test('a client installed as a node script reads usage with the person PATH and fails without it', async () => {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'ck-usage-script-'));
+  try {
+    const directory = join(root, 'run');
+    const home = join(root, 'home');
+    mkdirSync(directory, { mode: 0o700 });
+    mkdirSync(home, { mode: 0o700 });
+    // The npm global install and ~/.claude/local both start the client this way.
+    const client = join(root, 'cli.js');
+    writeFileSync(
+      client,
+      `#!/usr/bin/env node\nprocess.stdout.write(require('node:fs').readFileSync(${JSON.stringify(
+        new URL('./usage-fixture.jsonl', import.meta.url).pathname,
+      )}));\n`,
+    );
+    chmodSync(client, 0o755);
+    const digest = createHash('sha256').update(readFileSync(client)).digest('hex');
+    const read = async (path: string | undefined) => {
+      const context = {
+        operationId: 'usage_script',
+        executable: client,
+        executableSha256: digest,
+        clientVersion,
+        ...(path ? { path } : {}),
+        sessionId,
+        directory,
+        home,
+        temporary: directory,
+      };
+      const scope = anthropicUsageReaderScope(context);
+      const handle = startAnthropicUsageReader({
+        ...context,
+        trust: { nativeTrust: 'accepted', scopeHash: scope.scopeHash },
+        lifecycle: { intent() {}, owned() {}, quiescent() {} },
+      });
+      return handle.result;
+    };
+    const withPath = await read(`${dirname(process.execPath)}:/usr/bin:/bin`);
+    assert.equal(withPath.reason, null, withPath.detail ?? undefined);
+    assert.equal(withPath.reading?.status, 'reported');
+    // The same client under the fixed system PATH cannot find node, which the old launch did.
+    const without = await read(undefined);
+    assert.equal(without.reading, null);
+    assert.notEqual(without.reason, null);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 function refreshFixture(
   t: TestContext,
   mode: 'success' | 'held' | 'unknown' | 'error' | 'large' = 'success',
+  /** The controller's chat client resolver. Without one the pinned profile stands in. */
+  chat?: (profile: NativeProfileResolution) => ChatClientResolution,
 ) {
   const directory = mkdtempSync(join(realpathSync(tmpdir()), 'ck-usage-'));
   const clock = createTestClock(at);
@@ -441,6 +520,7 @@ function refreshFixture(
     now: clock.now,
     id,
     nativeProfiles: () => [profile],
+    ...(chat ? { chatClients: { anthropic: () => chat(profile) } } : {}),
     googleUsageClient: () => ({ available: false as const, reason: 'client-unavailable' as const }),
     nativeSpawn() {
       assert.fail('No native auth or model process is allowed.');
@@ -645,6 +725,56 @@ test('a usage read needs no consent and survives retries and reopen, and a turn 
     'applied',
   );
   assert.equal(f.calls(), 4);
+});
+
+test('an Anthropic quota read runs on any build in range and refuses one outside it with the card line', async (t) => {
+  const found = (version: string) =>
+    clientVersionStatus('anthropic', { state: 'version', path: '/usr/local/bin/claude', version });
+  // A build other than the pinned one, with a digest the writer profile would never match.
+  const newer = refreshFixture(t, 'success', (profile) => ({
+    status: found('2.1.340'),
+    profile: {
+      ...profile,
+      facts: { ...profile.facts, clientVersion: '2.1.340' },
+      client: { executable: '/never-executed/newer', sha256: 'e'.repeat(64), version: '2.1.340' },
+    },
+  }));
+  const ready = newer.status();
+  assert.equal(ready?.available, true);
+  assert.equal(ready?.reason, 'available');
+  assert.equal(ready?.clientVersion, '2.1.340');
+  assert.equal(
+    ready?.client?.message,
+    'Claude Code 2.1.340 found. Tested with 2.1.302; newer builds usually work.',
+  );
+  assert.equal((await newer.controller.execute(newer.command(), 'local-owner')).outcome, 'applied');
+  assert.equal(newer.calls(), 1);
+  assert.deepEqual(newer.status()?.reading?.windows, reported);
+
+  const line =
+    'Claude Code 1.9.0 is older than the minimum 2.1.0. Update it with claude update, then press Check again.';
+  const older = refreshFixture(t, 'success', () => ({ status: found('1.9.0') }));
+  const refused = older.status();
+  assert.equal(refused?.available, false);
+  assert.equal(refused?.reason, 'client-version-unsupported');
+  assert.equal(refused?.client?.message, line);
+  const result = await older.controller.execute(older.command(), 'local-owner');
+  assert.equal(result.outcome, 'blocked');
+  assert.equal(result.reason, 'client-version-unsupported');
+  assert.equal(result.next, line);
+  assert.equal(older.calls(), 0);
+  // Check again on the card goes through the controller and answers with the same line.
+  const checked = await older.controller.execute(
+    {
+      protocol: 1,
+      key: older.id('cmd'),
+      actor: { id: 'usage-fixture', kind: 'cli' },
+      command: 'CheckProviderClient',
+      payload: { family: 'anthropic' },
+    },
+    'local-owner',
+  );
+  assert.deepEqual(checked, { outcome: 'applied', next: line });
 });
 
 test('manual usage Stop, failed cooldown and uncertain ownership never replay a native read', async (t) => {

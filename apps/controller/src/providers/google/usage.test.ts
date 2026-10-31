@@ -259,13 +259,17 @@ test('the google quota read maps zero-turn account buckets to window observation
       }
     }
 
-    // Client discovery never executes the client or reads account files.
+    // Discovery runs only the client's --version flag and never reads account files.
     assert.equal(googleUsageDescriptor.clientVersion, '1.4.2');
     if (process.platform !== 'darwin' || process.arch !== 'arm64') {
-      assert.deepEqual(resolveGoogleUsageClient(environment), {
-        available: false,
-        reason: 'unsupported-platform',
-      });
+      const refused = resolveGoogleUsageClient(environment);
+      assert.equal(refused.available, false);
+      assert.equal(refused.reason, 'unsupported-platform');
+      assert.equal(refused.status?.state, 'unavailable');
+      assert.match(
+        refused.status?.message ?? '',
+        /Google is not available on Linux|Apple silicon|Windows/,
+      );
     } else {
       assert.equal(
         resolveGoogleUsageClient({ ...environment, HOME: home }).reason,
@@ -277,9 +281,11 @@ test('the google quota read maps zero-turn account buckets to window observation
         resolveGoogleUsageClient({ HOME: environment.HOME }, [bin]).reason,
         'client-unavailable',
       );
+      // The reader accepts a range of builds, so a file with no readable version is refused as
+      // unreadable, and it still never sees an account file.
       writeFileSync(join(bin, 'agy'), 'private-canary', { mode: 0o700 });
       const mismatch = resolveGoogleUsageClient({ HOME: environment.HOME }, [bin]);
-      assert.equal(mismatch.reason, 'client-build-mismatch');
+      assert.equal(mismatch.reason, 'client-version-unreadable');
       assert(!JSON.stringify(mismatch).includes('private'));
     }
   } finally {

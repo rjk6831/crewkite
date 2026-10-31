@@ -52,11 +52,17 @@ import {
   SEARCH_HITS,
   THREAD_TOOLS,
 } from '../../chat/local-tools.ts';
-import { attachedLine, attachedSection, byteSize } from '../../chat/prompt.ts';
+import {
+  attachedLine,
+  attachedSection,
+  byteSize,
+  withoutThreadToolsLine,
+} from '../../chat/prompt.ts';
 import { cachedRepoMap } from '../../chat/repo-map.ts';
 import type { ThreadReads } from '../../chat/thread-reader.ts';
 import { frameTrace } from '../../chat/trace.ts';
-import { localPromptRoom } from './budget.ts';
+import { withGitCeiling } from '../../host/git-ceiling.ts';
+import { localPromptRoom, localThreadReadBytes } from './budget.ts';
 
 // Local chat over the LM Studio SDK. The model has no agent loop of its own, so CrewKite runs
 // it: a small prompt (framing, a repo map, a rolling summary, the recent turns), the SDK's
@@ -214,15 +220,13 @@ const offeredTools = (request: ChatTurnRequest, threads = false): readonly Local
   [...LOCAL_TOOLS, ...(threads ? THREAD_TOOLS : [])].filter(
     ({ function: definition }) => !request.readOnly || !CHANGING_TOOLS.has(definition.name),
   );
-// A thread read may take a quarter of the prompt room, at three bytes a token, and never more
-// than the bound every tool result already has.
-const threadReadBytes = (contextLength: number) =>
-  Math.min(OUTPUT_BYTES, Math.floor(localPromptRoom(contextLength) * 0.25) * 3);
 // The reply budget R is what the prompt leaves of the context C the instance reports, less a
 // margin for the chat template's own tokens. A turn starts only when R is at least the larger of
 // 2,048 and 30 percent of C, so a small window still gets a usable reply and a large one a reply
 // in proportion. Reasoning counts inside R. The rule lives in contracts as `localBudget`.
 const MAP_SHARE = 0.18;
+// The outline ranks files by imports and fits a token budget, so a sample of a large copy serves.
+const MAP_FILES = 50_000;
 const SUMMARY_SHARE = 0.6;
 const SUMMARY_TOKENS = 300;
 // Chat templates wrap each message in role markers. This is a margin, measured nowhere.
@@ -344,7 +348,7 @@ async function buildPrompt(
         base: request.scratch.base,
         // Listing the tree is only needed when the cache misses.
         get files() {
-          return listFiles(root, request.environment);
+          return listFiles(root, request.environment, MAP_FILES);
         },
         read: (path) => readScratchFile(root, path),
         budgetTokens: mapBudget,
@@ -724,8 +728,8 @@ function startLocalTurn(
   const noticed = new Set<string>();
   let summaries = 0;
   let ending: 'stopped' | 'timeout' | null = null;
-  // Set from the instance's context once the turn connects.
-  let threadBytes = OUTPUT_BYTES;
+  // Set once the prompt is built, from the room it leaves. No thread read runs before then.
+  let threadBytes = 0;
   let connecting: ReturnType<LocalConnect> | null = null;
   let items = 0;
   let permissions = 0;
@@ -865,11 +869,17 @@ function startLocalTurn(
     closeText();
     closeThinking();
     let streamed = 0;
+    let environment: NodeJS.ProcessEnv;
+    try {
+      environment = withGitCeiling(request.environment, request.scratch.directory);
+    } catch (error) {
+      return { refused: error instanceof Error ? error.message : 'The environment is not usable.' };
+    }
     // A per-call context: `permitted` turns true only after the person allows a command.
     const context = {
       ...(threads ? { threads, threadBytes } : {}),
       scratch: request.scratch.directory,
-      environment: request.environment,
+      environment,
       signal: abort.signal,
       permitted: false,
       onGroup: (group: number) => groups.push(group),
@@ -1073,7 +1083,6 @@ function startLocalTurn(
     }
     if (ending) return ended();
     const { model, contextLength, modelKey, fellBack } = connection;
-    threadBytes = threadReadBytes(contextLength);
     if (connection.connectedWithoutToken !== undefined) {
       // The trace says how this turn reached the runtime, so a failed connect can be read later.
       const trace = frameTrace(now, { lines: 4, bytes: 1024 });
@@ -1162,7 +1171,12 @@ function startLocalTurn(
         return null;
       }
     };
-    const message = [request.prompt, attachedSection(files.texts)].filter(Boolean).join('\n\n');
+    const message = [
+      threads === null ? withoutThreadToolsLine(request.prompt) : request.prompt,
+      attachedSection(files.texts),
+    ]
+      .filter(Boolean)
+      .join('\n\n');
     const build = (summary: Summary | null, trim: boolean) =>
       bounded(
         buildPrompt(
@@ -1204,6 +1218,8 @@ function startLocalTurn(
       return finish('done', null);
     }
     const replyTokens = budget.outputTokens;
+    // A thread read gets the prompt room this prompt leaves, never more than any tool result.
+    threadBytes = localThreadReadBytes(contextLength, prompt.tokens, OUTPUT_BYTES);
     if (prompt.carried && prompt.summary) summaries = prompt.summary.count;
 
     // `act` runs rounds until one ends without a native call. When that round wrote its calls as

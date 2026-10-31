@@ -10,6 +10,7 @@ import type {
   ChatSession,
   ChatToolKind,
 } from '@crewkite/contracts';
+import type { ThreadMcp } from './mcp-servers.ts';
 
 // One interface for every provider behind the chat. The controller owns the thread, the
 // scratch copy, permissions and the event log. An adapter owns one native process or
@@ -45,6 +46,17 @@ export type ChatTurnRequest = Readonly<{
   history: readonly ChatHistoryEntry[];
   /** Native session to resume when the provider supports it. Null on the first turn. */
   session: ChatSession | null;
+  /**
+   * False when the controller decided this turn runs without the thread tools. The packet does not
+   * name them, and the adapter starts no thread tools server and sends an empty MCP config.
+   */
+  threadTools?: boolean;
+  /**
+   * The person's own MCP servers this turn may start, with the policy each can reach. The
+   * controller decides it per turn. An adapter starts exactly these and asks the controller's gate
+   * about their calls. Absent means none.
+   */
+  mcp?: ThreadMcp;
   /** The scratch copy where edits land. Never the person's checkout. */
   scratch: Readonly<{ directory: string; base: string; projectName: string }>;
   /** Private per-turn working directory under the controller home, for logs and sockets. */
@@ -54,6 +66,11 @@ export type ChatTurnRequest = Readonly<{
   permissionGrants?: readonly ChatToolKind[];
   /** Review and advice turns. The adapter offers no edit or command tool and declines any ask. */
   readOnly?: boolean;
+  /**
+   * Whether the client may start subagents: the crew role's switch, or the family default when
+   * the role has none. The adapter passes the client's own switch. Absent means the default.
+   */
+  subagents?: boolean;
   /** Wall-clock budget for the whole turn, in milliseconds. */
   deadlineMs: number;
   /** Environment for the native client: HOME, PATH and what the profile already resolved. */

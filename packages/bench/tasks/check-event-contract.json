@@ -1,0 +1,30 @@
+{
+  "id": "check-event-contract",
+  "title": "Define the strict check event shapes",
+  "repository": "self",
+  "base": "dde9f4a74f1fc52b87750c85ebf14e2ac44e531c",
+  "solution": "0d034647ec8297e8983053ae95c95da7b4e3cb3c",
+  "text": "A positive exit for a test file can hide missing assertions, so the controller needs a bounded event stream for file-qualified check completions. Add CheckEventSchema to the contracts package with its inferred CheckEvent type, a union discriminated by type with strict members. start carries version, which must be 1. test carries file and name (strings of at most 4096 characters, empty allowed), an optional kind of test or suite, and the booleans passed, skipped and todo. summary carries file (null or non-empty text), a success boolean and counts with tests, passed, failed, cancelled, skipped, todo and suites, each a non-negative safe integer and no other count. output carries a channel of stdout or stderr and text of at most 65536 characters, empty allowed. end carries nothing else. Unknown fields, a wrong version, a non-boolean flag, an empty summary file, over-long strings and counts that are negative, fractional, above the safe integer range, NaN or infinite are refused.",
+  "hidden": ["packages/contracts/src/contracts.test.ts"],
+  "checks": [
+    {
+      "name": "contracts",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=process boundaries reject unknown fields and invalid command identity",
+        "packages/contracts/src/contracts.test.ts"
+      ]
+    }
+  ],
+  "difficulty": "easy",
+  "tags": ["contracts", "validation", "checks"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:24:28.976Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["contracts"],
+    "baseFailure": "missing-module",
+    "passedOnSolution": ["contracts"]
+  }
+}

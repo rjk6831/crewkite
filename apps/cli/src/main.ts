@@ -26,6 +26,7 @@ import {
 } from '@crewkite/client/node';
 import {
   ArtifactSchema,
+  CLI_EXIT,
   type Command,
   type CommandResult,
   CommandSchema,
@@ -50,11 +51,36 @@ import {
   TaskSchema,
   type WorkspaceContinuation,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
+import { runUsageAnalytics } from './chat/analytics.ts';
+import { connectChat } from './chat/connect.ts';
+import { runExportCommand } from './chat/export.ts';
+import { runNotesCommand } from './chat/notes.ts';
+import {
+  type Connect,
+  notDone,
+  projectIdArg,
+  runPrint,
+  runThreadCommand,
+  threadIdArg,
+  UsageError,
+} from './chat/scripting.ts';
+import { runSearchCommand } from './chat/search.ts';
+import { runDiagnosticsCommand } from './diagnostics.ts';
 
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
 
-const help = `Usage: crewkite project add <path> [--json] [--home path]
+const help = `Usage: crewkite                     interactive mode in a terminal [--no-animation]
+       crewkite <--version|-v|version>   print the version
+       crewkite <--help|-h|help>         print this text
+       crewkite -p <message> [--thread task-id | --project project-id | --register] [--model family[/model[:effort]]] [--permission-policy ask|allow-edits|allow-all] [--file path ...] [--json]
+       crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show|changes> ... (crewkite thread --help)
+       crewkite diagnostics export <folder> [--thread task-id] [--home path]
+       crewkite search <text> [--limit 1..50] [--per-thread 1..5] [--json] [--home path]
+       crewkite notes <list|add|remove> <project-id> [text|note-id] [--json] (crewkite notes --help)
+       crewkite export <task-id> [--markdown path] [--html path] [--home path]
+       crewkite project add <path> [--json] [--home path]
        crewkite task create <project-id> --title text --outcome text --criterion text [--criterion text ...] [--json] [--home path]
        crewkite task <list|show|watch|start|pause|stop|resume|switch|approve|deny> [id] [--json] [--home path]
        crewkite artifact <read|verify|save> <artifact-id> [--output new-file] [--json] [--home path]
@@ -81,6 +107,7 @@ const help = `Usage: crewkite project add <path> [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
        crewkite usage show [--json] [--home path]
+       crewkite usage <thread|project> <id> [--csv new-file] [--json] [--home path]
        crewkite usage refresh --family google|openai|anthropic [--native-trust --usage-scope hash] [--json] [--home path]
        crewkite usage stop <operation-id> --family anthropic [--json] [--home path]
        crewkite task prepare-native <task-id> <profile-id> <path> --policy file [--native-trust --source-consent] [--existing-credits] [--confirm-subscription-only] [--maximum-task-ms 300000|600000] [--context-lines START:END] [--permission-mode mode] [--handoff-target profile[:existing-credits] ...]
@@ -124,7 +151,19 @@ const terminalOutput: Output = {
     process.stderr.write(text);
   },
 };
-export async function runCli(args: string[], output: Output = terminalOutput): Promise<number> {
+export async function runCli(
+  args: string[],
+  output: Output = terminalOutput,
+  connect: Connect = connectChat,
+): Promise<number> {
+  if (args[0] === 'thread') return runThreadCommand(args.slice(1), output, connect);
+  if (args[0] === 'diagnostics') return runDiagnosticsCommand(args.slice(1), output, connect);
+  if (args[0] === 'search') return runSearchCommand(args.slice(1), output, connect);
+  if (args[0] === 'notes') return runNotesCommand(args.slice(1), output, connect);
+  if (args[0] === 'usage' && (args[1] === 'thread' || args[1] === 'project'))
+    return runUsageAnalytics(args.slice(1), output, connect);
+  if (args[0] === 'export') return runExportCommand(args.slice(1), output, connect);
+  if (printRequested(args)) return runPrint(args, output, connect);
   let client: ControllerClient | undefined;
   const streamWrite = async (text: string) => {
     if (output === terminalOutput) {
@@ -146,6 +185,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
         limit: { type: 'string' },
         home: { type: 'string' },
         help: { type: 'boolean', short: 'h' },
+        version: { type: 'boolean', short: 'v' },
         'before-cursor': { type: 'string' },
         title: { type: 'string' },
         outcome: { type: 'string' },
@@ -175,8 +215,24 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
         'confirm-quota-account': { type: 'boolean' },
       },
     });
-    if (values.help || positionals.length === 0) {
+    if (values.version || positionals[0] === 'version') {
+      if (positionals.length > (values.version ? 0 : 1))
+        throw new UsageError('Use crewkite --version alone. Use --help.');
+      output.out(`${CREWKITE_VERSION}\n`);
+      return 0;
+    }
+    if (values.help || positionals.length === 0 || positionals[0] === 'help') {
       output.out(help);
+      return 0;
+    }
+    // Asking for the usage commands without naming one lists them, as the other command groups do.
+    if (positionals.length === 1 && positionals[0] === 'usage') {
+      output.out(
+        `${help
+          .split('\n')
+          .filter((line) => /^\s+crewkite usage /.test(line))
+          .join('\n')}\n`,
+      );
       return 0;
     }
     const [area, action, id, ...extra] = positionals;
@@ -366,6 +422,9 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
         (action === 'list' ? id !== undefined : id === undefined))
     )
       throw new Error('Invalid task command. Use --help.');
+    // Approval commands take an approval ID. Every other task command names a task or a project.
+    if (area === 'task' && id !== undefined && action !== 'approve' && action !== 'deny')
+      (action === 'create' ? projectIdArg : threadIdArg)(id);
     if (area === 'project' && (action !== 'add' || id === undefined))
       throw new Error('Use project add with one repository path.');
     const creatingTask = area === 'task' && action === 'create';
@@ -734,7 +793,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
           ...(savedTo ? { savedTo } : {}),
           ...(nextCommand ? { nextCommand } : {}),
         },
-        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}${created?.success ? `\n${command?.command === 'RegisterProject' ? 'Project' : 'Task'} ${created.data.id}` : ''}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
+        `${nextCommand ? (command?.command === 'AcceptCandidate' ? 'Local branch approval required.' : 'Export approval required.') : (result.reason ?? result.outcome)}${!succeeded(result) && command?.command === 'RegisterProject' && result.next ? `\n${result.next}` : ''}${created?.success ? `\n${command?.command === 'RegisterProject' ? 'Project' : 'Task'} ${created.data.id}` : ''}\nCommand key ${command?.key}${savedTo ? `\nPatch saved to ${savedTo}` : ''}${nextCommand ? `\nNext: ${nextCommand.map((arg) => `'${arg.replaceAll("'", "'\\''")}'`).join(' ')}` : ''}`,
       );
     };
     const finishAction = async (result: CommandResult) => {
@@ -980,7 +1039,9 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
       const result = await request('GetHealth', {});
       print(
         result,
-        result.data?.kind === 'health' ? result.data.status : (result.reason ?? result.outcome),
+        result.data?.kind === 'health'
+          ? [result.data.status, ...result.data.blockers].join('\n')
+          : (result.reason ?? result.outcome),
       );
       return succeeded(result) ? 0 : 2;
     }
@@ -1017,7 +1078,7 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
             [
               ...workspace.usageReaders.map(
                 (reader) =>
-                  `${reader.family} quota reader  ${reader.reason}${reader.readState ? `  ${reader.readState}, ${reader.readReason ?? 'no result'}${reader.lastRequest ? `, last request ${reader.lastRequest}` : ''}` : ''}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}`,
+                  `${reader.family} quota reader  ${reader.reason}${reader.readState ? `  ${reader.readState}, ${reader.readReason ?? 'no result'}${reader.lastRequest ? `, last request ${reader.lastRequest}` : ''}` : ''}  last attempt ${reader.lastAttemptAt ?? 'none'}  last observed ${reader.lastObservedAt ?? 'none'}${reader.client ? `\n  ${reader.client.message}` : ''}`,
               ),
               ...workspace.usageReaders
                 .filter((reader) => reader.family === 'anthropic')
@@ -1966,7 +2027,8 @@ export async function runCli(args: string[], output: Output = terminalOutput): P
     return succeeded(result) ? 0 : 2;
   } catch (error) {
     output.err(`${terminalText(error instanceof Error ? error.message : 'CLI command failed.')}\n`);
-    return 1;
+    // Arguments that do not parse did nothing. Other errors keep the task commands' status 1.
+    return notDone(error) ? CLI_EXIT.notDone : CLI_EXIT.failed;
   } finally {
     client?.close();
   }
@@ -2074,5 +2136,58 @@ function succeeded(result: CommandResult) {
   return result.outcome === 'applied' || result.outcome === 'already-applied';
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
-  process.exitCode = await runCli(process.argv.slice(2));
+// Options of print mode that take a value, so the word after them is not a positional.
+const printValueOptions = new Set([
+  '--home',
+  '--model',
+  '--file',
+  '--thread',
+  '--project',
+  '--permission-policy',
+]);
+
+/** Print mode only when -p or --print comes before the first positional argument. */
+export function printRequested(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '-p' || arg === '--print' || /^(-p.|--print=)/.test(arg)) return true;
+    if (!arg.startsWith('-') || arg === '--') return false;
+    if (printValueOptions.has(arg)) index++;
+  }
+  return false;
+}
+
+/** No subcommand on a terminal opens the interactive mode. It takes --home and --no-animation. */
+export function interactiveArgs(args: readonly string[]): boolean {
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (arg === '--no-animation' || arg.startsWith('--home=')) continue;
+    if (arg === '--home' && index + 1 < args.length) {
+      index++;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  const args = process.argv.slice(2);
+  if (process.stdout.isTTY && process.stdin.isTTY && interactiveArgs(args)) {
+    // Ink and the renderer modules load only here, so the commands and print mode run without them.
+    const { startInteractive } = await import('./interactive/start.ts').catch((error) => {
+      // Only a missing Ink, React or renderer module means a package without the interactive mode.
+      const missing =
+        (error as NodeJS.ErrnoException).code === 'ERR_MODULE_NOT_FOUND' &&
+        /'(?:ink|react)'|apps\/desktop\/src\/renderer\//.test(String((error as Error).message));
+      if (!missing) throw error;
+      return { startInteractive: null };
+    });
+    if (!startInteractive) {
+      process.stderr.write(
+        'Interactive mode needs a source checkout with its dependencies installed. The thread commands and crewkite -p work here.\n',
+      );
+      process.exitCode = 2;
+    } else process.exitCode = await startInteractive(args);
+  } else process.exitCode = await runCli(args);
+}

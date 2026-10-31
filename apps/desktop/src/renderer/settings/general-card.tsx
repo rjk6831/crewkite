@@ -1,6 +1,12 @@
-import type { ChatCatalogRead, ChatModelSelection } from '@crewkite/contracts';
+import type { DesktopSource } from '@crewkite/client';
+import {
+  allowsSubagents,
+  type ChatCatalogRead,
+  type ChatModelSelection,
+} from '@crewkite/contracts';
 import { useState } from 'react';
 import { familyName } from '../components.tsx';
+import { runExport } from '../diagnostics.tsx';
 import { EffortSelect } from '../thread/model-picker.tsx';
 import {
   type CrewPreset,
@@ -14,6 +20,7 @@ import {
   writeThreadDefaults,
 } from './preferences.ts';
 import '../thread/crew.css';
+import { SubagentSwitch } from '../thread/subagent-switch.tsx';
 
 const auto = 'auto';
 const saved_ = 'saved';
@@ -157,24 +164,35 @@ export function GeneralCard({
   catalog,
   theme,
   onTheme,
+  onShowWelcome,
+  source,
+  threadId,
 }: {
   catalog: ChatCatalogRead | null;
   theme: string;
   onTheme: (theme: 'system' | 'dark' | 'light') => void;
+  onShowWelcome?: () => void;
+  source?: Pick<DesktopSource, 'exportDiagnostics'>;
+  threadId?: string;
 }) {
+  const [exportNote, setExportNote] = useState<string | null>(null);
   const [saved, setSaved] = useState<ThreadDefaults>(() => readThreadDefaults());
   const change = (next: ThreadDefaults) => {
     setSaved(next);
     writeThreadDefaults(next);
   };
   const [presets, setPresets] = useState<CrewPreset[]>(() => readCrewPresets());
-  const pin = (name: CrewPreset['name'], role: string, selection: ChatModelSelection | null) => {
+  const pin = (
+    name: CrewPreset['name'],
+    role: string,
+    change: Partial<Pick<CrewPreset['members'][number], 'selection' | 'allowSubagents'>>,
+  ) => {
     const next = presets.map((preset) =>
       preset.name === name
         ? {
             ...preset,
             members: preset.members.map((member) =>
-              member.role === role ? { ...member, selection } : member,
+              member.role === role ? { ...member, ...change } : member,
             ),
           }
         : preset,
@@ -285,7 +303,16 @@ export function GeneralCard({
                       choices={choices}
                       value={member.selection}
                       autoText={autoLabel(member.role)}
-                      onChange={(selection) => pin(preset.name, member.role, selection)}
+                      onChange={(selection) => pin(preset.name, member.role, { selection })}
+                    />
+                    <SubagentSwitch
+                      id={`settings-${presetId(preset.name)}-${member.role}-subagents`}
+                      role={`${preset.name} ${crewRoleNames[member.role]}`}
+                      family={member.selection?.family ?? null}
+                      checked={allowsSubagents(member, member.selection?.family)}
+                      onChange={(allowSubagents) =>
+                        pin(preset.name, member.role, { allowSubagents })
+                      }
                     />
                   </span>
                 </div>
@@ -314,7 +341,50 @@ export function GeneralCard({
             </fieldset>
           </div>
         </div>
+        {onShowWelcome && (
+          <div className="st-row">
+            <span className="st-field" id="settings-welcome">
+              <span className="st-name">Welcome</span>
+              <small className="st-hint">
+                The first-run steps: connect a provider, add a project and start a thread.
+              </small>
+            </span>
+            <div className="st-controls">
+              <button
+                type="button"
+                className="button secondary"
+                aria-describedby="settings-welcome"
+                onClick={onShowWelcome}
+              >
+                Show the welcome again
+              </button>
+            </div>
+          </div>
+        )}
+        <div className="st-row">
+          <span className="st-field">
+            <span className="st-name">Diagnostics</span>
+            <small className="st-hint">
+              Saves a folder with versions, the end of the controller log and the last 200 events of
+              the open thread. Secrets, your home folder and email addresses are removed, and
+              nothing is sent anywhere.
+            </small>
+          </span>
+          <div className="st-controls">
+            <button
+              type="button"
+              onClick={() => void runExport(source, threadId).then(setExportNote)}
+            >
+              Export diagnostics
+            </button>
+          </div>
+        </div>
       </div>
+      {exportNote && (
+        <p className="st-note" role="status">
+          {exportNote}
+        </p>
+      )}
     </section>
   );
 }

@@ -12,7 +12,12 @@ import {
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
 import { encodeFrame, FrameDecoder, ProtocolError } from '@crewkite/client';
-import { readControllerEndpoint } from '@crewkite/client/node';
+import {
+  controllerSocketPlace,
+  publishControllerSocket,
+  readControllerToken,
+  withdrawControllerSocket,
+} from '@crewkite/client/node';
 import {
   type Command,
   canonicalJson,
@@ -24,11 +29,11 @@ import type { Controller } from '../commands/controller.ts';
 export async function serve(
   controller: Controller,
 ): Promise<{ close: () => Promise<void>; socketPath: string }> {
-  const socketPath = join(controller.home, 'control.sock');
+  const socketPath = controllerSocketPlace(controller.home);
   const sockets = new Set<Socket>();
   const authenticated = new Set<Socket>();
   let usageTimer: ReturnType<typeof setInterval> | undefined;
-  let ownsSocket = false;
+  let release = async () => {};
   try {
     try {
       const tokenFile = openSync(
@@ -45,7 +50,7 @@ export async function serve(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
-    const { token } = readControllerEndpoint(controller.home);
+    const token = readControllerToken(controller.home);
     try {
       const state = lstatSync(socketPath);
       if (!state.isSocket() || state.uid !== process.getuid?.())
@@ -256,8 +261,28 @@ export async function serve(
         resolve();
       });
     });
-    ownsSocket = true;
     chmodSync(socketPath, 0o600);
+    // The socket is removed only while it is still the one this process bound.
+    const bound = lstatSync(socketPath).ino;
+    let released = false;
+    release = async () => {
+      if (released) return;
+      released = true;
+      clearInterval(usageTimer);
+      for (const socket of sockets) socket.destroy();
+      if (server.listening)
+        await new Promise<void>((resolve, reject) =>
+          server.close((error) => (error ? reject(error) : resolve())),
+        );
+      try {
+        const state = lstatSync(socketPath);
+        if (state.isSocket() && state.ino === bound) unlinkSync(socketPath);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+      }
+      withdrawControllerSocket(controller.home, socketPath);
+    };
+    publishControllerSocket(controller.home, socketPath);
     void controller.refreshUsage('start');
     usageTimer = setInterval(() => {
       if (authenticated.size) void controller.refreshUsage('interval');
@@ -265,26 +290,11 @@ export async function serve(
     usageTimer.unref();
     return {
       socketPath,
-      close: async () => {
-        clearInterval(usageTimer);
-        for (const socket of sockets) socket.destroy();
-        await new Promise<void>((resolve, reject) =>
-          server.close((error) => (error ? reject(error) : resolve())),
-        );
-        if (ownsSocket) {
-          try {
-            unlinkSync(socketPath);
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
-          }
-          ownsSocket = false;
-        }
-      },
+      close: () => release(),
     };
   } catch (error) {
     clearInterval(usageTimer);
-    if (ownsSocket) unlinkSync(socketPath);
-
+    await release();
     throw error;
   }
 }

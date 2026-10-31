@@ -94,3 +94,381 @@ The challenge table is the acceptance plan. The current suite covers the named c
 ## What fakes can and cannot prove
 
 Fake providers prove controller decisions: admission, routing, recovery and evidence identity. They never prove that a live route authenticates, bills correctly or respects its tool boundary. Those claims need a qualification run on the real client, recorded with its date and version.
+
+## Thread tools agreement and the control socket
+
+Two claims from the rc-05 follow-up. Each lives in an existing test.
+
+| Claim | Where |
+|-------|-------|
+| A turn without thread tools gets a packet that does not name them, a request the adapters read as no tools, and one notice | `chat/service.test.ts` queue row, `chat/prompt.test.ts`, the Anthropic config row |
+| A client with another temporary directory finds the socket through the home record, a squatted per-user folder makes the controller bind elsewhere and the client refuse an untrusted folder, a home reached through a link names the same socket, and a removed socket gives a restart message | `packages/client/src/output.test.ts` |
+| A turn whose thread tools source gives none loses the packet line, runs with an empty config and traces the notice | Anthropic config row |
+| A controller on a home 120 characters deep answers a client and a CLI command, and a socket file left by a crashed run does not block the start | `packages/client/src/output.test.ts`, `packages/client/src/client.test.ts`, `apps/cli/src/main.test.ts` |
+
+## The person's MCP servers
+
+Three claims from the thread MCP servers change. Each lives in a test.
+
+| Claim | Where |
+|-------|-------|
+| A server's policy never exceeds the thread's, a listed read runs unasked only under the reads policy, and a server's annotations or an unlisted name never widen it | `chat/mcp-servers.test.ts`, with a scripted stdio server in `chat/mcp-fixture-server.mjs` |
+| Each family gets the servers the thread turned on only where the controller's gate sees their calls: Anthropic in the one strict config, Google only while every call asks, OpenAI, Local and read only turns never | `chat/mcp-servers.test.ts`, the Anthropic config and permission rows, the queue row in `chat/service.test.ts` |
+| A stored secret is sealed on disk, never returned to the window, kept across an edit, refused without a keychain and removed from a turn's events | `apps/desktop/src/main/mcp-vault.test.ts`, `apps/desktop/src/main/grants.test.ts` |
+
+## Scratch copy clones
+
+The first turn on a thread fills its scratch directory through `copyScratch` in `apps/controller/src/chat/scratch-copy.ts`. `scratchPlan` in `host/source.ts` lists the base tree with each regular file's size and no bytes, and it applies the same link, submodule and non-UTF-8 path rules as `committedFiles` with `scratch: true`, because both run one classifier. No byte limit applies to the regular files. When the project's checkout sits on the thread's base and git sees no change to a tracked file, each regular file whose parent folders are real folders and whose size matches the committed size is cloned from the checkout with `fs.copyFileSync` and `COPYFILE_FICLONE_FORCE`. The clone is then stream-hashed as a git blob with no filters and compared with the committed oid. A mismatch, such as a same-size edit git was told to ignore with assume-unchanged or skip-worktree, or a checkout that changed during the copy, removes the clone and writes the committed bytes. Every other file is read from git in runs of at most 32 MiB and written. A file larger than a run streams from `git cat-file blob` straight to its target. The first EXDEV, ENOTSUP or similar error ends the clone attempts and the rest is written. `materialize` still checks every path and link before it writes, and `copyScratch` calls it with a write hook, so a clone never skips a check. Progress uses the same `ImportProgress` update as a file import, one per 4 MiB and a final one.
+
+Two tests protect these claims in `scratch-copy.test.ts`. A checkout on the base is cloned, reports progress and leaves out the base's outside link. It holds a same-size edit that git was told to ignore, and the copy still has the committed bytes and the checkout's committed tree hash. A volume that cannot clone, and an edited checkout, both fall back to writing and produce that same tree hash. The fallback test lowers the run limit to 1 MiB over a fixture that holds a 66 MiB random file, and asserts the big blob streams to its target and the small blobs arrive as one 16 byte read, so a base larger than a run still copies. Both inject the clone primitive, so they run on Linux with no reflink support, no network and no waits. Deleting a thread removes its `chat/<task>` folder, which holds the scratch copy, so a clone adds nothing to delete; the existing delete test in `service.test.ts` covers it.
+
+Measurement on a 1 GiB repository, 256 files of 4 MiB random bytes in 16 folders, generated outside the repository by this script and never committed:
+
+```sh
+dir=$1; mkdir -p "$dir" && cd "$dir" && git init -q
+i=0; while [ $i -lt 256 ]; do
+  d=$(printf 'part%02d' $((i % 16))); mkdir -p "$d"
+  head -c 4194304 /dev/urandom > "$d/blob$i.bin"; i=$((i+1))
+done
+git add -A && git -c user.name=Fixture -c user.email=fixture@example.invalid commit -qm fixture
+```
+
+A throwaway test built the controller fixture, committed the 1 GiB tree on top of its repository, sent one message to a scripted adapter and timed the send until the turn finished. That span covers `ensureScratch` and a one-word turn.
+
+| Where | Path taken | Send to done | Bytes |
+|-------|------------|--------------|-------|
+| Linux 6.18 container, ext4 on a virtual disk | clone attempted, first call fails, 256 files read from git and written | 14.4 s and 14.3 s in two runs | 1,073,741,824 written |
+| APFS on the Mac | clone | still to be measured on the Mac | still to be measured on the Mac |
+
+ext4 has no reflink, so this container could not exercise a successful clone, and I have no figure for it. Before this change the same repository could not start a turn at all, because the whole-read path stopped at 64 MiB. The write path now works at 1 GiB with memory held to one run. The APFS figure, and the bytes it leaves unshared on disk, come from running the same script on the Mac.
+
+Changes, Discard and Accept read the base the same way, by oid. The object format comes from `git rev-parse --show-object-format`. `hashCandidateFiles` streams every scratch file through git's blob hash and compares it with the oid in `scratchPlan`, under the same link, special file, ignore and collision rules as before. Only changed files are read: Changes reads the base blob and the scratch file of each changed path, Discard reads one blob, and Accept writes only changed files into a repository that borrows the project's objects, so the pack holds the new trees and changed blobs. On the 1 GiB fixture with one edited file, hashing the scratch took 1.07 s, the Changes read took 1.17 s, and building the Accept tree took 0.27 s, at 121 MiB resident, warm cache, same ext4 container.
+
+A comparison reads at most 64 MiB of changed files for patches. A changed file past that shows a "Not compared" note in place of a patch, with the sizes that caused it, and Accept still takes it. A scratch copy has no file count cap, so no chat path raises `ScratchTooLarge` now. The handlers that turned it into text in Accept, `readChanges`, the thread diff tool, the reviewer brief and the handoff packet are still in place and have no test of their own. Only an unreadable scratch for another cause, such as a special file, keeps the "remove new links and special files" message.
+
+The fallback test also covers the over-limit case. Its fixture holds a 66 MiB file, over the 64 MiB the whole-base read allowed. It edits the copy, lists the changes, builds the Accept tree, publishes it as a branch (the new 66 MiB of random bytes is more than a pack buffer holds, so the pack goes through a file) and discards each change. The accept test in `service.test.ts` adds 2,001 files and expects Accept to refuse and name both counts, since it only publishes files that Changes can list. On the earlier code, Changes and Discard on such a base stop with "A committed blob is unavailable locally. Fetch it outside this workspace and prepare again." The source test plans a 250,001-file base from one shared blob, so the old cap is gone at the layer that held it. The full copy, Changes and Accept on 250,000 real files was measured by hand with a throwaway script (ADR 0027 amendment of 2026-10-31 has the numbers), since a test that writes that many files costs more than it protects.
+
+One limit stays. A patch still reads the changed file into memory, so one file near the Buffer limit fails there.
+
+For the Mac check: the clone path uses `COPYFILE_FICLONE_FORCE`, which maps to `clonefile`. Node does not expose file flags or extended attributes, so a clone keeps whatever flags and quarantine attributes the checkout file carries. Check on the Mac that a cloned file carries none that the committed bytes would not, and measure the clone time with the verification read included, since each clone is now read once to hash it.
+
+## Extension seam
+
+Three claims cover the extension seam in [ADR 0047](adr/0047-extensions-attach-through-one-versioned-seam.md). They live in `apps/controller/src/extensions/extensions.test.ts`.
+
+- The manifest table refuses a version that is not three numbers, a contract that is not a version, an authority outside the closed list, an older or newer contract major, a newer contract minor, a slot that runs an undeclared command, event kinds without the event authority, an entry outside the folder, an unknown field and a folder that names another extension. A contract major bump reads as one plain line.
+- An extension command passes the built-in checks: another principal is denied, an unknown task is refused before the extension runs, an undeclared command is refused, a reused key with changed content is refused and a retry with the same key answers from its receipt without a second event. The probe extension's context holds only its declared authority. Its thread reader returns the thread the command ran on whatever it is asked, the frozen context cannot be pointed at another thread, a result that carries limits is refused, a built-in event kind cannot be emitted, and an asynchronous command or a `then` getter that throws is refused. A context the module kept reads and emits nothing once its command returned. The task record stays byte for byte the same, and a configure whose commit fails changes no on or off choice.
+- The reference extension from the testkit is listed off with its manifest. Its thread action and command appear only while it is on, and turning it off removes both. A new sibling module or `package.json` in its folder turns it off until the file goes, a link or a folder over 256 files is refused, and a contract major bump in its manifest turns it off with the plain line. A folder that changes while its module loads stays off, and a module fixed after a failed load needs a restart.
+
+These run against a real controller and real SQLite with synthetic extension modules. They make no claim about the behavior of a separately licensed extension.
+
+## Project checks in the loop
+
+The detection table builds small project directories and checks which checks the controller reads from them: package.json scripts with the package manager chosen by the lock file, pyproject.toml tool tables, Makefile targets, a Cargo.toml, a broken manifest and an empty project. It also checks the resolved text, which names the pre and post scripts npm runs, and the rule for commands a person adds: shells, wrappers such as env, inline code flags and paths outside the scratch copy are refused. A detected check starts switched off.
+
+The crew chain rows run a real Node script as a check after a fix turn. The script lives in the scratch copy and the row turns the check on from there. The first run fails, and its output reaches the next fixer turn as the whole message. The second run passes, and the chain finishes with two fixes. The rows read the run records, the output artifact bytes and the lines `thread_checks` returns. A second row has the fixer edit the script. The chain then raises the permission question even though the thread allows commands, nothing runs before the answer, and the answer renews the pin so the next run needs no question.
+
+The stop row opens a check that runs until stopped. A message sent meanwhile waits, Stop ends the process and the chain, and the queue is kept: the message runs afterwards and its own chain reaches a check again. A second service on the same store then reads that open check as failed with the restart reason. Its process is still present, so the operation journal cannot prove it gone and the thread takes no turn. Once the process table shows the group gone, the next command lifts the hold and the queue runs. The permission row shows that Glide with Allow all runs without a question, that Balanced asks with the exact commands, that a denial runs nothing, that Allow for this thread covers the same command set afterwards, that a changed script asks again, and that the same checks run on merged copies. A closed service refuses and an unknown thread throws. These are real local processes with no network, installed dependencies or provider.
+
+Output is read from each process as it starts, so a check that exits before the artifact store has opened its file keeps its output. The tail on the card is redacted and holds the last 1000 characters. The full output is in the artifact store. A pin covers the command, the script text behind it and files of the copy named in a custom command. It does not cover files a script goes on to read. No claim covers the checks of a real project, a package manager or a toolchain.
+
+## Composer parity
+
+Three claims cover the composer additions, and each runs at the lowest layer that can see it.
+
+The mention ranking table runs in the client package on a synthetic file list. It checks that exact and prefix name matches outrank looser ones, that case is ignored, that a subsequence still finds a file, that an empty query lists the shallowest entries, that every answer stays within the limit and that the order does not depend on the input order. The same table checks that an at sign inside an email address starts no mention and that insertion writes the path the provider's tools open: relative to the copy root, a trailing slash on a folder and backticks around a path with white space.
+
+The controller table builds a scratch copy with ignored folders, a link to a file outside and instruction files, then asks for completions. Nothing under `node_modules` or `.git`, no link and no path outside the copy comes back, and the limit bounds the answer. The same table checks the instruction chip source: plain instruction files at the copy root are listed, a link to an outside file is not, a folder swapped for a link to somewhere else offers none of its old files, only a listed name can be read, and a copy with none lists none.
+
+The saved prompt table covers the controller home. Prompts persist, a repeated name replaces its body, the export is the versioned JSON file in name order, and a damaged file is refused and left as it is. The same table parses `/prompt name key=value` and checks that insertion fills the values given and names the placeholders still open. A message that starts with a command word, such as `/new endpoint returns 500`, or a path such as `/usr/bin` stays a message, and an exact command name such as `/pr` is chosen before longer names that start with it.
+
+These tables use synthetic files and no network. They do not exercise the composer's keyboard handling or the Settings card, which a manual desktop check covers.
+
+## CLI
+
+Six claims cover the interactive CLI and its scripting path. Each runs a real controller on a private socket with the scripted chat adapter, or a pure module, and no provider client.
+
+- Print mode streams the reply to stdout and exits with the status of its turn: 0 when done, 1 when it failed on a usage limit or the controller went away, and 3 when another command stopped it. It finds the registered project from `INIT_CWD` with a misleading `GIT_DIR` set, refuses an unregistered checkout with status 2 and registers nothing until `--register`. A permission policy in `cli.json` leaves a new thread on ask; `--permission-policy` sets it for the run. Arguments that do not parse exit 2 in every command.
+- The thread commands with `--json` write only lines `CliJsonLineSchema` accepts, whose full shape matches the pinned hash for `v: 3`, through a new thread, a watched permission answered by `thread permit`, Accept, `list` and `show`. Push without `--confirm` sends nothing and says what it would push.
+- Each interactive view draws a scripted thread: the wordmark at both sizes, the folded reads, Markdown, the open permission with its options and the thread policy, the answered thread, Changes with the diff and the accepted branch, the crew, the plan card in Balanced and after a stop, Settings with provider cards and a dotted stale gauge, the thread list and help. Under `NO_COLOR` every view keeps its text and draws no colour. The kite panels and gauges take the desktop's colours, yellow at 40 percent and red at empty, and the spinner moves only with full animation.
+- Slash commands parse only from the shared list, and the message box keeps multi-line editing, history on Up and Down, slash and mention completion, and absolute paths after `@` as attachments.
+- `cli.json` is checked with the schemas the desktop saves its defaults with, falls back to defaults with a named field, is written private to its owner, and backs the renderer's preference functions. Key bindings match their modifiers exactly.
+- The interactive app preselects the project from `INIT_CWD`, offers the saved policy and keeps ask when the person declines, keeps a digit as text until Tab gives the request focus, answers it with a digit, asks before Ctrl+C leaves a running reply, stops it with Escape and leaves on the next Ctrl+C.
+
+These tests establish the CLI's own wiring. The controller's permission, acceptance and push rules keep their existing claims, and the CLI test adds none of its own.
+
+## Parallel plan slices
+
+Three test functions cover the parallel rules of the ADR 0045 amendment. Each runs at the lowest layer that can see it, with scripted adapters, a synthetic repository and real SQLite.
+
+- The ready table in the plan tests is pure. It checks that independent slices on two families start together, that two ready slices on one family start one at a time in plan order, that a family busy in another thread holds its slice back, that a slice waits until every dependency is done, that a slice with no family never starts and that nothing starts while a slice is blocked.
+- The lane rows in the service tests run a real plan in Glide on two scripted families. In the first row, slice 1 parks on a question while slice 2 runs and finishes on the other family, which proves two slice turns were open at once. Slice 2 then waits to merge until slice 1 has, slice 3 waits for its family, and slice 4 starts from a copy that already holds slice 1's merged file. Every slice turn worked in its own copy, never the thread's, and the thread copy ends with all four files. The conflict rows have two slices change one file. The second one is blocked with the path on the card and a line, and the orchestrator's model gets one turn in the thread copy with the slice's version quoted. When that turn writes the merge, the plan finishes. When it fails, the plan stops with the slice blocked. The stop row cancels the plan while slice 1 runs and slice 2 has finished but waits to merge: slice 1's turn ends stopped, slice 2 merges before the stop and keeps its file, and the rest show not run. A row whose second slice cannot start shows that the first slice's turn, opened in the same step, starts as stopped and never reaches its provider.
+- The restart test stops the controller while a slice's review runs. A second service on the same store fails the open turn and writes "Plan stopped: restarted." with the slice not run.
+
+The renderer's plan card table adds a blocked row that can run again and a row that lists what it waits on and its conflicts. None of this covers a live provider, a real merge of two models' edits, or the time a real copy takes on a large repository.
+
+## Google terms gate
+
+One claim covers the Google gate in `apps/controller/src/commands/google-terms.test.ts`.
+
+- The controller refuses a Google connection step until the person acknowledged the current terms text. A first connection with no acknowledgement is refused, an acknowledgement of an old text version is refused and stores nothing, an acknowledgement of the current version is stored with the controller time and the version, the same step then reaches setup, and a stored acknowledgement of an older version is refused again. The renderer flow test keeps the setup sequence with a current acknowledgement in place. A chat turn, ask, plan slice, handoff or crew turn that lands on Google is refused with a pointer to Settings > Google until the current text is acknowledged; the chat service test covers that row. The interactive CLI asks the same question and sends the acknowledgement only on an explicit yes, and its app test covers both answers.
+
+This runs against a real controller and real SQLite with no network.
+
+## Local thread read room
+
+One table in `apps/controller/src/providers/local/budget.test.ts` covers the room a Local thread read gets.
+
+- A thread read gets the prompt room that the built prompt leaves, at three bytes a token, within the 64 KiB bound every tool result has. A small prompt leaves most of the room, large attachments leave less, a prompt that fills or passes the room leaves nothing, and a context too small for any prompt leaves nothing. A second test sweeps six context sizes and checks that the read never passes the room and never grows as the prompt grows.
+- The tool test in `apps/controller/src/chat/local-tools.test.ts` checks that no room gives an empty result and that a room smaller than the cut notice gets the text alone.
+
+## Per-turn MCP config file
+
+One row in the Anthropic chat table in `apps/controller/src/providers/anthropic/chat.test.ts` covers the file that holds the person's MCP servers for a turn.
+
+- The adapter creates `mcp.json` with mode 0600 and with O_EXCL and O_NOFOLLOW, so a link or a file already at that path refuses the turn with one plain line at the launch stage. The client never starts. Nothing is written through the link or over the file, the placed link or file stays where it was, and the turn removes only a file it created itself.
+
+## First-run welcome
+
+One table in `apps/desktop/src/renderer/onboarding/flow.test.ts` covers which welcome step shows.
+
+- The welcome stays hidden until the desktop has read its flag and the workspace and model catalog have loaded, and it stays hidden once it ended. A first launch starts on the provider step, and Continue turns on only when a family is ready. Google counts as ready only after the current terms acknowledgement is stored, so a connected Google family without it leaves Continue off. A person with at least one project never sees the welcome, whatever their provider state, because Local is held in memory only and a sign-in or Google acknowledgement can lapse. They see it only when they ask for it again from Settings. Once the welcome is on screen, adding a project or connecting a family does not hide it. A family that disconnects sends the person back to the provider step, and a missing project back to the project step. Skip reads "Skip for now" only on the provider step with no ready family.
+
+A second file, `apps/desktop/src/main/onboarding-store.test.ts`, covers the flag file on a temp directory. A missing, corrupt, oversized, linked or false file reads as not finished, a true file reads as finished, and a write round trips even when a stale temporary file is left behind.
+
+The flow test is a pure function test with no controller, no window and no network. What a Mac can show is the layout in both themes, the focus move at each step and the folder picker.
+
+## Diagnostics bundle and crash records
+
+Five claims cover the shared redaction, the diagnostics export and crash capture. Each runs at the lowest layer that can see it, in `apps/controller/src/diagnostics`, with temporary folders, no network and no waits.
+
+- The shared secret table in `redact.test.ts` runs `redact` in `apps/controller/src/chat/redact.ts`, which the thread tools, the check output and the diagnostics bundle all use. Rows cover bare and prefixed password, secret, key, token, credential and cookie names in `=`, `:` and JSON forms, a JSON value on the line after its key, Bearer and Basic credentials, every GitHub token prefix, JWTs, Google OAuth tokens, private key blocks across lines, URL userinfo, query parameters and `--api-key`, `--token` and `--password` argument pairs. Negative rows keep words like keyboard and tokenizer, a SHA-256 digest, a path that contains secret and the plain word Basic.
+- The diagnostics table adds my home folder as `~`, including at the end of a sentence and without touching a longer user name, and email addresses. Structured data loses the whole value under a secret key, whether it is a string, number, array or object.
+- The crash record claim writes a record with multi-byte text far over its limits and checks the file stays under 8 KiB with the secret and the home path gone, keeps the newest five of eight records, reports the newest one as unseen until the person dismisses it, shows a later crash again, and refuses a dismiss name that leaves the crashes folder.
+- The crash capture claim spawns Node on scripts that throw an error, a value with no prototype, an error whose getters throw and a rejected promise. Each must exit with status 1, keep its own error on stderr and leave exactly one record. A link in place of the crashes folder gets no record.
+- The bundle claim builds from a fixture home with a log larger than its tail, a settings file with a secret, 250 events and one pinned client. It lists exactly the six parts in order and parses against the contract. The settings part carries only the fields the CLI settings schema knows, so a file with another field is reported as unreadable. No secret, email address or home path survives in any part. The log tail starts at a whole line, the thread holds the newest 200 events, the client path is shortened to `~` and keeps its digest, and a call with no desktop and no thread still returns every part. The same claim writes the parts through the folder writer the desktop and the CLI share and checks that it refuses to replace a folder.
+
+The controller log, the crash handlers and the save dialog are not exercised here. A manual check on the Mac covers the native message box that lists the parts, the save dialog that names the new folder, and the line after a forced renderer crash.
+
+## Thread history search and the long thread
+
+Search and the long thread have their own tests at three layers. They use real SQLite, the scripted chat adapter and synthetic threads, and no provider client or network.
+
+- The ranking and grouping table in `apps/controller/src/chat/history-search.test.ts` runs a title hit, a message hit, a tool summary hit and a file path hit through the index. A title outranks the same word in a message, each thread appears once with its best hits, and every hit names the turn and message to open. Case and accents fold, and Thai, Japanese and path fragments match. Words under three characters are ignored, and quotes, operators and wildcards in a query are text. A page is bounded in threads, hits per thread and bytes and says when it left matches out, and 600 matching messages are cut at the best ones. A thread with 450 strong matches keeps only its best few, and two quieter threads still appear on the page. Snippet marks cover exactly the matched characters, a marker that does not open or close a stretch is dropped, and a message that holds the marker characters itself is shown without marks.
+- The index stays in step. A thread that exists before migration 018 is indexed by the backfill the same way live writes index it, and the two give identical rows. Running the backfill again after the rows are cleared restores them. Through a real controller, a new turn, a rename and a delete change what search finds in the same commit, and deleting the thread leaves no rows behind.
+- The contract tests keep the payload and page bounds, refuse a query with a NUL character, refuse a page over its byte limit, and keep `SearchChatHistory` a read that carries the `chat-search` kind. The CLI test runs `crewkite search` against a real controller and checks one JSON line per thread with its hits and a closing summary line, the plain text form, an empty result, a note for a query too short to match, and exit status 2 with no output for missing, blank or malformed arguments.
+- The window tests in `apps/desktop/src/renderer/thread/virtual-window.test.ts` check the mounted rows of a long thread. A thread of 60 rows or fewer mounts all of them at any scroll position. A 2,000 row thread at the top, middle, end and past the end mounts under 60 rows, and the two blocks of padding plus the mounted rows add up to the full height. Every row that overlaps the view or its overscan is mounted. A pinned row far above or below the window is drawn as well, the rows stay in order, and the blocks of padding still add up to the full height. The list pins the row that holds focus, a row with an open card or an error line, and a turn waiting on a permission answer; the page checks behind those pins are manual. The downgrade block in the native proposal test in `controller.test.ts` drops every table and trigger of migration 018 before it applies the migrations again. The reveal tests in `history-reveal.test.ts` check which row a hit lands on, how a snippet splits at the controller's marks including marks that run past the end, and that the words marked in the thread are the words the index matches.
+- `open-time.test.ts` writes a 2,000 turn thread through the controller's own tables, reads the first page through `ReadChatThread`, parses it as the renderer does, and builds the thread state, the rows and the first window. In this container it opens in about 70 to 100 ms cold, with 55 to 80 ms in the controller read and 10 to 20 ms in the state build, and in about 30 to 40 ms warm as the median of seven runs. The test fails above 1.5 s cold or 300 ms warm. It then pages all 4,000 messages in over 20 reads and checks that 11 rows are mounted out of 4,000, which took about 470 to 520 ms in this container.
+
+The container numbers say the work is far inside the budgets. They do not time the page in a real window. The tests do not drive a DOM, so the scroll follow, Load earlier anchoring, the jump to a search hit and the word marks are checked by hand.
+
+Mac steps for the reference Mac:
+
+- Open a thread of about 2,000 turns from a cold start and again warm, and record the time to the last message on screen. The budgets are 1.5 s cold and 300 ms warm.
+- Scroll through the whole thread with the trackpad and the scrollbar, and check that nothing flashes or jumps. Press Load earlier at the top and check that the view stays on the same message.
+- In a long thread, open a tool card, focus a button inside a row, and leave a permission request unanswered. Scroll far away and back, and check that the card is still open, focus has not dropped to the page, and the request is still there.
+- Search for a word that appears deep in an old turn, open the result, and check that the thread scrolls to that turn with the row and the word marked. Repeat with the arrow keys and Enter only.
+
+## Project notes
+
+Project notes are short facts the controller stores for a project and sends with every turn. The claims below protect them.
+
+The size rule lives in a pure function, so one table in `packages/contracts/src/notes.test.ts` pins it. It covers no notes, a note at the cap, one byte over, multibyte text counted in bytes, and the 200-note count limit. The same file checks that note text refuses control characters and lone surrogates, that Save as note offers the selection or else the first paragraph and never cuts a surrogate pair, and that the Markdown export lists notes oldest first with each note line in a block quote, so a note cannot open a section of its own.
+
+The store claims run on real SQLite in `apps/controller/src/chat/project-notes.test.ts`. A restart keeps the list, ordering is created time then id, an edit keeps its note in place, and the cap and count limits hold per project with a refusal reason for each case.
+
+The packet claims run in the same file. Notes reach all four families. A new session reads them in its system context, and a resumed session gets them in front of its message only when they differ from the hash of the notes that session last received. One table sends six turns to each family: the first turn reads the notes in its context, two resumed turns with unchanged notes send none, an edited note goes again and goes once, and removing every note tells the session so. Another table checks the block for a session that held other notes, none, or was saved before notes existed. A resumed turn counts the block against the 96 KiB packet cap, so a 90 KiB reply from another family plus a changed 16 KiB list still fits. The notes and the instruction files share 64 KiB, with the notes capped at 16 KiB, so the instruction files keep at least 48 KiB. The adapter tests already prove each family sends its system context on a new session, so these tables stop at the request the controller builds.
+
+When a resume fails and a new session starts, the notes block is taken out of the message because the new session reads the notes in its system context. One row each in `apps/controller/src/providers/openai/chat.test.ts` and `apps/controller/src/providers/google/chat.test.ts` covers this.
+
+The command line claim in `apps/cli/src/chat/notes.test.ts` drives list, add and remove through a real controller socket and checks each refusal sentence and exit status. A change answers with the project and its byte count, and the command line reads the list again.
+
+The migration for notes is number 019, which follows 018 without a gap. The tests in `project-notes.test.ts` and the command line test apply the real migration folder.
+
+## Usage analytics
+
+Four files cover the usage numbers of a thread and a project. All of them use real SQLite, the real file system or pure functions, with no network and no sleeps.
+
+- The aggregation table in `apps/controller/src/chat/analytics.test.ts` builds one fixture thread on two families with a handoff, a passed and a failed check, two accepted branches, a turn that reported tokens in and not out, turns that reported none and a turn still running. It checks that sums count only what a client reported, that a family with no reported tokens stays null, and that tokens in and tokens out each say how many turns they cover, because a turn can report one and not the other. Checks count only runs that passed or failed, so a running or stopped run is left out. Checks and acceptances that the thread record no longer holds are counted from the journal, and an acceptance is one branch accepted at one time.
+- The same table checks the allowance rule. A turn is charged to a gauge window only when a reading before it and a reading after it, each within 15 minutes, agree on the reset and do not rise, and no other turn of the family in any thread overlaps them. A later reading that rises or resets leaves the turn unmeasured.
+- The recovery row gives a thread turns that startup recovery failed with the time of the restart hours later. A turn with agent events ends at its last event, a turn with none has unknown wall time, a turn that reached `turn.completed` keeps its stored end, and a turn that failed for another reason keeps its stored end.
+- The flood row writes thousands of usage readings that are unrelated to the thread: some inside the turn window but written before the thread's first journal entry, some a day before and a day after its turns. The gauge query must return only the two readings that can bracket the turn, which the test reads from the row count the query reports. Sabotage of the cursor bound or the time bound fails it.
+- The cap rows show that a family with ten windows reports the eight read most recently and says two were left out, that three turns of 0.1 each total 0.3 and not 0.30000000000000004, and that a thread of 502 turns lists the newest 500 and says two were left out.
+- The project table adds two threads, lists them by title and reads a missing thread and project as not found.
+- The CSV table in `packages/client/src/analytics-csv.test.ts` checks quotes, commas, line breaks, formula starts (including a start after spaces, a leading line feed or return, and the full-width forms of the four signs), Thai text, emoji and a lone surrogate, and reads a whole file back with a small parser. Unknown values are empty cells and zero stays zero. A capped read ends with a row that says how many turns, threads or gauge rows the file leaves out, and a complete read has no such row.
+- The save test in `apps/desktop/src/main/save-file.test.ts` writes through the helper the desktop uses: a new file with owner-only access is flushed and renamed over the destination, nothing else is left in the folder, and a link at the destination is replaced and never written through.
+- The CLI test in `apps/cli/src/chat/analytics.test.ts` runs both commands against a real controller with the scripted chat adapter. It checks the printed numbers, the new CSV file, the refusal to replace it and the exit status of bad arguments.
+
+The native save dialog in the desktop main process and the two views need a manual check on a Mac. Gauge readings in the tests are synthetic, so no test shows that a live client reports the same windows.
+
+The allowance rule checks overlap against the chat turns of the project only. A task run draws on the same allowance and is not a chat turn, so it is not checked, and neither are other projects or use outside CrewKite. The Analytics tab and the project view say so beside the numbers. The gauge read starts at the thread's first journal entry, so readings from before a thread began are not used and the first turn of a new thread is often unmeasured.
+
+## Command palette, export and share page
+
+I protect these claims at the lowest layer that can see each one, with no network and no provider.
+
+- The share page table in `apps/controller/src/chat/export.test.ts` renders one thread per row and puts the row's text in the title, a file name, a message and a tool line. The rows are a script tag, an onerror attribute, a javascript link, a token, a bearer header, an email address, an absolute path inside the project, a sibling folder that only shares a prefix with it, the home path, another person's home path, a WSL path, the temp folders, tokens and emails split by invisible characters, and Unicode with control and reordering characters. Each row checks that the dangerous text is escaped or gone and that the redacted form is present. Every page must hold no `<script`, no address with two slashes, only the tags and attributes the renderer writes and the Content-Security-Policy meta with `default-src 'none'`, `style-src 'unsafe-inline'` and `img-src data:`.
+- The Markdown row renders a thread with an attachment and two tool calls and compares the whole file. Each tool call is one line, the attachment is named in a fence and left out of the file, a token in a tool title is redacted, a project path is shown relative to the project and the header says that redaction can miss shapes it does not know. A second test checks that a message cannot forge a heading or close a code fence, because the renderer fences every message one backtick longer than the longest run inside it.
+- The controller row sends a real message to a scripted provider and then sends `ExportChatThread` for both formats. It checks the folded tool line, a token and an email address in the reply, the home path as `~`, the filename and the refusal for an unknown thread. This is where the store queries are checked.
+- The shared redaction table in `apps/controller/src/diagnostics/redact.test.ts` covers Slack, Google and AWS keys, cookie headers and curl arguments, values on the line after an assignment, and keys split by zero width characters, soft hyphens, byte order marks and tag characters. It keeps an emoji joiner and ordinary words intact. A timing test reads a 256 KiB adversarial string for every rule shape and fails above 200 milliseconds, and the share renderer has the same timing check.
+- The CLI row in `apps/cli/src/chat/export.test.ts` runs `crewkite export` against a real controller. It writes both files, refuses to replace an existing file, refuses a missing flag and an invalid thread id, and writes nothing for an unknown thread. It claims both paths before it contacts the controller and removes them again when the export fails.
+- The main process row in `apps/desktop/src/main/export.test.ts` checks that the share page is saved exactly as previewed even when the thread changed since, that a save with no preview or for another thread is refused, that Markdown is read when saved, that a cancelled dialog writes nothing and that a link at the chosen path is never followed. The file is written to a private sibling, flushed and renamed, so a failed save never leaves half a file at the chosen path.
+- The frame navigation test in `apps/desktop/src/shared/frame-navigation.test.ts` checks that the one frame navigation the window allows is a subframe loading its own `about:srcdoc`, and that a main frame, a blank page, a web address, a data address and a script address stay cancelled.
+- The palette tests in `apps/desktop/src/renderer/palette/palette.test.ts` check fuzzy matching and ranking, including the marked letters of an astral character, and that every slash command has an entry. They also check that an entry with no composer or thread open is off and says why, that accept, push, pull request, export and share are never the entry Enter picks, and that a view's action runs only through what the view provided. The Enter rows check that typing "push" or "ext" and pressing Enter runs nothing while the top match is explicit, that an arrow choice runs, and that Enter never skips to a lower match. A last row checks that a palette command leaves the draft in the box and a typed command clears it.
+
+Redaction matches known patterns and ADR 0044 says it misses other shapes, so both exports say the same in their header. These tests do not show the system save dialog, the sandboxed preview frame inside a real window, the text view that replaces a frame that never loads, or how the palette sounds in a screen reader. A person on a Mac checks those.
+
+## macOS CI failures closed in sprint 2
+
+These are changes to existing claims. No new claim is added.
+
+- The Google gate claim in `apps/controller/src/commands/google-terms.test.ts` also covers order. A refused Google usage read stores no receipt, a changed command under the same key meets the gate before any idempotency check, and after the acknowledgement the same key reaches the read.
+- The Google writer rows in the native controller tables and the Google quota rows acknowledge the current terms in their setup, because they protect the writer and quota authority. The gate keeps its own claim.
+- The control socket claim in `packages/client/src/output.test.ts` keeps its folders under `/tmp`. A macOS temporary directory is long enough that the per-user socket path would pass the 100 byte bound, and the controller would then bind under `/tmp` by design. The test checks that the preferred path fits before it relies on it.
+- The Google writer claim checks a descendant that holds the group open with a scripted child, clock and group probe. A real descendant outlives its leader, and how soon the system's init reaps it decides whether cleanup sees the group gone. That made the row depend on the machine.
+
+## Benchmark harness
+
+Two test files in `packages/bench/src` cover the harness, three tests in `run.test.ts` and four in `manifest.test.ts`. Neither starts a provider or uses the network.
+
+- The verification table in `run.test.ts` builds a small git repository in a temporary folder and checks that a task verifies only when its checks fail on the base commit and pass on the solution commit. The rows are a visible check, a check on a hidden file, a check that already passes on the base, a check that fails on the solution and a task with no solution. A hidden check that imports a file only the solution adds is recorded as failing by a missing module, and the others as failing by an assertion.
+- The scripted run in `run.test.ts` sends two tasks through the controller's chat thread path with a scripted adapter, real SQLite and a review step. It checks that the run file holds both results with their outcomes, that tokens a client did not report stay null and print as unknown, that the changed file count and the review findings are recorded, that `bugsFoundAfter` is null, and that a task with no verification record is listed as an exclusion with its reason. The table has a row for each task and the summary line counts requested, ran, passed and excluded tasks. The run records its permission policy, which defaults to allow edits. The rows are matched whole, so unknown must sit in the token cells that are unknown, the base failure kind is in its column, and the review token columns and totals appear because the review step is on.
+- The work folder test in `run.test.ts` checks that a work folder under a checkout, or inside any repository, is refused, that the folder made for a run sits outside the checkout and outside every repository, and that a repository lookup from a kept scratch copy finds none, with and without the run's ceiling.
+- The manifest table in `manifest.test.ts` checks the schema row by row: a complete file, defaults, and the refusals for a bad id, a relative repository, a short base hash, text with diff lines, a hidden path that climbs out of the copy, a duplicate check name, an unknown difficulty and an unknown field. Rows for the verification record check that it needs the base failure kind and refuses a kind that is not defined. The folder test checks that a file name must match its task id and that a file that fails the schema stops the load with its name. A last test loads the shipped tasks and checks that each one carries a verification record with at least one check that failed on the base.
+
+These tests establish the harness's mechanics. They say nothing about how any model performs, and a live run through an installed client needs the owner's machine.
+
+## Platform-scoped claims
+
+CI runs the full suite on macOS 15 arm64, and a Linux container reports the claims below as skipped with a reason, not as failed. Each keeps running on macOS.
+
+- Candidate evidence runs its formatter section only on macOS, because the verify recipe pins the macOS arm64 Biome binary. The identity and historical checks before that section run everywhere.
+- The ACP writer claim runs only on macOS, because the client bundle is the signed macOS arm64 build.
+- The package upgrade claim skips its `installed` and `installed-initialized-owner` rows elsewhere, because they run the real activity check at the macOS `/usr/sbin/lsof` path. Its other rows run everywhere.
+- The retained descendant claim, the owned command stream claim and the authentication metadata cleanup claim skip outside macOS because Linux process ownership is unqualified. A Linux group can outlive the close of its streams for a few milliseconds, and an orphan that init never reaps stays in its group after SIGKILL, so the group absence proof does not settle. I record this as a Linux product gap.
+
+The project command claim has no platform scope. Its shell row copies a regular file named `sh`, because `/bin/sh` is a link on Linux and the identity check refuses a link before the shell check runs.
+
+The acceptance claim and the ACP scratch permission claim skip when the Node runtime that runs the tests belongs to another user. Both use that runtime as the native client, and the controller refuses a client that the running user does not own. This is the case in a container that runs as root with a Node install owned by a service account. Both pass when the runtime belongs to the user who runs the tests.
+
+## Plan slice review leftovers
+
+These rows extend the parallel plan slice claims.
+
+- The replay table in the plan tests runs on a synthetic repository with a real thread copy and real slice copies. A builder with no review chain replays every path it changed. A review that edits another slice's merged file and adds a file has both left out, while its edit to a path the builder changed stays. A fix after a review counts as the slice's own change, and a fix that puts a path back where the slice started gives it up, so a later review edit there stays out. A slice with a conflict writes none of its clean paths, and the replay after a resolve turn ends done writes them and keeps the orchestrator's merge. Without that second replay the thread copy holds neither.
+- In the service lane test, the blocked slice of both conflict rows also writes a clean file. It reaches the thread copy after a resolve turn that ends done and is absent after one that fails.
+- The read-only row in the service lane test replaces a base link in the thread copy before the slice starts. The slice's ask packet lists no changed files, since the slice copy never holds that change.
+
+These rows use scripted adapters. They do not cover a live reviewer that edits outside its slice.
+
+## First impression polish
+
+Four claims came out of hands-on QA of the desktop and the terminal.
+
+- The scripted chat adapter test in `packages/testkit/src/chat-adapter.test.ts` holds one table for the scripted ask. An ask before a tool step guards that tool: the tool starts, the ask names its call, and Deny leaves the file unwritten and reports the tool as denied. Allow once lets the edit land. The thread policy the controller passes answers without the person: allow-edits answers an edit, allow-all answers any ask, and a kind granted for the thread is allowed for the thread. Ask, and allow-edits on a command, wait for the person. The demo and any recorded video rely on the fake showing the safety model working.
+- The usage presentation table in `apps/desktop/src/renderer/usage-presentation.test.ts` keeps a provider that is not connected and has read nothing on the rail with Connect and no bar, so the rail and the terminal gauge row show one gauge per provider.
+- The interactive terminal claim in `apps/cli/src/interactive/app.test.ts` checks that `/provider` and `/model` before the first message set the family and model of the first turn without creating a thread, and that the thread the first message creates uses them.
+- The search hint test in `apps/desktop/src/renderer/thread/search-hint.test.ts` checks that the search shortcut reads as Command K on a Mac and Ctrl K elsewhere.
+
+The Google card checkbox layout and the Ctrl K hint on Linux are visual, and only a Mac run of the desktop confirms them.
+
+## CLI rough edges in sprint 2
+
+These claims come from the CLI QA pass. Each row lives in an existing table or test file, apart from the two small files named below.
+
+- The version claim in `packages/contracts/src/version.test.ts` reads every package.json and checks that its version equals the constant the OpenAI handshake, the health answer and the diagnostics bundle report. The bundle row in `apps/controller/src/diagnostics/bundle.test.ts` checks that a bundle with no desktop reports that constant.
+- The argument table in `apps/cli/src/main.test.ts` checks, without a controller command, that `--version`, `-v` and `version` print the constant, that `help` prints what `--help` prints, that `usage` alone lists the usage commands and exits 0, that `-v`, `--version` and `version` followed by another word exit 2, that the top level help names `--register`, `--permission-policy`, `--file` and the effort suffix, and that a malformed task or project ID prints one line and exits 2.
+- The thread table in `apps/cli/src/chat/scripting.test.ts` runs a real controller with the scripted chat adapter. It checks that a malformed ID given to a thread command or to print mode prints one line, exits 2 and writes nothing to stdout, that `thread changes` prints the changed files and, with `--json`, one result line without patches, and that `task changes` on a thread with no candidate exits 2.
+- The same table checks that a first message refused for a missing file leaves no new thread, for `thread new` and for `-p`. A send whose answer is lost (an unknown outcome) keeps its thread and prints its id, because the controller may have accepted the message. The print row checks that a dropped connection prints the reconnect line to stderr once.
+- The git claim in `apps/controller/src/host/vcs-probe.test.ts` runs the probe against a path with no git, a git that exits with an error and the real git. A second table checks that a working git is remembered, that a failure holds for under 30 seconds and that it is asked again after that. The last CLI row starts a controller whose probe reports each state and checks that health prints `degraded` with the cause and that a refused `project add` names the same cause.
+- The state guard in `scripts/desktop-state.test.ts` checks that `pnpm desktop` refuses a home or profile inside the checkout's internal folder, including the folder a link in it points to, a folder that holds or sits inside the checkout, a state root that is not the home folder, a path outside the root, or a shared folder. The row in `apps/desktop/src/main/runtime.test.ts` checks that the source desktop in that mode starts `apps/controller/src/main.ts` and never the demo controller.
+
+The reconnect line says about a minute, which is the existing retry schedule of the client (69 seconds in all). The desktop window opened by `pnpm desktop`, and the probe on a computer whose git is missing, need a Mac to confirm.
+
+## Controller safety and queue
+
+- The backup test in `store/backup.test.ts` upgrades one database file through several migration steps. A fresh database takes no copy. Each later upgrade leaves a copy named for the version it started from, holding that version's rows, with mode 0600. Only the newest two copies stay. A database already at the newest version takes none, and a file that already has a copy's name is never overwritten.
+- The ceiling tests check that every client launch and every project check run sets `GIT_CEILING_DIRECTORIES` to the parent of the scratch copy. `host/git-ceiling.test.ts` covers the helper over plain, linked, not yet made and plan slice copies, and runs a real repository lookup from a copy placed under a temporary repository: it finds that repository without the ceiling, finds none with it, and still finds a repository the copy carries itself. The OpenAI, Anthropic, Google and Local chat tests each read the environment their client or command received, and `project-command.test.ts` reads the one a check receives, from the copy's root and from a folder inside it, then starts a real program through the owned runner and reads the value it sees. Native writer and reviewer launches keep their own environments and are not covered.
+- The restart queue test in `chat/service.test.ts` crashes a controller after a message is sent and a second one is queued. After the restart the failed turn no longer holds the queue, so the queued message starts and finishes. A table row with a client that failed on its own keeps the queued message waiting through the same restart.
+- The stop test in `cli/chat/scripting.test.ts` checks the line `thread stop` prints for zero, one and several queued messages, and that a real stop of a running reply with one message queued behind it prints `Cleared 1 queued message.`
+- The backup rows also cover pruning and failure. A restored older database keeps the copy it just wrote plus the newest copy of another version, and three failed upgrades in a row leave their own latest copy plus the one copy of another version. A copy that cannot be written stops the upgrade with a line that names the folder, then the cause on a second line, and leaves the database at its old version.
+- The ceiling helper table also covers a copy that is itself a link, which takes the parent of its target, a copy not made yet under a link, and a parent folder with a colon in its name. The helper refuses that last one with one plain line, because the variable is split at colons.
+- The task lane rows extend the ceiling claim to the clients that work in a scratch copy for a run. The Google writer test and the OpenAI repository writer test read the environment each launched process received and expect the folder above the scratch copy. A last row in `host/git-ceiling.test.ts` starts the buffered node check process of an evaluated copy and reads the value it sees.
+- The recovery marker test in `chat/restart-failure.test.ts` checks that only the two failures startup recovery writes read back as caused by a restart. The same text with client output in the detail, a provider message or a protocol method, at another stage, or with another kind, and a live process failure, all read back as ordinary failures. A row in the restart queue table repeats the restart text with client output in the detail and keeps the queue held.
+
+## Changes pages, hunks and review comments
+
+These claims run against real git and real SQLite on temporary folders, through the controller and the scripted chat adapter, with no provider client and no network.
+
+- The partial accept table in `apps/controller/src/chat/change-review.test.ts` edits three far apart lines of one file and one line of another. With no hunk decisions Accept publishes both files whole. With two of three hunks accepted, the branch differs from the base by exactly the blob ids of the composed file and the untouched second file, and the copy still holds the third hunk. A row that discards one hunk and accepts another publishes only the accepted one and keeps its mark across the discard. After each Accept the marks are gone.
+- A decision drops when the file's bytes change, its hunks read as undecided and the changed hunk has a new key. A binary file lists no hunks and refuses a hunk decision.
+- Paging over 2,106 changed entries in pages of 2,000 and of 700 reaches every entry exactly once in path order. A file added between pages refuses the next page and an Accept that names the old listing. Accept with the new listing publishes all 2,106 files. The test took 69 s in the container while Accept started two processes per changed file to look up and write its object. Accept now looks up every object in one batch read and writes every scratch file through one hashing process, and the test takes about 3 s.
+- The comment table checks the exact queued message for a whole hunk and for two copy lines with the removed line between them, both in the provider prompt and in the stored user message. Lines outside the hunk are refused. `change-review-unit.test.ts` puts a quoted hunk that holds three or five backticks in a longer fence, refuses a hunk write through a folder the copy turned into a link, and refuses an Accept whose file bytes changed after the listing hashed them.
+- Decide and Discard on a hunk are refused while a turn runs and for an unknown task, the same as whole-file Discard.
+- `hunks.test.ts` composes a file from a chosen set of hunks for every subset that matters, keeps a hunk key when another hunk of the file is reverted, and keeps a missing final newline. `hunk-lines.test.ts` checks the base and copy line numbers the desktop gives each patch line and the range a pick names. `packages/contracts/src/changes.test.ts` keeps the page, decision and comment bounds and checks the three commands are mutations.
+
+I check the Changes tab itself by hand on the Mac. I expand a file, accept one of two hunks, accept to a branch and check that `git show` holds only that hunk. I discard a hunk and see the other keep its mark. I pick two lines, comment, and see the message appear in the thread, or in the queue while a reply runs.
+
+
+## Client version ranges
+
+Eight claims cover the chat path's version range and the trust checks it keeps. They run at the lowest layer that sees each one, with scripted clients on temp folders and no network.
+
+- The version table in `apps/controller/src/providers/client-versions.test.ts` sorts a reported version into tested, newer within the tested major, supported between the minimum and the tested build, older, a new major version and unreadable. Its rows cover a leading `v`, build metadata, output with no version, a newer 0.minor accepted as newer, and lines that announce an update, which are skipped. A second table orders prerelease builds by semantic versioning, with numeric identifiers compared by value.
+- The same file holds each family's tested build, minimum and update command in one table, and checks the plain lines Settings and the CLI show, with no en or em dash.
+- The trust table refuses a client file its group or other users can write, one in a folder other users can write, and one another account owns. A second table refuses a link found in a folder on the search path that other users can write, unless the folder is sticky and the link is mine or the system's. A scripted client shows that such a file never runs and that an unchanged build runs its `--version` flag once.
+- A file that cannot be hashed, as with EACCES or ENOENT, is unreadable and never runs or throws. An unreadable version is read again after a backoff that doubles from one minute to fifteen, at once after Check again or a changed file, and never in the cached-only mode used inside a transaction.
+- The version read stops at its bound and kills a process the client left in its group, passes only HOME, PATH, LANG and NO_COLOR to a client that prints its environment, and discards the version of a file that changed while it ran.
+- The OpenAI chat table launches a turn on a scripted client that reports a build newer than the tested one, and a newer build that exits before it answers initialize gets one line naming the found and tested builds.
+- The Anthropic quota table in `apps/controller/src/providers/anthropic/usage-reader.test.ts` runs a client installed as a `#!/usr/bin/env node` script with my PATH, reads on a build other than the pinned one inside the range, and refuses an older build with the card line, on Refresh and on Check again.
+- The catalog claim in `apps/controller/src/chat/catalog.test.ts` connects chat on a build the chat client accepts while the writer profile reports a build mismatch. The profile claim keeps the writer profiles on their exact pinned builds.
+
+A live client on the Mac confirms what the scripted clients cannot: each client's real `--version` output, its time to answer, and a chat turn on a build other than the tested one.
+
+## Linux preview platform gate
+
+Ten tests protect the platform gate from the 2026-10-31 amendment to ADR 0013. They run on every platform, with host values passed in, so the macOS job and both Linux jobs prove the same table.
+
+- The gate table in `apps/controller/src/providers/platform.test.ts` crosses the four families with macOS arm64 and x64, Linux x64, arm64 and riscv64, and Windows. It expects an allow or one exact refusal line for each cell. Google is refused on both Linux architectures with its own line, and Windows is refused with one line for every family.
+- The shared client gate gives the platform line first and the home line second, so a missing HOME on Linux reads as a home problem.
+- The Local writer connection stays on macOS arm64 and refuses Linux, Windows and Intel Macs with the platform reason, while Local chat on Linux uses the no-authentication loopback mode.
+- The Local token claim checks the keychain line for every platform except macOS. The controller claim in `apps/controller/src/commands/local-linux.test.ts` configures Local on a Linux host: token mode is refused by `ConfigureLocal` and by a desktop-supplied token with that line, and no-authentication mode connects through the probe with no token held.
+- The discovery claims check the search directories for Linux and macOS, the OpenAI native build path for each supported computer, and a scripted npm layout on a temp folder. The layout resolves to the native build through the same trust checks and refuses it once other users can write it.
+- The Biome claim maps each computer to its platform package, refuses musl and unknown systems, and checks that the installed package for this computer matches the root version.
+
+The scripted layout and the gate table cannot show that a real client on Linux prints the version output the parser reads, that the npm package really sits at the path the table names, or that process ownership settles on a Linux kernel. Only a Linux machine with the clients installed confirms those.
+
+Three more tests cover the Local setup line on Linux. The probe test in `apps/controller/src/providers/local/chat-connect.test.ts` reads the status from a real loopback socket that rejects the handshake with 401, 403 and 500, and tells a runtime that asks for a token from one that is down. The controller tests in `apps/controller/src/commands/local-notice.test.ts` show that a no-authentication connect that meets such a runtime ends without a token window and names the server line, that a runtime that is merely down gets no such line, and that the line clears when the runtime answers open or the connection changes. A saved token mode read on a Linux host carries the loopback and keychain line in place of the generic reason. The view claim in `local-setup-flow.test.ts` shows the controller's line replacing the generic one and yielding to an action message.
+
+## Large repositories (2026-10-31)
+
+These tests protect the change that replaced the 100,000-file cap with a free space check (ADR 0027 amendment of 2026-10-31) and the limits that refused work on large repositories.
+
+- `apps/controller/src/chat/scratch-copy.test.ts` runs a table over the room check: a copy that writes every byte is refused one byte short of its size plus 1 GiB and allowed at exactly that, a copy that may clone is allowed with only the 1 GiB and refused one byte under it, and a copy whose volume refuses the clone is refused for the rest of its size. A refused copy leaves no folder behind. The refusal is `ScratchNoRoom` and its message names what the copy needs and what the disk has. A second test reads free space through a folder that does not exist yet.
+- `apps/controller/src/host/source.test.ts` plans a 250,001-file base and expects every file in the plan.
+
+- `apps/controller/src/chat/local-tools.test.ts` reads lines from both ends of a file past the 8 MiB whole-file read and from a small file, and expects the same numbered output and line count either way. A large file with a line of two-byte characters, a CRLF line and a last bare CR reads with the long lines cut on a whole character and the same breaks the small path gives. It searches more files than the old 20,000-file walk with the only match sorted last, and expects the hit plus a line that counts the file too large to search.
+- `apps/desktop/src/main/grants.test.ts` expects main to take a clipboard text request only as a positive whole length with no other field, so the page can never name the bytes main saves. Main saves the clipboard text only when its length matches what the page pasted.
+
+The tests cannot show how long a copy of a large real repository takes on a Mac with clone support. The container numbers are in the ADR amendment; the Mac run is a release check. The composer's switch from pasted text to a file chip past 65,536 characters is a Mac check too.
+
+## Model lists without shipped names (2026-10-31)
+
+- `apps/controller/src/chat/catalog.test.ts` builds the Anthropic list from a real SQLite table of turns: with no client rows and no turns it is empty; with turns only it lists each model a finished turn used, newest first, with the efforts those turns used; with client rows it lists the rows first and the used models the rows leave out after them. A failed turn adds nothing, and a client effort name CrewKite has never seen passes through.
+- `apps/controller/src/providers/openai/model-catalog.test.ts` expects an empty Anthropic list before any read, where it used to expect four shipped names.
+
+What the Anthropic client's picker rows hold on a real account, and whether a typed older model ID runs on a subscription plan, is a Mac check.
+
+## Subagents (2026-10-31)
+
+These tests protect the subagent picture and the per-role switch. Each family runs a table of scripted frames through its real adapter, with no client, no network and no sleeps.
+
+- `apps/controller/src/providers/anthropic/subagents.test.ts` plays one spawn whose nested frames read, search and write text, and two spawns side by side where one fails and one never gets a result. Nested frames count under their parent call, the latest nested tool call is the action, the nested model replaces the one the spawn asked for, nested text and deltas never reach the reply, and nested tool calls open no card. A spawn with no result settles as stopped before the turn ends. A permission ask from a subagent comes to the person and the answer reaches the client as one control response. A role with subagents off passes `--disallowedTools Task,Agent` before the MCP config, and a role left on passes nothing.
+- `apps/controller/src/providers/openai/subagents.test.ts` shows an item type with no reader as a card titled in words. A spawn names two subagent threads; one thread's command becomes its action and a later wait finishes it, the other's failed turn fails it, and neither thread's words reach the reply. An agent item of an unknown shape, and a state that is not an object, still give a card and a count. An approval from a subagent thread still comes to the person. The launch passes `features.multi_agent` true only when the role turned it on.
+- `apps/controller/src/providers/google/subagents.test.ts` counts a call that names a subagent, takes a tool call from another session as its action, keeps that session's words out of the reply and shows a tool call with no readable ID as its own card. A role with subagents off opens the session with `invoke_subagent` disabled, and a role left on sends no metadata.
+- `apps/controller/src/chat/subagents.test.ts` reads each turn's switch from the role it runs as, with a fix and no fixer running as the builder. The tracker sends one event per change, keeps a subagent under the call that first named it and lists at most 32 while the counts go on.
+- `packages/contracts/src/subagents.test.ts` allows subagents for a crew saved before the switch and bounds the event's list. `apps/desktop/src/renderer/thread/subagent-view.test.ts` checks the chip's words, the badge while running, settled, failed and stopped at the turn's end, the rows and the unlisted line, the fold that keeps the newest report on its card, and a preset that keeps a role switched off and passes it to the crew it starts.
+
+Review fixes on the same day add these rows. The Anthropic table keeps a background spawn running after its call returns and stops it at the end of the turn. The OpenAI table counts a spawn that names its thread only on completion with no stand-in left over, stops a subagent the client never closed, answers a subagent's in-scratch edit and command under Allow edits and Allow all as the parent's would be, with the edit's ask naming its paths and delete mark, and adds a subagent's tokens to the turn stats. A role saved without the switch takes the family default, off for OpenAI, and the launch passes the feature only when the role turned it on. The Google table routes a subagent session's ask through the parent's policy, under Ask each time and Allow all, and declines one from a session no running subagent claims.
+
+Only a Mac with the live clients can confirm the real nested frame shapes of the Anthropic build, the OpenAI agent item and subagent thread notifications, whether the Google agent reports subagent calls or other sessions at all, whether each client honors its switch on the installed build, and whether the OpenAI client passes the turn's approval policy to each child thread.

@@ -1,0 +1,26 @@
+{
+  "id": "openai-discovery-credit-observations",
+  "title": "Read credit balances and reset counts as separate observations",
+  "repository": "self",
+  "base": "e983c4dc6bbfa811d0aecfbac454dd22bd443320",
+  "solution": "046ae531835114de28c7a482914a00981a3557c1",
+  "text": "Provider discovery in apps/controller/src/providers/openai/discovery.ts reads the rate limit buckets and reduces credits to the words unknown, unlimited, available or none. Keep that, and add four read-only observations while still excluding private text. In each bucket, credits may carry an optional balance that is null, absent or a decimal string of at most 128 characters matching an optional minus sign, digits and an optional fraction (for example 1234.5678900000 or -0.125). The bucket answers it as creditBalance with the string kept exactly as sent (no number conversion) and null when absent, so a balance of any other type, a non-numeric string or a longer string stops metadata as an invalid message. A bucket also accepts spendControlReached, a boolean or null or absent, answered as spendControlReached with null for unknown, and rateLimitReachedType, null or absent or one of rate_limit_reached, workspace_owner_credits_depleted, workspace_member_credits_depleted, workspace_owner_usage_limit_reached and workspace_member_usage_limit_reached, answered as rateLimitReachedType with null for unknown. Any other value for these two fields is an invalid message. The limits answer takes an optional rateLimitResetCredits object whose availableCount is a non-negative safe integer; it answers availableResetCount with that number, or null when the object is absent or null. Only the count is kept: the ids, titles and expiry times of individual reset credits never appear in the answer. A reset count must never be read as a usage balance, so creditBalance stays null when only reset details are given. Unknown fields inside credits, such as a private note, are dropped.",
+  "hidden": ["apps/controller/src/providers/openai/discovery.test.ts"],
+  "checks": [
+    {
+      "name": "discovery",
+      "command": "node",
+      "args": ["--test", "apps/controller/src/providers/openai/discovery.test.ts"]
+    }
+  ],
+  "difficulty": "medium",
+  "tags": ["openai", "discovery", "validation", "limits"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:20.523Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["discovery"],
+    "baseFailure": "assertion",
+    "passedOnSolution": ["discovery"]
+  }
+}

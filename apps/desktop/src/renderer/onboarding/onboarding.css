@@ -1,0 +1,181 @@
+/* First-run welcome. Colors come from the tokens in style.css, so light and dark both follow. */
+
+.onboarding {
+  flex: 1;
+  min-height: 0;
+  padding: 28px 32px 56px;
+  overflow-y: auto;
+}
+.onb-column {
+  display: grid;
+  gap: 18px;
+  max-width: 760px;
+  margin: 0 auto;
+}
+.onb-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.onb-eyebrow {
+  margin-bottom: 6px;
+  color: var(--text-dim);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 1.1px;
+  text-transform: uppercase;
+}
+.onboarding h1 {
+  margin-bottom: 4px;
+  font-size: 22px;
+  letter-spacing: -0.5px;
+}
+.onb-sub,
+.onb-lead {
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.7;
+}
+
+/* Progress */
+.onb-steps {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px 22px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.onb-steps li {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--text-dim);
+  font-size: 12px;
+}
+.onb-steps li.is-current {
+  color: var(--text);
+  font-weight: 600;
+}
+.onb-steps li.is-done {
+  color: var(--text-muted);
+}
+.onb-step-number {
+  display: grid;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  font-size: 11px;
+}
+.onb-steps li.is-current .onb-step-number {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: var(--accent-ink);
+}
+.onb-steps li.is-done .onb-step-number {
+  border-color: color-mix(in srgb, var(--green) 45%, var(--border));
+  color: var(--green);
+}
+
+/* The step */
+.onb-panel {
+  display: grid;
+  gap: 14px;
+  padding: 18px 20px 22px;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--surface);
+}
+.onb-panel h2 {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.1px;
+}
+.onb-panel h2:focus-visible {
+  outline-offset: 4px;
+}
+.onb-families {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.onb-family {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-raised);
+}
+.onb-family-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 14px;
+}
+.onb-family-head .family-mark {
+  flex-shrink: 0;
+  width: 20px;
+  height: 20px;
+  border-radius: 5px;
+  font-size: 11px;
+}
+.onb-family-text {
+  display: grid;
+  flex: 1;
+  gap: 2px;
+  min-width: 0;
+}
+.onb-family-name {
+  font-size: 13px;
+  font-weight: 600;
+}
+.onb-family-note {
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.onb-family-card {
+  padding: 0 14px 14px;
+}
+.onb-family-card[hidden] {
+  display: none;
+}
+
+/* Project and message */
+.onb-field {
+  display: grid;
+  gap: 6px;
+  max-width: 360px;
+  font-size: 12px;
+}
+.onb-field label {
+  color: var(--text-muted);
+}
+.onb-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.onb-message {
+  margin: 0;
+  padding: 12px 14px;
+  border: 1px solid var(--border-strong);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* Footer */
+.onb-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+.onb-foot-gap {
+  flex: 1;
+}

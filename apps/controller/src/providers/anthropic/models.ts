@@ -37,7 +37,7 @@ const MAX_BYTES = 4 * 1024 * 1024;
  * Reads the picker rows the client keeps for this account. The stream-json initialize request
  * answers from local state and the account profile, so no prompt is sent and no inference runs.
  * The client has no list command, and `claude models` would be read as a prompt. Resolves to
- * null when the client does not answer within the limit, so the caller keeps its shipped list.
+ * null when the client does not answer within the limit, so the caller keeps its last rows.
  * Rows hold one alias for each family, so an older model ID still needs to be typed.
  */
 export function readAnthropicModels(options: {

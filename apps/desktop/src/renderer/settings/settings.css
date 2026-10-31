@@ -116,6 +116,22 @@
   color: var(--text-dim);
   font-size: 11px;
 }
+.st-client {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin: -8px 0 16px;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.st-client p {
+  flex: 1;
+  overflow-wrap: anywhere;
+}
+.st-client.is-refused p {
+  color: var(--text);
+}
 .st-note {
   color: var(--text-muted);
   font-size: 11px;
@@ -263,4 +279,9 @@
   display: flex;
   flex-wrap: wrap;
   gap: 8px;
+}
+
+.st-note-text {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }

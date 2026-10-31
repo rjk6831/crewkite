@@ -1,0 +1,31 @@
+{
+  "id": "scratch-clone-checks-committed-bytes",
+  "title": "Check each cloned scratch file against the committed bytes",
+  "repository": "self",
+  "base": "128f831239dad61e3c59f5e64317fc640f727731",
+  "solution": "34ee6151798f3535c2b8d2548abaafaac5020379",
+  "text": "copyScratch in apps/controller/src/chat/scratch-copy.ts clones files from the person's checkout when git status shows no tracked change. A same-size edit that git was told to trust (assume-unchanged or skip-worktree) still reaches the clone, and from there the thread's scratch copy and an accepted branch. Make every clone prove it holds the committed bytes. After the clone call, hash the cloned file as it streams in 1 MiB reads, opened with O_NOFOLLOW, and compare it with the base. A planned file (one that has an oid) is identified by its blob id: hash the text blob <size> and a NUL byte followed by the bytes, with sha1 for a 40 character oid and sha256 for a 64 character oid. A file that came with its bytes is identified by its sha256 field. A size mismatch also fails. When the bytes do not match, remove the cloned file and write that file from the base as any other file, counting it as written, while later files may still be cloned. Any clone error also removes a partial target. Before cloning, check that every parent folder of the file in the checkout is a real directory and not a link, remembering the folders it already checked, and fall back to writing when one is not. Add an optional stream(file, target) to the copy options for a planned file larger than chunkBytes: it must write that file straight to its target instead of loading it, so such a file no longer goes through read. Add blobToFile(repository, oid, file) to apps/controller/src/host/source.ts, which accepts only a 40 or 64 character lowercase hex oid and writes git cat-file blob output for it into a new file with mode 0600, using a gitToFile helper that points git's standard output at the file. hashCandidateFiles must choose sha256 or sha1 from the repository's object format instead of from the first planned oid. A checkout whose same-size hidden edit is cloned must end with a scratch tree equal to a plain copy of the base, with exactly one file written and the rest cloned.",
+  "hidden": ["apps/controller/src/chat/scratch-copy.test.ts"],
+  "checks": [
+    {
+      "name": "scratch-copy",
+      "command": "node",
+      "args": [
+        "--test",
+        "--test-name-pattern=a clean checkout on the base is cloned and the copy holds the same tree as a plain copy",
+        "apps/controller/src/chat/scratch-copy.test.ts"
+      ],
+      "timeoutMs": 600000
+    }
+  ],
+  "difficulty": "hard",
+  "tags": ["controller", "chat", "filesystem", "integrity"],
+  "verification": {
+    "method": "The checks ran in a clean export of the base commit with the hidden files from the solution commit in place, and had to fail. They then ran in a clean export of the solution commit, and had to pass. Installed dependencies were linked from the checkout, and the checks ran with a minimal environment and a temporary home.",
+    "verifiedAt": "2026-10-30T19:26:31.825Z",
+    "node": "v24.22.0",
+    "failedOnBase": ["scratch-copy"],
+    "baseFailure": "missing-module",
+    "passedOnSolution": ["scratch-copy"]
+  }
+}

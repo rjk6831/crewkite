@@ -1,4 +1,8 @@
 import { z } from 'zod';
+import { ChatChecksEditSchema, ChatChecksStateSchema } from './checks.ts';
+import { ClientVersionStatusSchema } from './client-versions.ts';
+import { ChatPlanConflictsSchema, chatPlanLaneSchema } from './plan-lanes.ts';
+import { AllowSubagentsSchema, subagentActivityFields } from './subagents.ts';
 
 // Shared shape of a chat thread, its turns and the live agent stream.
 // Every provider adapter translates its native protocol into these events.
@@ -29,8 +33,13 @@ export const ChatRoleSchema = z.enum([
 /** Roles whose turns edit the scratch copy. Every other role runs read only. */
 export const writesScratch = (role: z.infer<typeof ChatRoleSchema>) =>
   role === 'assistant' || role === 'fixer';
-// The clients name their own levels. OpenAI offers up to ultra on some models, Anthropic up to max.
-export const ChatEffortSchema = z.enum([
+/**
+ * An effort level as the client names it. The clients name their own levels and add new ones, so
+ * any short lowercase name passes, and `default` leaves the level to the client. The names below
+ * are the ones seen so far, which the desktop labels; a new name shows as the client wrote it.
+ */
+export const ChatEffortSchema = z.string().regex(/^[a-z][a-z0-9._-]{0,31}$/);
+export const CHAT_KNOWN_EFFORTS = [
   'minimal',
   'low',
   'medium',
@@ -39,7 +48,9 @@ export const ChatEffortSchema = z.enum([
   'ultra',
   'max',
   'default',
-]);
+] as const;
+/** An effort the client applies, so not `default`. */
+export const ChatSetEffortSchema = ChatEffortSchema.refine((value) => value !== 'default');
 /**
  * How the thread picks the next family when a limit stops a turn and automatic handoff is on.
  * most-left takes the family with the most allowance left. resets-first spends the allowance that
@@ -90,7 +101,13 @@ export const ChatCrewSchema = z
   .strictObject({
     name: z.string().min(1).max(60),
     members: z
-      .array(z.strictObject({ role: ChatCrewRoleSchema, selection: ChatModelSelectionSchema }))
+      .array(
+        z.strictObject({
+          role: ChatCrewRoleSchema,
+          selection: ChatModelSelectionSchema,
+          allowSubagents: AllowSubagentsSchema,
+        }),
+      )
       .min(1)
       .max(5),
   })
@@ -219,7 +236,14 @@ export const ChatPlanSchema = z
   });
 export type ChatPlan = z.infer<typeof ChatPlanSchema>;
 
-export const ChatPlanSliceStatusSchema = z.enum(['queued', 'running', 'done', 'failed', 'not-run']);
+export const ChatPlanSliceStatusSchema = z.enum([
+  'queued',
+  'running',
+  'done',
+  'failed',
+  'not-run',
+  'blocked',
+]);
 export type ChatPlanSliceStatus = z.infer<typeof ChatPlanSliceStatusSchema>;
 /** Where the controller sent a slice and why, in the words of the system line. */
 export const ChatPlanAssignmentSchema = z.strictObject({
@@ -252,6 +276,10 @@ export const ChatPlanStateSchema = z
           candidates: z.array(ChatPlanAssignmentSchema).max(4),
           /** The builder turn that ran the slice. Null until it starts. */
           turnId: ChatTurnIdSchema.nullable(),
+          /** The running slice's lane. While it runs, `turnId` is the lane's newest turn. */
+          lane: chatPlanLaneSchema(ChatTurnIdSchema).optional(),
+          /** A blocked slice's paths that the thread copy changed too. */
+          conflicts: ChatPlanConflictsSchema.optional(),
         }),
       )
       .min(1)
@@ -372,6 +400,8 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     diff: ChatFileDiffSchema.optional(),
     summary: z.string().max(4096).optional(),
   }),
+  // The subagents one tool call started, as the client reported them so far.
+  z.strictObject({ type: z.literal('tool.subagents'), ...turnRef, ...subagentActivityFields }),
   z.strictObject({
     type: z.literal('permission.requested'),
     ...turnRef,
@@ -459,6 +489,8 @@ export const ChatTurnSchema = z.strictObject({
   stats: ChatTurnStatsSchema.optional(),
   /** Set when the reply stopped at the output limit, so a reopened view can offer Continue. */
   outputLimit: ChatOutputLimitSchema.optional(),
+  /** The plan slice whose lane opened the turn. It runs in that slice's own scratch copy. */
+  slice: ChatPlanSliceIdSchema.optional(),
 });
 export type ChatTurn = z.infer<typeof ChatTurnSchema>;
 
@@ -473,6 +505,11 @@ export const ChatSessionSchema = z.strictObject({
    * and reach the session in a delta packet. Missing on sessions saved before the field existed.
    */
   seenSequence: z.number().int().nonnegative().optional(),
+  /** The hash of the project notes section this session last received. Missing before notes. */
+  notesDigest: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
 });
 export type ChatSession = z.infer<typeof ChatSessionSchema>;
 
@@ -500,8 +537,10 @@ export type ChatAttachment = z.infer<typeof ChatAttachmentSchema>;
 /** Files on one message. Saved threads hold path strings in `attachments`, which still parse. */
 const files = z.array(ChatAttachmentSchema).max(32).default([]);
 const legacyAttachments = z.array(z.string().min(1).max(4096)).max(32).default([]);
+/** The most characters one message's text holds. Longer pasted text goes in as a file. */
+export const CHAT_MESSAGE_TEXT_MAX = 65_536;
 /** Message text. It may be empty when the message carries at least one file. */
-const messageText = z.string().max(65_536);
+const messageText = z.string().max(CHAT_MESSAGE_TEXT_MAX);
 const textOrFiles = (message: { text: string; files: readonly unknown[] }) =>
   message.text.length > 0 || message.files.length > 0;
 const TEXT_OR_FILES = 'A message needs text or at least one file.';
@@ -596,6 +635,8 @@ export const ChatThreadSchema = z.strictObject({
   skippedTotal: z.number().int().nonnegative().max(100_000).optional(),
   /** The plan card of the last orchestrator turn. Null or missing when no plan was proposed. */
   plan: ChatPlanStateSchema.nullable().optional(),
+  /** The project checks the thread knows and the latest runs. Missing until the first read. */
+  checks: ChatChecksStateSchema.optional(),
 });
 export type ChatThread = z.infer<typeof ChatThreadSchema>;
 
@@ -635,6 +676,8 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
   /** Null clears the crew; the thread goes back to manual. */
   crew: ChatCrewSchema.nullable().optional(),
   flightMode: ChatFlightModeSchema.optional(),
+  /** One edit to the thread's project checks. */
+  checks: ChatChecksEditSchema.optional(),
 });
 /** Stop the running turn cleanly and start a queued message now, with the stopped turn's packet. */
 export const SteerChatMessagePayloadSchema = z.strictObject({
@@ -651,6 +694,11 @@ export const AcceptChatChangesPayloadSchema = z.strictObject({
     .regex(/^(?!.*\/\/)[a-z0-9][a-z0-9/-]*[a-z0-9]$/),
   /** The commit message. The controller writes its own when the person leaves it out. */
   message: z.string().min(1).max(4096).optional(),
+  /** The Changes listing the person reviewed. A different current list refuses the Accept. */
+  listing: z
+    .string()
+    .regex(/^[a-f0-9]{64}$/)
+    .optional(),
 });
 const branchName = AcceptChatChangesPayloadSchema.shape.branch;
 /**
@@ -802,7 +850,7 @@ export const CancelChatPlanPayloadSchema = z.strictObject({
 
 /** Sent when a model read ends, so open pickers read the catalog again. */
 export const ChatCatalogChangeSchema = z.strictObject({
-  family: z.literal('openai'),
+  family: z.enum(['openai', 'anthropic']),
   models: z.number().int().min(0).max(64),
   /** What went wrong, in words for the person. Null when the read stored a list. */
   reason: z.string().min(1).max(400).nullable(),
@@ -875,16 +923,6 @@ export const ChatTurnEventsReadSchema = z
       context.addIssue({ code: 'custom', message: 'A turn event page exceeds its byte limit.' });
   });
 export type ChatTurnEventsRead = z.infer<typeof ChatTurnEventsReadSchema>;
-
-export const ChatChangesReadSchema = z.strictObject({
-  taskId: id('tsk'),
-  base: z
-    .string()
-    .regex(/^[a-f0-9]{40}$/)
-    .nullable(),
-  files: z.array(ChatFileDiffSchema).max(2000),
-});
-export type ChatChangesRead = z.infer<typeof ChatChangesReadSchema>;
 
 // Results of the read-only thread tools. A cloud client reaches them through the controller's
 // one MCP server; Local calls the same reads as native functions. Every result is bounded here so
@@ -991,9 +1029,10 @@ export const ChatCatalogEntrySchema = z.strictObject({
         /**
          * Where the entry came from. live: the client listed it on this account just now. known:
          * CrewKite ships it and the client could not confirm it. typed: the person entered the ID.
-         * Missing reads as live.
+         * used: a turn in this home finished on it, and the client's list leaves it out. Missing
+         * reads as live.
          */
-        source: z.enum(['live', 'known', 'typed']).optional(),
+        source: z.enum(['live', 'known', 'typed', 'used']).optional(),
       }),
     )
     .max(64),
@@ -1028,6 +1067,8 @@ export const ChatCatalogEntrySchema = z.strictObject({
    * native. Missing when the family reports nothing.
    */
   unlisted: ChatAttachmentDeliverySchema.exclude(['native']).optional(),
+  /** The installed client against the tested build. Missing for a family without one. */
+  client: ClientVersionStatusSchema.optional(),
 });
 export const ChatCatalogReadSchema = z.strictObject({
   families: z.array(ChatCatalogEntrySchema).max(4),
@@ -1050,7 +1091,6 @@ export const ReadChatTurnEventsPayloadSchema = z.strictObject({
     .regex(/^(0|[1-9][0-9]{0,19})$/)
     .optional(),
 });
-export const ReadChatChangesPayloadSchema = z.strictObject({ taskId: id('tsk') });
 export const ReadChatCatalogPayloadSchema = z.strictObject({ taskId: id('tsk').optional() });
 
 export type ChatCatalogEntry = z.infer<typeof ChatCatalogEntrySchema>;

@@ -36,7 +36,11 @@ process.stdin.on('end', () => {
 });
 `;
 
-test('authentication metadata waits for bounded owned child and descendant cleanup', async () => {
+test('authentication metadata waits for bounded owned child and descendant cleanup', {
+  skip:
+    process.platform !== 'darwin' &&
+    'Linux process ownership is unqualified: an orphan that init never reaps keeps its group present after SIGKILL',
+}, async () => {
   mkdirSync(resolve('internal'), { recursive: true });
   const root = mkdtempSync(resolve('internal/auth-process-'));
   const sha256 = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
@@ -69,6 +73,8 @@ test('authentication metadata waits for bounded owned child and descendant clean
     GH_TOKEN: secret,
     DEBUG: '1',
     CLAUDE_CODE_ENTRYPOINT: secret,
+    // A client installed as a script finds node on the person's own PATH.
+    PATH: '/opt/person/bin:/usr/bin:/bin',
   };
   try {
     for (const mode of [
@@ -156,7 +162,7 @@ test('authentication metadata waits for bounded owned child and descendant clean
             assert.deepEqual(options.env, {
               HOME: root,
               USER: userInfo().username,
-              PATH: '/usr/bin:/bin',
+              PATH: '/opt/person/bin:/usr/bin:/bin',
               LANG: 'C',
               TMPDIR: join(directory, 'tmp'),
               DISABLE_UPDATES: '1',

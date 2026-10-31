@@ -14,6 +14,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
+import { withGitCeiling } from '../../../host/git-ceiling.ts';
 import {
   type AcpConnection,
   type AcpDiagnostic,
@@ -954,7 +955,12 @@ export function startGoogleAcpWriter(options: AcpWriterOptions) {
   let openToolCount = 0;
   let openToolKinds: (typeof toolKinds)[number][] = [];
   const handle = startAcpProcess(
-    { ...options, timeoutMs: options.timeoutMs ?? 300000 },
+    {
+      ...options,
+      // The writer works in the scratch copy, which has no .git of its own.
+      environment: withGitCeiling(options.environment, options.scratch),
+      timeoutMs: options.timeoutMs ?? 300000,
+    },
     async (connection, onStop, settle): Promise<AcpWriterCompletion> => {
       const proof = await initialize(connection, options.client);
       if (hashCanonical(proof.capabilities) !== hashCanonical(plan.proof.capabilities))
