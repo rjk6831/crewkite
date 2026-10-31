@@ -42,7 +42,9 @@ The listing stays optional in the command for older clients. Every client in thi
 
 A scratch copy refused a base with more than 100,000 files. That number named no limit of the disk, of Git or of a provider, so it was a size ceiling of the kind this record rules out, and it kept large repositories from starting a thread at all. I remove it.
 
-- A thread copies a base of any file count. The tree listing may print up to 1 GiB, about a million paths.
-- Before it writes, the copy checks free space on the disk that holds the CrewKite home. A copy that writes every byte needs the base's size plus 1 GiB free. A copy that may clone from the checkout needs the 1 GiB up front, since a clone takes no new space, and checks again every 256 MiB it writes. A refusal names both numbers.
+- A thread copies a base of any file count. Git listings that grow with the repository may print up to 512 MiB, the most one JavaScript string holds.
+- Before it writes, the copy checks free space on the disk that holds the CrewKite home. A copy that writes every byte needs the base's size plus 1 GiB free. A copy that may clone from the checkout needs the 1 GiB up front, since a clone takes no new space. When the volume refuses a clone, the copy checks the rest of the size before it writes on, before each file it streams, and every 256 MiB. A refusal names both numbers, and the partial copy is removed.
+- The Local search covers every file the copy's .gitignore rules keep, and says how many files over 1 MiB it did not search. Local reads lines of a file of any size. Completion and the Local outline take the first 50,000 files, since they only need a sample.
+- Pasted text longer than one message goes in as a file that main saves from the clipboard.
 - The writer path for tasks keeps its 10,000 file limit.
 - In the container (2 CPUs, no clone support) a 250,000-file base planned in 4 s, copied in 21 s, listed Changes in 11 to 13 s and built the Accept tree in 9 s, with the controller at about 870 MB. These runs block the controller while they work; moving them off the main thread is later work.
