@@ -62,6 +62,13 @@ export const THREAD_TOOLS = {
   },
 } as const;
 export type ThreadToolName = keyof typeof THREAD_TOOLS;
+
+/** Asked for the turn that is reading. Its text is fixed, so the answer may pass it on. */
+export class AskingTurnError extends Error {
+  constructor() {
+    super('That id is the turn asking, which has no reply yet. Read an earlier turn.');
+  }
+}
 const toolNames = Object.keys(THREAD_TOOLS) as [ThreadToolName, ...ThreadToolName[]];
 
 // A 200 entry trace at its field limits, JSON escaped, stays under this.
@@ -155,7 +162,8 @@ export async function answer(
   let value: unknown;
   try {
     value = await read(reader, tool, args.data);
-  } catch {
+  } catch (error) {
+    if (error instanceof AskingTurnError) return { error: error.message };
     return { error: 'The thread could not be read.' };
   }
   if (!spec.result.safeParse(value).success)
