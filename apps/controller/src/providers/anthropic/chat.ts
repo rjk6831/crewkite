@@ -18,9 +18,9 @@ import { performance } from 'node:perf_hooks';
 import {
   type AgentEvent,
   type AnthropicUsageReadingSchema,
-  ChatEffortSchema,
   type ChatFailure,
   type ChatPermissionOption,
+  ChatSetEffortSchema,
   type ChatToolKind,
 } from '@crewkite/contracts';
 import { z } from 'zod';
@@ -129,7 +129,7 @@ const frame = z.object({
 const init = z.object({
   session_id: sessionId,
   model: z.string().min(1).max(200).optional(),
-  effort: ChatEffortSchema.exclude(['default']).nullish().catch(undefined),
+  effort: ChatSetEffortSchema.nullish().catch(undefined),
 });
 const streamEvent = z.object({
   event: z.object({
@@ -317,17 +317,6 @@ export function chatEnvironment(source: NodeJS.ProcessEnv, temporary: string): N
     CLAUDE_CODE_DISABLE_AUTO_MEMORY: '1',
   };
 }
-
-// The chat models the client offers on a subscription plan, and the efforts chatArguments can
-// pass. Default passes no flag and leaves the level to the client.
-export const anthropicChatModels = [
-  'claude-fable-5-1',
-  'claude-opus-5-5',
-  'claude-sonnet-5-5',
-  'claude-haiku-5-5',
-] as const;
-export const anthropicDefaultChatModel = 'claude-sonnet-5-5';
-export const anthropicChatEfforts = ['default', 'low', 'medium', 'high', 'xhigh', 'max'] as const;
 
 // The file types the stream-json user message takes as content blocks: base64 image blocks for
 // these four, a base64 document block for PDF, and a text document block, whose only media type

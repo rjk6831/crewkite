@@ -13,9 +13,9 @@ import {
 import { extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   type AgentEvent,
-  ChatEffortSchema,
   type ChatFailure,
   type ChatPermissionOption,
+  ChatSetEffortSchema,
   type ChatToolKind,
 } from '@crewkite/contracts';
 import { CREWKITE_VERSION } from '@crewkite/contracts/version';
@@ -290,7 +290,7 @@ const limitsReply = z.object({ ordinaryUsageAllowed: maybe(z.boolean()) });
 const threadReply = z.object({
   thread: z.object({ id: z.string().min(1).max(512) }),
   approvalPolicy: z.unknown().optional(),
-  reasoningEffort: ChatEffortSchema.exclude(['default']).optional().catch(undefined),
+  reasoningEffort: ChatSetEffortSchema.optional().catch(undefined),
 });
 const turnReply = z.object({ turn: z.object({ id }) });
 const scope = z.object({ threadId: z.string() });

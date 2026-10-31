@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { AnthropicNativeProfileSchema, LocalSetupSchema } from '@crewkite/contracts';
 import { resolveAnthropicNativeProfile } from '../providers/anthropic/profile.ts';
@@ -225,4 +226,67 @@ test('a writer profile build mismatch no longer disconnects chat when the chat c
     assert.equal(entry?.reason, reason, label);
     assert.equal(entry?.client?.message, message, label);
   }
+});
+
+test('Anthropic lists the client rows, then model IDs this home finished turns on, and ships none', () => {
+  const writer = AnthropicNativeProfileSchema.parse(resolveAnthropicNativeProfile({}).facts);
+  const db = new DatabaseSync(':memory:');
+  db.exec('CREATE TABLE chat_turns (id TEXT PRIMARY KEY, body TEXT NOT NULL)');
+  const insert = db.prepare('INSERT INTO chat_turns (id, body) VALUES (?, ?)');
+  const turn = (id: string, model: string, effort: string, state: string, startedAt: string) =>
+    insert.run(
+      id,
+      JSON.stringify({ selection: { family: 'anthropic', model, effort }, state, startedAt }),
+    );
+  turn('t1', 'model-old', 'high', 'done', '2026-10-01T00:00:00.000Z');
+  turn('t2', 'model-old', 'default', 'done', '2026-10-02T00:00:00.000Z');
+  turn('t3', 'model-older', 'low', 'done', '2026-09-01T00:00:00.000Z');
+  // A failed turn proves nothing about the model, and a listed one is not repeated.
+  turn('t4', 'model-typo', 'default', 'failed', '2026-10-03T00:00:00.000Z');
+  turn('t5', 'model-live', 'default', 'done', '2026-10-04T00:00:00.000Z');
+  const read = (rows: ChatCatalogInput['anthropicModels'], turns?: DatabaseSync) =>
+    buildChatCatalog({
+      profiles: [
+        AnthropicNativeProfileSchema.parse({ ...writer, available: true, reason: 'available' }),
+      ],
+      openAiModels: null,
+      anthropicModels: rows,
+      local: localSetup(false),
+      windows: [],
+      ...(turns ? { turns } : {}),
+      nowMs: Date.parse('2026-10-31T12:00:00.000Z'),
+    }).families.find((entry) => entry.family === 'anthropic');
+  const live = [
+    { value: 'alias', model: 'model-live', label: 'Live', efforts: ['low', 'brand-new'] },
+  ];
+  const cases: [string, ChatCatalogInput['anthropicModels'], DatabaseSync | undefined, unknown][] =
+    [
+      ['nothing read and no turns', null, undefined, []],
+      [
+        'turns only',
+        null,
+        db,
+        [
+          ['model-live', 'used', ['default']],
+          ['model-old', 'used', ['default', 'high']],
+          ['model-older', 'used', ['default', 'low']],
+        ],
+      ],
+      [
+        'rows then turns',
+        live,
+        db,
+        [
+          ['model-live', 'live', ['default', 'low', 'brand-new']],
+          ['model-old', 'used', ['default', 'high']],
+          ['model-older', 'used', ['default', 'low']],
+        ],
+      ],
+    ];
+  for (const [label, rows, turns, expected] of cases)
+    assert.deepEqual(
+      read(rows, turns)?.models.map((model) => [model.model, model.source, model.efforts]),
+      expected,
+      label,
+    );
 });

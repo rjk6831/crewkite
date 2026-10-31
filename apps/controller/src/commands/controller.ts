@@ -517,7 +517,7 @@ export class Controller {
   private localVision: { modelKey: string; vision: boolean } | null = null;
 
   // The Anthropic client's picker rows, read in the background. A read that fails leaves the last
-  // rows in place, or none, and the catalog then shows the shipped list as known.
+  // rows in place, or none, and the catalog then lists the model IDs this home ran turns on.
   private anthropicModelRows: readonly AnthropicLiveModel[] | null = null;
   private anthropicModelRead = { at: Number.NEGATIVE_INFINITY, busy: false };
 
@@ -547,7 +547,17 @@ export class Controller {
       schedule: this.options.schedule,
     })
       .then((rows) => {
-        if (rows && !this.closed) this.anthropicModelRows = rows;
+        if (!rows || this.closed) return;
+        this.anthropicModelRows = rows;
+        // CrewKite ships no Anthropic model names, so an open picker reads again when the list
+        // arrives.
+        this.store.transaction(() =>
+          this.event('chat.catalog', null, 0, {
+            family: 'anthropic',
+            models: Math.min(rows.length, 64),
+            reason: null,
+          }),
+        );
       })
       .catch(() => {})
       .finally(() => {

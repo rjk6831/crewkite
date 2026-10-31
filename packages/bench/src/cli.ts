@@ -2,7 +2,7 @@ import { readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { parseArgs } from 'node:util';
-import { ChatEffortSchema, ChatFamilySchema } from '@crewkite/contracts';
+import { CHAT_KNOWN_EFFORTS, ChatEffortSchema, ChatFamilySchema } from '@crewkite/contracts';
 import { loadTasks, type Task } from './manifest.ts';
 import { type RunReport, RunReportSchema, renderMarkdown, summarize, writeRun } from './report.ts';
 import { runBench, selectTasks } from './runner.ts';
@@ -149,7 +149,9 @@ export async function main(
       values.effort ?? (values.scripted ? 'default' : undefined),
     );
     if (!effort.success)
-      throw new UsageError(`Give --effort as one of ${ChatEffortSchema.options.join(', ')}.`);
+      throw new UsageError(
+        `Give --effort as a level the client names, such as ${CHAT_KNOWN_EFFORTS.join(', ')}.`,
+      );
     const minutes = Number(values['timeout-minutes'] ?? 30);
     if (!Number.isFinite(minutes) || minutes <= 0)
       throw new UsageError('Give --timeout-minutes as a positive number.');

@@ -107,7 +107,7 @@ export function threadEvent(event: Event, taskId: string): CliThreadEvent | null
 export function parseModelFlag(
   value: string,
 ): { family: ChatModelSelection['family']; model: string | null; effort: string | null } | null {
-  const match = /^([a-z]+)(?:\/([^:]+)(?::([a-z]+))?)?$/.exec(value);
+  const match = /^([a-z]+)(?:\/([^:]+)(?::([a-z][a-z0-9._-]*))?)?$/.exec(value);
   const family = ChatFamilySchema.safeParse(match?.[1]);
   if (!match || !family.success) return null;
   if (match[3] && !ChatEffortSchema.safeParse(match[3]).success) return null;
