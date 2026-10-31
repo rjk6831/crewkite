@@ -54,6 +54,11 @@ export async function startScriptedController(
     observations: fixtures.snapshot.usage.map((window) => window.observation),
     identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
     nativeProfiles: () => [unavailableNativeProfile(), scriptedProfile],
+    // The scripted adapter takes any model. These rows stand in for the client's picker.
+    anthropicModels: [
+      { value: 'model-a', model: 'model-a', label: 'Scripted model A', efforts: ['low', 'high'] },
+      { value: 'model-b', model: 'model-b', label: 'Scripted model B', efforts: [] },
+    ],
     nativeSpawn: () => {
       throw new Error('The scripted chat starts no provider client.');
     },

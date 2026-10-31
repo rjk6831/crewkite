@@ -188,6 +188,8 @@ export type ControllerOptions = {
   chatAdapters?: ReadonlyMap<ChatFamily, ChatAdapter>;
   /** The chat client per family, found by version range. Without one, the profiles stand in. */
   chatClients?: ChatClientResolvers;
+  /** Fixed Anthropic picker rows for a scripted setup, in place of reading the client. */
+  anthropicModels?: readonly AnthropicLiveModel[];
 };
 
 export class Controller {
@@ -288,6 +290,7 @@ export class Controller {
 
   constructor(options: ControllerOptions) {
     this.options = options;
+    this.anthropicModelRows = options.anthropicModels ?? null;
     this.usageResolution = options.googleUsageClient?.() ?? resolveGoogleUsageClient();
     this.profiles = [];
     this.home = options.home;
@@ -523,6 +526,7 @@ export class Controller {
 
   /** Starts a picker read when the last one is old. A catalog read never waits for it. */
   private refreshAnthropicModels(profiles: NativeProfileResolution[]) {
+    if (this.options.anthropicModels) return;
     const read = this.anthropicModelRead;
     const client = this.chatClientFor('anthropic', profiles).profile?.client;
     const now = Date.parse(this.now());

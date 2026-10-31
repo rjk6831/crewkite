@@ -127,6 +127,11 @@ export async function startDemoController(
         : () => configuredIdentity(directory),
     ...(options.chatScript && {
       nativeProfiles: () => [unavailableNativeProfile(), scriptedProfile],
+      // The scripted adapter takes any model. These rows stand in for the client's picker.
+      anthropicModels: [
+        { value: 'model-a', model: 'model-a', label: 'Scripted model A', efforts: ['low', 'high'] },
+        { value: 'model-b', model: 'model-b', label: 'Scripted model B', efforts: [] },
+      ],
       nativeSpawn: () => {
         throw new Error('The scripted chat does not start a provider client.');
       },
