@@ -14,7 +14,7 @@ import { AttachmentChips, chipOf, FileChips } from './attach.tsx';
 import { FailureLine, PermissionCard, ThinkingCard, ToolCard, ToolRunCard } from './cards.tsx';
 import { FamilyMark } from './family-mark.tsx';
 import { Markdown } from './markdown.tsx';
-import { effortLabels } from './model-picker.tsx';
+import { effortLabel } from './model-picker.tsx';
 import { ReplyMenu } from './reply-menu.tsx';
 import { markMatches } from './reveal-dom.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
@@ -26,15 +26,9 @@ import { layoutRows, mountPlan, rowTop, rowWindow } from './virtual-window.ts';
  * `OpenAI · large-1 · Ultra`, after the family mark. A default effort is left out: the client
  * picked it and the label would say nothing.
  */
-export function modelLine(selection: {
-  family: string;
-  model: string;
-  effort?: keyof typeof effortLabels;
-}) {
+export function modelLine(selection: { family: string; model: string; effort?: string }) {
   const effort =
-    selection.effort && selection.effort !== 'default'
-      ? ` · ${effortLabels[selection.effort]}`
-      : '';
+    selection.effort && selection.effort !== 'default' ? ` · ${effortLabel(selection.effort)}` : '';
   return `${familyName(selection.family)} · ${selection.model}${effort}`;
 }
 

@@ -18,7 +18,7 @@ import { MODEL_ID, modelGroups } from './model-groups.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 
-export const effortLabels: Record<ChatEffort, string> = {
+const knownEffortLabels: Readonly<Record<string, string>> = {
   minimal: 'Minimal',
   low: 'Low',
   medium: 'Medium',
@@ -28,6 +28,10 @@ export const effortLabels: Record<ChatEffort, string> = {
   max: 'Max',
   default: 'Default',
 };
+/** The label of an effort. A level a client added since shows its own name, first letter up. */
+export const effortLabel = (effort: ChatEffort): string =>
+  knownEffortLabels[effort] ??
+  `${effort.charAt(0).toUpperCase()}${effort.slice(1).replaceAll(/[-_.]/g, ' ')}`;
 
 /**
  * The efforts one model offers. Every place that edits a selection uses it, so labels match. A
@@ -52,11 +56,11 @@ export function EffortSelect({
       onChange={(event) => onChange(event.target.value as ChatEffort)}
     >
       {!efforts.includes(value) && (
-        <option value={value}>{effortLabels[value]} (not available now)</option>
+        <option value={value}>{effortLabel(value)} (not available now)</option>
       )}
       {efforts.map((effort) => (
         <option key={effort} value={effort}>
-          {effortLabels[effort]}
+          {effortLabel(effort)}
         </option>
       ))}
     </select>
@@ -354,6 +358,12 @@ export function ModelPicker({
                       <em>{older.length}</em>
                     </button>
                     {(shown ? older : kept).map(item)}
+                  </>
+                )}
+                {groups.used.length > 0 && (
+                  <>
+                    <p className="th-menu-sub">Used before on this account</p>
+                    {groups.used.map(item)}
                   </>
                 )}
                 {groups.known.length > 0 && (
