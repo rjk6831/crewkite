@@ -144,7 +144,7 @@ export function GoogleSetup({
   const connected = workspace.connection === 'connected' && !workspace.preview;
   // A step whose ownership is unknown runs nothing this card can follow. It waits for Clear.
   const active = !!setup?.operationId && setup.state !== 'unknown';
-  const installing = !!installation?.operationId;
+  const installing = !!installation?.operationId && installation.state !== 'unknown';
   const installed = installation?.state === 'installed' || !!setup?.client;
   const installUnknown = installation?.state === 'unknown';
   const unknown = setup?.state === 'unknown' || installUnknown;
@@ -166,7 +166,8 @@ export function GoogleSetup({
   // A setup started from another card, or before this one opened, keeps running in the controller.
   // Follow it, so the card shows the step and turns Connect off until it ends.
   useEffect(() => {
-    if (!(active || installing) || requested || pollAbort.current) return;
+    // After a 15-minute follow times out the card stops reading every second and says so.
+    if (!(active || installing) || requested || pollAbort.current || pollTimedOut) return;
     startPolling(generation.current);
   });
 
