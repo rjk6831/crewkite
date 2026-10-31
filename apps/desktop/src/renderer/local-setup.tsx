@@ -65,7 +65,12 @@ export function LocalSetup({
   const endpointError = endpoint.length > 0 && !parsedEndpoint.success;
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const busy = Boolean(workspace.pending || requested);
-  const owned = Boolean(setup?.operation || (setup && setup.generation !== 'idle'));
+  // The model read the card starts on its own, on open, every 15 seconds and when the window
+  // comes back, leaves the controls as they were. Greying them for each read made Settings blink.
+  const backgroundRead = quiet && setup?.operation?.kind === 'discovery';
+  const owned = Boolean(
+    (setup?.operation && !backgroundRead) || (setup && setup.generation !== 'idle'),
+  );
   const blocked = !connected || busy || workspace.retryAvailable || !setup || owned;
   const models = setup?.observation?.models;
   const selectedChoice = models?.find((model) => model.selectionId === choiceId);
@@ -270,8 +275,16 @@ export function LocalSetup({
         }
       });
   }
+  // The controls stay on during a background read, and the controller refuses a change while it
+  // runs. Say so plainly.
+  function readingInBackground() {
+    if (!observing.current) return false;
+    setMessage('Local is reading its models. Try again in a moment.');
+    return true;
+  }
   async function action(name: string, command: DesktopCommand) {
     if (!connected || workspace.retryAvailable || requested) return;
+    if (readingInBackground()) return;
     setRequested(name);
     setMessage(null);
     setConfirming(null);
@@ -312,6 +325,7 @@ export function LocalSetup({
   async function connectLocal() {
     if (!setup || !parsedEndpoint.success || !connected || workspace.retryAvailable || requested)
       return;
+    if (readingInBackground()) return;
     stopPolling();
     const generation = actionGeneration.current;
     setRequested('Local connection');
