@@ -3007,16 +3007,19 @@ export class ChatService {
       (crew && role === 'challenger'
         ? this.lastWrite(turn.taskId)
         : history.findLast((entry) => entry.role === 'assistant')?.text) ?? null;
-    if (role === 'advisor') return withNotes(adviceContext(name, directory, answer), notes);
-    if (role === 'ask') return withNotes(askContext(name, directory), notes);
-    if (role === 'challenger') return withNotes(challengeContext(name, directory, answer), notes);
-    if (role === 'orchestrator') return withNotes(orchestratorContext(name, directory), notes);
-    if (role !== 'reviewer') return systemContext(name, directory, turn.selection.family, notes);
+    const { family } = turn.selection;
+    if (role === 'advisor') return withNotes(adviceContext(name, directory, family, answer), notes);
+    if (role === 'ask') return withNotes(askContext(name, directory, family), notes);
+    if (role === 'challenger')
+      return withNotes(challengeContext(name, directory, family, answer), notes);
+    if (role === 'orchestrator')
+      return withNotes(orchestratorContext(name, directory, family), notes);
+    if (role !== 'reviewer') return systemContext(name, directory, family, notes);
     const base = thread.base ?? '';
     // The brief says why the changes could not be read, and the model works from the files.
     const files = this.scratchDiff(turn.taskId, root, base, directory);
     return withNotes(
-      reviewContext(name, directory, base, files, crew, this.unreadable.get(turn.taskId)),
+      reviewContext(name, directory, base, files, family, crew, this.unreadable.get(turn.taskId)),
       notes,
     );
   }

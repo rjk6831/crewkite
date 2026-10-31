@@ -97,7 +97,12 @@ export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
 // the app-server then exits before it answers initialize, so the launch override stays on-request.
 const approvalPolicy = (request: ChatTurnRequest) =>
   request.permissionPolicy === 'allow-all' ? 'on-request' : 'untrusted';
-// Review and advice turns read only.
+// Every read-only role (review, advice, challenge, ask, the orchestrator and a read-only slice)
+// runs in the read-only sandbox under `untrusted`. The client reads and searches through shell
+// commands, and it runs the ones on its own read-only list, such as cat, sed -n and rg, without
+// asking. The brief says so (readOnlyRules in chat/prompt.ts), since a brief that forbade every
+// command left the model with no way to read. Any other command comes back as a question, and
+// serverRequest denies it.
 const sandboxMode = (request: ChatTurnRequest) =>
   request.readOnly ? 'read-only' : 'workspace-write';
 // `other` spans every tool CrewKite cannot name, so no thread grant covers it. Only commands and
