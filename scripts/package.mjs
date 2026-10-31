@@ -282,10 +282,15 @@ export async function packageDesktop() {
   const revision = git('rev-parse', 'HEAD');
   // A package built from a checkout that fell behind its remote branch tests old code and the
   // live check then reports fixed bugs again. The warning names the gap; it does not stop the build.
-  for (const ref of ['origin/feat/chat-thread', 'origin/main']) {
+  for (const ref of ['origin/main']) {
     let behind = '';
     try {
-      behind = git('rev-list', '--count', `HEAD..${ref}`);
+      // A ref this clone lacks is no gap to report, so git's own error stays off the screen.
+      behind = execFileSync('git', ['rev-list', '--count', `HEAD..${ref}`], {
+        cwd: source,
+        encoding: 'utf8',
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim();
     } catch {
       continue;
     }
