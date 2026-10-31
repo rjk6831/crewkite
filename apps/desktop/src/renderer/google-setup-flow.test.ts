@@ -270,7 +270,7 @@ test('Google connect progress names the step and counts the download', () => {
   assert.deepEqual(download, {
     step: 'download',
     percent: 25,
-    detail: 'Downloading the official client: 50 percent, 53.8 MB of 108 MB.',
+    detail: 'Downloading the official client: 50%, 53.8 MB of 108 MB.',
   });
   const unpack = googleSetupProgress(
     installing({ step: 'extract', bytes: 0, totalBytes: 401_226_992 }),
@@ -278,6 +278,13 @@ test('Google connect progress names the step and counts the download', () => {
   );
   assert.equal(unpack?.step, 'verify');
   assert.equal(unpack?.percent, 50);
+  assert.equal(
+    googleSetupProgress(
+      installing({ step: 'extract', bytes: 17_900_000, totalBytes: 401_226_992 }),
+      'install',
+    )?.detail,
+    'Unpacking the client: 4%, 17.1 MB of 383 MB.',
+  );
   const verify = googleSetupProgress(
     installing({ step: 'verify', bytes: 401_226_992, totalBytes: 401_226_992 }),
     'install',
