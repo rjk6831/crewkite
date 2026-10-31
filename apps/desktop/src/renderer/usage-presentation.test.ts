@@ -350,7 +350,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         window('weekly', 'weekly', 63, 2880),
         window('weekly-fable', 'weekly', 20, 2880),
       ]),
-      expect: { bars: ['5 h 68%', 'week 63%'], resetsIn: 2880 * 60_000, read: 'Read 2 min ago' },
+      expect: { bars: ['5 h 68%', 'week 63%'], resetsIn: 2880 * 60_000, read: 'read 2 m ago' },
     },
     {
       claim: 'OpenAI primary is the five-hour bar and secondary the weekly bar',
@@ -358,7 +358,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         window('client:primary', 'five-hour', 12, 40),
         window('client:secondary', 'weekly', 70, 4000),
       ]),
-      expect: { bars: ['5 h 12%', 'week 70%'], resetsIn: 40 * 60_000, read: 'Read 2 min ago' },
+      expect: { bars: ['5 h 12%', 'week 70%'], resetsIn: 40 * 60_000, read: 'read 2 m ago' },
     },
     {
       claim: 'a family with one window gets one bar, and an unconnected reader asks for Connect',
@@ -369,7 +369,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         defaultModel: null,
         readAt: at(-125),
       }),
-      expect: { bars: ['99% left'], needsConnect: true, read: 'Read 2 h ago' },
+      expect: { bars: ['99% left'], needsConnect: true, read: 'read 2 h ago' },
     },
     {
       claim: 'Local has no bars, reads No limits and carries the hardware line',

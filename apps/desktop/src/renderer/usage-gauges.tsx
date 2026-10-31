@@ -63,15 +63,17 @@ export type UsageGaugesProps = {
   label?: string;
 };
 
-export function formatSpan(ms: number) {
+/** A span as "4 h 56 min", or "4 h 56 m" when `short` is set for narrow places such as the rail. */
+export function formatSpan(ms: number, short = false) {
   const minutes = Number.isFinite(ms) ? Math.max(0, Math.floor(ms / 60_000)) : 0;
-  if (minutes < 1) return 'under 1 min';
+  const unit = short ? 'm' : 'min';
+  if (minutes < 1) return `under 1 ${unit}`;
   const days = Math.floor(minutes / 1440);
   const hours = Math.floor((minutes % 1440) / 60);
   const rest = minutes % 60;
   if (days > 0) return hours > 0 ? `${days} d ${hours} h` : `${days} d`;
-  if (hours > 0) return rest > 0 ? `${hours} h ${rest} min` : `${hours} h`;
-  return `${rest} min`;
+  if (hours > 0) return rest > 0 ? `${hours} h ${rest} ${unit}` : `${hours} h`;
+  return `${rest} ${unit}`;
 }
 
 const sourceText: Record<Observation['source'], string> = {

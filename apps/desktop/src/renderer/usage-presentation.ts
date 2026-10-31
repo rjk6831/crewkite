@@ -402,13 +402,23 @@ export function gaugeAge(
   return { label, dotted: minutes > GAUGE_DOTTED_AFTER_MIN };
 }
 
-/** How long ago CrewKite read a report, in minutes and then hours. */
-export function readAgo(readAt: string | null | undefined, nowMs: number): string | null {
+/**
+ * How long ago CrewKite read a report, in minutes and then hours. `short` writes "read 3 m ago"
+ * for the rail, where the line has to fit beside the reset time.
+ */
+export function readAgo(
+  readAt: string | null | undefined,
+  nowMs: number,
+  short = false,
+): string | null {
   const at = readAt ? Date.parse(readAt) : Number.NaN;
   if (!Number.isFinite(at)) return null;
   const minutes = Math.floor(Math.max(0, nowMs - at) / 60_000);
-  if (minutes < 1) return 'Read just now';
-  return minutes < 60 ? `Read ${minutes} min ago` : `Read ${Math.floor(minutes / 60)} h ago`;
+  const read = short ? 'read' : 'Read';
+  if (minutes < 1) return `${read} just now`;
+  return minutes < 60
+    ? `${read} ${minutes} ${short ? 'm' : 'min'} ago`
+    : `${read} ${Math.floor(minutes / 60)} h ago`;
 }
 
 export type RailBar = { text: string; percent: number | null };
@@ -504,7 +514,7 @@ export function railFamilies(
       resetPassed: until !== null && until <= 0,
       needsConnect: !entry.connected && !setUp,
       setUp,
-      read: readAgo(entry.readAt, nowMs),
+      read: readAgo(entry.readAt, nowMs, true),
       detail:
         entry.family === 'local'
           ? localFacts(options.hardware, options.localSetup, entry.lastTurnStats).line

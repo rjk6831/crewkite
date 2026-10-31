@@ -1494,11 +1494,19 @@
   font-size: 13px;
   line-height: 12px;
 }
+/* One line at the rail's width. The figures are short, and a name that still runs long is cut. */
 .rail-usage-reset {
   display: flex;
   justify-content: space-between;
   gap: 8px;
+  min-width: 0;
   color: var(--text-dim);
+  white-space: nowrap;
+}
+.rail-usage-reset > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .rail-usage-connect {
   justify-self: start;
