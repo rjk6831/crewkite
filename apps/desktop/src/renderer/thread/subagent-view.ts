@@ -1,6 +1,6 @@
 import type { ChatRole, SubagentState } from '@crewkite/contracts';
 import { familyName } from '../family-name.ts';
-import type { Block, SubagentActivity, TurnIdentity } from './turn-fold.ts';
+import { type Block, type SubagentActivity, shownRole, type TurnIdentity } from './turn-fold.ts';
 
 // What the turn chip and a spawn card say about a turn and the subagents its client started.
 // Pure, so the words and states are tested without a renderer.
@@ -18,6 +18,8 @@ const chipRoles: Record<ChatRole, string> = {
 
 export type TurnChip = {
   role: string;
+  /** `Slice 2` on a turn a plan slice opened, else null. */
+  slice: string | null;
   family: TurnIdentity['family'];
   familyName: string;
   model: string;
@@ -30,7 +32,8 @@ export function turnChip(
   label: (family: string, model: string) => string = (_family, model) => model,
 ): TurnChip {
   return {
-    role: chipRoles[identity.role],
+    role: chipRoles[shownRole(identity)],
+    slice: identity.slice === undefined ? null : `Slice ${identity.slice}`,
     family: identity.family,
     familyName: familyName(identity.family),
     model: label(identity.family, identity.model),

@@ -34,13 +34,14 @@ export function TurnChip({ turn }: { turn: TurnView }) {
     <header className="th-turn-head sa-head">
       <span
         className={`sa-chip family-${chip.family}`}
-        title={`${chip.role}, ${chip.familyName} ${chip.model}${chip.effort ? `, ${effortLabel(chip.effort)} effort` : ''}`}
+        title={`${chip.slice ? `${chip.slice}, ` : ''}${chip.role}, ${chip.familyName} ${chip.model}${chip.effort ? `, ${effortLabel(chip.effort)} effort` : ''}`}
       >
         <span className="sa-seg sa-role">
           <FamilyMark family={chip.family} />
           <span>{chip.role}</span>
           <span className="th-sr">{chip.familyName}</span>
         </span>
+        {chip.slice && <span className="sa-seg sa-slice">{chip.slice}</span>}
         <span className="sa-seg sa-model">{chip.model}</span>
         {chip.effort && <span className="sa-seg sa-effort">{effortLabel(chip.effort)}</span>}
       </span>

@@ -73,7 +73,7 @@ const TurnRow = memo(function TurnRow({
     identity?.role === 'orchestrator' ? planlessText(text) : text;
   return (
     <article
-      className={`th-row th-assistant${identity?.role === 'ask' ? ' is-side' : ''}`}
+      className={`th-row th-assistant${identity?.role === 'ask' && identity.slice === undefined ? ' is-side' : ''}`}
       aria-busy={!turn.ended}
       data-turn-id={turn.id}
     >
