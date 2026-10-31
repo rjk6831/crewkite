@@ -7,6 +7,7 @@ import {
 } from '@crewkite/contracts';
 import { useEffect, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
+import { formatLocalTime } from './format-time.ts';
 import {
   type GoogleSetupStage,
   pollGoogleSetupStatus,
@@ -261,7 +262,9 @@ export function GoogleSetup({
         </p>
       ))}
       {termsAcknowledged ? (
-        <p className="muted small">You acknowledged this on {setup?.googleTerms?.at}.</p>
+        <p className="muted small">
+          You acknowledged this on {formatLocalTime(setup?.googleTerms?.at) ?? 'an unknown date'}.
+        </p>
       ) : (
         <label className="check-row small">
           <input
