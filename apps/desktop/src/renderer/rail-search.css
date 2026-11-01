@@ -12,8 +12,10 @@
   border-radius: 5px;
   color: var(--text-dim);
 }
-.rs-field:focus-within {
+.rs-field:has(.rs-input:focus-visible) {
   border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
 }
 .rs-input {
   flex: 1;
