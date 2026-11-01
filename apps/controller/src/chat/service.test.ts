@@ -2351,7 +2351,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           return;
         }
         if (row.card === null) {
-          assert.match(asked[1]?.prompt ?? '', /^The plan did not pass validation\. /, row.name);
+          assert.match(asked[1]?.prompt ?? '', /^The plan did not pass validation\. /m, row.name);
           assert.match(asked[1]?.prompt ?? '', /^> Fix the rounding\.$/m, row.name);
           return;
         }
@@ -2738,6 +2738,17 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         row.name,
       );
       assert.ok(!after.messages.some((message) => message.text.startsWith('Plan stopped')));
+      // The next orchestrator turn reads the earlier plan and its slice results (H10).
+      const planning = openai.requests.at(-1)?.prompt ?? '';
+      assert.match(planning, /^Conversation so far, oldest first:/m, row.name);
+      assert.match(planning, /^Slice 1 of 4 in plan p1: Part 1$/m, row.name);
+      assert.match(
+        planning,
+        /^The last plan in this thread:\nGoal: Split it\.\nPlan: finished\.$/m,
+        row.name,
+      );
+      assert.match(planning, /^Slice 1, Part 1: done, on OpenAI \(openai-model\)\.$/m, row.name);
+      assert.match(planning, /^Slice 2, Part 2: done, on Local \(local-model\)\.$/m, row.name);
       const fourth = read.turns.find((turn) => turn.slice === 4);
       assert.equal(held[fourth?.id ?? ''], true, row.name);
       const finished = lines.filter((line) => /^Slice \d finished/.test(line));
