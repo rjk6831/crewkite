@@ -1,5 +1,5 @@
 import type { ChatCheckRun, ChatChecksState, ChatThread } from '@crewkite/contracts';
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import './checks-card.css';
 
 const statusLabel: Record<ChatCheckRun['status'], string> = {
@@ -151,6 +151,7 @@ export function ChecksSettings({
 }) {
   const [command, setCommand] = useState('');
   const [error, setError] = useState<string | null>(null);
+  const field = useRef<HTMLInputElement>(null);
   const items = thread?.checks?.items ?? [];
   // The first look at a thread asks the controller to read the project files.
   const unread = !!thread && !thread.checks;
@@ -174,12 +175,23 @@ export function ChecksSettings({
   return (
     <fieldset className="th-checks-settings" disabled={!thread}>
       <legend>Project checks</legend>
-      {items.length === 0 ? (
-        <p className="th-muted">
-          {thread?.checks
-            ? 'No test, lint or type check was found in the project files.'
-            : 'The controller has not read the project files yet.'}
-        </p>
+      {items.length === 0 && thread?.checks ? (
+        <div className="th-checks-empty">
+          <p className="th-muted">
+            No checks found. CrewKite looks for package.json scripts, pytest in pyproject.toml or
+            pytest.ini, ruff and mypy tables, Cargo.toml, go.mod and Makefile test, lint and
+            typecheck targets.
+          </p>
+          <button
+            type="button"
+            className="th-pill th-outline"
+            onClick={() => field.current?.focus()}
+          >
+            Add a command
+          </button>
+        </div>
+      ) : items.length === 0 ? (
+        <p className="th-muted">The controller has not read the project files yet.</p>
       ) : (
         <ul>
           {items.map((item) => (
@@ -220,6 +232,7 @@ export function ChecksSettings({
         <label>
           Add a command
           <input
+            ref={field}
             value={command}
             placeholder="node scripts/check.js"
             onChange={(event) => setCommand(event.target.value)}

@@ -11,8 +11,10 @@ export const ChatCheckKindSchema = z.enum(['test', 'lint', 'typecheck', 'custom'
 export const ChatCheckSourceSchema = z.enum([
   'package.json',
   'pyproject.toml',
+  'pytest.ini',
   'Makefile',
   'Cargo.toml',
+  'go.mod',
   'custom',
 ]);
 
