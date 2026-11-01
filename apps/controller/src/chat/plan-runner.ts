@@ -683,7 +683,7 @@ export class PlanRunner {
       this.host.line(
         task,
         slice.readOnly
-          ? `Slice ${id} finished: it only read.`
+          ? `Slice ${id} finished. No files changed.`
           : resolved
             ? `Slice ${id} finished: the orchestrator merged it in the thread copy.${left}`
             : `Slice ${id} finished: ${plural(applied.length, 'file', 'files')} merged.${left}`,
