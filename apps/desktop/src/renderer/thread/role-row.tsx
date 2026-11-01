@@ -1,9 +1,10 @@
-import type {
-  ChatCatalogRead,
-  ChatFamily,
-  ChatModelSelection,
-  ChatRole,
-  ChatThread,
+import {
+  type ChatCatalogRead,
+  type ChatFamily,
+  type ChatModelSelection,
+  type ChatRole,
+  type ChatThread,
+  rankFamilies,
 } from '@crewkite/contracts';
 import { type KeyboardEvent, useEffect, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
@@ -29,13 +30,36 @@ export const QUICK_QUESTION = 'Quick question';
 export const askLabel = (selection: ChatModelSelection | null) =>
   selection ? `Send to ${familyName(selection.family)}` : 'Send the question';
 
+/** The row's note when no model is picked and no provider offers a default. */
+export const PICK_A_MODEL = 'Pick a model in the row to send.';
+
+// A connected family whose client lists no models still names the model it runs by default.
+function providerDefault(
+  catalog: ChatCatalogRead | null,
+  exclude: readonly ChatFamily[] = [],
+): ChatModelSelection | null {
+  const [entry] = rankFamilies(catalog?.families ?? [], exclude).filter(
+    (value) => value.defaultModel,
+  );
+  return entry?.defaultModel
+    ? { family: entry.family, model: entry.defaultModel, effort: 'default' }
+    : null;
+}
+
 // The default is a family other than the one that answered last, so the second look is
-// independent. With one connected family, that family is the only choice.
+// independent. With one connected family, that family is the only choice. A family whose client
+// lists no models takes its default model.
 function roleDefault(
   catalog: ChatCatalogRead | null,
   answeredBy: ChatFamily | null,
 ): ChatModelSelection | null {
-  return (answeredBy ? defaultSelection(catalog, [answeredBy]) : null) ?? defaultSelection(catalog);
+  const exclude = answeredBy ? [answeredBy] : null;
+  return (
+    (exclude ? defaultSelection(catalog, exclude) : null) ??
+    defaultSelection(catalog) ??
+    (exclude ? providerDefault(catalog, exclude) : null) ??
+    providerDefault(catalog)
+  );
 }
 
 /**
@@ -85,7 +109,7 @@ export function useRoleRun({
   function why(action: RowAction): string | null {
     if (blocked) return blocked;
     if (running && action !== 'ask') return 'Wait for the current turn to finish.';
-    if (!defaultSelection(catalog)) return 'No connected provider has allowance left.';
+    if (!roleDefault(catalog, null)) return 'No connected provider has allowance left.';
     if (action === 'ask') return null;
     if (action === 'reviewer' && !thread?.scratchReady)
       return 'There is no scratch copy to review yet.';
@@ -100,7 +124,8 @@ export function useRoleRun({
     setRole(action);
   }
   async function run() {
-    if (!role || !taskId || !picked || blocked) return;
+    if (!role || !taskId || blocked) return;
+    if (!picked) return onNote(PICK_A_MODEL);
     if (role !== 'ask' && running) return;
     try {
       if (role === 'ask') {
@@ -147,6 +172,7 @@ export function useRoleRun({
           onSelect={setPick}
           label={`${role === 'ask' ? QUICK_QUESTION : roleActions[role].label}: provider and model`}
         />
+        {!picked && <span className="th-row-note">{PICK_A_MODEL}</span>}
         {role === 'ask' ? (
           <button
             type="button"
