@@ -16,9 +16,17 @@ import {
   type Task,
   writesScratch,
 } from '@crewkite/contracts';
+import { isLocalFitFailure } from '../providers/local/chat.ts';
 import type { ChecksOutcome } from './checks.ts';
 import { detectType } from './files.ts';
-import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
+import {
+  assignPlan,
+  hasPlanBlock,
+  type PlanFile,
+  type PlanInputs,
+  parsePlan,
+  ruledOut,
+} from './plan.ts';
 import {
   laneCopy,
   laneFolder,
@@ -30,7 +38,14 @@ import {
   replayLane,
   resolveBrief,
 } from './plan-lanes.ts';
-import { familyName, fixerBrief, PLAN_RETRY, planRetryText, sliceBrief } from './prompt.ts';
+import {
+  familyName,
+  fixerBrief,
+  localSliceBrief,
+  PLAN_RETRY,
+  planRetryText,
+  sliceBrief,
+} from './prompt.ts';
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
 type Effects = (() => void)[];
@@ -131,6 +146,8 @@ export class PlanRunner {
    * checks, then `chain` while the fix or the challenge after them runs on the thread copy.
    */
   private readonly closing = new Map<string, 'checks' | 'chain'>();
+  /** The model and effort a Retry picked for a slice, by task and slice, until the slice starts. */
+  private readonly retried = new Map<string, ChatModelSelection>();
 
   constructor(host: PlanHost) {
     this.host = host;
@@ -248,8 +265,45 @@ export class PlanRunner {
     }
   }
 
+  /**
+   * Retry under a failed slice turn runs that slice again, on the model the person picked, the
+   * crew builder unless they picked another. In Balanced and Glide the plan goes on from there:
+   * the slices not done queue behind it. Manual runs the one slice.
+   */
+  retrySlice(
+    task: Task,
+    turn: ChatTurn,
+    picked: ChatModelSelection | undefined,
+    effects: Effects,
+  ): CommandResult {
+    const thread = this.host.thread(task.id);
+    const plan = thread.plan;
+    const slice = plan && turn.slice !== undefined ? find(plan, turn.slice) : undefined;
+    if (!plan || !slice)
+      return blocked('plan-not-found', 'Refresh the thread and use the plan card shown.');
+    const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
+    const selection = picked ?? builder;
+    if (!selection) return blocked('selection-unavailable', 'Pick a provider and model.');
+    const listed = this.host
+      .catalog(task.id)
+      .families.find((entry) => entry.family === selection.family && entry.connected)
+      ?.models.some((model) => model.model === selection.model);
+    if (!listed)
+      return blocked('selection-unavailable', 'Pick a model a connected provider lists.');
+    const own = selection.family === builder?.family && selection.model === builder.model;
+    const reason = `Slice ${slice.id} (${slice.difficulty}) assigned to ${familyName[selection.family]} (${selection.model}): ${own ? "Builder, the crew's model" : 'picked on Retry'}.`;
+    return this.run({ taskId: task.id, planId: plan.planId, sliceId: slice.id }, effects, {
+      assignment: { family: selection.family, model: selection.model, reason },
+      selection,
+    });
+  }
+
   /** Run a proposed plan, or one slice of it. */
-  run(payload: Payload<'RunChatPlan'>, effects: Effects): CommandResult {
+  run(
+    payload: Payload<'RunChatPlan'>,
+    effects: Effects,
+    retry?: { assignment: NonNullable<Slice['assignment']>; selection: ChatModelSelection },
+  ): CommandResult {
     const task = this.host.task(payload.taskId);
     if (!task) return blocked('task-not-found');
     const thread = this.host.thread(task.id);
@@ -295,11 +349,17 @@ export class PlanRunner {
       changes[slice.id] = { assignment: { ...candidate, reason } };
       picked.push(reason);
     }
-    // One slice runs alone, so every other slice that is not done waits as not run. A blocked
-    // slice runs again from a fresh copy.
+    if (retry && one) {
+      changes[one.id] = { assignment: retry.assignment };
+      this.retried.set(`${task.id}:${one.id}`, retry.selection);
+    }
+    // One slice runs alone, so every other slice that is not done waits as not run. A retry in
+    // Balanced or Glide goes on with the plan, so the rest queue behind it. A blocked slice runs
+    // again from a fresh copy.
+    const continues = !!retry && thread.flightMode !== 'manual';
     for (const slice of plan.slices)
       if (slice.status !== 'done') {
-        const runs = !one || slice.id === one.id;
+        const runs = !one || slice.id === one.id || continues;
         changes[slice.id] = {
           ...changes[slice.id],
           status: runs ? 'queued' : 'not-run',
@@ -349,7 +409,11 @@ export class PlanRunner {
     if (turn.state !== 'done') return;
     const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
     if (!builder) return;
-    const parsed = parsePlan(this.host.reply(turn) ?? '');
+    const reply = this.host.reply(turn) ?? '';
+    // A reply with no plan block answered the person directly, as the brief asks for a question
+    // or a request that changes no file. Nothing more runs.
+    if (!hasPlanBlock(reply)) return;
+    const parsed = parsePlan(reply);
     if ('error' in parsed) {
       const retried = this.host.message(turn)?.startsWith(PLAN_RETRY);
       if (!retried && !sentMessage(thread) && !thread.activeTurnId) {
@@ -371,11 +435,16 @@ export class PlanRunner {
       return;
     }
     const plan = parsed.plan;
-    const slices = assignPlan(plan, {
+    const fixer = thread.crew?.members.find((member) => member.role === 'fixer')?.selection;
+    const { rows: slices, unassigned } = assignPlan(plan, {
       families: this.host.catalog(task.id).families,
       mode: thread.handoffMode,
       now: Date.parse(this.host.now()),
       builder,
+      fixer: fixer ?? null,
+      autoHandoff: thread.autoHandoff,
+      // The message the orchestrator answered, or on its retry the request it quotes.
+      excluded: ruledOut(this.host.message(turn) ?? ''),
       localContext: this.host.localContext(),
       localSliceFits: this.host.localSliceFits,
       files: this.files(task.id, plan),
@@ -388,14 +457,12 @@ export class PlanRunner {
       slices,
     };
     this.host.putThread(task, { ...thread, plan: state });
-    // The plan card shows each assignment and its reason, so only a slice with no family to run
+    // The plan card shows each assignment and its reason, so only a slice with no model to run
     // on gets a line of its own.
-    for (const slice of slices)
-      if (!slice.assignment)
-        this.host.line(
-          task,
-          `Slice ${slice.id} (${slice.difficulty}) has no family to run on: no connected family has allowance left.`,
-        );
+    for (const slice of slices) {
+      const why = unassigned[slice.id];
+      if (!slice.assignment && why) this.host.line(task, why);
+    }
     if (state.phase === 'running') this.pump(task, effects);
   }
 
@@ -406,19 +473,18 @@ export class PlanRunner {
   private step(task: Task, thread: ChatThread, plan: ChatPlanState, slice: Slice, turn: ChatTurn) {
     const lane = slice.lane as Lane;
     const id = slice.id;
+    if (turn.state !== 'done' && this.handOn(task, thread, plan, slice, turn)) return true;
     if (turn.state !== 'done') {
       const stopped = turn.state === 'stopped';
       const status = lane.step === 'resolve' ? 'blocked' : stopped ? 'not-run' : 'failed';
       this.put(task, thread, plan, { [id]: { status, lane: undefined } });
       this.halt(
         task,
-        sentMessage(thread)
-          ? 'you sent a new message'
-          : stopped
-            ? 'you stopped the reply'
-            : lane.step === 'resolve'
-              ? `the orchestrator could not resolve slice ${id}`
-              : `slice ${id} failed. Run it again from the plan card`,
+        stopped
+          ? 'you stopped the reply'
+          : lane.step === 'resolve'
+            ? `the orchestrator could not resolve slice ${id}`
+            : `slice ${id} failed. Run it again from the plan card`,
         true,
       );
       return false;
@@ -476,6 +542,49 @@ export class PlanRunner {
   }
 
   /**
+   * A Local slice whose work did not fit the window goes to the crew builder, once, when the crew
+   * runs on its own. The slice starts over from a fresh copy. True when it was handed on.
+   */
+  private handOn(
+    task: Task,
+    thread: ChatThread,
+    plan: ChatPlanState,
+    slice: Slice,
+    turn: ChatTurn,
+  ) {
+    const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
+    if (
+      turn.state !== 'failed' ||
+      slice.lane?.step !== 'build' ||
+      turn.selection.family !== 'local' ||
+      !isLocalFitFailure(turn.failure) ||
+      thread.flightMode === 'manual' ||
+      sentMessage(thread) ||
+      !builder ||
+      builder.family === 'local'
+    )
+      return false;
+    const name = familyName[builder.family];
+    this.put(task, thread, plan, {
+      [slice.id]: {
+        status: 'queued',
+        turnId: null,
+        lane: undefined,
+        assignment: {
+          family: builder.family,
+          model: builder.model,
+          reason: `Slice ${slice.id} (${slice.difficulty}) assigned to ${name}: it did not fit Local's context.`,
+        },
+      },
+    });
+    this.host.line(
+      task,
+      `Slice ${slice.id} did not fit on Local, so the builder on ${name} takes it. ${turn.failure?.message ?? ''}`.trim(),
+    );
+    return true;
+  }
+
+  /**
    * Move the plan as far as it goes now: merge finished slices in plan order, open every lane
    * step whose family is free, start every ready slice, and close the plan after the last one.
    */
@@ -483,15 +592,8 @@ export class PlanRunner {
     let thread = this.host.thread(task.id);
     // After the last slice the checks and the crew chain move the plan on.
     if (thread.plan?.phase !== 'running' || this.closing.has(task.id)) return;
-    const lanes = () =>
-      (thread.plan as ChatPlanState).slices.filter(
-        (slice) => slice.lane && !slice.lane.pending && slice.turnId && this.open(slice.turnId),
-      );
-    // A message from the person ends the plan once its running turns end.
-    if (sentMessage(thread)) {
-      if (!lanes().length) this.halt(task, 'you sent a new message', true);
-      return;
-    }
+    // A message from the person waits in the queue while the plan runs, like any other message,
+    // and starts once the plan has ended.
     const done = new Set(thread.plan.slices.filter((s) => s.status === 'done').map((s) => s.id));
     const homeless = thread.plan.slices.find(
       (s) => s.status === 'queued' && !s.assignment && s.depends.every((dep) => done.has(dep)),
@@ -553,7 +655,14 @@ export class PlanRunner {
     }
     const lane: Lane = { step: 'build', pending: true, rounds: 0, fixes: 0, build: null };
     const saved = this.put(task, thread, plan, { [slice.id]: { status: 'running', lane } });
-    const selection = this.selection(task.id, saved, slice.assignment);
+    // A Retry keeps the effort the person picked with the model.
+    const key = `${task.id}:${slice.id}`;
+    const chosen = this.retried.get(key);
+    this.retried.delete(key);
+    const selection =
+      chosen && chosen.family === slice.assignment.family && chosen.model === slice.assignment.model
+        ? chosen
+        : this.selection(task.id, saved, slice.assignment);
     return this.openStep(task, saved, { ...slice, status: 'running', lane }, selection, effects);
   }
 
@@ -577,7 +686,11 @@ export class PlanRunner {
         this.halt(task, `the orchestrator's reply for slice ${id} is gone`, true);
         return this.host.thread(task.id);
       }
-      text = sliceBrief(source, brief, slice.assignment.reason);
+      // Local gets the compact brief, since its window has to hold the files as well.
+      text =
+        selection.family === 'local'
+          ? localSliceBrief(source, brief)
+          : sliceBrief(source, brief, slice.assignment.reason);
     } else if (lane.step === 'review') text = this.host.reviewBrief;
     else if (lane.step === 'fix') {
       const last = slice.turnId ? this.host.turn(slice.turnId) : undefined;
@@ -682,7 +795,7 @@ export class PlanRunner {
       this.host.line(
         task,
         slice.readOnly
-          ? `Slice ${id} finished: it only read.`
+          ? `Slice ${id} finished. No files changed.`
           : resolved
             ? `Slice ${id} finished: the orchestrator merged it in the thread copy.${left}`
             : `Slice ${id} finished: ${plural(applied.length, 'file', 'files')} merged.${left}`,
@@ -737,7 +850,6 @@ export class PlanRunner {
       if (!task || thread.plan?.phase !== 'running') return;
       if (!result) return this.halt(task, 'the checks could not run', true);
       if (result.outcome === 'stopped') return this.halt(task, 'you stopped the checks', true);
-      if (sentMessage(thread)) return this.halt(task, 'you sent a new message', true);
       const labels = (status: 'passed' | 'failed') =>
         result.runs
           .filter((run) => run.status === status)
@@ -809,14 +921,19 @@ export class PlanRunner {
     return parsed && 'plan' in parsed && parsed.plan.planId === plan.planId ? parsed.plan : null;
   }
 
-  /** The builder's effort on the builder's model, otherwise the model's own default. */
+  /**
+   * The crew member's effort on a crew model, the builder's first, otherwise the model's own
+   * default, as on a slice the handoff rule moved out of the crew.
+   */
   private selection(
     taskId: string,
     thread: ChatThread,
     assignment: NonNullable<Slice['assignment']>,
   ): ChatModelSelection {
-    const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
-    if (builder?.family === assignment.family && builder.model === assignment.model) return builder;
+    const own = ['builder', 'fixer']
+      .map((role) => thread.crew?.members.find((member) => member.role === role)?.selection)
+      .find((value) => value?.family === assignment.family && value.model === assignment.model);
+    if (own) return own;
     const effort = this.host
       .catalog(taskId)
       .families.find((entry) => entry.family === assignment.family)

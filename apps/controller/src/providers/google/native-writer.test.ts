@@ -818,6 +818,64 @@ else {
         diagnostic: null,
       });
     }
+    {
+      // The leader writes a valid result and exits with its group gone. A stalled event loop
+      // runs the expired closure check before the pending pipe close, and the result stands.
+      let settled = false;
+      const timers: Array<{ delay: number; work: () => void; active: boolean }> = [];
+      const signals: NodeJS.Signals[] = [];
+      const child = new EventEmitter() as ReturnType<typeof spawn>;
+      const stdout = new PassThrough();
+      Object.assign(child, { pid: 12347, stdout, stderr: new PassThrough(), unref: () => child });
+      const handle = startGoogleWriter({
+        client,
+        environment,
+        admission,
+        attemptId,
+        repositoryRoot: resolve('.'),
+        directory,
+        temporaryDirectory: runtime,
+        file,
+        task: 'stalled close',
+        timeoutMs: 3000,
+        deadline: 3000,
+        now: () => 0,
+        onSubmitted: () => {},
+        spawn: () => child,
+        groupAbsent: () => true,
+        signalGroup: (_, signal) => {
+          signals.push(signal);
+        },
+        schedule: (work, delay) => {
+          const timer = { delay, work, active: true };
+          timers.push(timer);
+          return () => {
+            timer.active = false;
+          };
+        },
+      });
+      void handle.result.then(() => {
+        settled = true;
+      });
+      const turn = () => new Promise((resolve) => setImmediate(resolve));
+      stdout.write(wire(start));
+      stdout.write(wire(end));
+      await turn();
+      child.emit('exit', 0, null);
+      const check = timers.find((value) => value.active && value.delay === 250);
+      assert(check, 'the exit schedules a closure check');
+      check.active = false;
+      check.work();
+      await turn();
+      assert.deepEqual(signals, [], 'an absent group is never signalled');
+      assert.equal(settled, false, 'the result waits for the pending close');
+      child.emit('close', 0, null);
+      const result = await handle.result;
+      assert.equal(result.reason, null);
+      assert.equal(result.quiescent, true);
+      assert.equal(result.exitCode, 0);
+      assert(result.metadata, 'the written result is kept');
+    }
     for (const content of ['text\0tail', '\ud800'])
       await assert.rejects(
         runGoogleWriter({

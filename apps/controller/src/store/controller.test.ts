@@ -40,6 +40,7 @@ import {
   CommandSchema,
   canonicalJson,
   GoogleAcpProfileSchema,
+  GoogleAcpSetupSchema,
   LocalNativeProfileSchema,
   MAX_FRAME_BYTES,
   type Observation,
@@ -7954,8 +7955,25 @@ test('google quota authority survives retries and restart while sharing one oper
   const context = await setup(t, options, () => controller.close());
   controller = context.controller;
   t.after(() => rmSync(socketRoot, { recursive: true, force: true }));
-  // These rows protect quota authority. The gate has its own claim in google-terms.test.ts.
+  // These rows protect quota authority. The gates have their own claims in google-terms.test.ts
+  // and google-quota-gate.test.ts: the person acknowledged the terms and Google is connected.
+  const connectGoogle = (target: Controller) => {
+    const acknowledged = target.store.googleAcpSetup();
+    target.store.transaction(() =>
+      target.store.putGoogleAcpSetup(
+        GoogleAcpSetupSchema.parse({
+          ...acknowledged,
+          revision: acknowledged.revision + 1,
+          state: 'ready',
+          proofId: 'art_01K7M1N2P3Q4R5S6T7V8W9X0YZ',
+          client: { version: '1.4.0', sha256: fixtureClientHash, signerTeamId: 'EQHXZ8M8AV' },
+          auth: { method: 'oauth-personal', status: 'authenticated' },
+        }),
+      ),
+    );
+  };
   await acknowledgeGoogleTerms(context);
+  connectGoogle(controller);
   const refresh = () => context.command('ObserveUsage', { family: 'google' }, 0);
   assert.equal(controller.snapshot().usageReaders[0]?.available, true);
   assert.equal('enabled' in controller.snapshot().usageReaders[0], false);
@@ -8418,6 +8436,7 @@ test('google quota authority survives retries and restart while sharing one oper
     id: context.id,
   });
   await acknowledgeGoogleTerms({ controller, command: context.command });
+  connectGoogle(controller);
   const interrupted = refresh();
   controller.store.transaction(() => {
     controller.store.beginGoogleMetadata(

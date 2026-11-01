@@ -25,14 +25,17 @@ import {
   CommentChatChangePayloadSchema,
   CompleteChatMentionPayloadSchema,
   ConfigureChatThreadPayloadSchema,
+  type CrewChoiceId,
   DecideChatHunkPayloadSchema,
   DeleteChatPromptPayloadSchema,
   DeleteChatThreadPayloadSchema,
+  DeleteCrewPayloadSchema,
   DiscardChatChangePayloadSchema,
   DiscardChatHunkPayloadSchema,
   EditProjectNotePayloadSchema,
   HandoffChatThreadPayloadSchema,
   ImportChatAttachmentPayloadSchema,
+  ImportSavedCrewsPayloadSchema,
   normalizeNoteText,
   OpenChatPullRequestPayloadSchema,
   type ProjectNotesRead,
@@ -48,16 +51,22 @@ import {
   ReadChatThreadPayloadSchema,
   ReadChatTurnEventsPayloadSchema,
   ReadProjectNotesPayloadSchema,
+  ReadSavedCrewsPayloadSchema,
   RefreshChatModelsPayloadSchema,
   RemoveProjectNotePayloadSchema,
   RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   RetryChatTurnPayloadSchema,
   SaveChatPromptPayloadSchema,
+  SaveCrewPayloadSchema,
+  type SavedCrew,
+  type SavedCrewsRead,
+  SavedCrewsReadSchema,
   type SavedPrompts,
   SavedPromptsSchema,
   SearchChatHistoryPayloadSchema,
   SendChatMessagePayloadSchema,
+  SetDefaultCrewPayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from '@crewkite/contracts';
@@ -217,6 +226,30 @@ async function promptList(source: ThreadSource, command: string, payload: unknow
   const { kind: _kind, ...rest } = (data ?? {}) as Record<string, unknown>;
   return SavedPromptsSchema.parse(rest);
 }
+
+/**
+ * The crews saved in Settings and the default crew. The controller keeps them so the command line
+ * lists the same crews, and every change answers with the whole list.
+ */
+export const readCrews = (source: ThreadSource): Promise<SavedCrewsRead> =>
+  read(source, 'ReadSavedCrews', ReadSavedCrewsPayloadSchema.parse({}), SavedCrewsReadSchema);
+export const saveCrew = (source: ThreadSource, crew: SavedCrew): Promise<SavedCrewsRead> =>
+  read(source, 'SaveCrew', SaveCrewPayloadSchema.parse({ crew }), SavedCrewsReadSchema);
+export const deleteCrew = (source: ThreadSource, id: string): Promise<SavedCrewsRead> =>
+  read(source, 'DeleteCrew', DeleteCrewPayloadSchema.parse({ id }), SavedCrewsReadSchema);
+export const setDefaultCrew = (source: ThreadSource, id: CrewChoiceId): Promise<SavedCrewsRead> =>
+  read(source, 'SetDefaultCrew', SetDefaultCrewPayloadSchema.parse({ id }), SavedCrewsReadSchema);
+export const importCrews = (
+  source: ThreadSource,
+  crews: SavedCrew[],
+  defaultCrew: CrewChoiceId | null,
+): Promise<SavedCrewsRead> =>
+  read(
+    source,
+    'ImportSavedCrews',
+    ImportSavedCrewsPayloadSchema.parse({ crews, defaultCrew }),
+    SavedCrewsReadSchema,
+  );
 
 /**
  * A project's notes. A change answers with a small record, so each change reads the list again and

@@ -20,7 +20,7 @@ export function useProviderActions(workspace: Pick<Workspace, 'metadataCommand'>
 
   async function refreshAnthropic() {
     work('anthropic', true);
-    say('anthropic', 'Reading the native local usage report.');
+    say('anthropic', 'Reading usage.');
     try {
       const result = await workspace.metadataCommand({
         command: 'RefreshAnthropicUsage',
@@ -29,9 +29,8 @@ export function useProviderActions(workspace: Pick<Workspace, 'metadataCommand'>
       });
       say(
         'anthropic',
-        applied(result.outcome)
-          ? 'Native usage report retained. Report age is unknown.'
-          : refusal(result),
+        // A read that landed shows as the Last read time, so it needs no line of its own.
+        applied(result.outcome) ? '' : refusal(result),
       );
     } catch (failure) {
       say('anthropic', failure instanceof Error ? failure.message : 'The usage refresh failed.');

@@ -461,15 +461,22 @@ export class ProviderCommands {
           client = setup.client,
           auth = setup.auth;
         let ready = false;
+        // An initialize whose reply named no personal sign-in has nothing to sign in with. Its
+        // proof is not kept, so the next Connect step is another initialize, never a sign-in that
+        // the client would refuse as if the person had.
+        let incomplete = false;
         if (known && !revoked && !outcome.reason && outcome.metadata) {
           const proof = validateAcpSetupProof(
             outcome.metadata,
             resolution.client as AcpClientIdentity,
             this.options.googleAcp?.reviewMappings,
           );
-          proofId = this.nativeArtifact(proof).id;
+          incomplete =
+            operation === 'initialize' &&
+            !proof.capabilities.authMethods.includes('oauth-personal');
+          proofId = incomplete ? null : this.nativeArtifact(proof).id;
           client = proof.client;
-          auth = proof.auth;
+          auth = incomplete ? setup.auth : proof.auth;
           ready =
             !!proof.reviewMode && !!proof.configOptions && proof.auth.status === 'authenticated';
         }
@@ -480,7 +487,7 @@ export class ProviderCommands {
             ? 'unknown'
             : ready
               ? 'ready'
-              : !revoked && !outcome.reason && operation === 'initialize'
+              : !revoked && !outcome.reason && operation === 'initialize' && !incomplete
                 ? 'authentication-required'
                 : !revoked &&
                     !outcome.reason &&
@@ -498,7 +505,7 @@ export class ProviderCommands {
               ? 'acp-setup-timeout'
               : outcome.reason === 'authentication'
                 ? 'authentication-required'
-                : !revoked && operation === 'discover'
+                : !revoked && (operation === 'discover' || incomplete)
                   ? 'acp-capability-missing'
                   : null,
         });
@@ -563,6 +570,15 @@ export class ProviderCommands {
     } finally {
       runtime.resolve(CommandResultSchema.parse(result));
     }
+    // The quota read waits for Connect. The step that makes the setup ready starts the first one,
+    // once this step's runtime has let go of the Google journal. A harness that drives each step
+    // leaves registration off and reads when it chooses, as it does for the launch steps.
+    if (
+      this.options.registerGoogleAcp &&
+      result.outcome === 'applied' &&
+      this.store.googleAcpSetup().state === 'ready'
+    )
+      void runtime.promise.then(() => this.refreshGoogleUsage('connect')).catch(() => {});
   }
 
   /**
@@ -1371,7 +1387,14 @@ export class ProviderCommands {
             selectedModelKey ??=
               observation?.models.find((choice) => choice.selectionId === selection?.selectionId)
                 ?.identity.modelKey ?? null;
-            const kept = retainedSelection(selectedModelKey, nextObservation);
+            const picked = observation?.models.find(
+              (choice) => choice.selectionId === selection?.selectionId,
+            );
+            const kept = retainedSelection(
+              selectedModelKey,
+              nextObservation,
+              picked?.state === 'installed-unloaded',
+            );
             observation = nextObservation;
             observedAt = this.now();
             observationStale = false;

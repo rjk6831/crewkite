@@ -61,12 +61,20 @@ export type AcpImportResult = {
     | 'pin-conflict'
     | 'invalid-import'
     | 'signature-refused'
+    | 'signature-timeout'
     | 'ownership';
   client: AcpClientIdentity | null;
 };
 
 const KILL_MS = 250;
 const CUTOFF_MS = 1000;
+/**
+ * How long one codesign check may run. Each file gets its own window. codesign hashes every page
+ * of the file, and right after the unpack macOS also scans the new 281 MB and 120 MB files, so
+ * the first check can take many seconds. One shared five-second window for both files ran out
+ * on a first connect and read as a failed signature.
+ */
+export const ACP_SIGNATURE_MS = 60_000;
 
 function synchronous(callback: (() => unknown) | undefined) {
   const result = callback?.();
@@ -91,7 +99,7 @@ function signaturePhase(
       return () => clearTimeout(timer);
     });
   synchronous(dependencies.lifecycle?.beforePhase);
-  if (deadline - now() < 1000) return Promise.reject(new Error('signature-refused'));
+  if (deadline - now() < 1000) return Promise.reject(new Error('signature-timeout'));
   const child = (dependencies.spawn ?? spawn)('/usr/bin/codesign', args, {
     cwd: dirname(executable),
     env: { LANG: 'C', PATH: '/usr/bin:/bin' },
@@ -103,6 +111,7 @@ function signaturePhase(
     let closed = false;
     let finished = false;
     let failed = false;
+    let timedOut = false;
     let stopping = false;
     let killedAt: number | undefined;
     let code: number | null = null;
@@ -128,7 +137,10 @@ function signaturePhase(
       } catch {
         return reject(new Error('signature-refused'));
       }
-      if (failed || code !== 0 || now() >= deadline) return reject(new Error('signature-refused'));
+      // A check that ran out of time proves nothing about the signature. It is a separate reason,
+      // so the connect can run it again. A finished check that codesign refused stays refused.
+      if (timedOut || now() >= deadline) return reject(new Error('signature-timeout'));
+      if (failed || code !== 0) return reject(new Error('signature-refused'));
       try {
         resolve(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(output)));
       } catch {
@@ -219,6 +231,7 @@ function signaturePhase(
       schedule(
         () => {
           failed = true;
+          timedOut = true;
           stop();
         },
         Math.max(0, deadline - now() - 1000),
@@ -377,12 +390,13 @@ export async function importGoogleAcp(
     const executable = join(managed, 'agy_acp_server.par');
     const snapshot = managedSnapshot(options.home, executable);
     const receipts: SignatureReceipt[] = [];
-    const signatureDeadline = (dependencies.now ?? (() => performance.now()))() + 5000;
+    const clock = dependencies.now ?? (() => performance.now());
     try {
       for (const file of files) {
+        const deadline = clock() + ACP_SIGNATURE_MS;
         const receipt = await (
           dependencies.verifySignature ??
-          ((input) => verifyOsSignature(input, dependencies, signatureDeadline))
+          ((input) => verifyOsSignature(input, dependencies, deadline))
         )({ executable: join(managed, file.name), client: { ...client, sha256: file.sha256 } });
         if (
           receipt.verified !== true ||
@@ -406,8 +420,9 @@ export async function importGoogleAcp(
           return refused('invalid-import');
       }
     } catch (error) {
+      const message = error instanceof Error ? error.message : '';
       return refused(
-        error instanceof Error && error.message === 'ownership' ? 'ownership' : 'signature-refused',
+        message === 'ownership' || message === 'signature-timeout' ? message : 'signature-refused',
       );
     }
     const signature = (index: number) => ({

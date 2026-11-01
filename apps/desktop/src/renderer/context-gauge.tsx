@@ -16,6 +16,16 @@ export type ContextGaugeProps = {
   // Kite height in CSS pixels. The button keeps a 32px target at every size.
   size?: number;
   label?: string;
+  /** Amber and red show as the outline and a dot beside the kite. The tiles keep their colors. */
+  tone?: 'neutral' | 'amber' | 'red';
+  /** True while the reading passes the room, so a fold comes first. The top tile dips once. */
+  folding?: boolean;
+  /** Rows and lines that replace the used and capacity figures, with the status they go under. */
+  detail?: {
+    status: string;
+    rows: readonly (readonly [string, string])[];
+    lines: readonly string[];
+  };
 };
 
 type Point = readonly [number, number];
@@ -133,6 +143,9 @@ export function ContextGauge({
   unavailableReason,
   size = 28,
   label = 'Context window',
+  tone = 'neutral',
+  folding = false,
+  detail,
 }: ContextGaugeProps) {
   const uid = useId().replace(/[^a-zA-Z0-9]/g, '');
   const popover = useRef<HTMLDivElement>(null);
@@ -165,6 +178,12 @@ export function ContextGauge({
 
   useEffect(() => () => window.clearTimeout(leaveTimer.current), []);
 
+  // The dip plays once each time the reading starts to pass the room, never while it stays there.
+  const [dips, setDips] = useState(0);
+  useEffect(() => {
+    if (folding) setDips((count) => count + 1);
+  }, [folding]);
+
   const reported = measurement !== 'unknown';
   const used =
     reported && usedTokens !== null && Number.isFinite(usedTokens) && usedTokens >= 0
@@ -192,13 +211,22 @@ export function ContextGauge({
         ? `Last observed ${when}`
         : 'Last observed'
       : `${stale ? 'Stale' : 'Current'}${when ? `, measured ${when}` : ''}`;
-  const status = figures ? phrase : shown ? `Share unknown. ${phrase}` : 'Unknown';
+  const status =
+    figures && detail
+      ? detail.status
+      : figures
+        ? phrase
+        : shown
+          ? `Share unknown. ${phrase}`
+          : 'Unknown';
   const spokenPercent =
     figures?.percent === '<1%' ? 'less than 1 percent' : figures?.percent.replace('%', ' percent');
   const name = [
     label,
     figures ? `${spokenPercent} used` : used !== null ? 'share unknown' : 'usage unknown',
     figures?.over ? 'above capacity' : null,
+    tone === 'red' ? 'nearly full' : tone === 'amber' ? 'filling' : null,
+    folding ? 'older turns will be summarized' : null,
     shown ? spokenMeasurement[measurement] : null,
     updating ? 'updating' : null,
   ]
@@ -243,7 +271,11 @@ export function ContextGauge({
   };
 
   return (
-    <div className={stale ? 'context-gauge is-stale' : 'context-gauge'}>
+    <div
+      className={['context-gauge', stale && 'is-stale', tone !== 'neutral' && `is-${tone}`]
+        .filter(Boolean)
+        .join(' ')}
+    >
       <button
         type="button"
         className="context-gauge-button"
@@ -342,10 +374,10 @@ export function ContextGauge({
               clipPath={`url(#${ids.filled})`}
               mask={`url(#${ids.gaps})`}
             >
-              {TILES.map(([tone, points]) => (
+              {TILES.map(([color, points]) => (
                 <polygon
-                  key={tone}
-                  className={`context-gauge-tile is-${tone}`}
+                  key={color === 'amber' ? `${color}-${dips}` : color}
+                  className={`context-gauge-tile is-${color}${color === 'amber' && dips > 0 ? ' is-dipping' : ''}`}
                   points={points.map((point) => point.join(',')).join(' ')}
                 />
               ))}
@@ -383,6 +415,7 @@ export function ContextGauge({
             </g>
           )}
         </svg>
+        {tone !== 'neutral' && <span className="context-gauge-dot" aria-hidden="true" />}
       </button>
       <div
         ref={popover}
@@ -396,7 +429,18 @@ export function ContextGauge({
         <p className="context-gauge-heading">{label}</p>
         <div id={ids.body}>
           <p className="context-gauge-status">{status}</p>
-          {shown && (
+          {shown && detail && figures && (
+            <dl className="context-gauge-figures">
+              {detail.rows.map(([term, value]) => (
+                <div key={term}>
+                  <dt>{term}</dt>
+                  <dd>{value}</dd>
+                </div>
+              ))}
+            </dl>
+          )}
+          {figures && detail?.lines.map((line) => <p key={line}>{line}</p>)}
+          {shown && !(detail && figures) && (
             <dl className="context-gauge-figures">
               <div>
                 <dt>Used</dt>
@@ -414,9 +458,11 @@ export function ContextGauge({
               )}
             </dl>
           )}
-          {figures?.over && <p>Usage is above the reported capacity. The meter shows full.</p>}
+          {figures?.over && !detail && (
+            <p>Usage is above the reported capacity. The meter shows full.</p>
+          )}
           {figures === null && <p>{reason}</p>}
-          {updating && shown && (
+          {updating && shown && !detail && (
             <p>Updating. The meter moves only when a new measurement arrives.</p>
           )}
           <p className="context-gauge-note">

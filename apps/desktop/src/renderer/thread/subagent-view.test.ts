@@ -62,12 +62,12 @@ test('a plan slice turn names its slice, and a read-only slice reads as the buil
   assert.equal(read.role, 'Builder');
   assert.equal(read.slice, 'Slice 2');
   assert.equal(turnChip({ ...base, role: 'reviewer', slice: 3 }).role, 'Reviewer');
-  assert.equal(turnChip({ ...base, role: 'ask' }).role, 'Ask');
+  assert.equal(turnChip({ ...base, role: 'ask' }).role, 'Side question');
   assert.equal(turnChip({ ...base, role: 'ask' }).slice, null);
   assert.equal(replyLabel({ ...base, role: 'ask', slice: 2 }), 'Slice 2');
   assert.equal(replyLabel({ ...base, role: 'reviewer', slice: 2 }), 'Slice 2 reviewer');
   assert.equal(replyLabel({ ...base, role: 'assistant', slice: 1 }), 'Slice 1');
-  assert.equal(replyLabel({ ...base, role: 'ask' }), 'Ask');
+  assert.equal(replyLabel({ ...base, role: 'ask' }), 'Side question');
 });
 
 test('the chip shows the picker label for a listed model and the ID for one it does not list', () => {
@@ -291,13 +291,12 @@ test('a preset keeps what the person set for each role across a save and passes 
   );
 });
 
-test('the switch line says why OpenAI starts off and why Local has nothing to switch', () => {
+test('the switch line says why Local has nothing to switch and is absent for the others', () => {
   assert.equal(subagentSwitchNote('anthropic'), null);
   assert.equal(subagentSwitchNote('google'), null);
-  assert.equal(subagentSwitchNote('openai')?.disabled, false);
-  assert.match(subagentSwitchNote('openai')?.text ?? '', /approval policy/);
+  assert.equal(subagentSwitchNote('openai'), null);
   assert.equal(subagentSwitchNote('local')?.disabled, true);
-  // A role saved without the switch shows the family default.
-  assert.equal(allowsSubagents({}, 'openai'), false);
+  // A role saved without the switch shows the family default, on for every family.
+  assert.equal(allowsSubagents({}, 'openai'), true);
   assert.equal(allowsSubagents({}, 'anthropic'), true);
 });

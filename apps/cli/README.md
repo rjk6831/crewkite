@@ -19,7 +19,7 @@ A recorded session is in [docs/images/cli-session.txt](../../docs/images/cli-ses
 
 ## Interactive mode
 
-The screen opens with the kite wordmark, in block letters at 72 columns and wider and in two rows below that. Under it sit the thread, the message box, the model the next message goes to and one gauge per provider.
+The screen opens with the kite wordmark, drawn in half and quadrant blocks for twice the resolution of whole blocks: the word with the four panel kite above its last letter at 74 columns and wider, and a small three row kite beside the name below that. Without colour the kite reads as one diamond. Under it sit the thread, the message box, the model the next message goes to and one gauge per provider.
 
 A new thread goes to the registered project of the checkout you started in. The CLI takes that directory from `INIT_CWD` when pnpm set it, else the current directory, and a project matches when its folder name, HEAD commit and branch are the checkout's. When none or several match, the first send opens the thread list and asks which project to use.
 
@@ -44,7 +44,7 @@ A failed turn shows its cause, the provider's own message and the next step, wit
 
 ### Slash commands and mentions
 
-Type `/` for the list. `/new`, `/model [model[:effort]]`, `/provider family`, `/crew`, `/plan`, `/ask question`, `/handoff family`, `/changes`, `/accept [branch]`, `/push`, `/pr`, `/settings`, `/help` and `/prompt name` do what the same entries do in the desktop. `/ask` sends a read-only question to the best ranked family other than the thread's own. `/prompt name [key="value" ...]` puts the saved prompt of that name into the message box with the values filled in, for you to edit and send; a placeholder without a value stays in the text and a note names it, and an unknown name lists the saved prompts.
+Type `/` for the list. `/new`, `/model [model[:effort]]`, `/provider family`, `/crew`, `/plan`, `/ask question`, `/handoff family`, `/changes`, `/accept [branch]`, `/push`, `/pr`, `/settings`, `/help` and `/prompt name` do what the same entries do in the desktop. `/model` with nothing after it opens a list of every connected family's models, grouped by family, with each model's effort levels and the picked one in brackets. Up and Down move, Left and Right change the effort of the highlighted model, typing narrows the list, Enter picks and Esc closes. `/model id` or `/model id:effort` picks a listed model at once, and an ID no connected family lists opens the list filtered by it. `/ask` sends a read-only question to the best ranked family other than the thread's own. `/prompt name [key="value" ...]` puts the saved prompt of that name into the message box with the values filled in, for you to edit and send; a placeholder without a value stays in the text and a note names it, and an unknown name lists the saved prompts.
 
 `@` followed by part of a path offers the project's files and folders, ranked by the shared mention rules, and inserts the path. A path that starts with `/` or `~/`, such as `@~/Desktop/shot.png`, attaches that file from disk: the controller copies it into the thread's files and sends it the way each provider takes it.
 
@@ -54,7 +54,7 @@ Ctrl+G opens Changes: the changed files with their line counts and the diff of t
 
 ### Crew, plan and handoff
 
-`/crew` shows the crew, the flight mode, the permission policy and the handoff mode. 1, 2 and 3 apply the Solo, Pair and Full crew presets; F, P and H cycle the flight mode, permission policy and handoff mode; A turns automatic handoff on or off. `/plan` shows the orchestrator's plan card with each slice's state and assignment. R runs the plan, C cancels it, S stops it, and a slice number runs that slice once its dependencies are done.
+`/crew` shows the crew, the flight mode, the permission policy and the handoff mode, then lists the Solo, Pair and Full crew presets and the crews saved in the desktop's Settings, with the default crew for new threads and the thread's crew marked. Up and Down move, and Enter or the crew's number applies it to the thread, with the flight mode a saved crew brings. The controller keeps the saved crews, so the list matches the desktop's. Building and editing crews stays in the desktop. F, P and H cycle the flight mode, permission policy and handoff mode; A turns automatic handoff on or off. `/plan` shows the orchestrator's plan card with each slice's state and assignment. R runs the plan, C cancels it, S stops it, and a slice number runs that slice once its dependencies are done.
 
 ### Settings and appearance
 

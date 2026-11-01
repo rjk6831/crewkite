@@ -48,3 +48,14 @@ The switch on the card exists because I change the runtime's auth setting from i
 - The README principle reads: "Cloud-provider authentication stays with those clients, and CrewKite never reads or stores a provider credential. The one secret it can keep is the token of a model runtime on this device, only when I turn on Remember the Local token, and Forget removes it."
 - The wording "CrewKite never reads or stores a provider credential" holds for OpenAI, Anthropic and Google. The Local token is not a provider credential, and the sentence says so in plain words.
 - ADR 0025 is still Proposed. When I accept it, it gets a dated amendment that points here for the stored token and the mode switch.
+
+## Amendment, 2026-11-01: the switch is removed
+
+The Local card no longer has the Detect and No token switch. The release candidate d3-rc5 showed that it had nothing left to decide. The probe already runs at the start of every Connect in both saved modes, and only a runtime that answers 401 or 403 opens the token window. So Connect always detects, and the two options behaved the same at connect time. The switch and the line "A change here clears the connection and the model selection." only made the card harder to read.
+
+- Connect from the card saves token mode. A no-token mode saved earlier, by the CLI or by the switch, moves to token mode on the next Connect from the card. The connection and model selection reset once, as for any mode change.
+- On a computer without the macOS keychain, token mode is refused (ADR 0013, amendment of 2026-10-31). There Connect saves the no-token loopback mode and connects through the probe, as before.
+- "Remember the token on this device" appears only after a connect used a token, and only in token mode, since the blob belongs to one endpoint in token mode.
+- The controller keeps both saved values and their checks. The CLI still sets either one with `local configure --authentication`. With either value saved, Connect probes first and asks for a token only on 401 or 403.
+
+The stored token decision above stands. The text above that describes the switch, in Decision, Why and Consequences, records the card before this amendment.

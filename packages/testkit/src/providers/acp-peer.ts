@@ -8,6 +8,9 @@ export const acpPeerCases = [
   'complete',
   'fresh-no-mcp',
   'session-update',
+  'late-config',
+  'no-sign-in',
+  'sign-in-cancelled',
   'permission',
   'hunk',
   'hunk-sequential',
@@ -60,7 +63,7 @@ export const acpPeerCases = [
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
-/** Each transition follows a received message; the peer uses no clock or network. */
+/** Each transition follows a received message, except the late-config update; no network. */
 export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
   assert(acpPeerCases.includes(scenario));
   let cwd = '',
@@ -218,11 +221,17 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
           protocolVersion: scenario === 'bad-version' ? 2 : 1,
           agentInfo: { name: 'fixture', version: '1.4.0' },
           agentCapabilities: { sessionCapabilities: scenario === 'no-close' ? {} : { close: {} } },
-          authMethods: [{ id: 'oauth-personal', name: 'Personal' }],
+          authMethods:
+            scenario === 'no-sign-in' ? [] : [{ id: 'oauth-personal', name: 'Personal' }],
         });
       } else if (message.method === 'authenticate') {
         assert.equal(message.params.methodId, 'oauth-personal');
-        result(message.id, {});
+        // The person closed the browser sign-in.
+        if (scenario === 'sign-in-cancelled')
+          process.stdout.write(
+            `${JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'Sign-in cancelled' } })}\n`,
+          );
+        else result(message.id, {});
       } else if (message.method === 'session/new') {
         cwd = message.params.cwd;
         assert(Array.isArray(message.params.mcpServers));
@@ -263,6 +272,17 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
         if (scenario === 'session-update') {
           process.stdout.write(
             `${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'fixture-session', configOptions: config } })}\n${JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'fixture-session', update: { sessionUpdate: 'available_commands_update', availableCommands: [] } } })}\n`,
+          );
+        } else if (scenario === 'late-config') {
+          // The reply carries no options. They follow in an update a moment later, the one place
+          // the peer waits on a clock.
+          result(message.id, { sessionId: 'fixture-session', configOptions: [] });
+          setTimeout(
+            () =>
+              process.stdout.write(
+                `${JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'fixture-session', update: { sessionUpdate: 'config_option_update', configOptions: config } } })}\n`,
+              ),
+            300,
           );
         } else result(message.id, { sessionId: 'fixture-session', configOptions: config });
       } else if (message.method === 'session/set_config_option') {

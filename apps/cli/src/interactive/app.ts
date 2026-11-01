@@ -11,6 +11,7 @@ import {
   type CliSettings,
   type Event,
   rankFamilies,
+  type SavedCrewsRead,
   type TaskSummary,
 } from '@crewkite/contracts';
 import { Box, type Key, Static, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
@@ -25,10 +26,10 @@ import {
   useState,
 } from 'react';
 import {
-  crewFromPreset,
-  crewPresetNames,
+  crewChoicePatch,
+  crewChoices,
+  defaultChoiceId,
   familyModel,
-  readCrewPresets,
 } from '../../../desktop/src/renderer/settings/preferences.ts';
 import { tryWithChoices } from '../../../desktop/src/renderer/thread/file-fit.ts';
 import {
@@ -64,6 +65,14 @@ import {
 } from './composer-state.ts';
 import { beforeGoogleConnection } from './google-gate.ts';
 import { matches } from './keys.ts';
+import {
+  clampIndex,
+  flatRows,
+  type ModelRow,
+  modelById,
+  modelList,
+  stepEffort,
+} from './pickers.ts';
 import { colorAllowed, familyNames, palette, resolveTheme, safeText } from './theme.ts';
 import {
   type Animation,
@@ -74,6 +83,7 @@ import {
   FamilyMark,
   HelpView,
   handoffLabels,
+  ModelListView,
   PlanCardView,
   policyLabels,
   SettingsView,
@@ -88,7 +98,9 @@ import {
 // draw, the renderer's thread state folds the stream, and the controller decides every command.
 
 type Printed = { key: string; node: ReactNode };
-type View = 'thread' | 'threads' | 'changes' | 'crew' | 'plan' | 'settings' | 'help';
+type View = 'thread' | 'threads' | 'changes' | 'crew' | 'model' | 'plan' | 'settings' | 'help';
+/** The open `/model` list: the typed filter, the cursor and the effort moved on each row. */
+type ModelPick = { filter: string; index: number; efforts: Record<string, string> };
 type Confirm = { question: string; yes: () => void | Promise<void>; no?: () => void };
 type LinePrompt = { label: string; value: string; submit: (value: string) => void | Promise<void> };
 
@@ -171,6 +183,10 @@ export function App(props: AppProps) {
   // The family and model picked with /provider or /model before the first message. The first
   // turn uses it, and the thread's own selection takes over from there.
   const [firstChoice, setFirstChoice] = useState<ChatModelSelection | null>(null);
+  const [modelPick, setModelPick] = useState<ModelPick>({ filter: '', index: 0, efforts: {} });
+  // The crews saved in the desktop, read again each time /crew opens.
+  const [savedCrews, setSavedCrews] = useState<SavedCrewsRead | null>(null);
+  const [crewIndex, setCrewIndex] = useState(0);
   const taskRef = useRef<string | null>(null);
   taskRef.current = taskId;
   const [state, dispatch] = useReducer(threadReducer, initialThreadState(''));
@@ -402,52 +418,53 @@ export function App(props: AppProps) {
         needThread();
         setView('changes');
         break;
-      case 'crew':
+      case 'crew': {
         needThread();
         setView('crew');
+        // The list starts on the thread's crew, else on the default for new threads.
+        const read = await client.readCrews();
+        setSavedCrews(read);
+        const listed = crewChoices(store, read.crews);
+        const at = listed.findIndex((choice) => choice.name === thread?.crew?.name);
+        const preferred = listed.findIndex(
+          (choice) => choice.id === defaultChoiceId(listed, read.defaultCrew),
+        );
+        setCrewIndex(Math.max(0, at === -1 ? preferred : at));
         break;
+      }
       case 'plan':
         if (!thread?.plan)
           throw new Error('This thread has no plan. A crew with an orchestrator proposes one.');
         setView('plan');
         break;
-      case 'model':
       case 'provider': {
-        const current = selectionFor();
-        let selection: ChatModelSelection;
-        if (name === 'provider') {
-          const family = ChatFamilySchema.safeParse(argument);
-          if (!family.success) {
-            const connected = (catalog?.families ?? []).filter((entry) => entry.connected);
-            setNotice(
-              `Connected: ${connected.map((entry) => entry.family).join(', ')}. Use /provider family.`,
-            );
-            return true;
-          }
-          selection = selectionFor(family.data);
-        } else {
-          const entry = catalog?.families.find((value) => value.family === current.family);
-          const models = entry?.models ?? [];
-          const [model, effort] = argument.split(':');
-          const picked = model
-            ? models.find((value) => value.model === model)
-            : cycle(models, models.find((value) => value.model === current.model) ?? models[0], 1);
-          if (!picked) {
-            setNotice(`Models: ${models.map((value) => value.model).join(', ')}`);
-            return true;
-          }
-          selection = {
-            family: current.family,
-            model: picked.model,
-            effort: picked.efforts.find((value) => value === effort) ?? picked.defaultEffort,
-          };
+        const family = ChatFamilySchema.safeParse(argument);
+        if (!family.success) {
+          const connected = (catalog?.families ?? []).filter((entry) => entry.connected);
+          setNotice(
+            `Connected: ${connected.map((entry) => entry.family).join(', ')}. Use /provider family.`,
+          );
+          return true;
         }
-        // With no thread yet the choice rides on the first message, which creates the thread.
-        if (taskId) await client.configure({ taskId, selection });
-        else setFirstChoice(selection);
-        setNotice(
-          `${taskId ? 'Next message' : 'First message'}: ${familyNames[selection.family]} ${selection.model}.`,
+        await chooseModel(selectionFor(family.data));
+        break;
+      }
+      case 'model': {
+        // A known ID applies at once. Nothing typed, or an ID no family lists, opens the list.
+        const current = selectionFor();
+        const found = argument ? modelById(catalog, current, argument) : null;
+        if (found) {
+          await chooseModel(found);
+          break;
+        }
+        const filter = argument.split(':')[0];
+        const rows = flatRows(modelList(catalog, current, filter));
+        const at = rows.findIndex(
+          (row) => row.family === current.family && row.model === current.model,
         );
+        openModelList({ filter, index: Math.max(0, at), efforts: {} });
+        setView('model');
+        if (argument) setNotice(`No connected provider lists ${filter}.`);
         break;
       }
       case 'handoff': {
@@ -504,6 +521,77 @@ export function App(props: AppProps) {
       }
     }
     return true;
+  }
+
+  // The built-in crews, then the saved ones once the controller sent them.
+  const crewList = () => crewChoices(store, savedCrews?.crews ?? []);
+
+  // With no thread yet the choice rides on the first message, which creates the thread.
+  async function chooseModel(selection: ChatModelSelection) {
+    if (taskId) await client.configure({ taskId, selection });
+    else setFirstChoice(selection);
+    setNotice(
+      `${taskId ? 'Next message' : 'First message'}: ${familyNames[selection.family]} ${selection.model}${effortSuffix(selection.effort)}.`,
+    );
+  }
+
+  const currentSelection = (): ChatModelSelection | null => {
+    try {
+      return catalog ? selectionFor() : null;
+    } catch {
+      return null;
+    }
+  };
+  const modelGroupsShown = (pick: ModelPick) =>
+    modelList(catalog, currentSelection(), pick.filter).map((group) => ({
+      ...group,
+      rows: group.rows.map(
+        (row): ModelRow => ({
+          ...row,
+          effort: pick.efforts[`${row.family}:${row.model}`] ?? row.effort,
+        }),
+      ),
+    }));
+
+  // Keys can arrive faster than the list redraws, so each one reads and writes the latest state.
+  const pickRef = useRef(modelPick);
+  const updatePick = (change: (pick: ModelPick) => ModelPick) => {
+    pickRef.current = change(pickRef.current);
+    setModelPick(pickRef.current);
+  };
+  const openModelList = (pick: ModelPick) => updatePick(() => pick);
+
+  function modelKeys(input: string, key: Key) {
+    const pick = pickRef.current;
+    const rows = flatRows(modelGroupsShown(pick));
+    const index = clampIndex(pick.index, rows.length);
+    const row = rows[index];
+    if (key.upArrow || key.downArrow)
+      return updatePick((value) => ({
+        ...value,
+        index: clampIndex(index + (key.upArrow ? -1 : 1), rows.length),
+      }));
+    if ((key.leftArrow || key.rightArrow) && row)
+      return updatePick((value) => ({
+        ...value,
+        efforts: {
+          ...value.efforts,
+          [`${row.family}:${row.model}`]: stepEffort(row, key.rightArrow ? 1 : -1),
+        },
+      }));
+    if (key.return) {
+      if (!row) return;
+      setView('thread');
+      return run(() => chooseModel({ family: row.family, model: row.model, effort: row.effort }));
+    }
+    if (key.backspace || key.delete)
+      return updatePick((value) => ({
+        ...value,
+        filter: Array.from(value.filter).slice(0, -1).join(''),
+        index: 0,
+      }));
+    if (key.ctrl || key.meta || !input || /[\p{Cc}]/u.test(input)) return;
+    updatePick((value) => ({ ...value, filter: value.filter + input, index: 0 }));
   }
 
   function acceptFlow(branch?: string) {
@@ -723,21 +811,24 @@ export function App(props: AppProps) {
     }
   }
 
-  function crewKeys(input: string) {
+  function crewKeys(input: string, key: Key) {
     const id = taskId;
     if (!id || !thread) return;
-    if (/^[1-3]$/.test(input) && catalog) {
-      const preset = readCrewPresets(store).find(
-        (value) => value.name === crewPresetNames[Number(input) - 1],
-      );
-      const crew =
-        preset &&
-        crewFromPreset(preset, catalog, thread.selection, thread.handoffMode, now(), store);
-      return run(() => {
-        if (!crew) throw new Error('Connect a provider to form a crew.');
-        return client.configure({ taskId: id, crew });
+    const listed = crewList();
+    if (key.upArrow) return setCrewIndex((value) => clampIndex(value - 1, listed.length));
+    if (key.downArrow) return setCrewIndex((value) => clampIndex(value + 1, listed.length));
+    const picked = key.return
+      ? listed[clampIndex(crewIndex, listed.length)]
+      : /^[1-9]$/.test(input)
+        ? listed[Number(input) - 1]
+        : undefined;
+    if (picked)
+      return run(async () => {
+        const patch = catalog && crewChoicePatch(picked, catalog, thread, now(), store);
+        if (!patch) throw new Error('Connect a provider to form a crew.');
+        await client.configure({ taskId: id, ...patch });
+        setNotice(`Crew: ${picked.name}.`);
       });
-    }
     if (input === 'f')
       return run(() =>
         client.configure({
@@ -933,7 +1024,9 @@ export function App(props: AppProps) {
           return setChangeIndex((value) => Math.min((changes?.files.length ?? 1) - 1, value + 1));
         return changesKeys(input);
       case 'crew':
-        return crewKeys(input);
+        return crewKeys(input, key);
+      case 'model':
+        return modelKeys(input, key);
       case 'plan':
         return planKeys(input);
       case 'settings':
@@ -971,13 +1064,7 @@ export function App(props: AppProps) {
     }
   const live = items.slice(settledPrefix(items));
   const header: Printed = { key: 'wordmark', node: h(Wordmark, { columns, colors }) };
-  const selection = (() => {
-    try {
-      return catalog ? selectionFor() : null;
-    } catch {
-      return null;
-    }
-  })();
+  const selection = currentSelection();
   const project = projectIndex === null ? undefined : projects[projectIndex];
 
   const body = (() => {
@@ -1010,8 +1097,27 @@ export function App(props: AppProps) {
           colors,
           width,
         });
-      case 'crew':
-        return thread ? h(CrewView, { thread, colors }) : h(Text, null, 'Start a thread first.');
+      case 'crew': {
+        if (!thread) return h(Text, null, 'Start a thread first.');
+        const listed = crewList();
+        return h(CrewView, {
+          thread,
+          colors,
+          choices: listed,
+          defaultId: savedCrews ? defaultChoiceId(listed, savedCrews.defaultCrew) : null,
+          selected: clampIndex(crewIndex, listed.length),
+        });
+      }
+      case 'model': {
+        const groups = modelGroupsShown(modelPick);
+        return h(ModelListView, {
+          groups,
+          selected: clampIndex(modelPick.index, flatRows(groups).length),
+          current: currentSelection(),
+          filter: modelPick.filter,
+          colors,
+        });
+      }
       case 'plan':
         return thread?.plan
           ? h(PlanCardView, { plan: thread.plan, flight: thread.flightMode, colors })

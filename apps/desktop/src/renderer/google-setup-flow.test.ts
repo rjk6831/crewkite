@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { type CommandResult, GOOGLE_TERMS_VERSION, type WorkspaceState } from '@crewkite/contracts';
 import {
+  classifyGoogleFailure,
+  GOOGLE_CONNECT_LIMIT_MS,
   googleSetupProgress,
   nextGoogleStage,
   pollGoogleSetupStatus,
@@ -152,8 +154,9 @@ test('Google setup does not replay an unknown command outcome', async () => {
       return { outcome: 'outcome-unknown' };
     },
   });
+  // The flow reads the state once more to follow the step, finds nothing moved and stops there.
   assert.equal(result.kind, 'blocked');
-  assert.equal(reads, 1);
+  assert.equal(reads, 2);
   assert.equal(commands, 1);
 });
 
@@ -186,6 +189,14 @@ test('Google setup clears an unknown step once and retries a blocked one', async
   const states: GoogleState[] = [
     { googleAcpInstall: null, googleAcpSetup: setup(2, 'unknown', { client, operationId }) },
     { googleAcpInstall: null, googleAcpSetup: setup(3, 'blocked', { client }) },
+    {
+      googleAcpInstall: null,
+      googleAcpSetup: setup(5, 'authentication-required', {
+        client,
+        proofId: 'art_01K7M1N2P3Q4R5S6T7V8W9X0YZ',
+        auth: { method: 'oauth-personal', status: 'required' },
+      }),
+    },
     {
       googleAcpInstall: null,
       googleAcpSetup: setup(5, 'authentication-required', {
@@ -519,4 +530,234 @@ test('a step the controller started on its own is followed to its end', async ()
   assert.deepEqual(result, { kind: 'ready' });
   assert.equal(waits, 2);
   assert.deepEqual(flow.sent, ['AuthenticateGoogleAcp']);
+});
+
+const operation = 'cmd_01M69BW1J2CTWNBH0QKA4P08Y6';
+const installStatus = (
+  state: NonNullable<GoogleState['googleAcpInstall']>['state'],
+  reason: string | null = null,
+): NonNullable<GoogleState['googleAcpInstall']> => ({
+  profileId: 'google-acp-v1',
+  state,
+  operationId: ['installing', 'stopping', 'unknown'].includes(state) ? operation : null,
+  observedAt: '2026-11-01T00:00:00.000Z',
+  reason,
+  next: 'Status.',
+});
+const signedIn = (
+  revision: number,
+  change: Partial<NonNullable<GoogleState['googleAcpSetup']>> = {},
+) =>
+  setup(revision, 'discovery-required', {
+    client,
+    proofId: proof,
+    auth: { method: 'oauth-personal', status: 'authenticated' },
+    ...change,
+  });
+
+test('one Connect runs every step to the end when the install outlives its command', async () => {
+  // The 383 MB unpack outlived the install command's answer. The flow used to stop there with
+  // "The controller has not answered yet", and the card then offered a separate sign-in button.
+  const reads: GoogleState[] = [
+    { googleAcpInstall: null, googleAcpSetup: setup(0, 'uninitialized') },
+    { googleAcpInstall: installStatus('installing'), googleAcpSetup: setup(0, 'uninitialized') },
+    { googleAcpInstall: installStatus('installing'), googleAcpSetup: setup(0, 'uninitialized') },
+    // The controller initializes on its own after the install.
+    {
+      googleAcpInstall: installStatus('installed'),
+      googleAcpSetup: setup(1, 'initializing', { client, operationId: operation }),
+    },
+    { googleAcpInstall: installStatus('installed'), googleAcpSetup: signIn(2) },
+    { googleAcpInstall: installStatus('installed'), googleAcpSetup: signedIn(4) },
+    { googleAcpInstall: installStatus('installed'), googleAcpSetup: ready },
+  ];
+  const sent: string[] = [];
+  const stages: string[] = [];
+  let waits = 0;
+  const result = await runGoogleSetupFlow({
+    read: async () => reads.shift() as GoogleState,
+    active: () => true,
+    onStage: (stage) => stages.push(stage),
+    wait: async () => {
+      waits++;
+    },
+    command: async (input) => {
+      sent.push(input.command);
+      return input.command === 'InstallGoogleAcp'
+        ? { outcome: 'outcome-unknown', reason: 'response-timeout' }
+        : { outcome: 'applied' };
+    },
+  });
+  assert.deepEqual(result, { kind: 'ready' });
+  assert.deepEqual(sent, ['InstallGoogleAcp', 'AuthenticateGoogleAcp', 'DiscoverGoogleAcp']);
+  assert.deepEqual(stages, ['install', 'authenticate', 'discover']);
+  assert.equal(waits, 3);
+});
+
+test('transient failures run their step again with no word to the person', async () => {
+  // A signature check that ran out of time, then one codesign refused, then the install passes.
+  for (const reason of ['signature-timeout', 'signature-refused']) {
+    const flow = scripted({ googleAcpInstall: null, googleAcpSetup: setup(0, 'uninitialized') }, [
+      () => ({
+        result: {
+          outcome: 'blocked',
+          reason,
+          data: { kind: 'google-acp-install', install: installStatus('blocked', reason) },
+        },
+        state: {
+          googleAcpInstall: installStatus('blocked', reason),
+          googleAcpSetup: setup(0, 'uninitialized'),
+        },
+      }),
+      () => ({
+        result: { outcome: 'applied' },
+        state: { googleAcpInstall: installStatus('installed'), googleAcpSetup: ready },
+      }),
+    ]);
+    assert.deepEqual(await flow.run(), { kind: 'ready' }, reason);
+    assert.deepEqual(flow.sent, ['InstallGoogleAcp', 'InstallGoogleAcp'], reason);
+  }
+  // Discovery that applied but found no model choices or review mode yet is run again.
+  const missing = signedIn(5, { state: 'blocked', reason: 'acp-capability-missing' });
+  const discovery = scripted({ googleAcpInstall: null, googleAcpSetup: signedIn(4) }, [
+    () => ({
+      result: { outcome: 'applied' },
+      state: { googleAcpInstall: null, googleAcpSetup: missing },
+    }),
+    () => ({
+      result: { outcome: 'applied' },
+      state: { googleAcpInstall: null, googleAcpSetup: ready },
+    }),
+  ]);
+  assert.deepEqual(await discovery.run(), { kind: 'ready' });
+  assert.deepEqual(discovery.sent, ['DiscoverGoogleAcp', 'DiscoverGoogleAcp']);
+  assert.deepEqual(discovery.retries, ['discover 2 of 3']);
+  // Three tries that each find nothing end with the reason the state saved.
+  const never = scripted({ googleAcpInstall: null, googleAcpSetup: signedIn(4) }, [
+    () => ({
+      result: { outcome: 'applied' },
+      state: { googleAcpInstall: null, googleAcpSetup: missing },
+    }),
+    () => ({
+      result: { outcome: 'applied' },
+      state: { googleAcpInstall: null, googleAcpSetup: missing },
+    }),
+    () => ({
+      result: { outcome: 'applied' },
+      state: { googleAcpInstall: null, googleAcpSetup: missing },
+    }),
+  ]);
+  const result = await never.run();
+  assert.equal(result.kind === 'blocked' && result.result?.reason, 'acp-capability-missing');
+  assert.equal(never.sent.length, 3);
+});
+
+test('Try again resumes at the step that failed', async () => {
+  const rows: { name: string; state: GoogleState; command: string }[] = [
+    {
+      name: 'initialize',
+      state: {
+        googleAcpInstall: installStatus('installed'),
+        googleAcpSetup: setup(3, 'blocked', { client, reason: 'acp-setup-timeout' }),
+      },
+      command: 'InitializeGoogleAcp',
+    },
+    {
+      name: 'sign-in',
+      state: {
+        googleAcpInstall: installStatus('installed'),
+        googleAcpSetup: stuck(3, 'acp-setup-timeout'),
+      },
+      command: 'AuthenticateGoogleAcp',
+    },
+    {
+      name: 'discovery',
+      state: {
+        googleAcpInstall: installStatus('installed'),
+        googleAcpSetup: signedIn(5, { state: 'blocked', reason: 'acp-capability-missing' }),
+      },
+      command: 'DiscoverGoogleAcp',
+    },
+    {
+      // An install that failed earlier stays in the journal, and the client is installed now.
+      name: 'an older failed install',
+      state: {
+        googleAcpInstall: installStatus('blocked', 'signature-refused'),
+        googleAcpSetup: signedIn(5, { state: 'blocked', reason: 'acp-capability-missing' }),
+      },
+      command: 'DiscoverGoogleAcp',
+    },
+  ];
+  for (const row of rows) {
+    const flow = scripted(row.state, [
+      () => ({
+        result: { outcome: 'applied' },
+        state: { googleAcpInstall: null, googleAcpSetup: ready },
+      }),
+    ]);
+    assert.deepEqual(await flow.run(), { kind: 'ready' }, row.name);
+    assert.deepEqual(flow.sent, [row.command], row.name);
+  }
+});
+
+test('one Connect stops after twenty minutes', async () => {
+  let clock = 0;
+  const running = setup(1, 'authenticating', {
+    client,
+    proofId: proof,
+    operationId: operation,
+    auth: { method: 'oauth-personal', status: 'required' },
+  });
+  const result = await runGoogleSetupFlow({
+    read: async () => ({ googleAcpInstall: null, googleAcpSetup: running }),
+    active: () => true,
+    onStage: () => {},
+    now: () => clock,
+    wait: async () => {
+      clock += 60_000;
+    },
+    command: async () => assert.fail('A running step is followed, not sent.'),
+  });
+  assert.deepEqual(result, {
+    kind: 'blocked',
+    result: { outcome: 'blocked', reason: 'google-connect-limit' },
+  });
+  assert.equal(clock, GOOGLE_CONNECT_LIMIT_MS);
+});
+
+test('Google failures are transient or wait for the person', () => {
+  const state = (reason: string | null): GoogleState => ({
+    googleAcpInstall: installStatus('blocked', reason),
+    googleAcpSetup: signIn(3, { state: 'blocked', reason: reason as never }),
+  });
+  const rows: [string, CommandResult | undefined, GoogleState, string][] = [
+    ['install', { outcome: 'blocked', reason: 'signature-timeout' }, state(null), 'transient'],
+    ['install', { outcome: 'blocked', reason: 'stalled' }, state(null), 'transient'],
+    ['install', { outcome: 'blocked', reason: 'cancelled' }, state(null), 'person'],
+    ['install', { outcome: 'blocked', reason: 'pin-conflict' }, state(null), 'person'],
+    ['authenticate', { outcome: 'blocked', reason: 'acp-setup-timeout' }, state(null), 'transient'],
+    ['authenticate', { outcome: 'blocked', reason: 'acp-setup-stopped' }, state(null), 'person'],
+    [
+      'authenticate',
+      { outcome: 'blocked', reason: 'acp-setup-failed' },
+      state('authentication-required'),
+      'person',
+    ],
+    ['discover', { outcome: 'applied' }, state('acp-capability-missing'), 'transient'],
+    [
+      'discover',
+      { outcome: 'outcome-unknown', reason: 'response-timeout' },
+      state('acp-setup-timeout'),
+      'transient',
+    ],
+    ['initialize', { outcome: 'outcome-unknown' }, state(null), 'person'],
+    ['clear', { outcome: 'blocked', reason: 'google-ownership-unknown' }, state(null), 'person'],
+    ['initialize', { outcome: 'blocked', reason: 'something-new' }, state(null), 'person'],
+  ];
+  for (const [stage, result, value, expected] of rows)
+    assert.equal(
+      classifyGoogleFailure(stage as never, result, value),
+      expected,
+      `${stage} ${result?.reason ?? result?.outcome}`,
+    );
 });

@@ -58,6 +58,14 @@ import {
   SaveChatPromptPayloadSchema,
   SavedPromptsSchema,
 } from './composer.ts';
+import {
+  DeleteCrewPayloadSchema,
+  ImportSavedCrewsPayloadSchema,
+  ReadSavedCrewsPayloadSchema,
+  SaveCrewPayloadSchema,
+  SavedCrewsReadSchema,
+  SetDefaultCrewPayloadSchema,
+} from './crews.ts';
 import { DiagnosticsReadSchema, ReadDiagnosticsPayloadSchema } from './diagnostics.ts';
 import { ChatExportSchema, ExportChatThreadPayloadSchema } from './export.ts';
 import {
@@ -555,6 +563,12 @@ export const LocalHardwareStatusSchema = z
 export type LocalHardwareStatus = z.infer<typeof LocalHardwareStatusSchema>;
 /** Tokens a Local reply leaves for the chat template's own markers. */
 export const LOCAL_REPLY_MARGIN = 256;
+/** Share of the context the Local project outline may take. */
+export const LOCAL_OUTLINE_SHARE = 0.18;
+/** Tokens the Local rolling summary takes at most. */
+export const LOCAL_SUMMARY_TOKENS = 300;
+/** Bytes counted as one token when no tokenizer is at hand. Text and code run 3 to 5, so 3 never undercounts. */
+export const BYTES_PER_TOKEN_ESTIMATE = 3;
 /** The smallest reply budget a Local turn starts with: 2,048 or 30 percent of the context. */
 export const localReplyFloor = (contextLength: number) =>
   Math.max(2048, Math.ceil(contextLength * 0.3));
@@ -2550,6 +2564,11 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('AddProjectNote', AddProjectNotePayloadSchema),
   mutate('EditProjectNote', EditProjectNotePayloadSchema),
   mutate('RemoveProjectNote', RemoveProjectNotePayloadSchema),
+  read('ReadSavedCrews', ReadSavedCrewsPayloadSchema),
+  mutate('SaveCrew', SaveCrewPayloadSchema),
+  mutate('DeleteCrew', DeleteCrewPayloadSchema),
+  mutate('SetDefaultCrew', SetDefaultCrewPayloadSchema),
+  mutate('ImportSavedCrews', ImportSavedCrewsPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
   mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
@@ -3644,6 +3663,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatSearchResultSchema.safeExtend({ kind: z.literal('chat-search') }),
   ProjectNotesReadSchema.extend({ kind: z.literal('project-notes') }),
   ProjectNotesChangedSchema.extend({ kind: z.literal('project-notes-changed') }),
+  SavedCrewsReadSchema.extend({ kind: z.literal('saved-crews') }),
   ChatExportSchema.extend({ kind: z.literal('chat-export') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
@@ -3921,6 +3941,7 @@ export * from './checks.ts';
 export * from './cli.ts';
 export * from './client-versions.ts';
 export * from './composer.ts';
+export * from './crews.ts';
 export * from './diagnostics.ts';
 export * from './export.ts';
 export * from './extensions.ts';

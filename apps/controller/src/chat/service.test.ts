@@ -53,6 +53,8 @@ import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { Controller } from '../commands/controller.ts';
 import { git } from '../host/source.ts';
+import { localChatAdapter } from '../providers/local/chat.ts';
+import { fakeModel } from '../providers/local/chat-fake.ts';
 import { setup } from '../store/controller-fixture.ts';
 import { Store } from '../store/index.ts';
 import {
@@ -64,6 +66,7 @@ import {
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
 import { McpRegistry } from './mcp-servers.ts';
+import { parsePlan } from './plan.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
 import { AskingTurnError, answer } from './thread-tools/broker.ts';
@@ -2054,7 +2057,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       readOnlyAt: 2,
     },
     {
-      name: 'balanced waits for Run plan, and an override moves a slice to a ranked family',
+      name: "balanced waits for Run plan, and an override moves a slice to the crew's fixer model",
       plan: [planReply({ ...twoSlices, slices: [twoSlices.slices[0]] })],
       // OpenAI would build the slice without the override.
       builds: [reply('Unused.')],
@@ -2085,8 +2088,12 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
             failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
           },
         ],
+        // Retry under the failed slice runs it again, and the plan goes on to slice 2 (H9).
+        reply('Built 1.'),
+        reply('Built 2.'),
       ],
-      reviews: [reply('Clean.\nFindings: 0')],
+      retry: true,
+      reviews: [reply('Clean.\nFindings: 0'), reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
       turns: [
         ['orchestrator', 'openai'],
@@ -2098,7 +2105,10 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     },
     {
       name: 'a plan that fails validation goes back once, then stops',
-      plan: [reply('Here is my plan in prose.'), reply('Still prose.')],
+      plan: [
+        reply('```json plan\n{"planId": "p1"}\n```'),
+        reply('```json plan\n{"planId": "p1"}\n```'),
+      ],
       builds: [reply('Unused.')],
       reviews: [reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
@@ -2106,9 +2116,22 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         ['orchestrator', 'openai'],
         ['orchestrator', 'openai'],
       ],
-      line: 'Plan stopped: the plan did not pass validation. The reply has no fenced json block tagged plan.',
+      line: `Plan stopped: the plan did not pass validation. ${(parsePlan('```json plan\n{"planId": "p1"}\n```') as { error: string }).error}`,
       chain: null,
       card: null,
+    },
+    {
+      // A question gets its answer from the orchestrator, with no plan and nothing after it (H13).
+      name: 'an orchestrator that answers directly runs no plan',
+      plan: [reply('Halloween 2027 falls on a Sunday.')],
+      builds: [reply('Unused.')],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [['orchestrator', 'openai']],
+      line: 'Halloween 2027 falls on a Sunday.',
+      chain: null,
+      card: null,
+      answered: true,
     },
   ] as const;
   // Each row is a subtest with its own budget, and its thread closes when the row ends.
@@ -2169,6 +2192,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           { role: 'reviewer', selection: pick('anthropic') },
           { role: 'challenger', selection: pick('google') },
           ...(planned ? [{ role: 'orchestrator', selection: pick('openai') } as const] : []),
+          // The card offers the crew's own models, so the override picks the fixer's.
+          ...('balanced' in row ? [{ role: 'fixer', selection: pick('anthropic') } as const] : []),
         ],
       };
       const balanced = 'balanced' in row;
@@ -2205,12 +2230,16 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
             }),
           );
         };
-      const ended = next(
-        thread,
-        (event) =>
-          event.type === 'conversation.entry' &&
-          /^(Crew|Plan) (finished|stopped)/.test((event.payload as { text: string }).text),
-      );
+      // A direct answer writes no closing line, so the row waits for its reply.
+      const ended =
+        'answered' in row
+          ? settles(thread)
+          : next(
+              thread,
+              (event) =>
+                event.type === 'conversation.entry' &&
+                /^(Crew|Plan) (finished|stopped)/.test((event.payload as { text: string }).text),
+            );
       if (balanced) {
         const proposed = next(
           thread,
@@ -2232,7 +2261,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           for (const effect of effects) effect();
           return result;
         };
-        // Only a ranked candidate on the card can take a slice.
+        // Only a candidate on the card can take a slice.
         assert.equal(
           run([{ sliceId: 1, family: 'google', model: 'google-unranked' }]).reason,
           'override-not-ranked',
@@ -2320,11 +2349,71 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           row.card,
           row.name,
         );
+        if ('retry' in row) {
+          const failed = read.turns.find((turn) => turn.slice === 1);
+          const finished = next(
+            thread,
+            (event) =>
+              event.type === 'conversation.entry' &&
+              /^Crew finished/.test((event.payload as { text: string }).text),
+          );
+          // A slice turn takes no Regenerate, and Retry runs only the slice, not a new message.
+          assert.equal(
+            act(store, (effects) =>
+              service.retryTurn(
+                { taskId, turnId: failed?.id as string, mode: 'regenerate' },
+                effects,
+              ),
+            ).reason,
+            'slice-turn',
+            row.name,
+          );
+          assert.equal(
+            act(store, (effects) =>
+              service.retryTurn({ taskId, turnId: failed?.id as string, mode: 'retry' }, effects),
+            ).outcome,
+            'applied',
+            row.name,
+          );
+          await finished;
+          const again = thread.read();
+          const plan = again.thread.plan;
+          assert.deepEqual(
+            plan ? [plan.phase, ...plan.slices.map((value) => value.status)] : null,
+            ['finished', 'done', 'done'],
+            row.name,
+          );
+          assert.equal(
+            plan?.slices[0].assignment?.reason,
+            "Slice 1 (medium) assigned to OpenAI (openai-model): Builder, the crew's model.",
+            row.name,
+          );
+          // No turn ran outside the plan: every turn after the orchestrator is a slice or the
+          // challenge after the last one.
+          assert.deepEqual(
+            again.turns.map((turn) => [turn.role, turn.slice ?? null]),
+            [
+              ['orchestrator', null],
+              ['assistant', 1],
+              ['assistant', 1],
+              ['reviewer', 1],
+              ['assistant', 2],
+              ['reviewer', 2],
+              ['challenger', null],
+            ],
+            row.name,
+          );
+          return;
+        }
         const asked = adapters.get('openai')?.requests ?? [];
         assert.equal(asked[0]?.role, 'orchestrator', row.name);
         assert.match(asked[0]?.systemContext ?? '', /```json plan/, row.name);
+        if ('answered' in row) {
+          assert.equal(asked.length, 1, row.name);
+          return;
+        }
         if (row.card === null) {
-          assert.match(asked[1]?.prompt ?? '', /^The plan did not pass validation\. /, row.name);
+          assert.match(asked[1]?.prompt ?? '', /^The plan did not pass validation\. /m, row.name);
           assert.match(asked[1]?.prompt ?? '', /^> Fix the rounding\.$/m, row.name);
           return;
         }
@@ -2416,7 +2505,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
 });
 
 // A plan's slices run side by side, each in its own scratch copy, and merge in plan order.
-// OpenAI takes the medium slices and Local the easy ones, so two families answer at once.
+// The crew builder on OpenAI takes the medium slices and its fixer on Local the hard ones, so two
+// families answer at once.
 test('plan slices run side by side in their own copies, merge in plan order and stop together', {
   timeout: 60000,
 }, async (t) => {
@@ -2439,7 +2529,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     stopReason: 'error',
     failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
   };
-  const slice = (id: number, difficulty: 'easy' | 'medium', depends: number[] = []) => ({
+  const slice = (id: number, difficulty: 'hard' | 'medium', depends: number[] = []) => ({
     id,
     title: `Part ${id}`,
     brief: `Do part ${id}.`,
@@ -2456,8 +2546,13 @@ test('plan slices run side by side in their own copies, merge in plan order and 
   const rows = [
     {
       name: 'two families at once, a shared family waits, a dependency starts from merged work',
-      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'medium'), slice(4, 'easy', [1])],
-      openai: [[park, write('a.txt', 'one\n'), reply('Built 1.')], [write('c.txt', 'three\n')]],
+      slices: [slice(1, 'medium'), slice(2, 'hard'), slice(3, 'medium'), slice(4, 'hard', [1])],
+      openai: [
+        [park, write('a.txt', 'one\n'), reply('Built 1.')],
+        [write('c.txt', 'three\n')],
+        // The message queued during the plan, answered once the plan finished.
+        [reply('Queued answer.')],
+      ],
       local: [[write('b.txt', 'two\n')], [write('d.txt', 'four\n')]],
       line: 'Crew finished: 4 slices, 0 reviews, 0 fixes.',
       card: ['finished', 'done', 'done', 'done', 'done'],
@@ -2465,7 +2560,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     },
     {
       name: 'a conflict blocks the slice and the orchestrator merges it in one turn',
-      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      slices: [slice(1, 'medium'), slice(2, 'hard')],
       openai: [[write('net.mjs', 'one\n')], [write('net.mjs', 'one\ntwo\n'), reply('Merged.')]],
       // The clean c.txt merges only after the resolve turn ends done.
       local: [[write('net.mjs', 'two\n'), write('c.txt', 'clean\n')]],
@@ -2477,7 +2572,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     {
       // No part of the blocked slice reaches the thread copy, its clean c.txt included.
       name: 'a conflict the orchestrator cannot resolve stops the plan with the slice blocked',
-      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      slices: [slice(1, 'medium'), slice(2, 'hard')],
       openai: [[write('net.mjs', 'one\n')], [failed]],
       local: [[write('net.mjs', 'two\n'), write('c.txt', 'clean\n')]],
       line: 'Plan stopped: the orchestrator could not resolve slice 2.',
@@ -2488,7 +2583,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     {
       // Slice 2 finished while slice 1 runs, so it merges before the stop and is not lost.
       name: 'stop ends every running slice and keeps the finished one',
-      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'easy', [2])],
+      slices: [slice(1, 'medium'), slice(2, 'hard'), slice(3, 'hard', [2])],
       openai: [[{ kind: 'wait' } as const]],
       local: [[write('b.txt', 'two\n')]],
       line: 'Plan stopped: you cancelled it.',
@@ -2499,7 +2594,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     {
       // Slice 2 cannot start, and the slice 1 turn opened in the same step never runs.
       name: 'a slice that cannot start stops the plan before a sibling opened beside it runs',
-      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      slices: [slice(1, 'medium'), slice(2, 'hard')],
       openai: [[write('a.txt', 'one\n')]],
       local: [],
       line: 'Plan stopped: slice 2 could not start. Connect this provider in Settings or pick another.',
@@ -2511,7 +2606,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       // The thread copy replaced a base link, which never reaches a slice copy. The read-only
       // slice's packet lists what its own copy changed against the base, so it lists nothing.
       name: "a read-only slice's packet carries its own copy's diff, not the thread copy's",
-      slices: [{ ...slice(1, 'easy'), readOnly: true }],
+      slices: [{ ...slice(1, 'hard'), readOnly: true }],
       openai: [],
       local: [[reply('Read it.')]],
       line: 'Crew finished: 1 slice, 0 reviews, 0 fixes.',
@@ -2571,6 +2666,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       name: 'Plan crew',
       members: [
         { role: 'builder', selection: pick('openai') },
+        { role: 'fixer', selection: pick('local') },
         { role: 'orchestrator', selection: pick('openai') },
       ],
     };
@@ -2596,6 +2692,14 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         event.type === 'chat.thread' &&
         (event.payload as ChatThread).plan?.slices[1]?.lane?.step === 'merge',
     );
+    const queuedAnswer =
+      row.name.startsWith('two families') &&
+      next(
+        thread,
+        (event) =>
+          event.type === 'conversation.entry' &&
+          (event.payload as { text: string }).text === 'Queued answer.',
+      );
     thread.send('Split the work.', pick('openai'));
     if (row.name.startsWith('two families')) {
       await parked;
@@ -2610,6 +2714,14 @@ test('plan slices run side by side in their own copies, merge in plan order and 
           ['queued', null],
           ['queued', null],
         ],
+        row.name,
+      );
+      // A message sent while the plan runs waits in the queue, and the plan goes on (H16).
+      assert.equal(thread.send('One more thing.', pick('openai')).outcome, 'applied', row.name);
+      const waiting = thread.read().thread;
+      assert.deepEqual(
+        [waiting.plan?.phase, waiting.queued.map((message) => message.text)],
+        ['running', ['One more thing.']],
         row.name,
       );
       const open = thread.read().turns.find((turn) => turn.slice === 1);
@@ -2636,7 +2748,9 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     if ('stop' in row || 'unplugged' in row) await settles(thread);
     const read = thread.read();
     const lines = read.messages.map((message) => message.text);
-    assert.equal(lines.at(-1), row.line, row.name);
+    // The message queued during the plan starts after the closing line.
+    const queuedLines = ['One more thing.', 'Queued answer.'];
+    assert.equal(lines.filter((line) => !queuedLines.includes(line)).at(-1), row.line, row.name);
     const card = read.thread.plan;
     assert.deepEqual(
       card ? [card.phase, ...card.slices.map((value) => value.status)] : null,
@@ -2667,7 +2781,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     if (row.name.startsWith('two families')) {
       // Slices start in one turn per family. Slice 4 started from slice 1's merged work.
       assert.deepEqual(
-        read.turns.map((turn) => [turn.selection.family, turn.slice ?? null]),
+        read.turns.slice(0, 5).map((turn) => [turn.selection.family, turn.slice ?? null]),
         [
           ['openai', null],
           ['openai', 1],
@@ -2677,6 +2791,26 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         ],
         row.name,
       );
+      // The queued message starts once the plan has finished, as the orchestrator's next turn.
+      await queuedAnswer;
+      const after = thread.read();
+      assert.deepEqual(
+        after.turns.slice(5).map((turn) => [turn.role, turn.state]),
+        [['orchestrator', 'done']],
+        row.name,
+      );
+      assert.ok(!after.messages.some((message) => message.text.startsWith('Plan stopped')));
+      // The next orchestrator turn reads the earlier plan and its slice results (H10).
+      const planning = openai.requests.at(-1)?.prompt ?? '';
+      assert.match(planning, /^Conversation so far, oldest first:/m, row.name);
+      assert.match(planning, /^Slice 1 of 4 in plan p1: Part 1$/m, row.name);
+      assert.match(
+        planning,
+        /^The last plan in this thread:\nGoal: Split it\.\nPlan: finished\.$/m,
+        row.name,
+      );
+      assert.match(planning, /^Slice 1, Part 1: done, on OpenAI \(openai-model\)\.$/m, row.name);
+      assert.match(planning, /^Slice 2, Part 2: done, on Local \(local-model\)\.$/m, row.name);
       const fourth = read.turns.find((turn) => turn.slice === 4);
       assert.equal(held[fourth?.id ?? ''], true, row.name);
       const finished = lines.filter((line) => /^Slice \d finished/.test(line));
@@ -2716,6 +2850,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         /^Files changed in the scratch copy against the base commit:\nNo files changed yet\.$/m,
         row.name,
       );
+      assert.ok(lines.includes('Slice 1 finished. No files changed.'), row.name);
     }
     if ('unplugged' in row) {
       assert.equal(read.turns.find((turn) => turn.slice === 1)?.state, 'stopped', row.name);
@@ -2723,6 +2858,50 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       assert.ok(!existsSync(join(scratch, 'a.txt')), row.name);
     }
   }
+});
+
+// A new thread's first message goes to the orchestrator. The thread then holds the crew builder
+// as its pick, so the composer offers the builder for the next message (H2).
+test('the first message to an orchestrator leaves the crew builder as the thread pick', {
+  timeout: 30000,
+}, async (t) => {
+  const builder: ChatModelSelection = { family: 'openai', model: 'openai-model', effort: 'high' };
+  const orchestrator: ChatModelSelection = {
+    family: 'anthropic',
+    model: 'anthropic-model',
+    effort: 'medium',
+  };
+  const thread = standalone(t, {
+    adapters: new Map([
+      [
+        'anthropic',
+        createScriptedChatAdapter({
+          family: 'anthropic',
+          turns: [[{ kind: 'text', itemId: 'r', chunks: ['No plan needed.'] }]],
+        }),
+      ],
+    ]),
+  });
+  const { store, service, taskId } = thread;
+  const crew: ChatCrew = {
+    name: 'Plan crew',
+    members: [
+      { role: 'builder', selection: builder },
+      { role: 'orchestrator', selection: orchestrator },
+    ],
+  };
+  store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+  assert.equal(thread.read().thread.selection, null);
+  const idle = settles(thread);
+  thread.send('What does this do?', builder);
+  await idle;
+  const read = thread.read();
+  assert.deepEqual(read.turns[0] && [read.turns[0].role, read.turns[0].selection.family], [
+    'orchestrator',
+    'anthropic',
+  ]);
+  assert.deepEqual(read.thread.selection, builder);
+  await service.close();
 });
 
 // Startup recovery stops a plan whose slice was mid-review with one plain line.
@@ -3095,6 +3274,19 @@ test('balanced and glide run read-only commands without asking under the ask pol
     { mode: 'glide', input: { command: "bash -c 'ls' && rm x" }, answered: false },
     { mode: 'glide', input: { command: 'npm i' }, answered: false },
     { mode: 'glide', input: { CommandLine: 'ls', Cwd: '/etc' }, answered: false },
+    // A read-only command on a file outside the copy follows the policy (H11).
+    {
+      mode: 'glide',
+      input: { command: "rg -n 'x' /Users/raykraft/.agent/memories/MEMORY.md" },
+      answered: false,
+    },
+    {
+      mode: 'glide',
+      input: {
+        command: '/bin/zsh -lc "sed -n \'46,51p\' /Users/raykraft/.agent/memories/MEMORY.md"',
+      },
+      answered: false,
+    },
     { mode: 'manual', input: { command: 'ls' }, answered: false },
   ] as const;
   for (const row of cases) {
@@ -4137,5 +4329,142 @@ test('startup recovery lets a queued message start, and any other failed turn st
       row.name,
     );
     if (row.started) assert.equal(after.turns[1].state, 'done', row.name);
+  }
+});
+
+test('a Local slice that cannot fit goes to the crew builder in balanced and glide with one line', {
+  timeout: 60000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep => ({ kind: 'text', itemId: 'r', chunks: [text] });
+  const plan = {
+    planId: 'p1',
+    goal: 'Add tax to the order total.',
+    slices: [
+      {
+        id: 1,
+        title: 'Apply tax',
+        brief: 'Use TAX_RATE in orderTotal.',
+        files: [],
+        depends: [],
+        difficulty: 'hard',
+        readOnly: false,
+      },
+    ],
+  };
+  for (const flightMode of ['balanced', 'glide'] as const) {
+    const now = createTestClock().now();
+    const openai = createScriptedChatAdapter({
+      family: 'openai',
+      turns: [
+        [reply(`\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``)],
+        [
+          {
+            kind: 'tool',
+            callId: 'w',
+            toolKind: 'edit',
+            title: 'Write a.txt',
+            write: { path: 'a.txt', content: 'taxed\n' },
+          },
+        ],
+      ],
+    });
+    // The scripted LM Studio model: the compact brief alone leaves less than the reply floor.
+    const prompts: string[] = [];
+    const { model, calls } = fakeModel([], { now: Date.parse(now) }, (text) =>
+      text.includes('Task: Use TAX_RATE in orderTotal.') ? 7000 : Math.ceil(text.length / 4),
+    );
+    const local = localChatAdapter({
+      connect: async (request) => {
+        prompts.push(request.prompt);
+        return {
+          model,
+          contextLength: 8192,
+          modelKey: 'local-model',
+          fellBack: false,
+          vision: false,
+          files: { prepareImageBase64: async () => ({}) as never },
+          dispose: async () => {},
+        };
+      },
+    });
+    const families = [familyEntry('openai', 10, null, now), familyEntry('local', 90, null, now)];
+    const thread = standalone(t, {
+      adapters: new Map<ChatFamily, ChatAdapter>([
+        ['openai', openai],
+        ['local', local],
+      ]),
+      catalog: () => ({ families }),
+      localContext: () => 8192,
+      localSliceFits: () => true,
+    });
+    const { store, service, taskId } = thread;
+    const crew: ChatCrew = {
+      name: 'Plan crew',
+      members: [
+        { role: 'builder', selection: pick('openai') },
+        // Local is in the crew as its fixer, so it takes the hard slice.
+        { role: 'fixer', selection: pick('local') },
+        { role: 'orchestrator', selection: pick('openai') },
+      ],
+    };
+    store.transaction(() => service.configure({ taskId, crew, flightMode }));
+    const ended = next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        /^(Crew finished|Plan stopped)/.test((event.payload as { text: string }).text),
+    );
+    const proposed = next(
+      thread,
+      (event) =>
+        event.type === 'chat.thread' && (event.payload as ChatThread).plan?.phase === 'proposed',
+    );
+    const free = settles(thread);
+    thread.send('Add tax.', pick('openai'));
+    if (flightMode === 'balanced') {
+      await proposed;
+      await free;
+      assert.equal(
+        act(store, (effects) => service.runPlan({ taskId, planId: 'p1' }, effects)).outcome,
+        'applied',
+        flightMode,
+      );
+    }
+    await ended;
+    const read = thread.read();
+    const lines = read.messages.map((message) => message.text);
+    assert.equal(lines.at(-1), 'Crew finished: 1 slice, 0 reviews, 0 fixes.', flightMode);
+    assert.ok(
+      lines.some((line) =>
+        /^Slice 1 did not fit on Local, so the builder on OpenAI takes it\. This request takes [\d,]+ tokens of the Local model's 8,192 token context and leaves [\d,]+ for the reply, short of the 2,458 it needs\.$/.test(
+          line,
+        ),
+      ),
+      flightMode,
+    );
+    // Local got the compact brief and never ran the model; the builder ran the slice.
+    assert.equal(calls.length, 0, flightMode);
+    assert.match(
+      prompts[0] ?? '',
+      /Goal: Add tax to the order total\.\n\nTask: Use TAX_RATE in orderTotal\./,
+    );
+    assert.ok(!(prompts[0] ?? '').includes('assigned to'), flightMode);
+    assert.deepEqual(
+      read.turns.map((turn) => [turn.selection.family, turn.slice ?? null, turn.state]),
+      [
+        ['openai', null, 'done'],
+        ['local', 1, 'failed'],
+        ['openai', 1, 'done'],
+      ],
+      flightMode,
+    );
+    assert.equal(read.thread.plan?.slices[0]?.assignment?.family, 'openai', flightMode);
+    const scratch = join(dirname(thread.root), 'chat', taskId, 'scratch');
+    assert.equal(readFileSync(join(scratch, 'a.txt'), 'utf8'), 'taxed\n', flightMode);
   }
 });

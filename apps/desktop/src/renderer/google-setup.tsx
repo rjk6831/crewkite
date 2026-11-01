@@ -11,6 +11,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
 import { formatLocalTime } from './format-time.ts';
 import {
+  GOOGLE_CONNECT_LIMIT_MS,
   GOOGLE_PROGRESS_STEPS,
   type GoogleSetupProgress,
   type GoogleSetupStage,
@@ -22,8 +23,8 @@ import type { Workspace } from './source.ts';
 import './google-setup.css';
 
 // A first connect downloads about 110 MB and waits on a browser sign-in, so the card reads the
-// status each second for up to 15 minutes while a step runs.
-const POLL_ATTEMPTS = 900;
+// status each second for as long as one Connect may run.
+const POLL_ATTEMPTS = GOOGLE_CONNECT_LIMIT_MS / 1_000;
 
 /** The whole connect as one bar, the current step named, and every step listed under it. */
 function GoogleProgress({ progress }: { progress: GoogleSetupProgress }) {
@@ -87,7 +88,7 @@ const refusalText: Record<string, string> = {
   'google-operation-active':
     'Another Google step is running, such as the quota read or a coding turn. Try again when it ends.',
   'google-ownership-unknown':
-    'CrewKite cannot prove the last Google step ended, so Google setup is paused. Press Clear and try again.',
+    'CrewKite cannot prove the last Google step ended, so Google setup is paused. Press Try again.',
   'google-install-active': 'The official client is still installing. This card follows it.',
   'google-install-ownership-unknown':
     'CrewKite cannot prove the last install check ended. Refresh status in a minute.',
@@ -95,8 +96,12 @@ const refusalText: Record<string, string> = {
   'acp-setup-failed': 'The Google client stopped before the step finished. Press Try again.',
   'acp-setup-stopped': 'The step was stopped before it finished.',
   'acp-proof-unavailable': 'The saved setup no longer matches the client. Press Try again.',
-  'acp-setup-not-current': 'The setup moved on since this card read it. Review the status above.',
-  'response-timeout': 'The controller has not answered yet. The step may still be running.',
+  'acp-setup-not-current': 'The setup moved on since this card read it. Press Try again.',
+  'acp-capability-missing':
+    'The client did not report the model choices CrewKite needs. Press Try again.',
+  'authentication-required': 'The Google sign-in did not finish. Press Try again to sign in.',
+  'google-connect-limit':
+    'Connect did not finish within 20 minutes. Press Try again to continue from this step.',
 };
 
 // Why the coding setup is not ready, from the Google profile, in plain words.
@@ -118,15 +123,6 @@ function installOutcome(result: CommandResult | undefined) {
     result.data.install.reason === result.reason
   );
 }
-
-// What a retry line names: "Retrying sign-in (2 of 3)".
-const retryLabels: Record<GoogleSetupStage, string> = {
-  clear: 'the clear',
-  install: 'the download',
-  initialize: 'initialization',
-  authenticate: 'sign-in',
-  discover: 'discovery',
-};
 
 const stageLabels: Record<GoogleSetupStage, string> = {
   clear: 'Clearing the stuck setup step',
@@ -153,7 +149,6 @@ export function GoogleSetup({
   );
   const reader = snapshot.usageReaders.find((value) => value.family === 'google');
   const [requested, setRequested] = useState<GoogleSetupStage | null>(null);
-  const [retry, setRetry] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [pollTimedOut, setPollTimedOut] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
@@ -246,12 +241,9 @@ export function GoogleSetup({
         read: workspace.refresh,
         command: workspace.metadataCommand,
         active: () => mounted.current && generation.current === currentGeneration,
+        // A transient failure runs its step again with no word here. The bar shows the step.
         onStage: (stage) => {
           if (mounted.current && generation.current === currentGeneration) setRequested(stage);
-        },
-        onRetry: (stage, attempt, tries) => {
-          if (mounted.current && generation.current === currentGeneration)
-            setRetry(`Retrying ${retryLabels[stage]} (${attempt} of ${tries})`);
         },
       });
       if (!mounted.current || generation.current !== currentGeneration) return;
@@ -286,7 +278,6 @@ export function GoogleSetup({
         pollAbort.current?.abort();
         pollAbort.current = null;
         setRequested(null);
-        setRetry(null);
         // The poll gives up after 15 minutes, and a browser sign-in can take longer. Once the
         // flow ends, the slow-setup line no longer describes anything.
         setPollTimedOut(false);
@@ -298,7 +289,6 @@ export function GoogleSetup({
     if (!connected || cancelBusy) return;
     stopPolling();
     setRequested(null);
-    setRetry(null);
     setPollTimedOut(false);
     setCancelBusy(true);
     try {
@@ -345,14 +335,9 @@ export function GoogleSetup({
     }
   }
 
-  const primaryLabel =
-    setup?.state === 'unknown'
-      ? 'Clear and try again'
-      : setup?.state === 'blocked' || installation?.state === 'blocked'
-        ? 'Try again'
-        : setup?.state === 'authentication-required'
-          ? 'Sign in with Google'
-          : 'Connect Google';
+  // One button. Connect runs every step to the end, sign-in included, and Try again resumes at
+  // the step that failed, clearing a stuck step first when its process has ended.
+  const primaryLabel = needsRepair ? 'Try again' : 'Connect Google';
   const profileReason =
     profile && !profile.available && 'reason' in profile
       ? profile.reason === 'acp-capability-missing'
@@ -377,11 +362,14 @@ export function GoogleSetup({
     : installation?.state === 'idle'
       ? 'Not installed'
       : 'Unknown';
-  const quotaAvailable = reader?.lastObservedAt
-    ? 'Reported'
-    : reader?.available
-      ? 'Reader ready, not read'
-      : 'Unknown';
+  // The quota read waits for Connect.
+  const quotaAvailable = !ready
+    ? 'Read after Connect'
+    : reader?.lastObservedAt
+      ? 'Reported'
+      : reader?.available
+        ? 'Reader ready, not read'
+        : 'Unknown';
 
   return (
     <section className="card view-stack" aria-labelledby="google-setup-title">
@@ -390,25 +378,26 @@ export function GoogleSetup({
         <span>{setupLabels[setup?.state ?? 'uninitialized'] ?? setup?.state}</span>
       </div>
       <p className="muted small">{googleAcpLabel}</p>
-      {GOOGLE_TERMS_SUMMARY.map((line) => (
-        <p key={line} className="muted small">
-          {line}
-        </p>
-      ))}
-      {termsAcknowledged ? (
-        <p className="muted small">
-          You acknowledged this on {formatLocalTime(setup?.googleTerms?.at) ?? 'an unknown date'}.
-        </p>
-      ) : (
-        <label className="check-row small">
-          <input
-            type="checkbox"
-            checked={termsChecked}
-            onChange={(event) => setTermsChecked(event.target.checked)}
-          />
-          <span>{GOOGLE_TERMS_CHECKBOX}</span>
-        </label>
-      )}
+      {/* The terms and the acknowledgement lead the card, at body size. */}
+      <div className="gs-terms">
+        {GOOGLE_TERMS_SUMMARY.map((line) => (
+          <p key={line}>{line}</p>
+        ))}
+        {termsAcknowledged ? (
+          <p className="muted small">
+            You acknowledged this on {formatLocalTime(setup?.googleTerms?.at) ?? 'an unknown date'}.
+          </p>
+        ) : (
+          <label className="check-row gs-terms-check">
+            <input
+              type="checkbox"
+              checked={termsChecked}
+              onChange={(event) => setTermsChecked(event.target.checked)}
+            />
+            <span>{GOOGLE_TERMS_CHECKBOX}</span>
+          </label>
+        )}
+      </div>
       {!termsAcknowledged && (ready || needsRepair) && (
         <button
           className="button secondary"
@@ -427,11 +416,14 @@ export function GoogleSetup({
           Acknowledge
         </button>
       )}
-      <p className="muted small">
-        Connect Google downloads and verifies the official client when needed, initializes it, then
-        opens browser sign-in for your Google account and discovers your choices. You complete and
-        control the Google sign-in. Initialization and discovery use no model prompt.
-      </p>
+      <details className="gs-how">
+        <summary>How Connect works</summary>
+        <p className="muted small">
+          Connect Google downloads and verifies the official client when needed, initializes it,
+          then opens browser sign-in for your Google account and discovers your choices. You
+          complete and control the Google sign-in. Initialization and discovery use no model prompt.
+        </p>
+      </details>
       <div className="facts-grid compact">
         <Fact label="Official client" value={officialClient} />
         <Fact label="Google account" value={googleAccount} />
@@ -467,14 +459,13 @@ export function GoogleSetup({
       ) : active ? (
         <p role="status">Google setup is running…</p>
       ) : null}
-      {retry && <p className="muted small">{retry}</p>}
       {pollTimedOut && !ready && (
         <p role="status">Taking longer than expected. Review status before retrying.</p>
       )}
-      {installation?.reason && (
+      {!working && installation?.reason && (
         <p className="muted small">{refusalText[installation.reason] ?? installation.next}</p>
       )}
-      {installed && !codingReady && !working && profileReason && (
+      {installed && !codingReady && !working && !message && profileReason && (
         <p className="muted small">{profileReason}</p>
       )}
       {/* The model list is known once discovery ends. Until then the line would only say unknown. */}
@@ -514,7 +505,7 @@ export function GoogleSetup({
           </p>
         </details>
       )}
-      {message && <p role="status">{message}</p>}
+      {message && !working && <p role="status">{message}</p>}
     </section>
   );
 }

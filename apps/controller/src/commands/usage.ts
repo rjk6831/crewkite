@@ -459,13 +459,18 @@ export class UsageCommands {
     }
   }
 
+  /** Google is connected once its setup is ready: installed, signed in and discovered. */
+  googleConnected(this: Controller): boolean {
+    return this.store.googleAcpSetup().state === 'ready';
+  }
+
   refreshGoogleUsage(
     this: Controller,
     trigger: 'start' | 'connect' | 'interval',
   ): Promise<CommandResult> | undefined {
     try {
       if (this.closed || this.acpStart) return;
-      if (!googleTermsAcknowledged(this.store)) return;
+      if (!googleTermsAcknowledged(this.store) || !this.googleConnected()) return;
       if (this.usageRead) return this.usageRead.promise;
       const reader = this.store.googleUsageReader();
       const nowMs = Date.parse(this.now());
@@ -529,6 +534,14 @@ export class UsageCommands {
         outcome: 'blocked',
         reason: 'google-terms-not-acknowledged',
         next: 'Acknowledge the Google terms in Settings > Google before reading Google usage.',
+      });
+    // The Google quota read starts the Google client. It waits for Connect, so nothing Google runs
+    // before the person connected it, and no gauge shows for a provider that is not connected.
+    if (command.payload.family === 'google' && !this.googleConnected())
+      return Promise.resolve({
+        outcome: 'blocked',
+        reason: 'google-not-connected',
+        next: 'Connect Google in Settings > Google before reading Google usage.',
       });
     // Resolve the client now. observeUsage runs inside the command's transaction.
     if (command.payload.family === 'openai')

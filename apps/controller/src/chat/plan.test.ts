@@ -3,15 +3,16 @@ import { cpSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } 
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
-import type {
-  ChatCatalogEntry,
-  ChatFamily,
-  ChatHandoffMode,
-  ChatPlan,
-  ChatPlanSlice,
-} from '@crewkite/contracts';
+import type { ChatCatalogEntry, ChatFamily, ChatPlan, ChatPlanSlice } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
-import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
+import {
+  assignPlan,
+  hasPlanBlock,
+  type PlanFile,
+  type PlanInputs,
+  parsePlan,
+  ruledOut,
+} from './plan.ts';
 import {
   laneCopy,
   laneFolder,
@@ -66,145 +67,227 @@ const slice = (
 const fits: PlanInputs['localSliceFits'] = (files, _context, image) =>
   !image && files.reduce((sum, file) => sum + file.bytes, 0) <= 12_000;
 
-test('assignment is a pure function of connected families, allowances, difficulty and Local fit', () => {
-  const builder = { family: 'anthropic', model: 'anthropic-pinned', effort: 'default' } as const;
+test('slices stay inside the crew: the builder, the fixer for a hard slice, Local only as a crew role, the handoff rule on a limit', () => {
+  const openai = { family: 'openai', model: 'openai-pinned', effort: 'high' } as const;
+  const anthropic = { family: 'anthropic', model: 'anthropic-model', effort: 'medium' } as const;
+  const local = { family: 'local', model: 'local-model', effort: 'default' } as const;
+  const pinned = (value: ChatCatalogEntry, model: string) => ({
+    ...value,
+    models: [...value.models, { ...value.models[0], model, label: `${value.family} pinned` }],
+  });
   const all = [
-    entry('openai', 60, 10),
+    pinned(entry('openai', 60, 10), 'openai-pinned'),
     entry('anthropic', 40, 2),
-    entry('google', 60, 10),
+    entry('google', 80, 10),
     entry('local', null, null),
   ];
   const files: Record<string, PlanFile> = {
     'src/small.ts': { bytes: 4000, image: false },
     'src/big.ts': { bytes: 40_000, image: false },
-    'docs/shot.png': { bytes: 900, image: true },
   };
   const rows: {
     name: string;
     slices: ChatPlanSlice[];
+    builder?: PlanInputs['builder'];
+    fixer?: PlanInputs['fixer'];
     families?: ChatCatalogEntry[];
-    mode?: ChatHandoffMode;
-    localContext?: number | null;
-    want: [string, string, string][];
-    candidates?: string[];
+    autoHandoff?: boolean;
+    excluded?: ChatFamily[];
+    want: ([string, string, string] | string)[];
+    candidates?: string[][];
   }[] = [
     {
-      name: 'easy fits Local, hard stays on the builder',
-      slices: [slice(1, 'easy', ['src/small.ts']), slice(2, 'hard', ['src/big.ts'])],
+      name: 'builder only: every slice runs on the builder and Local stays out of the crew',
+      slices: [
+        slice(1, 'easy', ['src/small.ts']),
+        slice(2, 'medium'),
+        slice(3, 'hard', [], { family: 'google' }),
+      ],
+      want: [
+        [
+          'openai',
+          'openai-pinned',
+          "Slice 1 (easy) assigned to OpenAI (openai pinned): Builder, the crew's model.",
+        ],
+        [
+          'openai',
+          'openai-pinned',
+          "Slice 2 (medium) assigned to OpenAI (openai pinned): Builder, the crew's model.",
+        ],
+        [
+          'openai',
+          'openai-pinned',
+          "Slice 3 (hard) assigned to OpenAI (openai pinned): Builder, the crew's model.",
+        ],
+      ],
+      candidates: [['openai'], ['openai'], ['openai']],
+    },
+    {
+      name: 'builder plus fixer: a hard slice goes to the fixer, the rest to the builder',
+      slices: [slice(1, 'medium'), slice(2, 'hard')],
+      fixer: anthropic,
+      want: [
+        [
+          'openai',
+          'openai-pinned',
+          "Slice 1 (medium) assigned to OpenAI (openai pinned): Builder, the crew's model.",
+        ],
+        [
+          'anthropic',
+          'anthropic-model',
+          'Slice 2 (hard) assigned to Anthropic (anthropic): Fixer, hard slice.',
+        ],
+      ],
+      candidates: [
+        ['openai', 'anthropic'],
+        ['anthropic', 'openai'],
+      ],
+    },
+    {
+      name: 'a fixer on the builder model leaves a hard slice on the builder',
+      slices: [slice(1, 'hard')],
+      fixer: openai,
+      want: [
+        [
+          'openai',
+          'openai-pinned',
+          "Slice 1 (hard) assigned to OpenAI (openai pinned): Builder, the crew's model.",
+        ],
+      ],
+    },
+    {
+      name: 'a fixer out of allowance leaves a hard slice on the builder',
+      slices: [slice(1, 'hard')],
+      fixer: anthropic,
+      families: [all[0] as ChatCatalogEntry, entry('anthropic', 0, 2), entry('google', 80, 10)],
+      want: [
+        [
+          'openai',
+          'openai-pinned',
+          'Slice 1 (hard) assigned to OpenAI (openai pinned): Builder, since Anthropic has no allowance left.',
+        ],
+      ],
+    },
+    {
+      name: 'Local runs a slice only as a crew role, and only when the slice fits',
+      slices: [slice(1, 'easy', ['src/small.ts']), slice(2, 'medium', ['src/big.ts'])],
+      builder: local,
+      fixer: anthropic,
       want: [
         [
           'local',
           'local-model',
-          'Slice 1 (easy) assigned to Local: 5,478 token room, Local first.',
+          "Slice 1 (easy) assigned to Local (local): Builder, the crew's model.",
         ],
         [
           'anthropic',
-          'anthropic-pinned',
-          'Slice 2 (hard) assigned to Anthropic: the crew builder, ranked 3 of 3 by Most allowance left.',
-        ],
-      ],
-      // Local does not fit slice 2, so it is no candidate there.
-      candidates: ['openai', 'google', 'anthropic'],
-    },
-    {
-      name: 'easy that does not fit goes to the top-ranked family',
-      slices: [slice(1, 'easy', ['src/big.ts'])],
-      want: [
-        [
-          'openai',
-          'openai-model',
-          "Slice 1 (easy) assigned to OpenAI: the files do not fit Local's 5,478 token room, first by Most allowance left.",
+          'anthropic-model',
+          "Slice 2 (medium) assigned to Anthropic (anthropic): Fixer, since the files do not fit Local's 5,478 token room.",
         ],
       ],
     },
     {
-      name: 'an image never goes to Local',
-      slices: [slice(1, 'easy', ['docs/shot.png'])],
-      want: [
-        [
-          'openai',
-          'openai-model',
-          'Slice 1 (easy) assigned to OpenAI: Local takes no image file, first by Most allowance left.',
-        ],
-      ],
-    },
-    {
-      name: 'the hint breaks a tie between equal families',
-      slices: [slice(1, 'easy', ['docs/shot.png'], { family: 'google' })],
-      want: [
-        [
-          'google',
-          'google-model',
-          'Slice 1 (easy) assigned to Google: Local takes no image file, first by Most allowance left. The plan hint broke a tie.',
-        ],
-      ],
-    },
-    {
-      name: 'the hint never adds a family at zero',
-      slices: [slice(1, 'medium', [], { family: 'google' })],
-      families: [entry('openai', 60, 10), entry('anthropic', 0, 2), entry('google', 0, 10)],
-      localContext: null,
-      want: [
-        [
-          'openai',
-          'openai-model',
-          "Slice 1 (medium) assigned to OpenAI: the builder's family Anthropic does not rank, first by Most allowance left.",
-        ],
-      ],
-      candidates: ['openai'],
-    },
-    {
-      name: 'Resets soonest puts the builder first and Local stays out without a context',
+      // "Do not assign anything to Local AI" rules Local out, crew role or not (H15).
+      name: 'a family the message rules out takes no slice',
       slices: [slice(1, 'easy', ['src/small.ts'])],
-      mode: 'resets-first',
-      localContext: null,
+      builder: local,
+      fixer: anthropic,
+      excluded: ['local'],
       want: [
         [
           'anthropic',
-          'anthropic-pinned',
-          'Slice 1 (easy) assigned to Anthropic: Local reports no context length, first by Resets soonest.',
+          'anthropic-model',
+          'Slice 1 (easy) assigned to Anthropic (anthropic): Fixer, since your message rules out Local.',
+        ],
+      ],
+      candidates: [['anthropic']],
+    },
+    {
+      name: 'the handoff rule skips a family the message rules out',
+      slices: [slice(1, 'medium')],
+      families: [
+        pinned(entry('openai', 0, 10), 'openai-pinned'),
+        entry('anthropic', 40, 2),
+        entry('google', 80, 10),
+      ],
+      autoHandoff: true,
+      excluded: ['google'],
+      want: [
+        [
+          'anthropic',
+          'anthropic-model',
+          'Slice 1 (medium) assigned to Anthropic (anthropic): Continue on another provider, since OpenAI has no allowance left. Ranked 1 of 1 by Most allowance left.',
         ],
       ],
     },
     {
-      name: 'no Local connected',
-      slices: [slice(1, 'easy')],
-      families: [entry('openai', 60, 10), entry('google', 70, 10)],
+      name: 'on a limit with Continue on another provider on, the handoff rule moves the slice',
+      slices: [slice(1, 'medium')],
+      families: [
+        pinned(entry('openai', 0, 10), 'openai-pinned'),
+        entry('anthropic', 40, 2),
+        entry('google', 80, 10),
+      ],
+      autoHandoff: true,
       want: [
         [
           'google',
           'google-model',
-          'Slice 1 (easy) assigned to Google: Local is not connected, first by Most allowance left.',
+          'Slice 1 (medium) assigned to Google (google): Continue on another provider, since OpenAI has no allowance left. Ranked 1 of 2 by Most allowance left.',
+        ],
+      ],
+      candidates: [['google', 'anthropic']],
+    },
+    {
+      name: 'the plan hint breaks a tie only among families the handoff rule ranks',
+      slices: [slice(1, 'medium', [], { family: 'anthropic' })],
+      families: [
+        pinned(entry('openai', 0, 10), 'openai-pinned'),
+        entry('google', 60, 10),
+        entry('anthropic', 60, 10),
+      ],
+      autoHandoff: true,
+      want: [
+        [
+          'anthropic',
+          'anthropic-model',
+          'Slice 1 (medium) assigned to Anthropic (anthropic): Continue on another provider, since OpenAI has no allowance left. Ranked 2 of 2 by Most allowance left. The plan hint broke a tie.',
         ],
       ],
     },
     {
-      name: 'nothing ranks',
+      name: 'on a limit with Continue on another provider off, the slice has no model',
       slices: [slice(1, 'hard')],
-      families: [entry('openai', 0, 10)],
-      want: [],
-      candidates: [],
+      fixer: anthropic,
+      families: [pinned(entry('openai', 0, 10), 'openai-pinned'), entry('google', 80, 10)],
+      want: [
+        'Slice 1 (hard) has no model in the crew to run on: Anthropic is not connected, and OpenAI has no allowance left. Continue on another provider is off.',
+      ],
+      candidates: [[]],
     },
   ];
   for (const row of rows) {
     const plan: ChatPlan = { planId: 'p1', goal: 'Ship it.', slices: row.slices };
     const inputs: PlanInputs = {
       families: row.families ?? all,
-      mode: row.mode ?? 'most-left',
+      mode: 'most-left',
       now: NOW,
-      builder,
-      localContext: row.localContext === undefined ? 8192 : row.localContext,
+      builder: row.builder ?? openai,
+      fixer: row.fixer ?? null,
+      autoHandoff: row.autoHandoff ?? false,
+      excluded: row.excluded ?? [],
+      localContext: 8192,
       localSliceFits: fits,
       files,
     };
-    const cards = assignPlan(plan, inputs);
+    const { rows: cards, unassigned } = assignPlan(plan, inputs);
     // Same inputs, same card.
-    assert.deepEqual(assignPlan(plan, inputs), cards, row.name);
+    assert.deepEqual(assignPlan(plan, inputs).rows, cards, row.name);
     assert.deepEqual(
-      cards.flatMap((card) =>
+      cards.map((card) =>
         card.assignment
-          ? [[card.assignment.family, card.assignment.model, card.assignment.reason]]
-          : [],
+          ? [card.assignment.family, card.assignment.model, card.assignment.reason]
+          : unassigned[card.id],
       ),
       row.want,
       row.name,
@@ -215,7 +298,7 @@ test('assignment is a pure function of connected families, allowances, difficult
     );
     if (row.candidates)
       assert.deepEqual(
-        cards.at(-1)?.candidates.map((value) => value.family),
+        cards.map((card) => card.candidates.map((value) => value.family)),
         row.candidates,
         row.name,
       );
@@ -225,6 +308,18 @@ test('assignment is a pure function of connected families, allowances, difficult
   const block = (body: string) => `Here is the plan.\n\n\`\`\`json plan\n${body}\n\`\`\`\n`;
   const plan = { planId: 'p1', goal: 'Ship it.', slices: [slice(1, 'easy')] };
   assert.deepEqual(parsePlan(block(JSON.stringify(plan))), { plan });
+  // A provider the message rules out, and words that rule nothing out.
+  assert.deepEqual(ruledOut('Do not assign anything to Local AI.'), ['local']);
+  assert.deepEqual(ruledOut("Split it in four, but don't use Google or OpenAI."), [
+    'google',
+    'openai',
+  ]);
+  assert.deepEqual(ruledOut('Run it without LM Studio.'), ['local']);
+  assert.deepEqual(ruledOut('Use Local for the small parts. OpenAI takes the rest.'), []);
+  // A reply with no plan block answered the person; one with a broken block goes back.
+  assert.equal(hasPlanBlock('Halloween 2027 falls on a Sunday.'), false);
+  assert.equal(hasPlanBlock(block('{')), true);
+  assert.equal(hasPlanBlock('```json plan\n{"planId": "p1"'), true);
   assert.deepEqual(parsePlan('No block.'), {
     error: 'The reply has no fenced json block tagged plan.',
   });

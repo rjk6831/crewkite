@@ -76,6 +76,11 @@ export type ToolContext = Readonly<{
   threads?: ThreadReads;
   /** Most bytes a thread tool result may take, sized from the room the Local prompt has left. */
   threadBytes?: number;
+  /**
+   * Most bytes a read, a search or a thread read may return, sized from the room the turn has left
+   * above the smallest reply. Absent means only the usual bounds apply.
+   */
+  readBytes?: number;
   scratch: string;
   environment: NodeJS.ProcessEnv;
   signal?: AbortSignal;
@@ -870,6 +875,7 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
       ? (input as Record<string, unknown>)
       : {};
   const { kind, title } = describe(name, args);
+  const roomBytes = Math.max(0, context.readBytes ?? Number.POSITIVE_INFINITY);
   const failed = (error: string): PreparedTool => ({
     name,
     kind,
@@ -917,7 +923,10 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
             return `${call.start + index}: ${cut}`;
           });
           const header = `${file.relative} lines ${call.start}-${end} of ${total}`;
-          return { status: 'ok', output: bound([header, ...shown].join('\n')) };
+          return {
+            status: 'ok',
+            output: cutToRoom(bound([header, ...shown].join('\n')), roomBytes),
+          };
         });
       }
       case 'search': {
@@ -926,7 +935,10 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
           return failed('Patterns with nested repeats are not supported. Simplify the pattern.');
         return ready(null, async () => ({
           status: 'ok',
-          output: search(context.scratch, context.environment, call.pattern, call.glob),
+          output: cutToRoom(
+            search(context.scratch, context.environment, call.pattern, call.glob),
+            roomBytes,
+          ),
         }));
       }
       case 'edit': {
@@ -1017,7 +1029,7 @@ export function prepareTool(name: string, input: unknown, context: ToolContext):
       case 'thread_live': {
         const threads = context.threads;
         if (!threads) return failed('Thread tools are not available in this turn.');
-        const limit = context.threadBytes ?? OUTPUT_BYTES;
+        const limit = Math.min(context.threadBytes ?? OUTPUT_BYTES, roomBytes);
         return ready(null, async () => ({
           status: 'ok',
           output: cutToRoom(await readThread(name, threadArguments(args), threads), limit),

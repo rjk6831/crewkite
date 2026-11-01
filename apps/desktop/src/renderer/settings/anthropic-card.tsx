@@ -1,7 +1,7 @@
 import { RefreshCw } from 'lucide-react';
 import { formatLocalTime } from '../format-time.ts';
 import { usageCards } from '../thread/usage-cards.ts';
-import { anthropicReadReason, readAgo } from '../usage-presentation.ts';
+import { anthropicReadReason } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
 
@@ -14,12 +14,14 @@ const signInText = (state: string | undefined) =>
 
 export function AnthropicCard({ header, workspace, entry, now, actions, scopes }: CardProps) {
   const connection = header.nativeConnections.find(({ family }) => family === 'anthropic');
-  const { reader, profiles, nextReadAt, cooldownSeconds } = clientFor(header, 'anthropic', now);
+  const { reader, clientReady, nextReadAt, cooldownSeconds } = clientFor(header, 'anthropic', now);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const busy = actions.busy.anthropic;
   const message = actions.messages.anthropic;
   const detail = reader?.detail;
-  const read = readAgo(entry?.readAt ?? reader?.reading?.receivedAt, now);
+  const failure = reader?.readReason
+    ? anthropicReadReason(reader.readReason, reader.clientVersion)
+    : null;
   const cards = usageCards(
     scopes.filter(({ family }) => family === 'anthropic'),
     header,
@@ -37,21 +39,16 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
             <button
               type="button"
               className="button secondary"
-              disabled={
-                !connected ||
-                !profiles.some((profile) => profile.available) ||
-                busy ||
-                connection?.state === 'checking'
-              }
+              disabled={!connected || !clientReady || busy || connection?.state === 'checking'}
               onClick={() => void actions.checkAnthropic()}
             >
               Check Anthropic sign-in
             </button>
           </div>
-          <p className="st-note">
-            {connection?.next ??
-              'Check the existing native client sign-in. No model prompt is sent.'}
-          </p>
+          {/* The signed-in line above says enough. Other states carry the step to take. */}
+          {connection?.next && connection.state !== 'signed-in' && (
+            <p className="st-note">{connection.next}</p>
+          )}
           {connection?.state === 'signed-out' && (
             <p className="st-note">
               Follow the{' '}
@@ -67,8 +64,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
           )}
           {connection?.observedAt && (
             <p className="st-note">
-              Last checked: {formatLocalTime(connection.observedAt) ?? 'unknown'}. Billing and task
-              qualification remain unknown.
+              Last checked: {formatLocalTime(connection.observedAt) ?? 'unknown'}.
             </p>
           )}
           <div className="st-actions">
@@ -99,14 +95,8 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
                 </button>
               )}
           </div>
-          {read && <p role="status">{read}</p>}
-          <p className="st-note">
-            CrewKite runs the client's /usage command to read allowance, and again every ten minutes
-            while no Anthropic turn runs. Sign in with your subscription first.
-          </p>
-          {reader?.readReason && (
-            <p role="status">{anthropicReadReason(reader.readReason, reader.clientVersion)}</p>
-          )}
+          <p className="st-note">Usage is read again every ten minutes while Anthropic is idle.</p>
+          {failure && <p role="status">{failure}</p>}
           {detail && reader?.readReason && reader.readReason !== 'reported' && (
             <>
               <p className="st-note">The client wrote</p>

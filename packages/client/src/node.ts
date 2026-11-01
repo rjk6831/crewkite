@@ -472,22 +472,26 @@ export class ControllerClient {
                           ? 40000
                           : command.command === 'CheckNativeConnection'
                             ? 35000
-                            : command.command === 'AuthenticateGoogleAcp'
-                              ? 130000
+                            : // A setup step can first wait up to 20 s for a quota read, then
+                              // runs to its own deadline: 300 s for the browser sign-in, 30 s
+                              // to initialize and 20 s to discover.
+                              command.command === 'AuthenticateGoogleAcp'
+                              ? 330000
                               : command.command === 'InitializeGoogleAcp'
-                                ? 35000
-                                : [
-                                      'ObserveUsage',
-                                      'RefreshChatModels',
-                                      'CheckProviderClient',
-                                      'DiscoverGoogleAcp',
-                                      'StopGoogleAcpSetup',
-                                    ].includes(command.command)
-                                  ? 30000
-                                  : command.command === 'PrepareCandidateEvaluation' &&
-                                      command.payload.checkRecipeId === 'crewkite-verify-v1'
-                                    ? 65000
-                                    : 5000),
+                                ? 55000
+                                : command.command === 'DiscoverGoogleAcp'
+                                  ? 45000
+                                  : [
+                                        'ObserveUsage',
+                                        'RefreshChatModels',
+                                        'CheckProviderClient',
+                                        'StopGoogleAcpSetup',
+                                      ].includes(command.command)
+                                    ? 30000
+                                    : command.command === 'PrepareCandidateEvaluation' &&
+                                        command.payload.checkRecipeId === 'crewkite-verify-v1'
+                                      ? 65000
+                                      : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);

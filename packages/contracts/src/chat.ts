@@ -254,8 +254,9 @@ export const ChatPlanAssignmentSchema = z.strictObject({
 export type ChatPlanAssignment = z.infer<typeof ChatPlanAssignmentSchema>;
 /**
  * The plan card. It travels on the thread record, so it carries titles and status and leaves the
- * briefs in the orchestrator's reply. `candidates` are the ranked families a person can pick from
- * before the slice runs. proposed waits for Run plan; running, finished and stopped follow it.
+ * briefs in the orchestrator's reply. `candidates` are the crew models, or after a handoff the
+ * ranked families, a person can pick from before the slice runs. proposed waits for Run plan;
+ * running, finished and stopped follow it.
  */
 export const ChatPlanStateSchema = z
   .strictObject({

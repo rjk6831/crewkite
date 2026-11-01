@@ -52,8 +52,15 @@ import { canSend, isMacPlatform, shortcutFor } from './composer-rules.ts';
 import { deliveryNote, deliveryOf } from './file-fit.ts';
 import { InstructionChip } from './instruction-chip.tsx';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
+import { type NextMessageInput, nextMessage } from './next-message.ts';
 import { NotesChip } from './project-notes.tsx';
-import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
+import {
+  ASK_NEEDS_TEXT,
+  QUICK_QUESTION,
+  type RoleAction,
+  roleActions,
+  useRoleRun,
+} from './role-row.tsx';
 import { clearsDraft, slashEffect } from './slash-actions.ts';
 
 /**
@@ -100,7 +107,7 @@ export function Composer({
   taskId,
   thread,
   running,
-  context,
+  meter = null,
   currentFamily,
   blocked,
   notice,
@@ -111,6 +118,7 @@ export function Composer({
   onOpenCrew,
   onCatalog,
   localState,
+  startSelection = null,
   lastMessage = null,
   onNewThread,
   onOpenSettings,
@@ -121,7 +129,14 @@ export function Composer({
   taskId: string | null;
   thread: ChatThread | null;
   running: boolean;
-  context: { used: number; capacity: number | null } | null;
+  /**
+   * What the meter counts for the next message: the stored turns, and the window a turn on a
+   * family and model last reported. Null on a new thread.
+   */
+  meter?: {
+    history: NextMessageInput['history'];
+    windowFor: (family: ChatFamily, model: string) => number | null;
+  } | null;
   currentFamily: ChatFamily | null;
   blocked: string | null;
   notice: string | null;
@@ -135,6 +150,8 @@ export function Composer({
   onCatalog?: (catalog: ChatCatalogRead) => void;
   /** The saved Local setup, and a workspace read to get its current revision. */
   localState?: { setup: LocalSetup | null | undefined; refresh: () => Promise<WorkspaceState> };
+  /** The model the first message went to, while the new thread's record is on its way. */
+  startSelection?: ChatModelSelection | null;
   /** The newest message the person sent. Up in an empty box loads it back for editing. */
   lastMessage?: { text: string; files: readonly ChatAttachment[] } | null;
   /** The slash commands that move around the app. A view that cannot do one leaves it out. */
@@ -210,7 +227,15 @@ export function Composer({
   useEffect(() => {
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
-  const chosen = selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
+  // A thread with a crew offers its builder before any catalog default, so the pick never floats
+  // with the allowance readings while an orchestrator or a plan answers.
+  const builder = thread?.crew?.members.find((member) => member.role === 'builder')?.selection;
+  const chosen =
+    selection ??
+    builder ??
+    startSelection ??
+    preferredSelection(catalog) ??
+    defaultSelection(catalog);
   // An unfinished @ mention at the caret, or a slash command name at the start of the box.
   const trigger = taskId ? findMentionTrigger(text, caret) : null;
   const triggerQuery = trigger?.query;
@@ -299,6 +324,20 @@ export function Composer({
       ? lastSeen(saved.observedAt, Date.now(), !!saved.connected)
       : null;
   const adding = files.some((file) => file.busy);
+  // The meter is about the next message for the selected model, so it moves with the model, the
+  // draft and the attachments. Local reads its window from the loaded instance.
+  const estimate =
+    meter && selection
+      ? nextMessage({
+          family: selection.family,
+          capacity:
+            (selection.family === 'local' ? saved?.contextTokens : null) ??
+            meter.windowFor(selection.family, selection.model),
+          history: meter.history,
+          draft: text,
+          fileBytes: files.reduce((sum, file) => sum + file.bytes, 0),
+        })
+      : null;
   const canAttach = !!source.attachFiles && !blocked;
   async function submit(event?: FormEvent) {
     event?.preventDefault();
@@ -307,6 +346,22 @@ export function Composer({
     const slash = files.length === 0 ? parseSlash(body) : null;
     if (slash) {
       void runSlash(slash.name, slash.argument);
+      return;
+    }
+    // With the Quick question row open, Send and Enter send the box as the side question to the
+    // provider picked there. It never goes to the thread as a message, so the crew does not start.
+    if (roles.ask) {
+      if (files.length > 0) {
+        setNote(
+          'A quick question takes text only. Remove the files, or close the row to send them.',
+        );
+        return;
+      }
+      if (body === '') {
+        setNote(ASK_NEEDS_TEXT);
+        return;
+      }
+      await roles.ask();
       return;
     }
     if (!canSend({ text: body, files: files.length, blocked, adding })) return;
@@ -638,11 +693,11 @@ export function Composer({
               disabled={roles.why('ask') !== null}
               title={
                 roles.why('ask') ??
-                'Ask one family a read-only question. The answer posts beside the thread.'
+                'Ask one provider a side question. The answer posts beside the thread and changes nothing.'
               }
               onClick={() => roles.toggle('ask')}
             >
-              {roles.askLabel}
+              {QUICK_QUESTION}
             </button>
           </div>
         )}
@@ -687,13 +742,32 @@ export function Composer({
             </button>
           )}
           <div className="th-bar-end">
-            {context?.capacity && (
+            {estimate && (
               <ContextGauge
-                usedTokens={context.used}
-                capacityTokens={context.capacity}
+                usedTokens={estimate.tokens}
+                capacityTokens={estimate.capacity}
                 measurement="current"
                 updating={running}
                 size={22}
+                label="Next message"
+                tone={estimate.tone}
+                folding={estimate.folds}
+                detail={{
+                  status: `For ${selection?.model ?? 'the selected model'}`,
+                  rows: [
+                    [
+                      'This message',
+                      `about ${estimate.tokens.toLocaleString()} of ${estimate.capacity.toLocaleString()} tokens`,
+                    ],
+                    ['Thread history stored', `${estimate.storedTokens.toLocaleString()} tokens`],
+                  ],
+                  lines: [
+                    estimate.olderTurns,
+                    ...(estimate.folds
+                      ? ['Older turns will be summarized before this message.']
+                      : []),
+                  ],
+                }}
               />
             )}
             {running && (

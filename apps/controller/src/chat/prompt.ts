@@ -33,7 +33,15 @@ export const familyName: Record<ChatFamily, string> = {
 // model: the person picked another model of the same family, which starts a new native session.
 // session: the turns since the family last ran do not fit its session, so a new one starts.
 // ask: a read-only side question to one family, which reads the thread from the packet.
-export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model' | 'session' | 'ask';
+export type HandoffReason =
+  | 'manual'
+  | 'limit'
+  | 'steer'
+  | 'rerun'
+  | 'model'
+  | 'session'
+  | 'ask'
+  | 'plan';
 
 export function handoffReason(reason: HandoffReason): string {
   if (reason === 'rerun') return 'the person asked for the reply again';
@@ -41,6 +49,7 @@ export function handoffReason(reason: HandoffReason): string {
   if (reason === 'model') return 'model changed in the composer';
   if (reason === 'session') return 'the thread moved past what the old session could carry';
   if (reason === 'ask') return 'the person asked a side question';
+  if (reason === 'plan') return 'the orchestrator reads the thread before it plans';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
@@ -334,12 +343,12 @@ export function challengeContext(
 
 /** The example in the orchestrator brief. A test parses it with the plan schema. */
 export const PLAN_EXAMPLE =
-  '{"planId": "p1", "goal": "Add tax to the order total.", "slices": [{"id": 1, "title": "Add the tax rate", "brief": "Add TAX_RATE to src/config.ts and export it.", "files": ["src/config.ts"], "depends": [], "difficulty": "easy", "readOnly": false}, {"id": 2, "title": "Apply tax in totals", "brief": "Use TAX_RATE in orderTotal in src/totals.ts and round to the cent.", "files": ["src/totals.ts", "src/config.ts"], "depends": [1], "difficulty": "medium", "readOnly": false, "hint": {"family": "openai"}}]}';
+  '{"planId": "p1", "goal": "Add tax to the order total.", "slices": [{"id": 1, "title": "Add the tax rate", "brief": "Add TAX_RATE to src/config.ts and export it.", "files": ["src/config.ts"], "depends": [], "difficulty": "easy", "readOnly": false}, {"id": 2, "title": "Apply tax in totals", "brief": "Use TAX_RATE in orderTotal in src/totals.ts and round to the cent.", "files": ["src/totals.ts", "src/config.ts"], "depends": [1], "difficulty": "medium", "readOnly": false}]}';
 
 /**
- * Brief for an orchestrator turn. It reads, then answers with one plan block the controller
- * validates. The controller picks the model for each slice, so the brief asks for difficulty and
- * leaves the choice of family out.
+ * Brief for an orchestrator turn. It reads, then answers a question itself or proposes one plan
+ * block the controller validates. The controller assigns each slice inside the crew, so the brief asks for difficulty
+ * and leaves the choice of family out.
  */
 export function orchestratorContext(
   projectName: string,
@@ -349,9 +358,10 @@ export function orchestratorContext(
   return [
     `You are the orchestrator in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     readOnlyRules(family, 'plan the work'),
-    'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan and picks the model for each slice. Slices whose dependencies are done start together, each in its own copy of the project, with at most one turn per provider at a time. Each slice that changes files gets a review.',
+    'Answer a question, or a request that changes no file, yourself in plain sentences and write no plan block. A plan costs a turn per slice, so propose one only for work that changes files or splits into independent parts.',
+    'For that work, split the request into slices that one model can each finish in one turn. CrewKite checks the plan and assigns each slice inside the crew: every slice runs on the crew builder, and a hard slice runs on the crew fixer when the crew has one. No provider outside the crew takes a slice, and Local takes one only when a crew role is Local. When the crew builder reaches its usage limit and Continue on another provider is on, the handoff rule may still move a slice to another provider. A provider the person rules out in the message, such as "do not assign anything to Local", takes no slice, and CrewKite reads that from the message itself. Slices whose dependencies are done start together, each in its own copy of the project, with at most one turn per provider at a time. Each slice that changes files gets a review.',
     'The slices are the parallel workers, and CrewKite starts them after your turn. Your own turn only reads and plans, so you start no agent to do the work. When the person asks for a number of agents or subagents, split the work into that many slices where it divides that way, leave the independent ones without depends, and say in your summary which slices run side by side.',
-    'Reply with a short summary in plain sentences: what each slice does and which ones run side by side. The person sees the plan as a card, so the summary does not repeat its JSON or list its fields. End the reply with exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
+    'With a plan, reply with a short summary in plain sentences: what each slice does and which ones run side by side. The person sees the plan as a card, so the summary does not repeat its JSON or list its fields. End the reply with exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
     PLAN_EXAMPLE,
     'Rules:',
     '- planId: letters, digits, dot, underscore or hyphen, at most 64 characters.',
@@ -362,7 +372,7 @@ export function orchestratorContext(
     '- depends: ids of the slices that must finish first. No cycles.',
     '- difficulty: easy for a small change a small local model can make from the named files alone; medium for a change across a few files that needs judgment; hard for design work or a change that needs much of the codebase in view.',
     '- readOnly: true when the slice only reads, such as an investigation, and changes no file.',
-    '- hint is optional. hint.family (openai, anthropic, google or local) only breaks a tie between families CrewKite already ranks.',
+    '- hint is optional and can be left out. hint.family only breaks a tie when the handoff rule moves a slice out of the crew.',
   ].join('\n');
 }
 
@@ -402,6 +412,24 @@ export function sliceBrief(
     slice.readOnly
       ? 'This slice only reads. Read and search the files it needs, change none of them, and report what you found.'
       : 'Do only this slice. Later slices cover the rest of the plan. Say which files you changed and why.',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
+/**
+ * The slice brief for a Local builder: the goal on one line, the task and the files. A small
+ * window has no room for the plan's framing, and Local starts fresh each turn, so nothing else
+ * has to travel in the message.
+ */
+export function localSliceBrief(
+  plan: { goal: string },
+  slice: { brief: string; files: readonly string[]; readOnly: boolean },
+): string {
+  return [
+    `Goal: ${plan.goal.replace(/\s+/g, ' ').trim()}`,
+    `Task: ${slice.brief}${slice.readOnly ? ' Read only and change no file.' : ''}`,
+    slice.files.length ? `Files:\n${slice.files.join('\n')}` : '',
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -482,6 +510,8 @@ export function handoffPacket(input: {
   earlier?: readonly EarlierFile[];
   /** True when this turn has the thread tools. The packet names them only then. */
   threadTools: boolean;
+  /** The thread's last plan and its slice results, for an orchestrator turn. */
+  plan?: string | null;
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -507,18 +537,21 @@ export function handoffPacket(input: {
   const opening =
     input.reason === 'ask'
       ? `This is a side question to ${familyName[input.to]} about the thread below. Answer it from the thread and the scratch copy, and change nothing.`
-      : input.reason === 'rerun'
-        ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-        : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
-          ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-          : input.from === input.to
-            ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-            : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+      : input.reason === 'plan'
+        ? 'You are the orchestrator of this thread. The conversation below holds the earlier plans: the plan replies, the slice briefs and what each slice answered. The last plan and its results follow it.'
+        : input.reason === 'rerun'
+          ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+          : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
+            ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+            : input.from === input.to
+              ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+              : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
     ...(input.threadTools ? [THREAD_TOOLS_LINE] : []),
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
+    input.plan ? `The last plan in this thread:\n${input.plan}` : '',
     `Files changed in the scratch copy against the base commit:\n${files}`,
     ...(input.instructions?.length
       ? [`Project instructions: ${input.instructions.join(', ')}`]
@@ -528,6 +561,30 @@ export function handoffPacket(input: {
   ]
     .filter(Boolean)
     .join('\n\n');
+}
+
+/**
+ * The thread's last plan in words for the orchestrator: its goal, where it stands, and each
+ * slice with its status and the model it ran on.
+ */
+export function planSummary(plan: {
+  goal: string;
+  phase: string;
+  slices: readonly {
+    id: number;
+    title: string;
+    status: string;
+    assignment: { family: ChatFamily; model: string } | null;
+  }[];
+}): string {
+  return [
+    `Goal: ${plan.goal}`,
+    `Plan: ${plan.phase}.`,
+    ...plan.slices.map(
+      (slice) =>
+        `Slice ${slice.id}, ${slice.title}: ${slice.status}${slice.assignment ? `, on ${familyName[slice.assignment.family]} (${slice.assignment.model})` : ''}.`,
+    ),
+  ].join('\n');
 }
 
 /** A file from an earlier message, and how this request reaches it. */

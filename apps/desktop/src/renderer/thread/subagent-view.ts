@@ -13,7 +13,7 @@ const chipRoles: Record<ChatRole, string> = {
   challenger: 'Challenger',
   fixer: 'Fixer',
   orchestrator: 'Orchestrator',
-  ask: 'Ask',
+  ask: 'Side question',
 };
 
 export type TurnChip = {
@@ -188,17 +188,11 @@ export function subagentRows(activity: SubagentActivity, ended: boolean, start =
 
 /**
  * The line under a role's subagent switch, and whether the switch does anything for the family.
- * Local runs one model with no subagents of its own. OpenAI subagents start off, since their
- * approvals rely on the client passing the turn's policy to each one.
+ * Local runs one model with no subagents of its own.
  */
 export function subagentSwitchNote(family: TurnIdentity['family'] | null | undefined) {
   if (family === 'local')
     return { text: 'Local starts no subagents, so there is nothing to turn off.', disabled: true };
-  if (family === 'openai')
-    return {
-      text: "Off until you turn it on: subagent approvals rely on the client passing this turn's approval policy to each subagent, which a live check has yet to confirm.",
-      disabled: false,
-    };
   return null;
 }
 

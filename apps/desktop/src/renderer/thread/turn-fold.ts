@@ -131,7 +131,7 @@ export const roleLabels: Record<ChatRole, string | null> = {
   challenger: 'Challenger',
   fixer: 'Fixer',
   orchestrator: 'Orchestrator',
-  ask: 'Ask',
+  ask: 'Side question',
 };
 
 /**
@@ -286,13 +286,30 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
     case 'text.completed': {
       const done = event.type === 'text.completed';
       const id = `text:${event.itemId}`;
+      // The newest block of this item, the item's own or one opened when its id came back.
+      const at = view.blocks.findLastIndex(
+        (block) => block.id === id || block.id.startsWith(`${id}:`),
+      );
+      const current = view.blocks[at];
+      const own = current?.id ?? id;
+      // A text item that already finished takes nothing more in its place. A client that uses
+      // the same item id again for a later message gets a new block where the text arrives, so
+      // the turn reads in the order it ran. The same completed text again changes nothing.
+      if (current?.kind === 'text' && current.done) {
+        if (done && current.text === event.text) return view;
+        const later = `${id}:${view.blocks.length}`;
+        return withBlocks(view, [
+          ...view.blocks,
+          { kind: 'text', id: later, text: event.text, done },
+        ]);
+      }
       return withBlocks(
         view,
-        put(view.blocks, id, (current) => ({
+        put(view.blocks, own, (previous) => ({
           kind: 'text',
-          id,
+          id: own,
           // A completed item carries the whole text, which repairs any delta lost on the way.
-          text: done || current?.kind !== 'text' ? event.text : current.text + event.text,
+          text: done || previous?.kind !== 'text' ? event.text : previous.text + event.text,
           done,
         })),
       );

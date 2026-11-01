@@ -3,15 +3,16 @@ import {
   type ChatCatalogRead,
   ChatCrewRoleSchema,
   type ChatFlightMode,
+  SAVED_CREWS_MAX,
 } from '@crewkite/contracts';
 import { Pencil, Plus, Trash2 } from 'lucide-react';
 import { useEffect, useId, useState } from 'react';
 import { Dialog } from '../components.tsx';
 import { RoleInfo } from '../thread/role-info.tsx';
 import { SubagentSwitch } from '../thread/subagent-switch.tsx';
+import { deleteCrew, saveCrew, setDefaultCrew } from './crew-store.ts';
 import { modelChoices, SelectionFields } from './general-card.tsx';
 import {
-  BUILT_IN_DEFAULT_CREW,
   type CrewChoice,
   type CrewMemberPin,
   type CrewPreset,
@@ -28,9 +29,7 @@ import {
   type SavedCrew,
   savedCrewId,
   writeCrewPresets,
-  writeDefaultCrew,
   writeProjectCrew,
-  writeSavedCrews,
 } from './preferences.ts';
 import '../thread/crew.css';
 
@@ -43,24 +42,17 @@ export const autoLabel = (role: string) =>
       ? 'Same as the builder'
       : 'Another connected family';
 
+const readChoices = () => ({
+  choices: crewChoices(),
+  defaultId: readDefaultCrew(),
+  projects: readProjectCrews(),
+  saved: readSavedCrews(),
+});
+
 /** The crews a thread can start from, read again whenever a saved crew or a default changes. */
 export function useCrewChoices() {
-  const [state, setState] = useState(() => ({
-    choices: crewChoices(),
-    defaultId: readDefaultCrew(),
-    projects: readProjectCrews(),
-  }));
-  useEffect(
-    () =>
-      onCrewChoices(() =>
-        setState({
-          choices: crewChoices(),
-          defaultId: readDefaultCrew(),
-          projects: readProjectCrews(),
-        }),
-      ),
-    [],
-  );
+  const [state, setState] = useState(readChoices);
+  useEffect(() => onCrewChoices(() => setState(readChoices())), []);
   return state;
 }
 
@@ -292,10 +284,22 @@ export function CrewsCard({
   catalog: ChatCatalogRead | null;
   projects: readonly { id: string; name: string }[];
 }) {
-  const { choices, defaultId, projects: projectCrews } = useCrewChoices();
+  const { choices, defaultId, projects: projectCrews, saved } = useCrewChoices();
   const [presets, setPresets] = useState<CrewPreset[]>(() => readCrewPresets());
-  const [saved, setSaved] = useState<SavedCrew[]>(() => readSavedCrews());
   const [editing, setEditing] = useState<SavedCrew | 'new' | null>(null);
+  const [problem, setProblem] = useState<string | null>(null);
+  // The controller keeps saved crews and the default. A change it refuses leaves the list as it
+  // was and says why.
+  async function change(work: () => Promise<void>): Promise<boolean> {
+    try {
+      await work();
+      setProblem(null);
+      return true;
+    } catch (failure) {
+      setProblem(failure instanceof Error ? failure.message : 'The change was not saved.');
+      return false;
+    }
+  }
   const choicesOfModels = modelChoices(catalog);
   const pin = (
     name: CrewPreset['name'],
@@ -315,14 +319,10 @@ export function CrewsCard({
     setPresets(next);
     writeCrewPresets(next);
   };
-  const store = (next: SavedCrew[]) => {
-    setSaved(next);
-    writeSavedCrews(next);
-  };
-  function remove(crew: SavedCrew) {
-    store(saved.filter((value) => value.id !== crew.id));
-    // A default or a project crew that named it goes back to the built-in default.
-    if (defaultId === `saved:${crew.id}`) writeDefaultCrew(BUILT_IN_DEFAULT_CREW);
+  // The controller hands the default back to Solo when it named the crew. A project crew that
+  // named it follows the default again.
+  async function remove(crew: SavedCrew) {
+    if (!(await change(() => deleteCrew(crew.id)))) return;
     for (const [project, id] of Object.entries(projectCrews))
       if (id === `saved:${crew.id}`) writeProjectCrew(project, null);
   }
@@ -347,10 +347,15 @@ export function CrewsCard({
               id="settings-default-crew"
               value={defaultId}
               choices={choices}
-              onChange={writeDefaultCrew}
+              onChange={(id) => void change(() => setDefaultCrew(id))}
             />
           </div>
         </div>
+        {problem && (
+          <p className="st-note" role="alert">
+            {problem}
+          </p>
+        )}
         {projects.length > 0 && (
           <div className="st-row">
             <span className="st-field">
@@ -411,7 +416,7 @@ export function CrewsCard({
                       type="button"
                       className="button secondary"
                       aria-label={`Delete ${crew.name}`}
-                      onClick={() => remove(crew)}
+                      onClick={() => void remove(crew)}
                     >
                       <Trash2 size={13} aria-hidden="true" />
                       Delete
@@ -423,7 +428,7 @@ export function CrewsCard({
             <button
               type="button"
               className="button secondary"
-              disabled={saved.length >= 24}
+              disabled={saved.length >= SAVED_CREWS_MAX}
               onClick={() => setEditing('new')}
             >
               <Plus size={14} aria-hidden="true" />
@@ -491,14 +496,9 @@ export function CrewsCard({
           initial={editing === 'new' ? null : editing}
           saved={saved}
           onClose={() => setEditing(null)}
-          onSave={(crew) => {
-            store(
-              saved.some((value) => value.id === crew.id)
-                ? saved.map((value) => (value.id === crew.id ? crew : value))
-                : [...saved, crew],
-            );
-            setEditing(null);
-          }}
+          onSave={(crew) =>
+            void change(() => saveCrew(crew)).then((done) => done && setEditing(null))
+          }
         />
       )}
     </section>

@@ -36,6 +36,7 @@ import {
   stripTurnNotes,
   withoutThreadToolsLine,
 } from '../../chat/prompt.ts';
+import { outsidePaths } from '../../chat/read-only-command.ts';
 import { readableType, SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
@@ -103,7 +104,8 @@ export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
 // commands, and under `untrusted` it asked about most of them (pwd, ls -la, rg --files), which a
 // read-only turn could only deny, so the model was left with no way to read. Under `never` each
 // command runs inside the sandbox without a question, and the sandbox refuses every write and
-// every network call; a refused command fails in place and is never escalated. The brief keeps
+// every network call; a refused command fails in place and is never escalated. turn/start narrows
+// what the sandbox reads to the scratch copy (readOnlySandbox below). The brief keeps
 // the model to read-only commands (readOnlyRules in chat/prompt.ts). serverRequest still denies a
 // question that arrives on a read-only turn.
 const approvalPolicy = (request: ChatTurnRequest) =>
@@ -116,6 +118,15 @@ const launchApprovalPolicy = (request: ChatTurnRequest) =>
   request.readOnly ? 'never' : 'on-request';
 const sandboxMode = (request: ChatTurnRequest) =>
   request.readOnly ? 'read-only' : 'workspace-write';
+// The read-only sandbox reads the whole disk by default. A read-only turn narrows it to the
+// scratch copy and the platform's own files, so a command cannot read a file outside the copy,
+// such as the client's memory files under the home folder (H11). The turn also stops when a
+// command names a path outside the copy, in case a client build ignores the narrower policy.
+const readOnlySandbox = (directory: string) => ({
+  type: 'readOnly',
+  access: { type: 'restricted', includePlatformDefaults: true, readableRoots: [directory] },
+  networkAccess: false,
+});
 // `other` spans every tool CrewKite cannot name, so no thread grant covers it. Only commands and
 // file changes ask here today; the guard holds if another request kind starts asking.
 const threadGrant = (request: ChatTurnRequest, kind: ChatToolKind) =>
@@ -897,29 +908,43 @@ class OpenAiChatTurn {
     // turn/start sets the effort for this turn and the ones after it. thread/start and
     // thread/resume have no effort field, so every turn names its own and a resumed thread follows
     // the composer. Default sends none and leaves the thread's level as it is.
-    this.call(
-      'turn/start',
-      {
-        threadId: this.threadId,
-        input: [...this.media.map((file) => file.input), { type: 'text', text }],
-        ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
-      },
-      (reply) => {
-        if ('error' in reply)
-          return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
-        this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
-        // The client accepted the effort. A default turn runs at the thread's own level.
-        this.send({
-          type: 'turn.started',
-          turnId: this.request.turnId,
-          family: 'openai',
-          model: selection.model,
-          effort:
-            selection.effort === 'default' ? (this.threadEffort ?? 'default') : selection.effort,
-          role: this.request.role,
-        });
-      },
-    );
+    const start = (narrow: boolean) =>
+      this.call(
+        'turn/start',
+        {
+          threadId: this.threadId,
+          input: [...this.media.map((file) => file.input), { type: 'text', text }],
+          ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
+          ...(this.request.readOnly
+            ? {
+                sandboxPolicy: narrow
+                  ? readOnlySandbox(this.request.scratch.directory)
+                  : { type: 'readOnly', networkAccess: false },
+              }
+            : {}),
+        },
+        (reply) => onStart(reply, narrow),
+      );
+    // A client build that does not know the narrower read-only policy refuses it. The turn then
+    // starts on the plain read-only sandbox, and the path check on each command still stops a read
+    // outside the scratch copy.
+    const onStart = (reply: Reply, narrow: boolean) => {
+      if ('error' in reply && narrow && this.request.readOnly) return start(false);
+      if ('error' in reply)
+        return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
+      this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
+      // The client accepted the effort. A default turn runs at the thread's own level.
+      this.send({
+        type: 'turn.started',
+        turnId: this.request.turnId,
+        family: 'openai',
+        model: selection.model,
+        effort:
+          selection.effort === 'default' ? (this.threadEffort ?? 'default') : selection.effort,
+        role: this.request.role,
+      });
+    };
+    start(true);
   }
 
   /** Frames matter until the turn ends, and after an interrupt until the client confirms it. */
@@ -1181,6 +1206,23 @@ class OpenAiChatTurn {
       kind = 'command';
       title = detail || 'Run a command';
       input = { command: detail, cwd: value?.cwd ?? null };
+      // A read-only turn runs commands without a question, so one that reaches past the copy
+      // ends the turn here.
+      const outside = this.request.readOnly
+        ? outsidePaths(input, this.request.scratch.directory)
+        : [];
+      if (outside.length) {
+        this.interrupt();
+        this.fail(
+          chatFailure({
+            stage: 'tool',
+            kind: 'internal',
+            message: `The turn stopped: a read-only command named a path outside the scratch copy (${clip(outside.join(', '), 400)}).`,
+            nextAction: 'Ask again. Read-only turns read only inside the scratch copy.',
+          }),
+        );
+        return;
+      }
     } else if (head.type === 'fileChange') {
       const entries = this.paths(raw);
       this.edits.set(head.id, entries);

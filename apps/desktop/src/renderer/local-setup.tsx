@@ -266,7 +266,7 @@ export function LocalSetup({
           setMessage(null);
         if (result === 'timeout') {
           setPollTimedOut(true);
-          setMessage('Taking longer than expected. Try Refresh.');
+          setMessage('Taking longer than expected. Try Refresh model list.');
         }
       })
       .catch(() => {
@@ -305,9 +305,7 @@ export function LocalSetup({
             ? `${name} requested. Watch the saved status.`
             : command.command === 'CancelLocalConnectionInput'
               ? 'Connection input closed. Local is not connected.'
-              : command.command === 'ConfigureLocal'
-                ? 'Authentication setting saved. Press Connect.'
-                : `${name} confirmed.`;
+              : `${name} confirmed.`;
       setMessage(done ? said : (result.next ?? result.reason ?? `${name} was not confirmed.`));
       if (done && command.command === 'SelectLocalModel') {
         // The command only saved the choice. It counts once a read made after it still holds the
@@ -319,7 +317,6 @@ export function LocalSetup({
         setLastChoice(null);
         setConfirming(null);
       }
-      if (applied(result.outcome) && command.command === 'ConfigureLocal') setEndpointEdited(false);
     } catch {
       if (mounted.current)
         setMessage(`${name} could not be confirmed. Reconnect and use exact retry if available.`);
@@ -342,7 +339,6 @@ export function LocalSetup({
       const result = await connectLocalFlow({
         setup,
         endpoint: parsedEndpoint.data,
-        authMode,
         command: workspace.command,
         active: () => mounted.current && actionGeneration.current === generation,
       });
@@ -374,7 +370,10 @@ export function LocalSetup({
         Connect to an existing Local runtime on this device. Every Connect checks whether the
         runtime wants a token. When it does, a native window asks for it. CrewKite does not change
         the runtime's authentication setting or load a model. Load the model in the Local app when
-        needed.
+        needed.{' '}
+        <ExternalLink href="https://github.com/rjk6831/crewkite/blob/main/docs/local-models.md">
+          Local models
+        </ExternalLink>
       </p>
       <p className="notice" role="status">
         {status}
@@ -467,74 +466,31 @@ export function LocalSetup({
           Disconnect Local
         </button>
       </div>
-      <div className="st-field">
-        <span className="st-name" id={`${titleId}-auth`}>
-          Runtime token
-        </span>
-        <fieldset
-          className="st-segment"
-          aria-labelledby={`${titleId}-auth`}
-          aria-describedby={`${titleId}-auth-hint`}
-          disabled={blocked || !setup?.endpoint}
-        >
-          {(
-            [
-              ['token', 'Detect'],
-              ['none', 'No token'],
-            ] as const
-          ).map(([mode, label]) => (
-            <label key={mode} className={authMode === mode ? 'is-on' : undefined}>
-              <input
-                type="radio"
-                name={`${titleId}-auth`}
-                value={mode}
-                checked={authMode === mode}
-                onChange={() => {
-                  stopPolling();
-                  if (setup?.endpoint && mode !== authMode)
-                    void action('Authentication setting', {
-                      command: 'ConfigureLocal',
-                      expectedRevision: setup.revision,
-                      payload: { endpoint: setup.endpoint, authMode: mode },
-                    });
-                }}
-              />
-              {label}
-            </label>
-          ))}
-        </fieldset>
-        <small className="st-hint" id={`${titleId}-auth-hint`}>
-          {authMode === 'token'
-            ? 'Connect checks the runtime first and asks for its token only when the runtime answers that it needs one. The token stays in memory.'
-            : 'For a runtime with auth off on this device. If it asks for a token after all, Connect opens the token window for that connection.'}
-        </small>
-      </div>
-      <p className="muted small">
-        A change here clears the connection and the model selection.{' '}
-        <ExternalLink href="https://github.com/rjk6831/crewkite/blob/main/docs/local-models.md">
-          Local models
-        </ExternalLink>
-      </p>
-      {remembered && (remembered.remembered || (remembered.available && tokenHeld)) && (
-        <div className="button-row">
-          <p className="muted small">
-            {remembered.remembered
-              ? 'The token is kept on this device for this endpoint.'
-              : 'Keep the token on this device so Connect needs no prompt after a restart.'}
-          </p>
-          <button
-            className="button secondary"
-            type="button"
-            disabled={!connected || busy || workspace.retryAvailable}
-            onClick={() => void keepToken(!remembered.remembered)}
-          >
-            {remembered.remembered ? 'Forget' : 'Remember on this device'}
-          </button>
-        </div>
-      )}
-      {remembered && !remembered.available && !remembered.remembered && tokenHeld && (
-        <p className="muted small">{remembered.reason}</p>
-      )}
+      {/* Remember appears once a token was used. A saved no-token mode keeps no token. */}
+      {remembered &&
+        authMode === 'token' &&
+        (remembered.remembered || (remembered.available && tokenHeld)) && (
+          <div className="button-row">
+            <p className="muted small">
+              {remembered.remembered
+                ? 'The token is kept on this device for this endpoint.'
+                : 'Connect will not ask for it again after a restart.'}
+            </p>
+            <button
+              className="button secondary"
+              type="button"
+              disabled={!connected || busy || workspace.retryAvailable}
+              onClick={() => void keepToken(!remembered.remembered)}
+            >
+              {remembered.remembered ? 'Forget' : 'Remember the token on this device'}
+            </button>
+          </div>
+        )}
+      {remembered &&
+        authMode === 'token' &&
+        !remembered.available &&
+        !remembered.remembered &&
+        tokenHeld && <p className="muted small">{remembered.reason}</p>}
       {setup?.operation && !(quiet && setup.operation.kind === 'discovery') && (
         <div className="button-row">
           <p className="muted small" role="status">
@@ -577,7 +533,9 @@ export function LocalSetup({
         <Fact
           label="Selected model"
           value={
+            // The pick shows at once. The controller's saved selection replaces it when it lands.
             currentChoice?.identity.displayName ??
+            (requested === 'Model selection' ? selectedChoice?.identity.displayName : null) ??
             (setup?.selection ? 'Previous observation' : stale && lastChoice ? lastChoice : 'None')
           }
         />
@@ -704,7 +662,7 @@ export function LocalSetup({
           else void reobserve().then((problem) => mounted.current && setMessage(problem));
         }}
       >
-        Refresh
+        Refresh model list
       </button>
     </section>
   );

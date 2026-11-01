@@ -314,7 +314,11 @@ export class AnthropicUsageRefresh {
   recover() {
     const state = this.state();
     if (!state || state.state === 'quiescent') return;
-    const known = state.groups.length > 0 && state.groups.every(groupAbsent);
+    // A launch saves its intent before it starts a process. A read with no saved intent and no
+    // group never started one, as when a client update made the launch throw.
+    const known = state.groups.length
+      ? state.groups.every(groupAbsent)
+      : !this.intentSaved(state.operationId);
     const recovered = {
       ...state,
       state: known ? ('quiescent' as const) : ('unknown' as const),
@@ -325,6 +329,13 @@ export class AnthropicUsageRefresh {
       outcome: known ? 'blocked' : 'outcome-unknown',
       reason: known ? 'usage-read-interrupted' : 'anthropic-metadata-ownership-unknown',
     });
+  }
+
+  private intentSaved(operationId: string) {
+    const prefix = `anthropic-usage:${operationId}:intent-`;
+    return !!this.options.store.db
+      .prepare('SELECT 1 FROM receipts WHERE substr(command_key,1,?)=? LIMIT 1')
+      .get(prefix.length, prefix);
   }
 
   private complete(key: string, result: CommandResult) {
@@ -425,26 +436,24 @@ export class AnthropicUsageRefresh {
     this.active = active;
     void (async () => {
       let result: CommandResult;
-      let invoked = false;
+      // The client the launch runs. An update that lands before any process starts binds the read
+      // to the new build, which the chat resolver has checked as it checks every launch.
+      let bound = binding;
+      const revoked = () =>
+        this.closed ||
+        active.stopped ||
+        this.active !== active ||
+        this.state()?.operationId !== record.operationId ||
+        !!this.options.blocked();
       const current = () => {
-        if (
-          this.closed ||
-          active.stopped ||
-          this.active !== active ||
-          this.binding()?.scopeHash !== binding.scopeHash ||
-          this.state()?.operationId !== record.operationId ||
-          this.options.blocked()
-        )
+        if (revoked() || this.binding()?.scopeHash !== bound.scopeHash)
           throw Error('usage-read-revoked');
       };
-      try {
-        this.options.changed();
-        current();
-        mkdirSync(binding.context.temporary, { recursive: true, mode: 0o700 });
-        const context = { ...binding.context, operationId: command.key, sessionId: randomUUID() };
+      const launch = () => {
+        mkdirSync(bound.context.temporary, { recursive: true, mode: 0o700 });
+        const context = { ...bound.context, operationId: command.key, sessionId: randomUUID() };
         const scope = anthropicUsageReaderScope(context);
-        invoked = true;
-        const handle = startAnthropicUsageReader(
+        return startAnthropicUsageReader(
           {
             ...context,
             trust: { nativeTrust: 'accepted', scopeHash: scope.scopeHash },
@@ -454,8 +463,9 @@ export class AnthropicUsageRefresh {
                 this.save(record, `intent-${hashCanonical(launch)}`);
               },
               owned: (group) => {
-                current();
+                // The group is kept before any check, so a process that exists is never lost.
                 record.groups = [group];
+                current();
                 record.state = 'owned';
                 this.save(record, 'owned');
               },
@@ -464,11 +474,33 @@ export class AnthropicUsageRefresh {
           },
           { ...this.options.reader, schedule: this.options.schedule, receivedAt: this.options.now },
         );
+      };
+      try {
+        this.options.changed();
+        current();
+        let handle: ReturnType<typeof startAnthropicUsageReader>;
+        try {
+          handle = launch();
+        } catch (error) {
+          // The launch refused before a process started: the client changed after the read
+          // resolved it, or the file no longer matched its digest. One new binding is tried.
+          let next: ReturnType<AnthropicUsageRefresh['binding']> = null;
+          try {
+            next = this.binding();
+          } catch {}
+          if (record.groups.length || revoked() || !next || next.scopeHash === bound.scopeHash)
+            throw error;
+          bound = next;
+          record.scopeHash = next.scopeHash;
+          handle = launch();
+        }
         active.handle = handle;
         if (active.stopped || this.closed) handle.stop();
         const outcome = await handle.result;
-        const known = outcome.quiescent && record.groups.length > 0;
-        const matching = this.binding()?.scopeHash === binding.scopeHash;
+        // The owner reports every group it starts before it checks anything, so a read with no
+        // group started no process.
+        const known = outcome.quiescent;
+        const matching = this.binding()?.scopeHash === bound.scopeHash;
         record.state = known ? 'quiescent' : 'unknown';
         record.reason = !known
           ? 'ownership-unknown'
@@ -481,7 +513,7 @@ export class AnthropicUsageRefresh {
         record.detail = outcome.detail;
         if (known && !active.stopped && !this.closed && matching && outcome.reading) {
           record.reading = AnthropicUsageReadingSchema.parse(outcome.reading);
-          record.readingScopeHash = binding.scopeHash;
+          record.readingScopeHash = bound.scopeHash;
         }
         this.save(record, 'complete');
         result = {
@@ -494,9 +526,10 @@ export class AnthropicUsageRefresh {
         };
       } catch {
         active.handle?.stop();
-        let known = !invoked;
-        if (active.handle)
-          known = (await active.handle.result).quiescent && record.groups.length > 0;
+        // A launch that threw before its owner reported a group started no process. A group it
+        // did report must be gone before the read counts as settled.
+        let known = record.groups.every(groupAbsent);
+        if (active.handle) known = (await active.handle.result).quiescent;
         record.state = known ? 'quiescent' : 'unknown';
         record.reason = 'usage-read-failed';
         this.save(record, 'failed');

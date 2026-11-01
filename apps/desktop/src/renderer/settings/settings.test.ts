@@ -1,8 +1,11 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ChatCatalogRead } from '@crewkite/contracts';
+import type { ChatCatalogRead, SavedCrew, SavedCrewsRead } from '@crewkite/contracts';
+import { deleteCrew, loadCrews, saveCrew, setDefaultCrew } from './crew-store.ts';
 import {
   applyDraft,
+  clearLegacyCrews,
+  crewChoicePatch,
   crewChoices,
   crewForProject,
   crewFromPreset,
@@ -10,17 +13,18 @@ import {
   draftConfigure,
   draftSettings,
   familyModel,
+  firstAnswer,
   flightPreset,
   preferredSelection,
   readCrewPresets,
   readDefaultCrew,
+  readLegacyCrews,
   readSavedCrews,
   readThreadDefaults,
+  setSavedCrews,
   writeCrewPresets,
-  writeDefaultCrew,
   writeFamilyDefault,
   writeProjectCrew,
-  writeSavedCrews,
   writeThreadDefaults,
 } from './preferences.ts';
 
@@ -261,45 +265,67 @@ test('new thread settings follow the controller rules and configure only what ch
   assert.deepEqual(draftConfigure(applyDraft(fresh, { autoHandoff: true })), [
     { autoHandoff: true },
   ]);
+  // The starting chip names who answers the first message: the orchestrator when the crew has one
+  // and the thread runs on its own, else the builder on the model the message went to (H3).
+  const planner = { family: 'anthropic', model: 'opus', effort: 'medium' } as const;
+  const planned = {
+    name: 'Full crew',
+    members: [
+      { role: 'builder' as const, selection },
+      { role: 'orchestrator' as const, selection: planner },
+    ],
+  };
+  assert.deepEqual(firstAnswer({ crew: planned, flightMode: 'glide' }, selection), {
+    ...planner,
+    role: 'orchestrator',
+  });
+  assert.deepEqual(firstAnswer({ crew: planned, flightMode: 'manual' }, selection), {
+    ...selection,
+    role: 'assistant',
+  });
+  assert.deepEqual(firstAnswer({ crew, flightMode: 'balanced' }, selection), {
+    ...selection,
+    role: 'assistant',
+  });
+  assert.equal(firstAnswer({ crew: null, flightMode: 'manual' }, null), null);
 });
 
-// Claim: saved crews list with the presets in one set of choices, one of them is the default for
-// new threads, a project can start with its own, and a deleted or broken crew falls back to Solo.
-test('saved crews join the presets, one is the default, and bad storage falls back to Solo', () => {
+// Claim: saved crews from the controller list with the presets in one set of choices, one of them
+// is the default for new threads, a project can start with its own, and a default the list no
+// longer holds falls back to Solo.
+test('saved crews join the presets, one is the default, and a missing one falls back to Solo', (t) => {
+  t.after(() => setSavedCrews(null));
   const values = new Map<string, string>();
   const store = {
     getItem: (key: string) => values.get(key) ?? null,
     setItem: (key: string, value: string) => void values.set(key, value),
   };
+  setSavedCrews(null);
   assert.deepEqual(
     crewChoices(store).map((choice) => choice.id),
     ['preset:Solo', 'preset:Pair', 'preset:Full crew'],
   );
   assert.equal(readDefaultCrew(store), 'preset:Solo');
   const pinned = { family: 'openai', model: 'large-1', effort: 'high' } as const;
-  writeSavedCrews(
-    [
+  setSavedCrews({
+    crews: [
       {
         id: 'crew-a',
         name: 'Review heavy',
-        // Saved out of order: the roles read back in crew order.
         members: [
-          { role: 'challenger', selection: null },
           { role: 'builder', selection: pinned, allowSubagents: false },
+          { role: 'challenger', selection: null },
         ],
         flightMode: 'glide',
       },
     ],
-    store,
-  );
+    defaultCrew: 'saved:crew-a',
+    imported: true,
+  });
   const [, , , saved] = crewChoices(store);
   assert.equal(saved.id, 'saved:crew-a');
   assert.equal(saved.flightMode, 'glide');
   assert.equal(saved.hint, 'Builder, Challenger. Glide.');
-  assert.deepEqual(
-    saved.template.members.map((member) => member.role),
-    ['builder', 'challenger'],
-  );
   // A saved crew builds a thread crew the same way a preset does, its pins included.
   const catalog: ChatCatalogRead = {
     families: [entry('openai', true, []), entry('anthropic', true, [])],
@@ -308,8 +334,18 @@ test('saved crews join the presets, one is the default, and bad storage falls ba
   assert.equal(crew?.name, 'Review heavy');
   assert.deepEqual(crew?.members[0], { role: 'builder', selection: pinned, allowSubagents: false });
   assert.equal(crew?.members[1].selection.family, 'anthropic');
+  // Picking it on a thread moves the thread to the builder's model and brings Glide.
+  const patch = crewChoicePatch(
+    saved,
+    catalog,
+    { selection: null, handoffMode: 'most-left' },
+    NOW,
+    store,
+  );
+  assert.equal(patch?.crew.name, 'Review heavy');
+  assert.deepEqual(patch?.selection, pinned);
+  assert.equal(patch?.flightMode, 'glide');
 
-  writeDefaultCrew('saved:crew-a', store);
   assert.equal(readDefaultCrew(store), 'saved:crew-a');
   assert.equal(crewForProject('prj-1', store).id, 'saved:crew-a');
   writeProjectCrew('prj-1', 'preset:Pair', store);
@@ -321,20 +357,118 @@ test('saved crews join the presets, one is the default, and bad storage falls ba
   // Names are unique across presets and saved crews, and an edit may keep its own name.
   assert.equal(crewNameProblem(' ', [], null), 'Name the crew.');
   assert.equal(crewNameProblem('pair', [], null), 'Another crew has this name.');
-  const list = readSavedCrews(store);
+  const list = readSavedCrews();
   assert.equal(crewNameProblem('review HEAVY', list, null), 'Another crew has this name.');
   assert.equal(crewNameProblem('Review heavy', list, 'crew-a'), null);
 
-  // A crew without a builder, or with a bad id, does not read; the default goes back to Solo.
+  // A default naming a crew the list no longer holds reads as Solo.
+  setSavedCrews({ crews: [], defaultCrew: 'saved:crew-a', imported: true });
+  assert.equal(readDefaultCrew(store), 'preset:Solo');
+});
+
+// Claim: the crews this window kept before the controller held them read once, whole entries
+// only, and move to the controller on the first launch. Their keys go after the controller holds
+// them, and later launches send nothing. Each change takes the list the controller answers with.
+test('crews kept in the window move to the controller once and every change goes through it', async (t) => {
+  t.after(() => setSavedCrews(null));
+  const values = new Map<string, string>();
+  const store = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => void values.set(key, value),
+    removeItem: (key: string) => void values.delete(key),
+  };
   values.set(
     'crewkite-saved-crews-v1',
     JSON.stringify([
+      {
+        id: 'crew-a',
+        name: ' Review heavy ',
+        // Saved out of order: the roles read back in crew order.
+        members: [{ role: 'challenger' }, { role: 'builder', allowSubagents: false }],
+        flightMode: 'glide',
+      },
       { id: 'crew-b', name: 'No builder', members: [{ role: 'reviewer' }], flightMode: 'manual' },
       { id: 'Bad id!', name: 'X', members: [{ role: 'builder' }] },
     ]),
   );
-  assert.deepEqual(readSavedCrews(store), []);
-  assert.equal(readDefaultCrew(store), 'preset:Solo');
+  values.set('crewkite-default-crew-v1', JSON.stringify('saved:crew-a'));
+  const kept = values.get('crewkite-saved-crews-v1') ?? '';
+  assert.deepEqual(readLegacyCrews(store), {
+    crews: [
+      {
+        id: 'crew-a',
+        name: 'Review heavy',
+        members: [
+          { role: 'builder', selection: null, allowSubagents: false },
+          { role: 'challenger', selection: null },
+        ],
+        flightMode: 'glide',
+      },
+    ],
+    defaultCrew: 'saved:crew-a',
+  });
   values.set('crewkite-saved-crews-v1', '{not json');
-  assert.deepEqual(readSavedCrews(store), []);
+  assert.deepEqual(readLegacyCrews(store).crews, []);
+  values.set('crewkite-saved-crews-v1', kept);
+
+  // A controller that holds the list, as the real one does, and records each command.
+  const sent: { command: string; payload: Record<string, unknown> }[] = [];
+  let held: SavedCrewsRead = { crews: [], defaultCrew: 'preset:Solo', imported: false };
+  const source = {
+    command: async (input: unknown) => {
+      const { command, payload } = input as (typeof sent)[number];
+      sent.push({ command, payload });
+      if (command === 'ImportSavedCrews' && !held.imported)
+        held = {
+          crews: payload.crews as SavedCrew[],
+          defaultCrew: (payload.defaultCrew as string) ?? held.defaultCrew,
+          imported: true,
+        };
+      if (command === 'SaveCrew')
+        held = { ...held, crews: [...held.crews, payload.crew as SavedCrew] };
+      if (command === 'SetDefaultCrew') held = { ...held, defaultCrew: payload.id as string };
+      if (command === 'DeleteCrew')
+        held = {
+          ...held,
+          crews: held.crews.filter((crew) => crew.id !== payload.id),
+          defaultCrew:
+            held.defaultCrew === `saved:${payload.id}` ? 'preset:Solo' : held.defaultCrew,
+        };
+      return { outcome: 'applied', data: { kind: 'saved-crews', ...structuredClone(held) } };
+    },
+  } as never;
+  await loadCrews(source, store);
+  assert.deepEqual(
+    sent.map(({ command }) => command),
+    ['ReadSavedCrews', 'ImportSavedCrews'],
+  );
+  assert.equal(values.has('crewkite-saved-crews-v1'), false);
+  assert.equal(values.has('crewkite-default-crew-v1'), false);
+  assert.equal(readDefaultCrew(store), 'saved:crew-a');
+  assert.deepEqual(
+    readSavedCrews().map(({ name }) => name),
+    ['Review heavy'],
+  );
+  sent.length = 0;
+  await loadCrews(source, store);
+  assert.deepEqual(
+    sent.map(({ command }) => command),
+    ['ReadSavedCrews'],
+  );
+
+  await saveCrew({
+    id: 'crew-c',
+    name: 'Quick',
+    members: [{ role: 'builder', selection: null }],
+    flightMode: 'manual',
+  });
+  await setDefaultCrew('saved:crew-c');
+  assert.equal(readDefaultCrew(store), 'saved:crew-c');
+  await deleteCrew('crew-c');
+  assert.equal(readDefaultCrew(store), 'preset:Solo');
+  assert.deepEqual(
+    readSavedCrews().map(({ id }) => id),
+    ['crew-a'],
+  );
+  clearLegacyCrews(store);
 });

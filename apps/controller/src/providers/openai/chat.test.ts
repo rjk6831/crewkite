@@ -23,6 +23,8 @@
 //   {"id":4,"method":"model/list","params":{"limit":100,"includeHidden":true}}, before the thread
 //     only when the turn carries an image or audio file
 //   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}],"effort":E}}, effort left out for default,
+//     on a read-only turn with "sandboxPolicy":{"type":"readOnly","access":{"type":"restricted",
+//     "includePlatformDefaults":true,"readableRoots":[SCRATCH]},"networkAccess":false}
 //     with {"type":"localImage","path":P} or {"type":"localAudio","path":P} before the text for each such file
 //   {"id":R,"result":{"decision":"accept"|"acceptForSession"|"decline"}}, the answer to approval request R
 //   {"id":N,"method":"turn/interrupt","params":{"threadId":T,"turnId":U}}
@@ -165,6 +167,10 @@ const scripts = {
     done('failed', given.error ?? limit),
   ],
   reply: () => [['item/completed', { ...ids(), item: message('message-1', 'Hello.') }], done()],
+  // A read-only command on a file outside the scratch copy, as one OpenAI turn ran it (H11).
+  'outside-read': () => [
+    ['item/started', { ...ids(), item: { ...command, command: "/bin/zsh -lc \"sed -n '46,51p' /Users/raykraft/.codex/memories/MEMORY.md\"", cwd: given.cwd } }],
+  ],
   'usage-warning': () => [
     ['warning', { message: 'You have used 80% of your usage limit.' }],
     ['warning', { message: 'A setting in config.toml is deprecated.' }],
@@ -180,6 +186,9 @@ input.on('line', (line) => {
   if (scenario === 'crash') return;
   appendFileSync(frames, line + '\n');
   const value = JSON.parse(line);
+  // An older client build refuses the narrower read-only sandbox policy.
+  if (value.method === 'turn/start' && given.refuseRestricted && value.params.sandboxPolicy?.access)
+    return send({ id: value.id, error: { code: -32602, message: 'Invalid params: unknown variant access' } });
   if (value.method === 'turn/start' && scenario === 'refuse')
     return send({ id: value.id, error: { code: -32602, message: 'Invalid params: thread not loaded\nretry later' } });
   if (value.method === 'thread/resume' && given.lostThread)
@@ -244,6 +253,7 @@ function turn(
     detail?: {
       cwd?: string;
       network?: boolean;
+      refuseRestricted?: boolean;
       path?: string;
       movePath?: string;
       grantRoot?: string;
@@ -949,7 +959,46 @@ test('a read-only turn runs in the read-only sandbox under never, and an edit tu
     assert.equal(started?.params.sandbox, row.sandbox);
     assert(run.args().includes(`approval_policy="${row.launch}"`));
     assert(run.args().includes(`sandbox_mode="${row.sandbox}"`));
+    // A read-only turn reads only the scratch copy and the platform's own files.
+    const turned = run.frames().find((frame) => frame.method === 'turn/start');
+    assert.deepEqual(
+      turned?.params.sandboxPolicy,
+      row.sandbox === 'read-only'
+        ? {
+            type: 'readOnly',
+            access: {
+              type: 'restricted',
+              includePlatformDefaults: true,
+              readableRoots: [run.scratch],
+            },
+            networkAccess: false,
+          }
+        : undefined,
+    );
   }
+});
+
+test('a read-only turn falls back to the plain read-only sandbox when the client refuses the narrower one', async () => {
+  const run = turn('reply', { readOnly: true, detail: { refuseRestricted: true } });
+  const { stopReason } = await run.settled();
+  assert.equal(stopReason, 'done');
+  const starts = run.frames().filter((frame) => frame.method === 'turn/start');
+  assert.equal(starts.length, 2);
+  assert.ok(starts[0].params.sandboxPolicy.access);
+  assert.deepEqual(starts[1].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+});
+
+test('a read-only turn stops when a command names a path outside the scratch copy', async () => {
+  const run = turn('outside-read', { readOnly: true });
+  const { stopReason, failure } = await run.settled();
+  assert.equal(stopReason, 'error');
+  assert.equal(
+    failure?.message,
+    'The turn stopped: a read-only command named a path outside the scratch copy (/Users/raykraft/.codex/memories/MEMORY.md).',
+  );
+  assert.ok(run.frames().some((frame) => frame.method === 'turn/interrupt'));
+  // The command never shows as a tool call.
+  assert.ok(!run.events.some((event) => event.type === 'tool.started'));
 });
 
 test('a client that fails before its turn runs leaves its error output and last frames in the failure', async () => {

@@ -729,8 +729,12 @@ function ownedNativeCommand(
   child.once('exit', (code, value) => {
     exitCode = code;
     signal = value;
+    // A group member still running after the leader exits holds the group. An absent group
+    // with an open pipe is a close still in flight: after a stalled event loop this timer runs
+    // before the pending close, so it waits for close, and the deadline bounds a pipe held
+    // from outside the group.
     later(() => {
-      if (!closed || !absent()) stop('not-quiescent');
+      if (!absent()) stop('not-quiescent');
     }, 250);
   });
   child.once('close', (code, value) => {

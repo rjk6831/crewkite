@@ -10,6 +10,7 @@ import {
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
 import { formatSize } from './format-size.ts';
 import {
+  anthropicReadReason,
   anthropicUsageCard,
   gaugeAge,
   gaugeColor,
@@ -195,6 +196,33 @@ test('native usage gauges show the remaining percent without inventing freshness
   const before = JSON.stringify(reader);
   const card = anthropicUsageCard({ usageReaders: [reader] });
   assert(card);
+  // A single per-model window sits between the main gauges as the smaller featured one.
+  const withModel = anthropicUsageCard({
+    usageReaders: [
+      {
+        ...reader,
+        reading: {
+          ...reader.reading,
+          windows: [
+            ...reader.reading.windows,
+            { windowId: 'weekly-fable', remaining: { unit: 'percent', value: 89 }, resetsAt: null },
+          ],
+        },
+      },
+    ],
+  });
+  assert.equal(withModel?.featured?.label, 'Fable, weekly');
+  assert.ok(!withModel?.auxiliary?.some((row) => row.windowId === 'weekly-fable'));
+  // Off can mean no balance on an account with the switch on, so only on shows a row.
+  const credits = (is_enabled: boolean) =>
+    anthropicUsageCard({
+      usageReaders: [{ ...reader, reading: { ...reader.reading, extraUsage: { is_enabled } } }],
+    })?.credits;
+  assert.deepEqual(credits(false), []);
+  assert.deepEqual(
+    credits(true)?.map((row) => [row.label, row.value]),
+    [['Extra usage', 'On']],
+  );
   const rows = [...card.primary, ...(card.auxiliary ?? [])];
   assert.deepEqual(
     rows.map((row) => [row.label, row.remaining?.value]),
@@ -365,7 +393,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     },
     {
       claim: 'a family with one window gets one bar, and an unconnected reader asks for Connect',
-      entry: entry('google', [window('pool-daily', 'pool-daily', 99, 600)], {
+      entry: entry('openai', [window('pool-daily', 'pool-daily', 99, 600)], {
         connected: false,
         needsConnect: true,
         models: [],
@@ -373,6 +401,17 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         readAt: at(-125),
       }),
       expect: { bars: ['99% left'], needsConnect: true, read: 'read 2 h ago' },
+    },
+    {
+      claim: 'Google before Connect shows Connect and no bars, even with an older read',
+      entry: entry('google', [window('pool-daily', 'pool-daily', 99, 600)], {
+        connected: false,
+        needsConnect: true,
+        models: [],
+        defaultModel: null,
+        readAt: at(-125),
+      }),
+      expect: { bars: [], needsConnect: true },
     },
     {
       claim: 'Local has no bars, reads No limits and carries the hardware line',
@@ -454,13 +493,22 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
 test('usage windows show plain names, and an unknown ID reads as words', () => {
   const rows = [
     ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
-    ['3p-5h', 'Third-party 5 h'],
-    ['3p-weekly', 'Weekly'],
+    ['3p-5h', 'Non-Gemini models, 5 h'],
+    ['3p-weekly', 'Non-Gemini models, weekly'],
+    ['weekly-fable', 'Fable, weekly'],
     ['weekly', 'Weekly'],
     ['five-hour', 'Five-hour'],
     ['gemini-pro_24h', 'Gemini pro 24 h'],
-    ['3p-daily', 'Third-party daily'],
+    ['3p-daily', 'Non-Gemini models daily'],
     ['---', '---'],
   ];
   for (const [id, name] of rows) assert.equal(windowLabel(id), name, id);
+});
+
+test('an Anthropic read that worked leaves no status line, and a failed one says what to do', () => {
+  assert.equal(anthropicReadReason('reported', '2.4.0'), null);
+  assert.match(
+    anthropicReadReason('client-error', '2.4.0') ?? '',
+    /^Last refresh failed\. .*Check the Anthropic sign-in/,
+  );
 });

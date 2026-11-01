@@ -27,7 +27,7 @@ export const slashCommands: readonly SlashCommand[] = [
   { name: 'new', summary: 'Start a new thread.' },
   { name: 'model', summary: 'Pick the model for this thread.', argument: 'model' },
   { name: 'provider', summary: 'Pick the provider for this thread.', argument: 'family' },
-  { name: 'crew', summary: 'Show the crew and the flight mode.' },
+  { name: 'crew', summary: 'Show the crew and the flight mode, and pick a crew.' },
   { name: 'plan', summary: 'Show the plan the orchestrator proposed.' },
   { name: 'ask', summary: 'Ask another model a read-only question.', argument: 'question' },
   { name: 'handoff', summary: 'Move the thread to another provider.', argument: 'family' },

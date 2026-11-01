@@ -25,7 +25,6 @@ import { Dialog, short, titleCase } from './components.tsx';
 import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
-import { SUGGESTED_FIRST_MESSAGE } from './onboarding/flow.ts';
 import { Onboarding } from './onboarding/onboarding.tsx';
 import { useOnboarding } from './onboarding/use-onboarding.ts';
 import {
@@ -38,6 +37,7 @@ import { focusSection } from './palette/focus-section.ts';
 import { selectedOption } from './palette/select.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { RailSearch } from './rail-search.tsx';
+import { loadCrews } from './settings/crew-store.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { adjacentThread, isMacPlatform, searchHint, shortcutFor } from './thread/composer-rules.ts';
@@ -519,6 +519,12 @@ export function App() {
   useEffect(() => {
     void workspace.selectTask(selected);
   }, [selected, workspace.selectTask]);
+  // Saved crews live in the controller. They are read once it answers, and the first read after
+  // the move brings over the crews this window kept before.
+  useEffect(() => {
+    if (connection === 'connected' && workspace.source)
+      void loadCrews(workspace.source).catch(() => {});
+  }, [connection, workspace.source]);
   useEffect(() => {
     const first = projects[0];
     if (first && !taskPages[first.id]) void workspace.loadTasks(first.id);
@@ -578,10 +584,10 @@ export function App() {
     setAddedProject(project.data.id);
     startThread(project.data.id);
   }
-  // The last welcome step opens a new thread in the project with the suggested message in the box.
-  function finishWelcome(projectId: string) {
+  // The last welcome step opens a new thread in the project with its message, as edited, in the box.
+  function finishWelcome(projectId: string, message: string) {
     onboarding.finish();
-    setPrefill(SUGGESTED_FIRST_MESSAGE);
+    setPrefill(message);
     setAddedProject(projectId);
     startThread(projectId);
   }

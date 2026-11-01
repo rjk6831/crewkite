@@ -123,18 +123,28 @@ const windowNames = new Map([
   ['gemini-weekly', 'Weekly'],
   ['gemini-5h', 'Five-hour'],
   ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
-  ['3p-5h', 'Third-party 5 h'],
-  ['3p-weekly', 'Weekly'],
+  // Google keeps a separate allowance, reported as 3p, for the other vendors' models it serves.
+  // The gemini windows above are the Gemini models' own.
+  ['3p-5h', 'Non-Gemini models, 5 h'],
+  ['3p-weekly', 'Non-Gemini models, weekly'],
 ]);
 const windowWords = new Map([
-  ['3p', 'third-party'],
+  ['3p', 'Non-Gemini models'],
   ['wtu', ''],
 ]);
+
+// A per-model window, such as weekly-fable, names the model first: "Fable, weekly".
+const modelWindow = /^(weekly|five-hour)-([a-z][a-z0-9.-]*)$/;
 
 /** The name a usage window shows, from its reader's window ID. */
 export function windowLabel(windowId: string): string {
   const known = windowNames.get(windowId);
   if (known) return known;
+  const model = modelWindow.exec(windowId.toLowerCase());
+  if (model) {
+    const name = model[2].replace(/-/g, ' ');
+    return `${name[0].toUpperCase()}${name.slice(1)}, ${model[1] === 'weekly' ? 'weekly' : 'five-hour'}`;
+  }
   const words = windowId
     .split(/[-_\s]+/)
     .map((part) => {
@@ -305,10 +315,10 @@ const nextSteps = new Map([
   ['unreadable-output', 'Refresh to read it again.'],
 ]);
 
-/** The status line for the last Anthropic usage read. */
-export function anthropicReadReason(reason: string, clientVersion: string): string {
+/** The status line for a failed Anthropic usage read. Null when the read did not fail. */
+export function anthropicReadReason(reason: string, clientVersion: string): string | null {
   const failed = failedReads.get(reason);
-  if (!failed) return `Last refresh: ${reason}.`;
+  if (!failed) return null;
   const version = clientVersion === 'unknown' ? 'the client version' : `client ${clientVersion}`;
   return `Last refresh failed. ${failed} ${nextSteps.get(reason) ?? `Update CrewKite or report ${version}.`}`;
 }
@@ -338,6 +348,12 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     note: `Read when CrewKite received the report. The report gives no observation time or cache age. Report scope ${scope}.`,
   }));
   const primary = primaryWindows.flatMap((id) => rows.filter((row) => row.windowId === id));
+  // A single per-model window, such as weekly-fable, sits between the two main gauges as a smaller
+  // one, the way the Google card shows its model window.
+  const models = rows.filter(
+    (row) => !primary.includes(row) && modelWindow.test(row.windowId ?? ''),
+  );
+  const featured = models.length === 1 ? models[0] : null;
   return {
     id: 'native-quota:anthropic',
     title: 'Anthropic subscription',
@@ -346,14 +362,18 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     // Each gauge says how long ago CrewKite read the report. Details say the report has no time of its own.
     notice: reading ? undefined : 'Refresh Anthropic quota to read the native report.',
     primary,
-    auxiliary: rows.filter((row) => !primary.includes(row)),
-    credits: reading?.extraUsage
+    featured,
+    auxiliary: rows.filter((row) => !primary.includes(row) && row !== featured),
+    // The client reports extra usage as on only while the account holds a credit balance; with the
+    // switch on and no balance it reports off. So the card shows the row when the report says on
+    // and leaves it out otherwise, since off can mean either.
+    credits: reading?.extraUsage?.is_enabled
       ? [
           {
             id: 'native-extra-usage',
             label: 'Extra usage',
-            value: reading.extraUsage.is_enabled ? 'Enabled' : 'Disabled',
-            note: 'Separate from included allowance.',
+            value: 'On',
+            note: 'Paid credits used after the included allowance.',
           },
         ]
       : [],
@@ -511,11 +531,12 @@ export function railFamilies(
     );
     const tightest = tightestAllowance(entry, model);
     // A provider that is not connected and has read nothing keeps its row with Connect, so the
-    // rail shows one gauge per provider. It has no bar to draw yet.
+    // rail shows one gauge per provider. It has no bar to draw yet. Google reads its quota only
+    // once it is connected, so until then its row is Connect alone, whatever an older read left.
     const unread =
       entry.family !== 'local' &&
       !entry.connected &&
-      !entry.remaining.some((window) => window.percent !== null);
+      (entry.family === 'google' || !entry.remaining.some((window) => window.percent !== null));
     const bars: RailBar[] =
       unlimited || setUp || unread
         ? []
