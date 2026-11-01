@@ -1390,16 +1390,22 @@ export class ProviderCommands {
             const picked = observation?.models.find(
               (choice) => choice.selectionId === selection?.selectionId,
             );
-            const kept = retainedSelection(
-              selectedModelKey,
-              nextObservation,
-              picked?.state === 'installed-unloaded',
+            // With no model picked yet, a runtime holding exactly one eligible model selects it.
+            const eligible = nextObservation.models.filter(
+              (choice) => choice.state === 'loaded-eligible',
             );
+            const kept =
+              retainedSelection(
+                selectedModelKey,
+                nextObservation,
+                picked?.state === 'installed-unloaded',
+              ) ?? (selectedModelKey === null && eligible.length === 1 ? eligible[0] : null);
             observation = nextObservation;
             observedAt = this.now();
             observationStale = false;
             availableMemoryBytes = availableMemory() ?? null;
             if (kept && control.endpoint) {
+              selectedModelKey = kept.identity.modelKey;
               selection = {
                 selectionId: kept.selectionId,
                 observationHash: nextObservation.observationHash,
