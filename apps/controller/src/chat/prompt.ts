@@ -417,6 +417,24 @@ export function sliceBrief(
     .join('\n\n');
 }
 
+/**
+ * The slice brief for a Local builder: the goal on one line, the task and the files. A small
+ * window has no room for the plan's framing, and Local starts fresh each turn, so nothing else
+ * has to travel in the message.
+ */
+export function localSliceBrief(
+  plan: { goal: string },
+  slice: { brief: string; files: readonly string[]; readOnly: boolean },
+): string {
+  return [
+    `Goal: ${plan.goal.replace(/\s+/g, ' ').trim()}`,
+    `Task: ${slice.brief}${slice.readOnly ? ' Read only and change no file.' : ''}`,
+    slice.files.length ? `Files:\n${slice.files.join('\n')}` : '',
+  ]
+    .filter(Boolean)
+    .join('\n\n');
+}
+
 const FIXER_REVIEW_CHARACTERS = 16_000;
 
 /**

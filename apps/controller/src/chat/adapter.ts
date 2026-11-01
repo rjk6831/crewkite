@@ -68,6 +68,11 @@ export type ChatTurnRequest = Readonly<{
   /** Review and advice turns. The adapter offers no edit or command tool and declines any ask. */
   readOnly?: boolean;
   /**
+   * The plan slice whose lane opened the turn. A Local slice that cannot fit fails, so the plan
+   * can hand it on. Absent for every other turn.
+   */
+  slice?: number;
+  /**
    * Whether the client may start subagents: the crew role's switch, or the family default when
    * the role has none. The adapter passes the client's own switch. Absent means the default.
    */

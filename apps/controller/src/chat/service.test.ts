@@ -53,6 +53,8 @@ import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
 import type { Controller } from '../commands/controller.ts';
 import { git } from '../host/source.ts';
+import { localChatAdapter } from '../providers/local/chat.ts';
+import { fakeModel } from '../providers/local/chat-fake.ts';
 import { setup } from '../store/controller-fixture.ts';
 import { Store } from '../store/index.ts';
 import {
@@ -4327,5 +4329,140 @@ test('startup recovery lets a queued message start, and any other failed turn st
       row.name,
     );
     if (row.started) assert.equal(after.turns[1].state, 'done', row.name);
+  }
+});
+
+test('a Local slice that cannot fit goes to the crew builder in balanced and glide with one line', {
+  timeout: 60000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep => ({ kind: 'text', itemId: 'r', chunks: [text] });
+  const plan = {
+    planId: 'p1',
+    goal: 'Add tax to the order total.',
+    slices: [
+      {
+        id: 1,
+        title: 'Apply tax',
+        brief: 'Use TAX_RATE in orderTotal.',
+        files: [],
+        depends: [],
+        difficulty: 'easy',
+        readOnly: false,
+      },
+    ],
+  };
+  for (const flightMode of ['balanced', 'glide'] as const) {
+    const now = createTestClock().now();
+    const openai = createScriptedChatAdapter({
+      family: 'openai',
+      turns: [
+        [reply(`\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``)],
+        [
+          {
+            kind: 'tool',
+            callId: 'w',
+            toolKind: 'edit',
+            title: 'Write a.txt',
+            write: { path: 'a.txt', content: 'taxed\n' },
+          },
+        ],
+      ],
+    });
+    // The scripted LM Studio model: the compact brief alone leaves less than the reply floor.
+    const prompts: string[] = [];
+    const { model, calls } = fakeModel([], { now: Date.parse(now) }, (text) =>
+      text.includes('Task: Use TAX_RATE in orderTotal.') ? 7000 : Math.ceil(text.length / 4),
+    );
+    const local = localChatAdapter({
+      connect: async (request) => {
+        prompts.push(request.prompt);
+        return {
+          model,
+          contextLength: 8192,
+          modelKey: 'local-model',
+          fellBack: false,
+          vision: false,
+          files: { prepareImageBase64: async () => ({}) as never },
+          dispose: async () => {},
+        };
+      },
+    });
+    const families = [familyEntry('openai', 10, null, now), familyEntry('local', 90, null, now)];
+    const thread = standalone(t, {
+      adapters: new Map<ChatFamily, ChatAdapter>([
+        ['openai', openai],
+        ['local', local],
+      ]),
+      catalog: () => ({ families }),
+      localContext: () => 8192,
+      localSliceFits: () => true,
+    });
+    const { store, service, taskId } = thread;
+    const crew: ChatCrew = {
+      name: 'Plan crew',
+      members: [
+        { role: 'builder', selection: pick('openai') },
+        { role: 'orchestrator', selection: pick('openai') },
+      ],
+    };
+    store.transaction(() => service.configure({ taskId, crew, flightMode }));
+    const ended = next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        /^(Crew finished|Plan stopped)/.test((event.payload as { text: string }).text),
+    );
+    const proposed = next(
+      thread,
+      (event) =>
+        event.type === 'chat.thread' && (event.payload as ChatThread).plan?.phase === 'proposed',
+    );
+    const free = settles(thread);
+    thread.send('Add tax.', pick('openai'));
+    if (flightMode === 'balanced') {
+      await proposed;
+      await free;
+      assert.equal(
+        act(store, (effects) => service.runPlan({ taskId, planId: 'p1' }, effects)).outcome,
+        'applied',
+        flightMode,
+      );
+    }
+    await ended;
+    const read = thread.read();
+    const lines = read.messages.map((message) => message.text);
+    assert.equal(lines.at(-1), 'Crew finished: 1 slice, 0 reviews, 0 fixes.', flightMode);
+    assert.ok(
+      lines.some((line) =>
+        /^Slice 1 did not fit on Local, so the builder on OpenAI takes it\. This request takes [\d,]+ tokens of the Local model's 8,192 token context and leaves [\d,]+ for the reply, short of the 2,458 it needs\.$/.test(
+          line,
+        ),
+      ),
+      flightMode,
+    );
+    // Local got the compact brief and never ran the model; the builder ran the slice.
+    assert.equal(calls.length, 0, flightMode);
+    assert.match(
+      prompts[0] ?? '',
+      /Goal: Add tax to the order total\.\n\nTask: Use TAX_RATE in orderTotal\./,
+    );
+    assert.ok(!(prompts[0] ?? '').includes('assigned to'), flightMode);
+    assert.deepEqual(
+      read.turns.map((turn) => [turn.selection.family, turn.slice ?? null, turn.state]),
+      [
+        ['openai', null, 'done'],
+        ['local', 1, 'failed'],
+        ['openai', 1, 'done'],
+      ],
+      flightMode,
+    );
+    assert.equal(read.thread.plan?.slices[0]?.assignment?.family, 'openai', flightMode);
+    const scratch = join(dirname(thread.root), 'chat', taskId, 'scratch');
+    assert.equal(readFileSync(join(scratch, 'a.txt'), 'utf8'), 'taxed\n', flightMode);
   }
 });

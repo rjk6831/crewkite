@@ -244,6 +244,27 @@ const PERMISSION_OPTIONS: ChatPermissionOption[] = [
 const SETTINGS_ACTION = 'Open LM Studio, load a model and connect Local in Settings.';
 const SHORTEN_ACTION = 'Shorten the request or split it into smaller steps, then send again.';
 
+/**
+ * True when a Local turn failed because the work did not fit the loaded model's context. Every
+ * such failure is a protocol failure that asks for a smaller step, and no other failure is.
+ */
+export const isLocalFitFailure = (failure: ChatFailure | null | undefined) =>
+  failure?.kind === 'protocol' && failure.nextAction === SHORTEN_ACTION;
+
+// A turn whose tool results fill the window folds them into the rolling summary and goes on, at
+// most this many times. Past that the turn fails with the context it filled.
+const MAX_FOLDS = 2;
+const FOLD_CONTINUE =
+  'You already worked on this request in this turn, and the summary above holds what your tool calls found. Go on from it: read only what is still missing, then answer.';
+// Reads, searches and thread reads. The room check stops these, and edits and commands still run.
+const READING_TOOLS = new Set<string>([
+  'read_range',
+  'search',
+  ...THREAD_TOOLS.map((tool) => tool.function.name),
+]);
+const ROOM_FULL =
+  'The context has room only for your answer now. Do not call tools again. Answer from what you have read.';
+
 function systemPrompt(request: ChatTurnRequest, threads: boolean) {
   const names = offeredTools(request, threads).map((tool) => tool.function.name);
   return [
@@ -295,13 +316,19 @@ function loadSummary(request: ChatTurnRequest): Summary | null {
   }
 }
 
-function saveSummary(request: ChatTurnRequest, summary: string, count: number) {
+function saveSummary(
+  request: ChatTurnRequest,
+  summary: string,
+  count: number,
+  covered = request.history.length,
+) {
   const file = summaryFile(request);
   const value: Summary = {
     version: 1,
-    covered: request.history.length,
-    coveredHash: historyHash(request.history),
-    summary,
+    covered,
+    coveredHash: historyHash(request.history.slice(0, covered)),
+    // The schema's ceiling. A summary that outgrew it keeps its newest part.
+    summary: summary.slice(-16_384),
     count,
   };
   mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
@@ -441,6 +468,53 @@ async function summarize(
   );
   return content.trim() || null;
 }
+
+/**
+ * Notes on what this turn's tool calls found, at most the summary's size, so the turn can drop the
+ * raw results and go on. The results are cut to what the summary call can hold. Null when nothing
+ * came back.
+ */
+async function summarizeResults(
+  request: ChatTurnRequest,
+  model: LoadedModelLike,
+  contextLength: number,
+  results: readonly string[],
+  signal: AbortSignal,
+) {
+  const instructions = `Write notes of at most ${SUMMARY_TOKENS} tokens on what these tool results show for the request. Keep file paths, line numbers, names and values the answer needs. Write plain sentences with no preamble.`;
+  const room =
+    contextLength -
+    2 * SUMMARY_TOKENS -
+    LOCAL_REPLY_MARGIN -
+    (await model.countTokens(instructions));
+  if (room <= 0) return null;
+  // The request takes at most a quarter of the room, so the results keep the most of it.
+  const asked = `Request:\n${fitBytes(request.prompt, Math.floor(room / 4) * TEXT_BYTES_PER_RESULT)}`;
+  const left = room - (await model.countTokens(asked)) - 2 * MESSAGE_TOKENS;
+  if (left <= 0) return null;
+  // Each result gets an equal share, so the last read is in the notes as much as the first.
+  const share = Math.floor((left * TEXT_BYTES_PER_RESULT) / results.length) - 2;
+  const found = results.map((result) => fitBytes(result, Math.max(0, share))).join('\n\n');
+  let content = '';
+  await model.act(
+    [
+      { role: 'system', content: instructions },
+      { role: 'user', content: `${asked}\n\nTool results:\n${found}` },
+    ],
+    [],
+    {
+      maxTokens: 2 * SUMMARY_TOKENS,
+      enableThinking: false,
+      signal,
+      onPredictionCompleted: (result: PredictionResult) => {
+        content = result.nonReasoningContent;
+      },
+    },
+  );
+  return content.trim() || null;
+}
+// Text and code run three to five bytes a token. Three never undercounts.
+const TEXT_BYTES_PER_RESULT = 3;
 
 const describeError = (error: unknown) =>
   error instanceof Error ? error.message : typeof error === 'string' ? error : 'Unknown error.';
@@ -732,6 +806,14 @@ function startLocalTurn(
   let ending: 'stopped' | 'timeout' | null = null;
   // Set once the prompt is built, from the room it leaves. No thread read runs before then.
   let threadBytes = 0;
+  // The tokens the next round's prompt holds so far: the prompt of the running `act` call, what the
+  // model generated since and the tool results given back. Results count three bytes a token.
+  let spent = 0;
+  // Set once connected: true when the runtime takes a reasoning budget, and the window's size.
+  let budgeted = false;
+  let window = 0;
+  // What the tool calls returned since the last fold, as the summary call reads them.
+  const results: string[] = [];
   let connecting: ReturnType<LocalConnect> | null = null;
   let items = 0;
   let permissions = 0;
@@ -877,9 +959,13 @@ function startLocalTurn(
     } catch (error) {
       return { refused: error instanceof Error ? error.message : 'The environment is not usable.' };
     }
+    // Without a reasoning budget nothing holds the reasoning back, so a read gets only the room
+    // left above the smallest reply, and none once that room is gone.
+    const room = budgeted ? null : Math.max(0, localPromptRoom(window) - spent);
     // A per-call context: `permitted` turns true only after the person allows a command.
     const context = {
       ...(threads ? { threads, threadBytes } : {}),
+      ...(room === null ? {} : { readBytes: room * TEXT_BYTES_PER_RESULT }),
       scratch: request.scratch.directory,
       environment,
       signal: abort.signal,
@@ -911,6 +997,8 @@ function startLocalTurn(
         `Tool limit of ${MAX_TOOL_CALLS} calls reached.`,
         `The limit of ${MAX_TOOL_CALLS} tool calls for this turn is reached. Do not call tools again. Answer now with what you found.`,
       );
+    if (room !== null && room <= 0 && READING_TOOLS.has(tool.name))
+      return refuse('denied', 'The context is full. The model answers now.', ROOM_FULL);
     if (tool.error !== null) {
       emit({ type: 'tool.output', turnId, callId, chunk: fitBytes(tool.error, OUTPUT_BYTES) });
       return refuse('error', tool.error.slice(0, 200), tool.error);
@@ -950,6 +1038,8 @@ function startLocalTurn(
     if (tool.name !== 'run')
       emit({ type: 'tool.output', turnId, callId, chunk: fitBytes(outcome.output, OUTPUT_BYTES) });
     if (outcome.changedPath) changed.add(outcome.changedPath);
+    results.push(`${tool.title}:\n${outcome.output}`);
+    spent += Math.ceil(Buffer.byteLength(outcome.output) / TEXT_BYTES_PER_RESULT) + MESSAGE_TOKENS;
     emit({
       type: 'tool.completed',
       turnId,
@@ -1085,6 +1175,8 @@ function startLocalTurn(
     }
     if (ending) return ended();
     const { model, contextLength, modelKey, fellBack } = connection;
+    budgeted = connection.reasoningBudget === true;
+    window = contextLength;
     if (connection.connectedWithoutToken !== undefined) {
       // The trace says how this turn reached the runtime, so a failed connect can be read later.
       const trace = frameTrace(now, { lines: 4, bytes: 1024 });
@@ -1179,11 +1271,11 @@ function startLocalTurn(
     ]
       .filter(Boolean)
       .join('\n\n');
-    const build = (summary: Summary | null, trim: boolean) =>
+    const build = (summary: Summary | null, trim: boolean, text = message) =>
       bounded(
         buildPrompt(
           request,
-          message,
+          text,
           model,
           contextLength,
           summary,
@@ -1208,28 +1300,33 @@ function startLocalTurn(
     if (ending) return ended();
     // R, the reply budget, and half of it for reasoning when the runtime takes a reasoning budget.
     const budget =
-      prompt.kind === 'fits'
-        ? localBudget(contextLength, prompt.tokens, connection.reasoningBudget === true)
-        : null;
+      prompt.kind === 'fits' ? localBudget(contextLength, prompt.tokens, budgeted) : null;
     if (prompt.kind !== 'fits' || !budget) {
       const left = contextLength - prompt.tokens - LOCAL_REPLY_MARGIN;
       const figure = (value: number) => value.toLocaleString('en-US');
-      say(
-        `This request takes ${figure(prompt.tokens)} tokens of the Local model's ${figure(contextLength)} token context and leaves ${figure(Math.max(0, left))} for the reply, short of the ${figure(localReplyFloor(contextLength))} it needs. Send a smaller first step, such as one file or one function.`,
-      );
+      const counts = `This request takes ${figure(prompt.tokens)} tokens of the Local model's ${figure(contextLength)} token context and leaves ${figure(Math.max(0, left))} for the reply, short of the ${figure(localReplyFloor(contextLength))} it needs.`;
+      // A plan slice fails, so the plan can hand it to a family with more room.
+      if (request.slice !== undefined)
+        return finish(
+          'error',
+          chatFailure({
+            stage: 'prompt',
+            kind: 'protocol',
+            message: counts,
+            nextAction: SHORTEN_ACTION,
+          }),
+        );
+      say(`${counts} Send a smaller first step, such as one file or one function.`);
       return finish('done', null);
     }
-    const replyTokens = budget.outputTokens;
     // A thread read gets the prompt room this prompt leaves, never more than any tool result.
     threadBytes = localThreadReadBytes(contextLength, prompt.tokens, OUTPUT_BYTES);
     if (prompt.carried && prompt.summary) summaries = prompt.summary.count;
 
-    // `act` runs rounds until one ends without a native call. When that round wrote its calls as
-    // text, they run here and `act` starts again with the results, inside the same round budget.
-    let chat = prompt.chat;
+    let images: Awaited<ReturnType<LocalFiles['prepareImageBase64']>>[] = [];
     if (files.images.length) {
       try {
-        const images = await bounded(
+        images = await bounded(
           Promise.all(
             files.images.map(({ attachment, path }) =>
               connection.files.prepareImageBase64(
@@ -1239,9 +1336,6 @@ function startLocalTurn(
             ),
           ),
         );
-        // The person's message carries the images. Later `act` calls resend the same message,
-        // so the model keeps seeing them for the whole turn.
-        chat = [...chat.slice(0, -1), { ...chat[chat.length - 1], images }];
       } catch (error) {
         if (ending) return ended();
         const failure = streamFailure(error);
@@ -1258,19 +1352,98 @@ function startLocalTurn(
         );
       }
     }
+    // The person's message carries the images. Later `act` calls resend the same message, so the
+    // model keeps seeing them for the whole turn.
+    const withImages = (base: ChatInput): ChatInput =>
+      images.length ? [...base.slice(0, -1), { ...base[base.length - 1], images }] : base;
+
+    // `act` runs rounds until one ends without a native call. When that round wrote its calls as
+    // text, they run here and `act` starts again with the results, inside the same round budget.
+    // Each call gets R from the prompt it sends, so a longer chat gets a smaller reply budget.
+    let chat = withImages(prompt.chat);
+    // The messages added after the built prompt, counted for the next call's R.
+    let tail: ChatInput = [];
+
+    /**
+     * Fold the tool results since the last fold into the rolling summary and build the prompt
+     * again, with the summary in place of the raw results. False when the fold did not help.
+     */
+    let folds = 0;
+    const fold = async (): Promise<boolean> => {
+      if (prompt.kind !== 'fits' || !results.length || folds >= MAX_FOLDS) return false;
+      if (rounds.length >= MAX_ROUNDS) return false;
+      folds++;
+      let notes: string | null;
+      try {
+        notes = await bounded(
+          summarizeResults(request, model, contextLength, results, abort.signal),
+        );
+      } catch {
+        if (!ending)
+          notice('warning', 'Local: the tool results could not be folded into a summary.');
+        return false;
+      }
+      if (!notes || ending) return false;
+      const previous = prompt.summary;
+      summaries = (previous?.count ?? 0) + 1;
+      // The summary keeps the turns it already covered, so the next turn still reads it.
+      const covered = previous?.covered ?? 0;
+      const saved = saveSummary(
+        request,
+        previous ? `${previous.summary}\n${notes}` : notes,
+        summaries,
+        covered,
+      );
+      results.length = 0;
+      emit({
+        type: 'context.compacted',
+        turnId,
+        summaries,
+        coveredTurns:
+          request.history.slice(0, covered).filter((entry) => entry.role === 'user').length + 1,
+        usedTokens: usedContext(),
+        capacityTokens: contextLength,
+      });
+      const next = await build(saved, true, `${message}\n\n${FOLD_CONTINUE}`);
+      if (next.kind !== 'fits' || !next.carried) return false;
+      prompt = next;
+      chat = withImages(next.chat);
+      tail = [];
+      return true;
+    };
+
+    let current = budget;
+    let from = 0;
+    // True when the chat left no reply budget to call the model with.
+    let starved = false;
     try {
       for (;;) {
+        let tokens = prompt.tokens;
+        for (const entry of tail)
+          tokens += (await bounded(model.countTokens(entry.content ?? ''))) + MESSAGE_TOKENS;
+        const next = localBudget(contextLength, tokens, budgeted);
+        if (!next) {
+          if (await fold()) continue;
+          starved = true;
+          break;
+        }
+        current = next;
+        spent = tokens;
+        from = rounds.length;
         const appended: ChatInput = [];
         written = [];
         await bounded(
           model.act(chat, tools, {
-            maxTokens: replyTokens,
+            maxTokens: current.outputTokens,
             // A budget the runtime takes is capped at half of R. A thinking toggle stays as set.
-            ...(budget.reasoningTokens === null ? {} : { reasoningBudget: budget.reasoningTokens }),
+            ...(current.reasoningTokens === null
+              ? {}
+              : { reasoningBudget: current.reasoningTokens }),
             contextOverflowPolicy: 'stopAtLimit',
             maxPredictionRounds: MAX_ROUNDS - rounds.length,
             signal: abort.signal,
             onPredictionFragment: (fragment) => {
+              spent += fragment.tokensCount;
               if (fragment.reasoningType === 'none') counting.reply += fragment.tokensCount;
               else counting.reasoning += fragment.tokensCount;
               if (ending || fragment.isStructural) return;
@@ -1300,10 +1473,14 @@ function startLocalTurn(
             },
           }),
         );
-        const cut = rounds.some((stats) =>
-          ['contextLengthReached', 'modelUnloaded'].includes(stats.stopReason),
-        );
-        if (ending || cut || !written.length) break;
+        if (ending) break;
+        const these = rounds.slice(from);
+        if (these.some((stats) => stats.stopReason === 'modelUnloaded')) break;
+        // A turn that read and then ran out of room folds what it read and goes on.
+        const full = these.some((stats) => stats.stopReason === 'contextLengthReached');
+        const limited = these.at(-1)?.stopReason === 'maxPredictedTokensReached';
+        if ((full || limited) && (await fold())) continue;
+        if (ending || full || !written.length) break;
         if (rounds.length >= MAX_ROUNDS) {
           notice(
             'warning',
@@ -1311,15 +1488,20 @@ function startLocalTurn(
           );
           break;
         }
-        const results = await bounded(runWritten(written));
-        chat = [...chat, ...appended, { role: 'user', content: results }];
+        const output = await bounded(runWritten(written));
+        const added: ChatInput = [...appended, { role: 'user', content: output }];
+        chat = [...chat, ...added];
+        tail = [...tail, ...added];
       }
     } catch (error) {
       return ending ? ended() : finish('error', streamFailure(error));
     }
     if (ending) return ended();
-    const stops = new Set(rounds.map((stats) => stats.stopReason));
-    if (stops.has('contextLengthReached'))
+    if (rounds.some((stats) => stats.stopReason === 'modelUnloaded'))
+      return finish('error', streamFailure(new Error('The model was unloaded.')));
+    const last = rounds.at(-1);
+    // The last call's rounds filled the window, or the chat left no reply budget to call with.
+    if (starved || rounds.slice(from).some((stats) => stats.stopReason === 'contextLengthReached'))
       return finish(
         'error',
         chatFailure({
@@ -1329,10 +1511,7 @@ function startLocalTurn(
           nextAction: SHORTEN_ACTION,
         }),
       );
-    if (stops.has('modelUnloaded'))
-      return finish('error', streamFailure(new Error('The model was unloaded.')));
     // The service turns these counts into the output limit line and offers Continue.
-    const last = rounds.at(-1);
     if (last?.stopReason === 'maxPredictedTokensReached') {
       const tokens = counted.at(-1) ?? counting;
       const predicted = last.predictedTokensCount ?? tokens.reasoning + tokens.reply;
@@ -1340,7 +1519,7 @@ function startLocalTurn(
       outputLimit = {
         reasoningTokens,
         replyTokens: predicted - reasoningTokens,
-        allowedTokens: replyTokens,
+        allowedTokens: current.outputTokens,
       };
     }
 
