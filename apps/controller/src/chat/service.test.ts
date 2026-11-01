@@ -4351,7 +4351,7 @@ test('a Local slice that cannot fit goes to the crew builder in balanced and gli
         brief: 'Use TAX_RATE in orderTotal.',
         files: [],
         depends: [],
-        difficulty: 'easy',
+        difficulty: 'hard',
         readOnly: false,
       },
     ],
@@ -4407,6 +4407,8 @@ test('a Local slice that cannot fit goes to the crew builder in balanced and gli
       name: 'Plan crew',
       members: [
         { role: 'builder', selection: pick('openai') },
+        // Local is in the crew as its fixer, so it takes the hard slice.
+        { role: 'fixer', selection: pick('local') },
         { role: 'orchestrator', selection: pick('openai') },
       ],
     };
