@@ -876,6 +876,10 @@
   background-color: var(--surface-raised);
   font-size: 12px;
 }
+.th-row-note {
+  color: var(--text-muted);
+  font-size: 12px;
+}
 .th-attach-row > button:hover:not(:disabled) {
   background-color: var(--surface-hover);
 }
