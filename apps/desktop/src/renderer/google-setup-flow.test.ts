@@ -4,6 +4,7 @@ import { type CommandResult, GOOGLE_TERMS_VERSION, type WorkspaceState } from '@
 import {
   classifyGoogleFailure,
   GOOGLE_CONNECT_LIMIT_MS,
+  GOOGLE_READ_TRIES,
   googleSetupProgress,
   nextGoogleStage,
   pollGoogleSetupStatus,
@@ -760,4 +761,106 @@ test('Google failures are transient or wait for the person', () => {
       expected,
       `${stage} ${result?.reason ?? result?.outcome}`,
     );
+});
+
+test('a status read that fails once after the sign-in does not need a second press', async () => {
+  // A first connect on a fresh install: the install and initialize end, the sign-in finishes in
+  // the browser, and the next status read fails once while the account still reads unknown. The
+  // card used to pause there, and a second press resumed at the sign-in.
+  const installed = installStatus('installed');
+  const afterInitialize = signIn(2, { auth: { method: null, status: 'unknown' } });
+  const reads: (GoogleState | Error)[] = [
+    { googleAcpInstall: installed, googleAcpSetup: afterInitialize },
+    // The sign-in ended. The controller has not saved it yet, then one read fails.
+    {
+      googleAcpInstall: installed,
+      googleAcpSetup: setup(3, 'authenticating', {
+        client,
+        proofId: proof,
+        operationId: operation,
+      }),
+    },
+    new Error('response-timeout'),
+    {
+      googleAcpInstall: installed,
+      googleAcpSetup: setup(4, 'discovery-required', {
+        client,
+        proofId: proof,
+        auth: { method: 'oauth-personal', status: 'authenticated' },
+      }),
+    },
+    { googleAcpInstall: installed, googleAcpSetup: ready },
+  ];
+  const sent: string[] = [];
+  const stages: string[] = [];
+  const result = await runGoogleSetupFlow({
+    read: async () => {
+      const next = reads.shift();
+      if (next instanceof Error) throw next;
+      return next as GoogleState;
+    },
+    active: () => true,
+    onStage: (stage) => stages.push(stage),
+    wait: async () => {},
+    command: async (input) => {
+      sent.push(input.command);
+      return input.command === 'AuthenticateGoogleAcp'
+        ? { outcome: 'outcome-unknown', reason: 'response-timeout' }
+        : { outcome: 'applied' };
+    },
+  });
+  assert.deepEqual(result, { kind: 'ready' });
+  assert.deepEqual(sent, ['AuthenticateGoogleAcp', 'DiscoverGoogleAcp']);
+  assert.deepEqual(stages, ['authenticate', 'discover']);
+  assert.equal(reads.length, 0);
+});
+
+test('Connect pauses only after three failed status reads in a row', async () => {
+  let reads = 0;
+  let waits = 0;
+  const result = await runGoogleSetupFlow({
+    read: async () => {
+      reads++;
+      throw new Error('Controller is offline.');
+    },
+    active: () => true,
+    onStage: () => {},
+    wait: async () => {
+      waits++;
+    },
+    command: async () => ({ outcome: 'applied' }),
+  });
+  assert.deepEqual(result, {
+    kind: 'blocked',
+    result: { outcome: 'blocked', reason: 'google-status-unreadable' },
+  });
+  assert.equal(reads, GOOGLE_READ_TRIES);
+  assert.equal(waits, GOOGLE_READ_TRIES - 1);
+});
+
+test('the status poll tries a failed read again and gives up after three in a row', async () => {
+  const outcomes = [true, false, true, false, false, true, true];
+  let reads = 0;
+  const once = await pollGoogleSetupStatus({
+    wait: async () => {},
+    read: async () => {
+      if (!outcomes[reads++]) throw new Error('response-timeout');
+    },
+    active: () => true,
+    attempts: outcomes.length,
+  });
+  assert.equal(once, 'timeout');
+  assert.equal(reads, outcomes.length);
+
+  let failures = 0;
+  const always = await pollGoogleSetupStatus({
+    wait: async () => {},
+    read: async () => {
+      failures++;
+      throw new Error('response-timeout');
+    },
+    active: () => true,
+  });
+  assert.equal(always, 'unreadable');
+  assert.equal(failures, GOOGLE_READ_TRIES);
 });
