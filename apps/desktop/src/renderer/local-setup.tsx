@@ -6,6 +6,7 @@ import { ExternalLink } from './external-link.tsx';
 import { formatSize } from './format-size.ts';
 import {
   connectLocalFlow,
+  DEFAULT_LOCAL_ENDPOINT,
   followDiscovery,
   lastSeen,
   lowMemory,
@@ -36,6 +37,7 @@ const modelReasons = {
   'not-downloaded': 'Model is not downloaded',
 };
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
+const WAITING = 'Waiting for the connection and model metadata.';
 
 export function LocalSetup({
   snapshot,
@@ -47,7 +49,8 @@ export function LocalSetup({
   const setup = snapshot.localSetup;
   const authMode = setup?.authMode ?? 'token';
   const connectionReady = setup?.connected ?? setup?.secretConfigured ?? false;
-  const [endpoint, setEndpoint] = useState(setup?.endpoint ?? '');
+  // With nothing saved the field starts on the runtime's usual port, so Connect works as it is.
+  const [endpoint, setEndpoint] = useState(setup?.endpoint ?? DEFAULT_LOCAL_ENDPOINT);
   const [endpointEdited, setEndpointEdited] = useState(false);
   const [choiceId, setChoiceId] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
@@ -197,7 +200,7 @@ export function LocalSetup({
     }
   }
   useEffect(() => {
-    if (!endpointEdited) setEndpoint(setup?.endpoint ?? '');
+    if (!endpointEdited) setEndpoint(setup?.endpoint ?? DEFAULT_LOCAL_ENDPOINT);
   }, [setup?.endpoint, endpointEdited]);
   useEffect(() => {
     setChoiceId((current) =>
@@ -227,7 +230,7 @@ export function LocalSetup({
     pollAbort.current = control;
     setPolling(true);
     setPollTimedOut(false);
-    setMessage('Waiting for the connection and model metadata.');
+    setMessage(WAITING);
     void waitForLocalReadiness({
       endpoint: targetEndpoint,
       active: () =>
@@ -257,13 +260,26 @@ export function LocalSetup({
         setMessage(result.next ?? result.reason ?? 'Model metadata could not be read.');
         return false;
       },
+      reconnect: async (current) => {
+        const result = await workspace.command({
+          command: 'BeginLocalConnectionInput',
+          expectedRevision: current.revision,
+          payload: { consent: 'explicit' },
+        });
+        if (control.signal.aborted || !mounted.current || actionGeneration.current !== generation)
+          return false;
+        if (applied(result.outcome)) return true;
+        setMessage(result.next ?? result.reason ?? 'Local connection was not confirmed.');
+        return false;
+      },
     })
       .then((result) => {
         if (control.signal.aborted || !mounted.current) return;
         // A connect that ended without a connection leaves the card's reason line, such as a
         // failed connection, in place of the waiting line.
+        // A refusal said during the follow stays. Only the waiting line goes.
         if (result === 'ready' || (result === 'stopped' && actionGeneration.current === generation))
-          setMessage(null);
+          setMessage((current) => (current === WAITING ? null : current));
         if (result === 'timeout') {
           setPollTimedOut(true);
           setMessage('Taking longer than expected. Try Refresh model list.');

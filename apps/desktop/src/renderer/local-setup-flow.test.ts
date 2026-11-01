@@ -1,9 +1,10 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { LocalSetup } from '@crewkite/contracts';
+import { LocalEndpointSchema, type LocalSetup } from '@crewkite/contracts';
 import {
   connectInPlace,
   connectLocalFlow,
+  DEFAULT_LOCAL_ENDPOINT,
   DISCOVERY_FOLLOW_MS,
   followDiscovery,
   lastSeen,
@@ -124,6 +125,48 @@ test('local readiness polling stops after twenty fake clock ticks', async () => 
   assert.equal(result, 'timeout');
   assert.equal(ticks, 20);
   assert.equal(reads, 20);
+});
+
+test('one Connect sends the connection again when it ends saved and unconnected with no failure', async () => {
+  const follow = async (states: LocalSetup[]) => {
+    const calls: string[] = [];
+    const result = await waitForLocalReadiness({
+      endpoint: 'ws://127.0.0.1:1234',
+      wait: async () => {},
+      read: async () => states.shift() ?? setup({ operation: null }),
+      discover: async () => {
+        calls.push('discover');
+        return true;
+      },
+      reconnect: async () => {
+        calls.push('reconnect');
+        return true;
+      },
+      active: () => true,
+    });
+    return { result, calls };
+  };
+  const idle = setup({ operation: null, reason: 'connection-required' });
+  const connected = setup({ operation: null, connected: true, reason: 'discovery-required' });
+  const read = setup({
+    operation: null,
+    connected: true,
+    observation: {} as LocalSetup['observation'],
+    reason: 'model-selection-required',
+  });
+  // The field starts on the usual runtime port, a value Connect accepts as it is.
+  assert(LocalEndpointSchema.safeParse(DEFAULT_LOCAL_ENDPOINT).success);
+  // The first press ends unconnected with nothing failed: Connect goes out once more, then reads.
+  assert.deepEqual(await follow([setup(), idle, connected, read]), {
+    result: 'ready',
+    calls: ['reconnect', 'discover'],
+  });
+  // A second unconnected end stops, and a failed connection is never sent again.
+  assert.deepEqual(await follow([idle, idle]), { result: 'stopped', calls: ['reconnect'] });
+  assert.deepEqual(await follow([setup({ operation: null, reason: 'connection-unavailable' })]), {
+    result: 'stopped',
+    calls: [],
+  });
 });
 
 test('Local connect saves token mode wherever it can and no-token mode where token mode is refused', async () => {
