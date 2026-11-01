@@ -38,6 +38,9 @@ export const DISCOVERY_FOLLOW_MS = 30_000;
 
 export const WITHOUT_TOKEN = 'Connected without a token. The runtime has auth off on loopback.';
 
+/** The port the Local runtime listens on unless the person changed it. */
+export const DEFAULT_LOCAL_ENDPOINT = 'ws://127.0.0.1:1234';
+
 /**
  * The label on a cached observation. Null when nothing says when it was read. `connected` is a new
  * connection whose first read has not landed, so only the age shows.
@@ -299,10 +302,16 @@ export async function connectLocalFlow({
 // Set once this computer refuses token mode, so a later Connect does not ask again.
 let tokenModeRefused = false;
 
+/**
+ * Follows one Connect until the models are read. A connect that ends with the endpoint saved, no
+ * failure and still no connection is sent once more: on a first Connect the card stopped there and
+ * the person had to press Connect a second time. `reconnect` sends it and is false when refused.
+ */
 export async function waitForLocalReadiness({
   endpoint,
   read,
   discover,
+  reconnect,
   wait,
   active,
   attempts = 20,
@@ -310,11 +319,13 @@ export async function waitForLocalReadiness({
   endpoint: string;
   read: () => Promise<LocalSetup | null | undefined>;
   discover: (setup: LocalSetup) => Promise<boolean>;
+  reconnect?: (setup: LocalSetup) => Promise<boolean>;
   wait: () => Promise<void>;
   active: () => boolean;
   attempts?: number;
 }): Promise<LocalReadinessResult> {
   let discoveryRequested = false;
+  let reconnected = false;
   for (let attempt = 0; attempt < attempts; attempt++) {
     await wait();
     if (!active()) return 'stopped';
@@ -322,6 +333,17 @@ export async function waitForLocalReadiness({
     if (!active() || !setup || setup.endpoint !== endpoint) return 'stopped';
     if (setup.observation && !setup.observationStale && !setup.operation) return 'ready';
     if (setup.operation) continue;
+    if (
+      !setup.connected &&
+      reconnect &&
+      !reconnected &&
+      setup.reason === 'connection-required' &&
+      !setup.notice
+    ) {
+      reconnected = true;
+      if (!(await reconnect(setup))) return 'stopped';
+      continue;
+    }
     if (!setup.connected) return 'stopped';
     if (!discoveryRequested) {
       discoveryRequested = true;
