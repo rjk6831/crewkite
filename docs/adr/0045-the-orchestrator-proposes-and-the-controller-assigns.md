@@ -110,3 +110,7 @@ The Easy-slice paragraph under Why and the Local consequence no longer hold. Loc
 ## Amendment, 2026-11-01: the orchestrator answers questions itself
 
 The Decision section has the orchestrator return a plan block every time, and a reply without one went back once and then stopped the chain. In a d3-rc5 run a question about the calendar became a one-slice plan to confirm the answer. The orchestrator now answers a question, or a request that changes no file, in plain sentences with no plan block, and proposes a plan only for work that changes files or splits into independent parts. A reply with no plan block is that answer: nothing runs after it and no line follows. A reply with a plan block that fails the schema still goes back once with the error, and a second failure stops the chain with one line.
+
+## Amendment, 2026-11-01: a message waits while a plan runs
+
+A message the person sent while a plan ran stopped the plan with "Plan stopped: you sent a new message." once its running turns ended. A message now waits in the thread's queue while the plan runs, as it does behind any running turn, and starts once the plan has finished or stopped. Stop and Cancel still stop the plan.

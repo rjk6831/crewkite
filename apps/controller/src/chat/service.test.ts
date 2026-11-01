@@ -2485,7 +2485,12 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     {
       name: 'two families at once, a shared family waits, a dependency starts from merged work',
       slices: [slice(1, 'medium'), slice(2, 'hard'), slice(3, 'medium'), slice(4, 'hard', [1])],
-      openai: [[park, write('a.txt', 'one\n'), reply('Built 1.')], [write('c.txt', 'three\n')]],
+      openai: [
+        [park, write('a.txt', 'one\n'), reply('Built 1.')],
+        [write('c.txt', 'three\n')],
+        // The message queued during the plan, answered once the plan finished.
+        [reply('Queued answer.')],
+      ],
       local: [[write('b.txt', 'two\n')], [write('d.txt', 'four\n')]],
       line: 'Crew finished: 4 slices, 0 reviews, 0 fixes.',
       card: ['finished', 'done', 'done', 'done', 'done'],
@@ -2625,6 +2630,14 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         event.type === 'chat.thread' &&
         (event.payload as ChatThread).plan?.slices[1]?.lane?.step === 'merge',
     );
+    const queuedAnswer =
+      row.name.startsWith('two families') &&
+      next(
+        thread,
+        (event) =>
+          event.type === 'conversation.entry' &&
+          (event.payload as { text: string }).text === 'Queued answer.',
+      );
     thread.send('Split the work.', pick('openai'));
     if (row.name.startsWith('two families')) {
       await parked;
@@ -2639,6 +2652,14 @@ test('plan slices run side by side in their own copies, merge in plan order and 
           ['queued', null],
           ['queued', null],
         ],
+        row.name,
+      );
+      // A message sent while the plan runs waits in the queue, and the plan goes on (H16).
+      assert.equal(thread.send('One more thing.', pick('openai')).outcome, 'applied', row.name);
+      const waiting = thread.read().thread;
+      assert.deepEqual(
+        [waiting.plan?.phase, waiting.queued.map((message) => message.text)],
+        ['running', ['One more thing.']],
         row.name,
       );
       const open = thread.read().turns.find((turn) => turn.slice === 1);
@@ -2665,7 +2686,9 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     if ('stop' in row || 'unplugged' in row) await settles(thread);
     const read = thread.read();
     const lines = read.messages.map((message) => message.text);
-    assert.equal(lines.at(-1), row.line, row.name);
+    // The message queued during the plan starts after the closing line.
+    const queuedLines = ['One more thing.', 'Queued answer.'];
+    assert.equal(lines.filter((line) => !queuedLines.includes(line)).at(-1), row.line, row.name);
     const card = read.thread.plan;
     assert.deepEqual(
       card ? [card.phase, ...card.slices.map((value) => value.status)] : null,
@@ -2696,7 +2719,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     if (row.name.startsWith('two families')) {
       // Slices start in one turn per family. Slice 4 started from slice 1's merged work.
       assert.deepEqual(
-        read.turns.map((turn) => [turn.selection.family, turn.slice ?? null]),
+        read.turns.slice(0, 5).map((turn) => [turn.selection.family, turn.slice ?? null]),
         [
           ['openai', null],
           ['openai', 1],
@@ -2706,6 +2729,15 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         ],
         row.name,
       );
+      // The queued message starts once the plan has finished, as the orchestrator's next turn.
+      await queuedAnswer;
+      const after = thread.read();
+      assert.deepEqual(
+        after.turns.slice(5).map((turn) => [turn.role, turn.state]),
+        [['orchestrator', 'done']],
+        row.name,
+      );
+      assert.ok(!after.messages.some((message) => message.text.startsWith('Plan stopped')));
       const fourth = read.turns.find((turn) => turn.slice === 4);
       assert.equal(held[fourth?.id ?? ''], true, row.name);
       const finished = lines.filter((line) => /^Slice \d finished/.test(line));

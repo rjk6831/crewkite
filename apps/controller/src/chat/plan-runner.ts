@@ -417,13 +417,11 @@ export class PlanRunner {
       this.put(task, thread, plan, { [id]: { status, lane: undefined } });
       this.halt(
         task,
-        sentMessage(thread)
-          ? 'you sent a new message'
-          : stopped
-            ? 'you stopped the reply'
-            : lane.step === 'resolve'
-              ? `the orchestrator could not resolve slice ${id}`
-              : `slice ${id} failed. Run it again from the plan card`,
+        stopped
+          ? 'you stopped the reply'
+          : lane.step === 'resolve'
+            ? `the orchestrator could not resolve slice ${id}`
+            : `slice ${id} failed. Run it again from the plan card`,
         true,
       );
       return false;
@@ -488,15 +486,8 @@ export class PlanRunner {
     let thread = this.host.thread(task.id);
     // After the last slice the checks and the crew chain move the plan on.
     if (thread.plan?.phase !== 'running' || this.closing.has(task.id)) return;
-    const lanes = () =>
-      (thread.plan as ChatPlanState).slices.filter(
-        (slice) => slice.lane && !slice.lane.pending && slice.turnId && this.open(slice.turnId),
-      );
-    // A message from the person ends the plan once its running turns end.
-    if (sentMessage(thread)) {
-      if (!lanes().length) this.halt(task, 'you sent a new message', true);
-      return;
-    }
+    // A message from the person waits in the queue while the plan runs, like any other message,
+    // and starts once the plan has ended.
     const done = new Set(thread.plan.slices.filter((s) => s.status === 'done').map((s) => s.id));
     const homeless = thread.plan.slices.find(
       (s) => s.status === 'queued' && !s.assignment && s.depends.every((dep) => done.has(dep)),
@@ -742,7 +733,6 @@ export class PlanRunner {
       if (!task || thread.plan?.phase !== 'running') return;
       if (!result) return this.halt(task, 'the checks could not run', true);
       if (result.outcome === 'stopped') return this.halt(task, 'you stopped the checks', true);
-      if (sentMessage(thread)) return this.halt(task, 'you sent a new message', true);
       const labels = (status: 'passed' | 'failed') =>
         result.runs
           .filter((run) => run.status === status)
