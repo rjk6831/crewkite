@@ -1,7 +1,7 @@
 import { randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { uptime } from 'node:os';
-import { basename, dirname, join, resolve } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
@@ -117,7 +117,6 @@ import {
   readChatBranchStatus,
 } from './git.ts';
 import { searchHistory } from './history-search.ts';
-import { scratchPath } from './local-tools.ts';
 import type { McpRegistry } from './mcp-servers.ts';
 import { createMentionIndex, readInstructions as readInstructionFiles } from './mentions.ts';
 import type { PlanInputs } from './plan.ts';
@@ -145,6 +144,7 @@ import {
   withAttachments,
   withNotes,
 } from './prompt.ts';
+import { inScratch, readOnlyCommand } from './read-only-command.ts';
 import { failedByRestart, restartFailure } from './restart-failure.ts';
 import { copyScratch } from './scratch-copy.ts';
 import { turnAllowsSubagents } from './subagents.ts';
@@ -349,22 +349,6 @@ const CREW_CHALLENGE = 'Challenge the assumptions behind the last answer.';
 const MAX_FIXES = 2;
 const CREW_ROLES = { review: 'reviewer', fix: 'fixer', challenge: 'challenger' } as const;
 type CrewStep = keyof typeof CREW_ROLES;
-// Commands Balanced and Glide run without asking. Each reads files and changes nothing. sed
-// counts only as `sed -n` with a line range to print.
-const READ_ONLY_COMMANDS = new Set(['ls', 'cat', 'head', 'tail', 'wc', 'rg', 'grep', 'find']);
-const SED_PRINT = /^(\d+|\$)(,(\d+|\$))?p$/;
-// A client can wrap the command in a shell. The script inside is read by the same rules.
-const SHELLS = new Set(['sh', 'bash', 'zsh']);
-const READ_ONLY_GIT = new Set(['status', 'diff', 'log', 'show']);
-// find can run, delete or write through these. rg runs programs with --pre, --hostname-bin and
-// --search-zip. git diff and show write a file with --output and run configured programs with
-// --ext-diff and --textconv.
-const WRITING_FLAGS =
-  /^(-exec|-execdir|-ok|-okdir|-delete|-fprint0?|-fprintf|-fls|--pre|--pre-glob|--hostname-bin|-z|--search-zip|--output|--ext-diff|--textconv)(=|$)/;
-// A piece of a word the read-only commands accept: plain characters, or a quoted part the shell
-// passes on as it stands. No globs, variables, substitutions or escapes outside quotes.
-const WORD_PIECE = /^(?:[A-Za-z0-9._/=:,+@%-]+|'[^'\n]*'|"[^"$`\\!\n]*")/;
-
 // The media type of the artifacts that hold large event output (commands/controller.ts).
 const EVENT_OUTPUT = 'application/vnd.crewkite.event+json';
 // One receipt per stored name. The same bytes under another name can carry another type.
@@ -3979,20 +3963,6 @@ function launchPolicy(thread: ChatThread, role: ChatTurn['role']): PolicyLimit {
 }
 
 /**
- * A path inside the scratch copy by the rules the Local tools use: no `..`, nothing in `.git`, and
- * no link that leads out of the copy. The copy itself counts as inside.
- */
-function inScratch(scratch: string, path: string): boolean {
-  if (resolve(path) === resolve(scratch) || path === '.') return true;
-  try {
-    scratchPath(scratch, path);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-/**
  * True when the tool input names at least one file and every one is inside the scratch copy. An
  * input that names none could write anywhere, so it goes to the person.
  */
@@ -4008,81 +3978,6 @@ function editsInside(input: unknown, scratch: string): boolean {
     paths.length > 0 &&
     paths.every((path) => typeof path === 'string' && path !== '' && inScratch(scratch, path))
   );
-}
-
-/**
- * Every spelling of a path an argument can carry: the word, each part around `=`, and the tail
- * after a short flag written together with its value, such as `-f/etc/passwd`.
- */
-function pathParts(word: string): string[] {
-  const parts = [word, ...word.split('=')];
-  const short = /^-([A-Za-z]+)(.+)$/.exec(word);
-  if (short) for (let at = 1; at <= short[1].length; at++) parts.push(word.slice(at + 1));
-  return parts.filter((part) => part !== '' && !part.startsWith('-'));
-}
-
-/**
- * True for one command from the read-only set that stays in the scratch copy. Any shell operator,
- * substitution or redirect could chain a second command, so those go to the person, and so does
- * an argument that points outside the copy or a flag that writes or runs something.
- */
-function readOnlyCommand(input: unknown, scratch: string): boolean {
-  if (!input || typeof input !== 'object') return false;
-  // Clients name the fields differently: command and cwd, or CommandLine and Cwd.
-  const fields = new Map(
-    Object.entries(input as Record<string, unknown>).map(([key, value]) => [
-      key.toLowerCase(),
-      value,
-    ]),
-  );
-  const command = fields.get('command') ?? fields.get('commandline');
-  const cwd = fields.get('cwd');
-  if (typeof command !== 'string') return false;
-  if (cwd != null && (typeof cwd !== 'string' || !inScratch(scratch, cwd))) return false;
-  return readOnlyWords(shellWords(command), scratch, true);
-}
-
-function readOnlyWords(words: string[] | null, scratch: string, outer: boolean): boolean {
-  if (!words?.length) return false;
-  const [program, ...rest] = words;
-  const name = program.split('/').at(-1) ?? '';
-  if (outer && SHELLS.has(name) && rest.length === 2 && (rest[0] === '-c' || rest[0] === '-lc'))
-    return readOnlyWords(shellWords(rest[1]), scratch, false);
-  const inside = (word: string) =>
-    pathParts(word).every((part) => !part.startsWith('~') && inScratch(scratch, part));
-  if (program === 'sed') {
-    const [flag, script, ...files] = rest;
-    return flag === '-n' && SED_PRINT.test(script ?? '') && files.length > 0 && files.every(inside);
-  }
-  if (program === 'git' ? !READ_ONLY_GIT.has(rest[0] ?? '') : !READ_ONLY_COMMANDS.has(program))
-    return false;
-  return rest.every((word) => !WRITING_FLAGS.test(word) && inside(word));
-}
-
-/**
- * The words the shell hands the program, or null when the command holds anything the shell
- * would act on: an operator, a redirect, a glob, a variable or an escape outside quotes.
- */
-function shellWords(command: string): string[] | null {
-  const words: string[] = [];
-  let word: string | null = null;
-  let rest = command.trim();
-  while (rest) {
-    const space = /^[ \t]+/.exec(rest);
-    if (space) {
-      if (word !== null) words.push(word);
-      word = null;
-      rest = rest.slice(space[0].length);
-      continue;
-    }
-    const piece = WORD_PIECE.exec(rest)?.[0];
-    if (!piece) return null;
-    const quoted = piece.startsWith("'") || piece.startsWith('"');
-    word = (word ?? '') + (quoted ? piece.slice(1, -1) : piece);
-    rest = rest.slice(piece.length);
-  }
-  if (word !== null) words.push(word);
-  return words;
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */

@@ -3095,6 +3095,19 @@ test('balanced and glide run read-only commands without asking under the ask pol
     { mode: 'glide', input: { command: "bash -c 'ls' && rm x" }, answered: false },
     { mode: 'glide', input: { command: 'npm i' }, answered: false },
     { mode: 'glide', input: { CommandLine: 'ls', Cwd: '/etc' }, answered: false },
+    // A read-only command on a file outside the copy follows the policy (H11).
+    {
+      mode: 'glide',
+      input: { command: "rg -n 'x' /Users/raykraft/.agent/memories/MEMORY.md" },
+      answered: false,
+    },
+    {
+      mode: 'glide',
+      input: {
+        command: '/bin/zsh -lc "sed -n \'46,51p\' /Users/raykraft/.agent/memories/MEMORY.md"',
+      },
+      answered: false,
+    },
     { mode: 'manual', input: { command: 'ls' }, answered: false },
   ] as const;
   for (const row of cases) {
