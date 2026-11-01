@@ -17,6 +17,7 @@ import { effortLabel } from './model-picker.tsx';
 import { planlessText } from './plan-card.ts';
 import { ReplyMenu } from './reply-menu.tsx';
 import { markMatches } from './reveal-dom.ts';
+import { subagentStarts } from './subagent-view.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 import { TurnChip } from './turn-chip.tsx';
 import { blankTurn, briefLabel, replySource, type TurnIdentity, viewBlocks } from './turn-fold.ts';
@@ -68,6 +69,7 @@ const TurnRow = memo(function TurnRow({
   const identity = turn.identity;
   const source = turn.ended && turn.status === 'done' ? replySource(turn.blocks) : '';
   const copyable = source !== '';
+  const starts = subagentStarts(turn.blocks);
   // The plan card shows the orchestrator's plan, so its reply leaves the plan block out.
   const shownText = (text: string) =>
     identity?.role === 'orchestrator' ? planlessText(text) : text;
@@ -107,6 +109,7 @@ const TurnRow = memo(function TurnRow({
                 key={block.id}
                 block={block}
                 ended={turn.ended}
+                subagentStart={starts.get(block.id) ?? 0}
                 onOpenChanges={onOpenChanges}
               />
             );

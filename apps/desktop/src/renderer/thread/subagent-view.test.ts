@@ -3,14 +3,22 @@ import { test } from 'node:test';
 import { type AgentEvent, allowsSubagents, type ChatCatalogRead } from '@crewkite/contracts';
 import { crewFromPreset, readCrewPresets, writeCrewPresets } from '../settings/preferences.ts';
 import {
+  spawnCardBadge,
   subagentBadge,
   subagentRows,
+  subagentStarts,
   subagentSwitchNote,
   turnActivities,
   turnChip,
   unlistedLine,
 } from './subagent-view.ts';
-import { applyEvent, blankTurn, replyLabel, type SubagentActivity } from './turn-fold.ts';
+import {
+  applyEvent,
+  type Block,
+  blankTurn,
+  replyLabel,
+  type SubagentActivity,
+} from './turn-fold.ts';
 
 const turnId = 'trn_00000000000000000000000001';
 const agent = (id: string, state: 'running' | 'done' | 'failed' | 'stopped', action?: string) => ({
@@ -134,6 +142,75 @@ test('a spawn card lists each subagent with its latest action and names the ones
   );
   assert.equal(unlistedLine(listed), '3 subagents more not listed.');
   assert.equal(unlistedLine(activity([agent('a', 'done')])), null);
+});
+
+test('subagents are numbered across the turn and each spawn card is labelled by its own', () => {
+  const spawn = (id: string, subagents: SubagentActivity): Block => ({
+    kind: 'tool',
+    id,
+    toolKind: 'other',
+    title: 'Spawn agent',
+    input: null,
+    output: '',
+    truncated: false,
+    status: 'running',
+    diff: null,
+    summary: null,
+    subagents,
+  });
+  const cards = [
+    activity([agent('a', 'done', 'Read src/cart.mjs')]),
+    activity([agent('b', 'running')]),
+    activity([agent('c', 'running'), agent('d', 'done')]),
+  ];
+  const blocks = [
+    spawn('t1', cards[0]),
+    { kind: 'text', id: 'x', text: 'Next', done: true } as Block,
+    spawn('t2', cards[1]),
+    spawn('t3', cards[2]),
+  ];
+  const starts = subagentStarts(blocks);
+  assert.deepEqual(
+    [...starts],
+    [
+      ['t1', 0],
+      ['t2', 1],
+      ['t3', 2],
+    ],
+  );
+  assert.deepEqual(
+    cards.flatMap((card, index) =>
+      subagentRows(card, false, starts.get(`t${index + 1}`)).map((row) => row.name),
+    ),
+    ['Subagent 1', 'Subagent 2', 'Subagent 3', 'Subagent 4'],
+  );
+  assert.deepEqual(spawnCardBadge(cards[0], false, 0), {
+    text: 'Subagent 1',
+    label: 'Subagent 1, finished',
+    tone: 'done',
+  });
+  assert.deepEqual(spawnCardBadge(cards[1], false, 1), {
+    text: 'Subagent 2',
+    label: 'Subagent 2, running',
+    tone: 'running',
+  });
+  assert.deepEqual(spawnCardBadge(cards[2], false, 2), {
+    text: 'Subagents 3 to 4',
+    label: 'Subagents 3 to 4, 1 running',
+    tone: 'running',
+  });
+  assert.deepEqual(spawnCardBadge(cards[1], true, 1), {
+    text: 'Subagent 2',
+    label: 'Subagent 2, stopped',
+    tone: 'failed',
+  });
+  // Agents the client left out of its list still take their numbers.
+  assert.equal(
+    subagentStarts([spawn('t1', activity([agent('a', 'done')], 2)), spawn('t2', cards[1])]).get(
+      't2',
+    ),
+    3,
+  );
 });
 
 test('the fold keeps the newest report on the parent card, even one that arrives before the card', () => {

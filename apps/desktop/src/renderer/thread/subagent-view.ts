@@ -103,6 +103,53 @@ export function subagentBadge(
 export const turnActivities = (blocks: readonly Block[]): SubagentActivity[] =>
   blocks.flatMap((block) => (block.kind === 'tool' && block.subagents ? [block.subagents] : []));
 
+/** How many subagents one spawn card started, counting any the client left out of its list. */
+const startedBy = (activity: SubagentActivity) =>
+  Math.max(activity.running + activity.finished, activity.agents.length);
+
+/**
+ * Subagents are numbered across the turn, so the agent on the second spawn card is Subagent 2.
+ * Maps each spawn card's block id to how many subagents came before it.
+ */
+export function subagentStarts(blocks: readonly Block[]): Map<string, number> {
+  const starts = new Map<string, number>();
+  let count = 0;
+  for (const block of blocks)
+    if (block.kind === 'tool' && block.subagents) {
+      starts.set(block.id, count);
+      count += startedBy(block.subagents);
+    }
+  return starts;
+}
+
+/**
+ * The badge on one spawn card: the subagents it started by their number in the turn, with the
+ * state as the tone. `start` is how many subagents earlier cards in the turn started.
+ */
+export function spawnCardBadge(
+  activity: SubagentActivity,
+  ended: boolean,
+  start = 0,
+): SubagentBadge | null {
+  const counts = subagentBadge([activity], ended);
+  const total = startedBy(activity);
+  if (!counts || total === 0) return null;
+  const text = total === 1 ? `Subagent ${start + 1}` : `Subagents ${start + 1} to ${start + total}`;
+  const state =
+    counts.tone === 'running'
+      ? total === 1
+        ? 'running'
+        : `${ended ? 0 : activity.running} running`
+      : counts.tone === 'failed'
+        ? total === 1
+          ? stateWords[shown(activity.agents[0]?.state ?? 'stopped', ended)].toLowerCase()
+          : counts.label.slice(counts.label.indexOf(',') + 2)
+        : total === 1
+          ? 'finished'
+          : 'all finished';
+  return { text, label: `${text}, ${state}`, tone: counts.tone };
+}
+
 const stateWords: Record<SubagentState, string> = {
   running: 'Running',
   done: 'Finished',
@@ -120,13 +167,16 @@ export type SubagentRow = {
   model: string | null;
 };
 
-/** The rows a spawn card lists: one per subagent, with its latest action. */
-export function subagentRows(activity: SubagentActivity, ended: boolean): SubagentRow[] {
+/**
+ * The rows a spawn card lists: one per subagent, with its latest action. `start` is how many
+ * subagents earlier cards in the turn started, so the numbers run on across the turn.
+ */
+export function subagentRows(activity: SubagentActivity, ended: boolean, start = 0): SubagentRow[] {
   const rows = activity.agents.map((agent, index) => {
     const state = shown(agent.state, ended);
     return {
       key: agent.id,
-      name: `Subagent ${index + 1}`,
+      name: `Subagent ${start + index + 1}`,
       state,
       stateText: stateWords[state],
       action: agent.action ?? (state === 'running' ? 'Starting' : 'No action reported'),
