@@ -347,10 +347,19 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     notice: reading ? undefined : 'Refresh Anthropic quota to read the native report.',
     primary,
     auxiliary: rows.filter((row) => !primary.includes(row)),
-    // The report's extra_usage.is_enabled read false on an account with extra usage turned on
-    // (d3-rc5), so the client's flag does not say what the account has. The card shows no
-    // extra-usage row until the report carries it reliably.
-    credits: [],
+    // The client reports extra usage as on only while the account holds a credit balance; with the
+    // switch on and no balance it reports off. So the card shows the row when the report says on
+    // and leaves it out otherwise, since off can mean either.
+    credits: reading?.extraUsage?.is_enabled
+      ? [
+          {
+            id: 'native-extra-usage',
+            label: 'Extra usage',
+            value: 'On',
+            note: 'Paid credits used after the included allowance.',
+          },
+        ]
+      : [],
     emptyText: 'No subscription allowance was reported. Coding allowance remains unknown.',
   };
 }
