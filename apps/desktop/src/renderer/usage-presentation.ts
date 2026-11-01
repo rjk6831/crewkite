@@ -115,6 +115,39 @@ export function nativeUsageClients(
   }));
 }
 
+// Plain names for the usage windows the readers report. A window not listed here reads as its ID
+// turned into words, so a new one never shows as a raw ID.
+const windowNames = new Map([
+  ['weekly', 'Weekly'],
+  ['five-hour', 'Five-hour'],
+  ['gemini-weekly', 'Weekly'],
+  ['gemini-5h', 'Five-hour'],
+  ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
+  ['3p-5h', 'Third-party 5 h'],
+  ['3p-weekly', 'Weekly'],
+]);
+const windowWords = new Map([
+  ['3p', 'third-party'],
+  ['wtu', ''],
+]);
+
+/** The name a usage window shows, from its reader's window ID. */
+export function windowLabel(windowId: string): string {
+  const known = windowNames.get(windowId);
+  if (known) return known;
+  const words = windowId
+    .split(/[-_\s]+/)
+    .map((part) => {
+      const lower = part.toLowerCase();
+      const span = /^(\d+)([hdm])$/.exec(lower);
+      if (span) return `${span[1]} ${span[2]}`;
+      return windowWords.get(lower) ?? lower;
+    })
+    .filter((word) => word !== '');
+  const text = words.join(' ');
+  return text === '' ? windowId : text[0].toUpperCase() + text.slice(1);
+}
+
 /** Projection keeps report identity separate from account identity and execution admission. */
 export function projectUsagePresentation(
   snapshot: Pick<Snapshot, 'routes' | 'usage' | 'usageReaders'>,
@@ -197,7 +230,7 @@ export function projectUsagePresentation(
       return {
         id: `${id}:${observation.windowId}:${occurrence}`,
         windowId: observation.windowId,
-        label: observation.windowId,
+        label: windowLabel(observation.windowId),
         remaining: observation.remaining,
         resetsAt: observation.resetsAt,
         observedAt: observation.observedAt,
@@ -224,17 +257,15 @@ export function projectUsagePresentation(
     // center dial still shows it.
     const models = readings.filter(({ semantics }) => semantics?.scope === 'model');
     const featured = models.length === 1 ? models[0] : null;
-    const notices = scope.fixture
-      ? ['Fixture data. No account allowance is established.']
-      : ['Account and shared-pool identity are unknown.'];
+    const notices = scope.fixture ? ['Fixture data. No account allowance is established.'] : [];
     if (readings.length === 0) notices.push('No usage observations.');
     if (weekly.length > 1 || fiveHour.length > 1)
-      notices.push('Multiple provider windows match a primary period; all remain separate.');
+      notices.push('Several windows share a period, so each shows on its own.');
     if (family === 'google' && !scope.fixture) {
       if (reader && !reader.available)
-        notices.push('Quota reader is unavailable; retained reports remain visible.');
+        notices.push('The quota reader is not available. The last readings stay in view.');
       if (googleReports.size > 1)
-        notices.push('Google route reports differ; scopes are shown separately.');
+        notices.push('Google routes report different readings, so each shows on its own.');
     }
     return {
       id,
@@ -249,7 +280,7 @@ export function projectUsagePresentation(
       featured,
       satellites: readings.filter((reading) => !Object.values(primary).includes(reading)),
       reader: family === 'google' && !scope.fixture ? reader : null,
-      notice: notices.join(' '),
+      notice: notices.length > 0 ? notices.join(' ') : null,
     };
   });
 }
@@ -282,10 +313,7 @@ export function anthropicReadReason(reason: string, clientVersion: string): stri
   return `Last refresh failed. ${failed} ${nextSteps.get(reason) ?? `Update CrewKite or report ${version}.`}`;
 }
 
-const primaryLabels = new Map([
-  ['weekly', 'Weekly'],
-  ['five-hour', 'Five-hour'],
-]);
+const primaryWindows = ['weekly', 'five-hour'];
 
 /** The controller turned the report's used percent into what remains. */
 export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): UsageCard | null {
@@ -297,7 +325,7 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
   const rows: UsageReading[] = (reading?.windows ?? []).map((window, index) => ({
     id: `${index}:${window.windowId}`,
     windowId: window.windowId,
-    label: primaryLabels.get(window.windowId) ?? window.windowId,
+    label: windowLabel(window.windowId),
     remaining: window.remaining,
     state: 'reported',
     // The report carries no observation time of its own. The time CrewKite received it is the
@@ -309,14 +337,12 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     readAt: reading?.receivedAt ?? null,
     note: `Read when CrewKite received the report. The report gives no observation time or cache age. Report scope ${scope}.`,
   }));
-  const primary = [...primaryLabels.keys()].flatMap((id) =>
-    rows.filter((row) => row.windowId === id),
-  );
+  const primary = primaryWindows.flatMap((id) => rows.filter((row) => row.windowId === id));
   return {
     id: 'native-quota:anthropic',
-    title: 'Anthropic native quota',
-    scope: 'Native local usage report',
-    tags: [matching ? 'Current scope' : 'Earlier or unknown scope'],
+    title: 'Anthropic subscription',
+    // A report read under another sign-in says so. A current one needs no tag.
+    tags: matching ? [] : ['May be from an earlier sign-in'],
     // Each gauge says how long ago CrewKite read the report. Details say the report has no time of its own.
     notice: reading ? undefined : 'Refresh Anthropic quota to read the native report.',
     primary,

@@ -16,27 +16,36 @@ function usageReading(value: UsageGaugeReading, label = value.label): UsageReadi
   };
 }
 
+/** A card with three readings or fewer shows them all as dials of one size, side by side. */
+const DIAL_LIMIT = 3;
+
 /** The gauge cards the Usage page and the thread inspector both show. */
 export function usageCards(
   scopes: readonly UsageGaugeCard[],
   snapshot: Pick<Snapshot, 'usageReaders'>,
 ): UsageCard[] {
-  const cards: UsageCard[] = scopes.map((scope) => ({
-    id: scope.id,
-    title: scope.label,
-    scope: scope.scopeLabel,
-    tags: scope.fixture ? ['Fixture'] : undefined,
-    notice: scope.notice ?? undefined,
-    primary: [
+  const cards: UsageCard[] = scopes.map((scope) => {
+    const primary = [
       ...(scope.primary.weekly ? [usageReading(scope.primary.weekly, 'Weekly')] : []),
       ...(scope.primary.fiveHour ? [usageReading(scope.primary.fiveHour, 'Five-hour')] : []),
-    ],
-    featured: scope.featured ? usageReading(scope.featured) : null,
-    auxiliary: scope.satellites
+    ];
+    const featured = scope.featured ? usageReading(scope.featured) : null;
+    const auxiliary = scope.satellites
       .filter((reading) => reading !== scope.featured)
-      .map((reading) => usageReading(reading)),
-    emptyText: 'No usage observations.',
-  }));
+      .map((reading) => usageReading(reading));
+    const all = [...primary, ...(featured ? [featured] : []), ...auxiliary];
+    const even = all.length <= DIAL_LIMIT;
+    return {
+      id: scope.id,
+      title: scope.label,
+      tags: scope.fixture ? ['Fixture'] : undefined,
+      notice: scope.notice ?? undefined,
+      primary: even ? all : primary,
+      featured: even ? null : featured,
+      auxiliary: even ? [] : auxiliary,
+      emptyText: 'No usage observations.',
+    };
+  });
   const nativeQuota = anthropicUsageCard(snapshot);
   if (nativeQuota) cards.push(nativeQuota);
   return cards;

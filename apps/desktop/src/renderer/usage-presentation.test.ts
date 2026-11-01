@@ -17,6 +17,7 @@ import {
   nativeUsageClients,
   projectUsagePresentation,
   railFamilies,
+  windowLabel,
 } from './usage-presentation.ts';
 
 const id = createTestIds(DEMO_TIME, 9000n);
@@ -200,7 +201,7 @@ test('native usage gauges show the remaining percent without inventing freshness
     [
       ['Weekly', 0],
       ['Five-hour', 63],
-      ['scoped-pool', 100],
+      ['Scoped pool', 100],
     ],
   );
   assert(
@@ -212,7 +213,9 @@ test('native usage gauges show the remaining percent without inventing freshness
         row.reserve === undefined,
     ),
   );
-  assert(card.tags?.includes('Current scope'));
+  assert.deepEqual(card.tags, []);
+  assert.equal(card.title, 'Anthropic subscription');
+  assert.equal(card.scope, undefined);
   // The report has no time of its own, so the reading ages from the time CrewKite received it.
   assert(
     rows.every((row) => row.note?.startsWith('Read when CrewKite') && row.note.includes(scopeHash)),
@@ -269,7 +272,7 @@ test('native usage gauges show the remaining percent without inventing freshness
   const prior = anthropicUsageCard({
     usageReaders: [{ ...reader, readingScopeHash: 'c'.repeat(64) }],
   });
-  assert(prior?.tags?.includes('Earlier or unknown scope'));
+  assert(prior?.tags?.includes('May be from an earlier sign-in'));
   assert.equal(anthropicUsageCard({ usageReaders: [] }), null);
 });
 
@@ -446,4 +449,18 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     [150 * 1024 ** 2, '150 MB'],
   ];
   for (const [bytes, text] of sizes) assert.equal(formatSize(bytes), text, `${bytes}`);
+});
+
+test('usage windows show plain names, and an unknown ID reads as words', () => {
+  const rows = [
+    ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
+    ['3p-5h', 'Third-party 5 h'],
+    ['3p-weekly', 'Weekly'],
+    ['weekly', 'Weekly'],
+    ['five-hour', 'Five-hour'],
+    ['gemini-pro_24h', 'Gemini pro 24 h'],
+    ['3p-daily', 'Third-party daily'],
+    ['---', '---'],
+  ];
+  for (const [id, name] of rows) assert.equal(windowLabel(id), name, id);
 });
