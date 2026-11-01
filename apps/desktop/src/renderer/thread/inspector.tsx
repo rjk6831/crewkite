@@ -77,7 +77,7 @@ const roleNames: Record<ChatRole, string> = {
   challenger: 'Challenger',
   fixer: 'Fixer',
   orchestrator: 'Orchestrator',
-  ask: 'Ask',
+  ask: 'Side question',
 };
 
 // The chosen width is a local preference. Storage can be blocked, and the panel falls back to the
