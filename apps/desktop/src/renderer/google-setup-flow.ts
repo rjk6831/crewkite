@@ -151,6 +151,17 @@ export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' 
 }
 
 /**
+ * What the card says when a Connect ended on an error it could not read, such as a command the
+ * desktop refused before it reached the controller. Only a step that ended in an unknown state
+ * leaves the outcome unconfirmed. `state` is null when it could not be read.
+ */
+export function googleConnectError(state: GoogleState | null): string {
+  return state?.googleAcpSetup?.state === 'unknown' || state?.googleAcpInstall?.state === 'unknown'
+    ? 'The setup outcome could not be confirmed. Review status before retrying.'
+    : 'Connect stopped. Press Connect to try again.';
+}
+
+/**
  * The step a Connect press shows at once, before its first status read lands: the step the saved
  * state names next, or the download when it names none.
  */
