@@ -16,7 +16,6 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
       onCheck={() => actions.checkClient('google')}
       main={
         <>
-          <p className="st-note">The quota read runs by default. Chat needs Connect.</p>
           <GoogleSetup snapshot={header} workspace={workspace} />
           <ClientStatus family="google" header={header} now={now} facts={false}>
             <QuotaRefresh

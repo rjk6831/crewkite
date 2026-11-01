@@ -375,25 +375,26 @@ export function GoogleSetup({
         <span>{setupLabels[setup?.state ?? 'uninitialized'] ?? setup?.state}</span>
       </div>
       <p className="muted small">{googleAcpLabel}</p>
-      {GOOGLE_TERMS_SUMMARY.map((line) => (
-        <p key={line} className="muted small">
-          {line}
-        </p>
-      ))}
-      {termsAcknowledged ? (
-        <p className="muted small">
-          You acknowledged this on {formatLocalTime(setup?.googleTerms?.at) ?? 'an unknown date'}.
-        </p>
-      ) : (
-        <label className="check-row small">
-          <input
-            type="checkbox"
-            checked={termsChecked}
-            onChange={(event) => setTermsChecked(event.target.checked)}
-          />
-          <span>{GOOGLE_TERMS_CHECKBOX}</span>
-        </label>
-      )}
+      {/* The terms and the acknowledgement lead the card, at body size. */}
+      <div className="gs-terms">
+        {GOOGLE_TERMS_SUMMARY.map((line) => (
+          <p key={line}>{line}</p>
+        ))}
+        {termsAcknowledged ? (
+          <p className="muted small">
+            You acknowledged this on {formatLocalTime(setup?.googleTerms?.at) ?? 'an unknown date'}.
+          </p>
+        ) : (
+          <label className="check-row gs-terms-check">
+            <input
+              type="checkbox"
+              checked={termsChecked}
+              onChange={(event) => setTermsChecked(event.target.checked)}
+            />
+            <span>{GOOGLE_TERMS_CHECKBOX}</span>
+          </label>
+        )}
+      </div>
       {!termsAcknowledged && (ready || needsRepair) && (
         <button
           className="button secondary"
@@ -412,11 +413,14 @@ export function GoogleSetup({
           Acknowledge
         </button>
       )}
-      <p className="muted small">
-        Connect Google downloads and verifies the official client when needed, initializes it, then
-        opens browser sign-in for your Google account and discovers your choices. You complete and
-        control the Google sign-in. Initialization and discovery use no model prompt.
-      </p>
+      <details className="gs-how">
+        <summary>How Connect works</summary>
+        <p className="muted small">
+          Connect Google downloads and verifies the official client when needed, initializes it,
+          then opens browser sign-in for your Google account and discovers your choices. You
+          complete and control the Google sign-in. Initialization and discovery use no model prompt.
+        </p>
+      </details>
       <div className="facts-grid compact">
         <Fact label="Official client" value={officialClient} />
         <Fact label="Google account" value={googleAccount} />
