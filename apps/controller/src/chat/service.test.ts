@@ -3072,6 +3072,65 @@ test('a flight mode or policy change answers the open ask the new setting covers
   }
 });
 
+// Balanced and Glide answer a read-only command inside the scratch copy under any policy, in the
+// shape each family sends it. Manual leaves it to the policy.
+test('balanced and glide run read-only commands without asking under the ask policy', {
+  timeout: 30000,
+}, async (t) => {
+  const crew: ChatCrew = { name: 'Solo', members: [{ role: 'builder', selection }] };
+  const cases = [
+    {
+      mode: 'glide',
+      input: { CommandLine: 'grep -rn "createUser(" src', Cwd: '.' },
+      answered: true,
+    },
+    { mode: 'glide', input: { command: "sed -n '1,40p' src/app.ts" }, answered: true },
+    { mode: 'glide', input: { command: "/bin/zsh -lc 'ls -la src'" }, answered: true },
+    { mode: 'glide', input: { command: 'git log --oneline -5' }, answered: true },
+    { mode: 'balanced', input: { command: "rg -n 'a b' ." }, answered: true },
+    { mode: 'glide', input: { command: "sed -i 's/a/b/' src/app.ts" }, answered: false },
+    { mode: 'glide', input: { command: "sed -n '1p;w out' src/app.ts" }, answered: false },
+    { mode: 'glide', input: { command: 'grep -rn x src | sh' }, answered: false },
+    { mode: 'glide', input: { command: 'cat "$HOME/.ssh/id"' }, answered: false },
+    { mode: 'glide', input: { command: "bash -c 'ls' && rm x" }, answered: false },
+    { mode: 'glide', input: { command: 'npm i' }, answered: false },
+    { mode: 'glide', input: { CommandLine: 'ls', Cwd: '/etc' }, answered: false },
+    { mode: 'manual', input: { command: 'ls' }, answered: false },
+  ] as const;
+  for (const row of cases) {
+    const adapter = editingAdapter(['command'], row.input);
+    const thread = standalone(t, { adapters: new Map([['openai', adapter]]) });
+    const { store, service, taskId } = thread;
+    store.transaction(() =>
+      service.configure({
+        taskId,
+        permissionPolicy: 'ask',
+        ...(row.mode === 'manual' ? {} : { crew, flightMode: row.mode }),
+      }),
+    );
+    const name = `${row.mode} ${JSON.stringify(row.input)}`;
+    const parked = turnReaches(thread, 'waiting-permission');
+    const idle = settles(thread);
+    thread.send('Go.');
+    const turn = await parked;
+    await new Promise((resolve) => setImmediate(resolve));
+    const open = thread.read().turns[0].state === 'waiting-permission';
+    assert.equal(open, !row.answered, name);
+    if (open) {
+      const effects: (() => void)[] = [];
+      store.transaction(() =>
+        service.resolvePermission(
+          { taskId, turnId: turn.id, requestId: 'edit-1', choice: 'deny' },
+          effects,
+        ),
+      );
+      for (const effect of effects) effect();
+    }
+    await idle;
+    await service.close();
+  }
+});
+
 test('send now stops the running turn and starts the queued message with its packet', {
   timeout: 30000,
 }, async (t) => {

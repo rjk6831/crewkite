@@ -731,6 +731,26 @@ function CrewTab({
           ? mode.title
           : 'Balanced and Glide run with a crew. Picking one here starts the Solo crew, the builder alone, and Pair or Full crew above add the other roles.'}
       </p>
+      {/* The same setting as Permissions on the Thread tab, so mode and policy read in one place. */}
+      <label>
+        Permissions
+        <select
+          value={thread?.permissionPolicy ?? 'ask'}
+          disabled={!thread}
+          onChange={(event) =>
+            onConfigure({ permissionPolicy: event.target.value as ChatPermissionPolicy })
+          }
+        >
+          {permissionPolicies.map((policy) => (
+            <option key={policy.id} value={policy.id}>
+              {policy.label}
+            </option>
+          ))}
+        </select>
+      </label>
+      {crew && mode.id !== 'manual' && (
+        <p className="th-muted">Read-only commands in the scratch copy run without asking.</p>
+      )}
       <AutoHandoff thread={thread} onConfigure={onConfigure} />
       <ChecksSettings
         thread={thread}
