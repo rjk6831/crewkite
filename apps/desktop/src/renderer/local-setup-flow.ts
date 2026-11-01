@@ -248,29 +248,44 @@ type LocalConnectResult =
 const applied = (result: CommandResult) =>
   result.outcome === 'applied' || result.outcome === 'already-applied';
 
+/**
+ * Connect always detects: the controller probes the runtime and asks for a token only on 401 or
+ * 403. The saved mode is token wherever this computer can take one. A computer without the macOS
+ * keychain refuses token mode, and Connect saves the no-token loopback mode there (ADR 0043,
+ * amendment of 2026-11-01).
+ */
 export async function connectLocalFlow({
   setup,
   endpoint,
-  authMode,
   command,
   active,
 }: {
   setup: LocalSetup;
   endpoint: string;
-  authMode: 'token' | 'none';
   command: (input: DesktopCommand) => Promise<CommandResult>;
   active: () => boolean;
 }): Promise<LocalConnectResult> {
   let revision = setup.revision;
-  if (endpoint !== setup.endpoint) {
-    const configured = await command({
+  const saved = setup.authMode ?? 'token';
+  const configure = async (authMode: 'token' | 'none') => {
+    const result = await command({
       command: 'ConfigureLocal',
       expectedRevision: revision,
       payload: { endpoint, authMode },
     });
+    if (applied(result)) revision = result.revision ?? revision;
+    return result;
+  };
+  if (endpoint !== setup.endpoint || (saved === 'none' && !tokenModeRefused)) {
+    let configured: CommandResult | null = await configure(tokenModeRefused ? 'none' : 'token');
     if (!active()) return { kind: 'stopped' };
-    if (!applied(configured)) return { kind: 'blocked', result: configured };
-    revision = configured.revision ?? revision;
+    if (configured.reason === 'local-token-needs-macos') {
+      tokenModeRefused = true;
+      // On the saved endpoint, the saved no-token mode is already what this computer takes.
+      configured = endpoint === setup.endpoint ? null : await configure('none');
+      if (!active()) return { kind: 'stopped' };
+    }
+    if (configured && !applied(configured)) return { kind: 'blocked', result: configured };
   }
   const started = await command({
     command: 'BeginLocalConnectionInput',
@@ -280,6 +295,9 @@ export async function connectLocalFlow({
   if (!active()) return { kind: 'stopped' };
   return applied(started) ? { kind: 'started' } : { kind: 'blocked', result: started };
 }
+
+// Set once this computer refuses token mode, so a later Connect does not ask again.
+let tokenModeRefused = false;
 
 export async function waitForLocalReadiness({
   endpoint,

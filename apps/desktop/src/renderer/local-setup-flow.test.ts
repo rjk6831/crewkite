@@ -126,6 +126,54 @@ test('local readiness polling stops after twenty fake clock ticks', async () => 
   assert.equal(reads, 20);
 });
 
+test('Local connect saves token mode wherever it can and no-token mode where token mode is refused', async () => {
+  const run = async (saved: LocalSetup, endpoint: string, refuses: boolean) => {
+    const sent: string[] = [];
+    const result = await connectLocalFlow({
+      setup: saved,
+      endpoint,
+      active: () => true,
+      command: async (input) => {
+        sent.push(
+          input.command === 'ConfigureLocal'
+            ? `ConfigureLocal ${(input.payload as { authMode: string }).authMode}`
+            : input.command,
+        );
+        return input.command === 'ConfigureLocal' &&
+          refuses &&
+          (input.payload as { authMode: string }).authMode === 'token'
+          ? { outcome: 'blocked', reason: 'local-token-needs-macos' }
+          : { outcome: 'applied', revision: 2 };
+      },
+    });
+    return { kind: result.kind, sent };
+  };
+  const saved = setup({ operation: null });
+  const none = setup({ operation: null, authMode: 'none' });
+  // On a Mac: the saved token mode connects as it is, and a saved no-token mode moves to token.
+  assert.deepEqual(await run(saved, saved.endpoint as string, false), {
+    kind: 'started',
+    sent: ['BeginLocalConnectionInput'],
+  });
+  assert.deepEqual(await run(none, none.endpoint as string, false), {
+    kind: 'started',
+    sent: ['ConfigureLocal token', 'BeginLocalConnectionInput'],
+  });
+  // Where token mode is refused, a saved no-token endpoint connects, and a new one saves none.
+  assert.deepEqual(await run(none, none.endpoint as string, true), {
+    kind: 'started',
+    sent: ['ConfigureLocal token', 'BeginLocalConnectionInput'],
+  });
+  assert.deepEqual(await run(none, none.endpoint as string, true), {
+    kind: 'started',
+    sent: ['BeginLocalConnectionInput'],
+  });
+  assert.deepEqual(await run(none, 'ws://127.0.0.1:5678', true), {
+    kind: 'started',
+    sent: ['ConfigureLocal none', 'BeginLocalConnectionInput'],
+  });
+});
+
 test('Local connect stops its command chain when component ownership changes', async () => {
   let current = true;
   const configured = Promise.withResolvers<{
@@ -136,7 +184,6 @@ test('Local connect stops its command chain when component ownership changes', a
   const connecting = connectLocalFlow({
     setup: setup({ operation: null }),
     endpoint: 'ws://127.0.0.1:5678',
-    authMode: 'token',
     command: async (input) => {
       commands.push(input.command);
       if (input.command !== 'ConfigureLocal') assert.fail('connection input must not start');
