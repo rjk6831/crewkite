@@ -316,6 +316,24 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
   ]);
   assert.deepEqual(ruledOut('Run it without LM Studio.'), ['local']);
   assert.deepEqual(ruledOut('Use Local for the small parts. OpenAI takes the rest.'), []);
+  // Only an explicit exclusion of the provider as a worker counts. A provider named as part of the
+  // work, such as its sign-in button or its client config, rules nothing out.
+  const exclusions: [string, string[]][] = [
+    ["don't use Google", ['google']],
+    ['no OpenAI for this', ['openai']],
+    ['without Anthropic', ['anthropic']],
+    ['skip local models', ['local']],
+    ['do not run this on Google', ['google']],
+    ['Fix the login bug without breaking the Google sign-in button.', []],
+    ["Don't touch the local storage code", []],
+    ['do not mock OpenAI responses', []],
+    ['the local branch', []],
+    ['without breaking the Anthropic adapter', []],
+    ['no local changes', []],
+    ["don't change the OpenAI client config", []],
+  ];
+  for (const [message, families] of exclusions)
+    assert.deepEqual(ruledOut(message), families, message);
   // A reply with no plan block answered the person; one with a broken block goes back.
   assert.equal(hasPlanBlock('Halloween 2027 falls on a Sunday.'), false);
   assert.equal(hasPlanBlock(block('{')), true);
