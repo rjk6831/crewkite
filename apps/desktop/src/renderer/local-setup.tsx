@@ -266,7 +266,7 @@ export function LocalSetup({
           setMessage(null);
         if (result === 'timeout') {
           setPollTimedOut(true);
-          setMessage('Taking longer than expected. Try Refresh.');
+          setMessage('Taking longer than expected. Try Refresh model list.');
         }
       })
       .catch(() => {
@@ -533,7 +533,9 @@ export function LocalSetup({
         <Fact
           label="Selected model"
           value={
+            // The pick shows at once. The controller's saved selection replaces it when it lands.
             currentChoice?.identity.displayName ??
+            (requested === 'Model selection' ? selectedChoice?.identity.displayName : null) ??
             (setup?.selection ? 'Previous observation' : stale && lastChoice ? lastChoice : 'None')
           }
         />
@@ -660,7 +662,7 @@ export function LocalSetup({
           else void reobserve().then((problem) => mounted.current && setMessage(problem));
         }}
       >
-        Refresh
+        Refresh model list
       </button>
     </section>
   );

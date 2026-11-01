@@ -143,15 +143,20 @@ export function resolveLocalConnection(
 
 /**
  * The choice in a fresh read that keeps the selection. A reload or a runtime update changes the
- * selection ID, so the match is by model key, and only to one choice with a loaded instance. Null
- * clears the selection, and the person picks again.
+ * selection ID, so the match is by model key, and only to one choice with a loaded instance. A
+ * model picked while unloaded stays picked while the read still lists it unloaded, so the card can
+ * say to load it. Null clears the selection, and the person picks again.
  */
 export function retainedSelection(
   modelKey: string | null,
   next: z.output<typeof LocalModelObservationSchema>,
+  pickedUnloaded = false,
 ): z.output<typeof LocalModelObservationSchema>['models'][number] | null {
-  const loaded = next.models.filter(
-    (model) => model.identity.modelKey === modelKey && model.instanceReference !== null,
-  );
-  return modelKey !== null && loaded.length === 1 ? loaded[0] : null;
+  if (modelKey === null) return null;
+  const same = next.models.filter((model) => model.identity.modelKey === modelKey);
+  const loaded = same.filter((model) => model.instanceReference !== null);
+  if (loaded.length === 1) return loaded[0];
+  return pickedUnloaded && same.length === 1 && same[0].state === 'installed-unloaded'
+    ? same[0]
+    : null;
 }

@@ -1371,7 +1371,14 @@ export class ProviderCommands {
             selectedModelKey ??=
               observation?.models.find((choice) => choice.selectionId === selection?.selectionId)
                 ?.identity.modelKey ?? null;
-            const kept = retainedSelection(selectedModelKey, nextObservation);
+            const picked = observation?.models.find(
+              (choice) => choice.selectionId === selection?.selectionId,
+            );
+            const kept = retainedSelection(
+              selectedModelKey,
+              nextObservation,
+              picked?.state === 'installed-unloaded',
+            );
             observation = nextObservation;
             observedAt = this.now();
             observationStale = false;
