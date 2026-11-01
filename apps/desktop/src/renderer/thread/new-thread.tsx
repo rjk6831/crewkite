@@ -290,7 +290,6 @@ export function NewThread({
           taskId={null}
           thread={pending}
           running={false}
-          context={null}
           currentFamily={null}
           blocked={
             blocked ??

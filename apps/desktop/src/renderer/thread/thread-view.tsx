@@ -53,10 +53,11 @@ import {
   lastFamily,
   lastReply,
   lastUserMessage,
-  latestContext,
   liveSignals,
   newestTurnId,
   pausedQueueLine,
+  reportedWindow,
+  storedHistory,
   type ThreadItem,
   type ThreadSettings,
   triedFamilies,
@@ -558,7 +559,10 @@ function ThreadBody({
             taskId={task.id}
             thread={thread}
             running={activeTurn !== null}
-            context={latestContext(items)}
+            meter={{
+              history: storedHistory(state),
+              windowFor: (family, model) => reportedWindow(items, family, model),
+            }}
             currentFamily={lastFamily(state, items)}
             blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
             notice={notice}
