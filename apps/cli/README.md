@@ -54,7 +54,7 @@ Ctrl+G opens Changes: the changed files with their line counts and the diff of t
 
 ### Crew, plan and handoff
 
-`/crew` shows the crew, the flight mode, the permission policy and the handoff mode. 1, 2 and 3 apply the Solo, Pair and Full crew presets; F, P and H cycle the flight mode, permission policy and handoff mode; A turns automatic handoff on or off. `/plan` shows the orchestrator's plan card with each slice's state and assignment. R runs the plan, C cancels it, S stops it, and a slice number runs that slice once its dependencies are done.
+`/crew` shows the crew, the flight mode, the permission policy and the handoff mode, then lists the Solo, Pair and Full crew presets and the crews saved in the desktop's Settings, with the default crew for new threads and the thread's crew marked. Up and Down move, and Enter or the crew's number applies it to the thread, with the flight mode a saved crew brings. The controller keeps the saved crews, so the list matches the desktop's. Building and editing crews stays in the desktop. F, P and H cycle the flight mode, permission policy and handoff mode; A turns automatic handoff on or off. `/plan` shows the orchestrator's plan card with each slice's state and assignment. R runs the plan, C cancels it, S stops it, and a slice number runs that slice once its dependencies are done.
 
 ### Settings and appearance
 

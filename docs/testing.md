@@ -285,6 +285,8 @@ The command line claim in `apps/cli/src/chat/notes.test.ts` drives list, add and
 
 The migration for notes is number 019, which follows 018 without a gap. The tests in `project-notes.test.ts` and the command line test apply the real migration folder.
 
+Saved crews and the default crew live in the controller from migration 021. The tests in `apps/controller/src/chat/saved-crews.test.ts` apply the real migration folder. They check that crews keep the order they were saved in and an edit keeps its place, that names are unique across presets and crews whatever their case, that the list stops at 24, that the default names only a preset or a saved crew and goes back to Solo when its crew is deleted, and that the import from the desktop's storage runs once and leaves out entries that do not fit. A version 20 database upgrades after its backup copy and keeps its rows. Through the real controller, a refusal carries its sentence, a replayed key answers from its receipt and the crews survive a restart. The desktop test in `settings.test.ts` checks that the window lists the controller's crews with the presets, that crews kept in its storage move once and their keys go, and that each change takes the list the controller answers with. The CLI test in `app.test.ts` saves a crew through the controller, opens `/crew`, finds it marked as the default and applies it with its flight mode.
+
 ## Usage analytics
 
 Four files cover the usage numbers of a thread and a project. All of them use real SQLite, the real file system or pure functions, with no network and no sleeps.

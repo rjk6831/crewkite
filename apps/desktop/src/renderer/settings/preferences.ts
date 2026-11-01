@@ -1,4 +1,5 @@
 import {
+  BUILT_IN_DEFAULT_CREW,
   type ChatCatalogEntry,
   type ChatCatalogRead,
   type ChatCrew,
@@ -15,7 +16,15 @@ import {
   ChatPermissionPolicySchema,
   ChatSavedHandoffModeSchema,
   type ChatThread,
+  type SavedCrew as ContractSavedCrew,
+  type CrewChoiceId,
+  CrewChoiceIdSchema,
+  crewNameTaken,
+  orderedCrew,
   rankFamilies,
+  SAVED_CREWS_MAX,
+  SavedCrewSchema,
+  type SavedCrewsRead,
 } from '@crewkite/contracts';
 import type { ThreadSettings } from '../thread/thread-state.ts';
 
@@ -84,13 +93,14 @@ const builtIn: ThreadDefaults = {
   handoffMode: 'most-left',
 };
 
-function browserStore(): Store | null {
+function localStore(): Storage | null {
   try {
     return localStorage;
   } catch {
     return null;
   }
 }
+const browserStore = (): Store | null => localStore();
 
 export function readThreadDefaults(store: Store | null = browserStore()): ThreadDefaults {
   try {
@@ -448,15 +458,16 @@ export function crewFromPreset(
   return { name: preset.name, members };
 }
 
-// Crews the person builds in Settings > Crews, saved in order. Each holds the roles it has, a pin
-// or null per role, and the flight mode a thread takes when it starts from the crew.
-const savedCrewsKey = 'crewkite-saved-crews-v1';
-// The crew new threads start with, as a CrewChoice id, and the projects that start with another.
-const defaultCrewKey = 'crewkite-default-crew-v1';
+// Crews the person builds in Settings > Crews, and the crew new threads start with. The controller
+// keeps them, so the command line lists the same crews. This window holds the last list the
+// controller sent, and crew-store.ts sends every change. Before the controller held them they
+// lived under these two keys, which the first launch reads once and moves to the controller.
+const legacySavedCrewsKey = 'crewkite-saved-crews-v1';
+const legacyDefaultCrewKey = 'crewkite-default-crew-v1';
+// The projects that start with another crew stay in this window. Only the desktop uses them.
 const projectCrewsKey = 'crewkite-project-crews-v1';
-const SAVED_CREWS = 24;
 
-export type SavedCrew = CrewTemplate & { id: string; flightMode: ChatFlightMode };
+export type SavedCrew = ContractSavedCrew;
 
 /** A crew a thread can start from, as the Crew tab, Settings and the welcome list them. */
 export type CrewChoice = {
@@ -469,7 +480,7 @@ export type CrewChoice = {
   flightMode: ChatFlightMode | null;
 };
 
-export const BUILT_IN_DEFAULT_CREW = 'preset:Solo';
+export { BUILT_IN_DEFAULT_CREW };
 
 const parse = (store: Store | null, key: string): unknown => {
   try {
@@ -480,20 +491,32 @@ const parse = (store: Store | null, key: string): unknown => {
   }
 };
 
-const roleOrder = (role: ChatCrewRole) => ChatCrewRoleSchema.options.indexOf(role);
+let savedCrews: SavedCrewsRead | null = null;
 
-/** Saved crews that still read whole. An entry edited into a bad shape is left out. */
-export function readSavedCrews(store: Store | null = browserStore()): SavedCrew[] {
-  const saved = parse(store, savedCrewsKey);
-  if (!Array.isArray(saved)) return [];
+/** Takes the list the controller sent. Null forgets it, as when the controller goes away. */
+export function setSavedCrews(read: SavedCrewsRead | null) {
+  savedCrews = read;
+  for (const listener of crewListeners) listener();
+}
+
+/** Whether the controller's list has arrived. Until it does only the presets are listed. */
+export const savedCrewsLoaded = () => savedCrews !== null;
+
+/** The saved crews in the order they were first saved. */
+export const readSavedCrews = (): SavedCrew[] => savedCrews?.crews ?? [];
+
+/**
+ * The crews and the default this window kept before the controller held them. An entry edited
+ * into a bad shape is left out, and the rest still move.
+ */
+export function readLegacyCrews(store: Store | null = browserStore()): {
+  crews: SavedCrew[];
+  defaultCrew: CrewChoiceId | null;
+} {
+  const saved = parse(store, legacySavedCrewsKey);
   const crews: SavedCrew[] = [];
-  for (const value of saved.slice(0, SAVED_CREWS)) {
+  for (const value of Array.isArray(saved) ? saved.slice(0, SAVED_CREWS_MAX) : []) {
     const entry = value as Record<string, unknown> | null;
-    const id = entry?.id;
-    const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
-    const mode = ChatFlightModeSchema.safeParse(entry?.flightMode);
-    if (typeof id !== 'string' || !/^[a-z0-9-]{1,40}$/.test(id) || !name || name.length > 60)
-      continue;
     const members: CrewMemberPin[] = [];
     for (const item of Array.isArray(entry?.members) ? entry.members : []) {
       const role = ChatCrewRoleSchema.safeParse(item?.role);
@@ -507,18 +530,25 @@ export function readSavedCrews(store: Store | null = browserStore()): SavedCrew[
           : {}),
       });
     }
-    if (!members.some((member) => member.role === 'builder')) continue;
-    members.sort((a, b) => roleOrder(a.role) - roleOrder(b.role));
-    crews.push({ id, name, members, flightMode: mode.success ? mode.data : 'manual' });
+    const crew = SavedCrewSchema.safeParse({
+      id: entry?.id,
+      name: typeof entry?.name === 'string' ? entry.name.trim() : entry?.name,
+      members,
+      flightMode: ChatFlightModeSchema.safeParse(entry?.flightMode).data ?? 'manual',
+    });
+    if (crew.success && !crews.some((other) => other.id === crew.data.id))
+      crews.push(orderedCrew(crew.data));
   }
-  return crews;
+  const defaultCrew = CrewChoiceIdSchema.safeParse(parse(store, legacyDefaultCrewKey));
+  return { crews, defaultCrew: defaultCrew.success ? defaultCrew.data : null };
 }
 
-export function writeSavedCrews(crews: SavedCrew[], store: Store | null = browserStore()) {
+/** Removes the two keys once the controller holds what they held. */
+export function clearLegacyCrews(store: Pick<Storage, 'removeItem'> | null = localStore()) {
   try {
-    store?.setItem(savedCrewsKey, JSON.stringify(crews.slice(0, SAVED_CREWS)));
+    store?.removeItem(legacySavedCrewsKey);
+    store?.removeItem(legacyDefaultCrewKey);
   } catch {}
-  for (const listener of crewListeners) listener();
 }
 
 /** Why a name cannot be saved, or null. Names are unique across presets and saved crews. */
@@ -527,13 +557,10 @@ export function crewNameProblem(
   saved: readonly SavedCrew[],
   editing: string | null,
 ): string | null {
-  const wanted = name.trim().toLowerCase();
+  const wanted = name.trim();
   if (!wanted) return 'Name the crew.';
   if (wanted.length > 60) return 'Use 60 characters or fewer.';
-  const taken =
-    crewPresetNames.some((value) => value.toLowerCase() === wanted) ||
-    saved.some((crew) => crew.id !== editing && crew.name.toLowerCase() === wanted);
-  return taken ? 'Another crew has this name.' : null;
+  return crewNameTaken(wanted, saved, editing) ? 'Another crew has this name.' : null;
 }
 
 /** A new id for a saved crew. */
@@ -546,7 +573,10 @@ const summary = (crew: SavedCrew) =>
   }.`;
 
 /** Built-in presets first, then saved crews in the order they were made. */
-export function crewChoices(store: Store | null = browserStore()): CrewChoice[] {
+export function crewChoices(
+  store: Store | null = browserStore(),
+  saved: readonly SavedCrew[] = readSavedCrews(),
+): CrewChoice[] {
   return [
     ...readCrewPresets(store).map((preset) => ({
       id: `preset:${preset.name}`,
@@ -555,7 +585,7 @@ export function crewChoices(store: Store | null = browserStore()): CrewChoice[] 
       template: preset,
       flightMode: null,
     })),
-    ...readSavedCrews(store).map((crew) => ({
+    ...saved.map((crew) => ({
       id: `saved:${crew.id}`,
       name: crew.name,
       hint: summary(crew),
@@ -569,20 +599,13 @@ export function crewChoices(store: Store | null = browserStore()): CrewChoice[] 
 export const choiceNamed = (choices: readonly CrewChoice[], name: string | undefined) =>
   name === undefined ? undefined : choices.find((choice) => choice.name === name);
 
-/** The crew new threads start with. A saved crew that was deleted falls back to Solo. */
-export function readDefaultCrew(store: Store | null = browserStore()): string {
-  const id = parse(store, defaultCrewKey);
-  return typeof id === 'string' && crewChoices(store).some((choice) => choice.id === id)
-    ? id
-    : BUILT_IN_DEFAULT_CREW;
-}
+/** The default among `choices`: the one `wanted` names while it is listed, else Solo. */
+export const defaultChoiceId = (choices: readonly CrewChoice[], wanted: string | undefined) =>
+  wanted && choices.some((choice) => choice.id === wanted) ? wanted : BUILT_IN_DEFAULT_CREW;
 
-export function writeDefaultCrew(id: string, store: Store | null = browserStore()) {
-  try {
-    store?.setItem(defaultCrewKey, JSON.stringify(id));
-  } catch {}
-  for (const listener of crewListeners) listener();
-}
+/** The crew new threads start with. A saved crew that was deleted falls back to Solo. */
+export const readDefaultCrew = (store: Store | null = browserStore()): string =>
+  defaultChoiceId(crewChoices(store), savedCrews?.defaultCrew);
 
 /** Projects that start new threads with their own crew, keyed by project id. */
 export function readProjectCrews(store: Store | null = browserStore()): Record<string, string> {
@@ -630,4 +653,38 @@ const crewListeners = new Set<() => void>();
 export function onCrewChoices(listener: () => void): () => void {
   crewListeners.add(listener);
   return () => void crewListeners.delete(listener);
+}
+
+/**
+ * What picking a crew changes on a thread, as the Crew tab applies it: the crew built from the
+ * choice, the thread's model when the crew's builder moves it, and the flight mode a saved crew
+ * brings. Null when no family is connected.
+ */
+export function crewChoicePatch(
+  choice: CrewChoice,
+  catalog: ChatCatalogRead,
+  thread: Pick<ChatThread, 'selection' | 'handoffMode'>,
+  now: number = Date.now(),
+  store: Store | null = browserStore(),
+): { crew: ChatCrew; selection?: ChatModelSelection; flightMode?: ChatFlightMode } | null {
+  const crew = crewFromPreset(
+    choice.template,
+    catalog,
+    thread.selection,
+    thread.handoffMode,
+    now,
+    store,
+  );
+  if (!crew) return null;
+  const builder = crew.members.find((member) => member.role === 'builder')?.selection;
+  const moved =
+    builder &&
+    (builder.family !== thread.selection?.family ||
+      builder.model !== thread.selection?.model ||
+      builder.effort !== thread.selection?.effort);
+  return {
+    crew,
+    ...(moved ? { selection: builder } : {}),
+    ...(choice.flightMode ? { flightMode: choice.flightMode } : {}),
+  };
 }

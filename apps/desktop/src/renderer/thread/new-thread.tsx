@@ -19,6 +19,7 @@ import {
   draftConfigure,
   draftSettings,
   firstAnswer,
+  onCrewChoices,
   preferredSelection,
 } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
@@ -151,9 +152,16 @@ export function NewThread({
   // in the composer, so this runs once per project.
   const crewPicked = useRef(false);
   const crewFor = useRef<string | null>(null);
+  // Saved crews arrive from the controller after the window opens. When they do, the project's
+  // crew is picked again, unless the person already picked one.
+  const [crewsRead, setCrewsRead] = useState(0);
+  useEffect(() => onCrewChoices(() => setCrewsRead((value) => value + 1)), []);
+  const crewsSeen = useRef(-1);
   useEffect(() => {
-    if (!catalog || crewPicked.current || crewFor.current === projectId) return;
+    if (!catalog || crewPicked.current) return;
+    if (crewFor.current === projectId && crewsSeen.current === crewsRead) return;
     crewFor.current = projectId;
+    crewsSeen.current = crewsRead;
     setDraft((current) => {
       const choice = crewForProject(projectId);
       const model = current.selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
@@ -167,7 +175,7 @@ export function NewThread({
         ...(choice.flightMode ? { flightMode: choice.flightMode } : {}),
       });
     });
-  }, [catalog, projectId]);
+  }, [catalog, projectId, crewsRead]);
   const [panel, setPanel] = useState<{ open: boolean; tab: InspectorTab }>({
     open: false,
     tab: 'crew',

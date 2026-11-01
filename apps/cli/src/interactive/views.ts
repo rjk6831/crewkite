@@ -588,7 +588,27 @@ export const handoffLabels: Record<ChatThread['handoffMode'], string> = {
   'local-first': 'Local first',
 };
 
-export function CrewView({ thread, colors }: { thread: ChatThread; colors: Palette }) {
+/** One crew the `/crew` list offers. */
+export type CrewRow = { id: string; name: string; hint: string };
+
+/**
+ * The thread's crew and flight mode, then the built-in and saved crews to pick from. The default
+ * crew for new threads and the crew the thread has are marked. Given no list, the view shows the
+ * thread's crew alone.
+ */
+export function CrewView({
+  thread,
+  colors,
+  choices = [],
+  defaultId = null,
+  selected = 0,
+}: {
+  thread: ChatThread;
+  colors: Palette;
+  choices?: readonly CrewRow[];
+  defaultId?: string | null;
+  selected?: number;
+}) {
   const chain = thread.crewChain;
   return h(
     Box,
@@ -617,10 +637,35 @@ export function CrewView({ thread, colors }: { thread: ChatThread; colors: Palet
           `Chain: ${chain.step}, ${chain.reviewRounds} review rounds, ${chain.fixes} fixes${chain.reason ? `. ${safeText(chain.reason)}` : ''}`,
         )
       : null,
+    choices.length > 0
+      ? h(
+          Box,
+          { flexDirection: 'column', marginTop: 1 },
+          h(Text, { bold: true }, 'Crews'),
+          ...choices.map((choice, index) =>
+            h(
+              Text,
+              { key: choice.id },
+              h(
+                Text,
+                { inverse: index === selected },
+                `${index === selected ? '›' : ' '} ${index < 9 ? index + 1 : ' '} ${safeText(choice.name)}`,
+              ),
+              choice.id === defaultId ? h(Text, { color: colors.accent }, '  default') : null,
+              thread.crew?.name === choice.name
+                ? h(Text, { color: colors.green }, '  current')
+                : null,
+              h(Text, { color: colors.muted }, `  ${safeText(choice.hint)}`),
+            ),
+          ),
+        )
+      : null,
     h(
       Text,
       { color: colors.muted },
-      '1 Solo  2 Pair  3 Full crew  F flight mode  P policy  H handoff mode  A automatic handoff',
+      choices.length > 0
+        ? 'Up, Down, Enter or 1-9 apply a crew  F flight mode  P policy  H handoff mode  A automatic handoff'
+        : 'F flight mode  P policy  H handoff mode  A automatic handoff',
     ),
   );
 }

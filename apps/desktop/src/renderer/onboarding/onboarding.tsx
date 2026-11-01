@@ -10,11 +10,11 @@ import { ChevronDown, ChevronRight, Folder, Plus } from 'lucide-react';
 import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { AnthropicCard } from '../settings/anthropic-card.tsx';
+import { saveCrew, setDefaultCrew } from '../settings/crew-store.ts';
 import { CrewDialog, CrewSelect, useCrewChoices } from '../settings/crews-card.tsx';
 import { GoogleCard } from '../settings/google-card.tsx';
 import { LocalCard } from '../settings/local-card.tsx';
 import { OpenAiCard } from '../settings/openai-card.tsx';
-import { readSavedCrews, writeDefaultCrew, writeSavedCrews } from '../settings/preferences.ts';
 import { useProviderActions } from '../settings/provider-actions.ts';
 import type { CardProps, CatalogEntry } from '../settings/provider-card.tsx';
 import { useClock } from '../settings/use-catalog.ts';
@@ -177,8 +177,21 @@ function ProviderStep({
 }
 
 function CrewStep({ catalog }: { catalog: ChatCatalogRead | null }) {
-  const { choices, defaultId } = useCrewChoices();
+  const { choices, defaultId, saved } = useCrewChoices();
   const [building, setBuilding] = useState(false);
+  const [problem, setProblem] = useState<string | null>(null);
+  // The controller keeps the crews. A change it refuses says why under the list.
+  const change = (work: () => Promise<void>) =>
+    work().then(
+      () => {
+        setProblem(null);
+        return true;
+      },
+      (failure: unknown) => {
+        setProblem(failure instanceof Error ? failure.message : 'The change was not saved.');
+        return false;
+      },
+    );
   const select = useId();
   const chosen = choices.find((choice) => choice.id === defaultId);
   return (
@@ -190,8 +203,18 @@ function CrewStep({ catalog }: { catalog: ChatCatalogRead | null }) {
       </p>
       <div className="onb-field">
         <label htmlFor={select}>Default crew</label>
-        <CrewSelect id={select} value={defaultId} choices={choices} onChange={writeDefaultCrew} />
+        <CrewSelect
+          id={select}
+          value={defaultId}
+          choices={choices}
+          onChange={(id) => void change(() => setDefaultCrew(id))}
+        />
         {chosen && <p className="st-note">{chosen.hint}</p>}
+        {problem && (
+          <p className="st-note" role="alert">
+            {problem}
+          </p>
+        )}
       </div>
       <div className="onb-actions">
         <button type="button" className="button secondary" onClick={() => setBuilding(true)}>
@@ -203,13 +226,14 @@ function CrewStep({ catalog }: { catalog: ChatCatalogRead | null }) {
         <CrewDialog
           catalog={catalog}
           initial={null}
-          saved={readSavedCrews()}
+          saved={saved}
           onClose={() => setBuilding(false)}
-          onSave={(crew) => {
-            writeSavedCrews([...readSavedCrews(), crew]);
-            writeDefaultCrew(`saved:${crew.id}`);
-            setBuilding(false);
-          }}
+          onSave={(crew) =>
+            void change(async () => {
+              await saveCrew(crew);
+              await setDefaultCrew(`saved:${crew.id}`);
+            }).then((done) => done && setBuilding(false))
+          }
         />
       )}
     </>

@@ -216,12 +216,26 @@ test('each interactive view draws a scripted thread in colour and without it und
     {
       name: 'crew',
       view: (colors) =>
-        h(views.CrewView, { thread: { ...accepted, crew, flightMode: 'balanced' }, colors }),
+        h(views.CrewView, {
+          thread: { ...accepted, crew, flightMode: 'balanced' },
+          colors,
+          choices: [
+            { id: 'preset:Solo', name: 'Solo', hint: 'The builder only.' },
+            { id: 'preset:Pair', name: 'Pair', hint: 'A builder and a reviewer.' },
+            { id: 'saved:crew-a', name: 'Review heavy', hint: 'Builder, Challenger. Glide.' },
+          ],
+          defaultId: 'saved:crew-a',
+          selected: 2,
+        }),
       shows: [
         'Crew: Pair',
         /builder\s+A fixture-model/,
         /reviewer\s+L fixture-local/,
         'Flight mode: Balanced',
+        'Crews',
+        /2 Pair\s+current/,
+        /› 3 Review heavy\s+default\s+Builder, Challenger\. Glide\./,
+        'Enter or 1-9 apply a crew',
       ],
     },
     {

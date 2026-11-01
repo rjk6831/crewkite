@@ -58,6 +58,14 @@ import {
   SaveChatPromptPayloadSchema,
   SavedPromptsSchema,
 } from './composer.ts';
+import {
+  DeleteCrewPayloadSchema,
+  ImportSavedCrewsPayloadSchema,
+  ReadSavedCrewsPayloadSchema,
+  SaveCrewPayloadSchema,
+  SavedCrewsReadSchema,
+  SetDefaultCrewPayloadSchema,
+} from './crews.ts';
 import { DiagnosticsReadSchema, ReadDiagnosticsPayloadSchema } from './diagnostics.ts';
 import { ChatExportSchema, ExportChatThreadPayloadSchema } from './export.ts';
 import {
@@ -2556,6 +2564,11 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('AddProjectNote', AddProjectNotePayloadSchema),
   mutate('EditProjectNote', EditProjectNotePayloadSchema),
   mutate('RemoveProjectNote', RemoveProjectNotePayloadSchema),
+  read('ReadSavedCrews', ReadSavedCrewsPayloadSchema),
+  mutate('SaveCrew', SaveCrewPayloadSchema),
+  mutate('DeleteCrew', DeleteCrewPayloadSchema),
+  mutate('SetDefaultCrew', SetDefaultCrewPayloadSchema),
+  mutate('ImportSavedCrews', ImportSavedCrewsPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
   mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
@@ -3650,6 +3663,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ChatSearchResultSchema.safeExtend({ kind: z.literal('chat-search') }),
   ProjectNotesReadSchema.extend({ kind: z.literal('project-notes') }),
   ProjectNotesChangedSchema.extend({ kind: z.literal('project-notes-changed') }),
+  SavedCrewsReadSchema.extend({ kind: z.literal('saved-crews') }),
   ChatExportSchema.extend({ kind: z.literal('chat-export') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
@@ -3927,6 +3941,7 @@ export * from './checks.ts';
 export * from './cli.ts';
 export * from './client-versions.ts';
 export * from './composer.ts';
+export * from './crews.ts';
 export * from './diagnostics.ts';
 export * from './export.ts';
 export * from './extensions.ts';

@@ -49,6 +49,7 @@ import { exportThread } from '../chat/export.ts';
 import { McpRegistry } from '../chat/mcp-servers.ts';
 import { ProjectNotes } from '../chat/project-notes.ts';
 import { notesCommand, notesMutations } from '../chat/project-notes-command.ts';
+import { crewsCommand, crewsMutations, SavedCrews } from '../chat/saved-crews.ts';
 import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
@@ -435,6 +436,12 @@ export class Controller {
       () => `not_${this.id('msg').slice(4)}`,
     );
     return this.notesRuntime;
+  }
+
+  private crewsRuntime?: SavedCrews;
+  private savedCrews(): SavedCrews {
+    this.crewsRuntime ??= new SavedCrews(this.store.db, this.now);
+    return this.crewsRuntime;
   }
 
   private chatRuntime?: ChatService;
@@ -1409,6 +1416,9 @@ export class Controller {
     // Notes belong to a project, not a task. The controller checks the project and the size cap
     // when it applies the command, and a replayed key answers from its receipt.
     if (notesMutations.includes(command.command)) return;
+    // Saved crews belong to no task. The controller checks names, the limit and the default when
+    // it applies the command, and a replayed key answers from its receipt.
+    if (crewsMutations.includes(command.command)) return;
     if (
       [
         'SendChatMessage',
@@ -1682,6 +1692,12 @@ export class Controller {
       case 'EditProjectNote':
       case 'RemoveProjectNote':
         return notesCommand(this.projectNotes(), command);
+      case 'ReadSavedCrews':
+      case 'SaveCrew':
+      case 'DeleteCrew':
+      case 'SetDefaultCrew':
+      case 'ImportSavedCrews':
+        return crewsCommand(this.savedCrews(), command);
       case 'ReadChatAnalytics': {
         const analytics = readAnalytics(this.store, command.payload, this.now());
         return analytics

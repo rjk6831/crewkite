@@ -112,10 +112,41 @@ export function createPreviewSource(): DesktopSource {
           : { kind: 'project-notes-changed', projectId, bytes: now.bytes },
     } as CommandResult;
   }
+  // Saved crews answer from memory with the whole list, as the controller does.
+  let crews = {
+    crews: [] as { id: string }[],
+    defaultCrew: 'preset:Solo',
+    imported: true,
+  };
+  function crewCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
+    if (name === 'SaveCrew') {
+      const crew = payload.crew as { id: string };
+      crews = {
+        ...crews,
+        crews: crews.crews.some(({ id }) => id === crew.id)
+          ? crews.crews.map((value) => (value.id === crew.id ? crew : value))
+          : [...crews.crews, crew],
+      };
+    } else if (name === 'DeleteCrew')
+      crews = {
+        ...crews,
+        crews: crews.crews.filter(({ id }) => id !== payload.id),
+        defaultCrew:
+          crews.defaultCrew === `saved:${payload.id}` ? 'preset:Solo' : crews.defaultCrew,
+      };
+    else if (name === 'SetDefaultCrew') crews = { ...crews, defaultCrew: String(payload.id) };
+    else if (name !== 'ReadSavedCrews' && name !== 'ImportSavedCrews') return null;
+    return {
+      outcome: 'applied',
+      data: { kind: 'saved-crews', ...structuredClone(crews) },
+    } as CommandResult;
+  }
   function composerCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
     const applied = (data: unknown) => ({ outcome: 'applied', data }) as CommandResult;
     const noted = noteCommand(name, payload);
     if (noted) return noted;
+    const crewed = crewCommand(name, payload);
+    if (crewed) return crewed;
     const taskId = typeof payload.taskId === 'string' ? payload.taskId : fixtures.task.id;
     if (name === 'CompleteChatMention')
       return applied({

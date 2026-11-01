@@ -11,6 +11,7 @@ import {
   type CliSettings,
   type Event,
   rankFamilies,
+  type SavedCrewsRead,
   type TaskSummary,
 } from '@crewkite/contracts';
 import { Box, type Key, Static, Text, useApp, useInput, usePaste, useWindowSize } from 'ink';
@@ -25,10 +26,10 @@ import {
   useState,
 } from 'react';
 import {
-  crewFromPreset,
-  crewPresetNames,
+  crewChoicePatch,
+  crewChoices,
+  defaultChoiceId,
   familyModel,
-  readCrewPresets,
 } from '../../../desktop/src/renderer/settings/preferences.ts';
 import { tryWithChoices } from '../../../desktop/src/renderer/thread/file-fit.ts';
 import {
@@ -183,6 +184,9 @@ export function App(props: AppProps) {
   // turn uses it, and the thread's own selection takes over from there.
   const [firstChoice, setFirstChoice] = useState<ChatModelSelection | null>(null);
   const [modelPick, setModelPick] = useState<ModelPick>({ filter: '', index: 0, efforts: {} });
+  // The crews saved in the desktop, read again each time /crew opens.
+  const [savedCrews, setSavedCrews] = useState<SavedCrewsRead | null>(null);
+  const [crewIndex, setCrewIndex] = useState(0);
   const taskRef = useRef<string | null>(null);
   taskRef.current = taskId;
   const [state, dispatch] = useReducer(threadReducer, initialThreadState(''));
@@ -414,10 +418,20 @@ export function App(props: AppProps) {
         needThread();
         setView('changes');
         break;
-      case 'crew':
+      case 'crew': {
         needThread();
         setView('crew');
+        // The list starts on the thread's crew, else on the default for new threads.
+        const read = await client.readCrews();
+        setSavedCrews(read);
+        const listed = crewChoices(store, read.crews);
+        const at = listed.findIndex((choice) => choice.name === thread?.crew?.name);
+        const preferred = listed.findIndex(
+          (choice) => choice.id === defaultChoiceId(listed, read.defaultCrew),
+        );
+        setCrewIndex(Math.max(0, at === -1 ? preferred : at));
         break;
+      }
       case 'plan':
         if (!thread?.plan)
           throw new Error('This thread has no plan. A crew with an orchestrator proposes one.');
@@ -508,6 +522,9 @@ export function App(props: AppProps) {
     }
     return true;
   }
+
+  // The built-in crews, then the saved ones once the controller sent them.
+  const crewList = () => crewChoices(store, savedCrews?.crews ?? []);
 
   // With no thread yet the choice rides on the first message, which creates the thread.
   async function chooseModel(selection: ChatModelSelection) {
@@ -794,21 +811,24 @@ export function App(props: AppProps) {
     }
   }
 
-  function crewKeys(input: string) {
+  function crewKeys(input: string, key: Key) {
     const id = taskId;
     if (!id || !thread) return;
-    if (/^[1-3]$/.test(input) && catalog) {
-      const preset = readCrewPresets(store).find(
-        (value) => value.name === crewPresetNames[Number(input) - 1],
-      );
-      const crew =
-        preset &&
-        crewFromPreset(preset, catalog, thread.selection, thread.handoffMode, now(), store);
-      return run(() => {
-        if (!crew) throw new Error('Connect a provider to form a crew.');
-        return client.configure({ taskId: id, crew });
+    const listed = crewList();
+    if (key.upArrow) return setCrewIndex((value) => clampIndex(value - 1, listed.length));
+    if (key.downArrow) return setCrewIndex((value) => clampIndex(value + 1, listed.length));
+    const picked = key.return
+      ? listed[clampIndex(crewIndex, listed.length)]
+      : /^[1-9]$/.test(input)
+        ? listed[Number(input) - 1]
+        : undefined;
+    if (picked)
+      return run(async () => {
+        const patch = catalog && crewChoicePatch(picked, catalog, thread, now(), store);
+        if (!patch) throw new Error('Connect a provider to form a crew.');
+        await client.configure({ taskId: id, ...patch });
+        setNotice(`Crew: ${picked.name}.`);
       });
-    }
     if (input === 'f')
       return run(() =>
         client.configure({
@@ -1004,7 +1024,7 @@ export function App(props: AppProps) {
           return setChangeIndex((value) => Math.min((changes?.files.length ?? 1) - 1, value + 1));
         return changesKeys(input);
       case 'crew':
-        return crewKeys(input);
+        return crewKeys(input, key);
       case 'model':
         return modelKeys(input, key);
       case 'plan':
@@ -1077,8 +1097,17 @@ export function App(props: AppProps) {
           colors,
           width,
         });
-      case 'crew':
-        return thread ? h(CrewView, { thread, colors }) : h(Text, null, 'Start a thread first.');
+      case 'crew': {
+        if (!thread) return h(Text, null, 'Start a thread first.');
+        const listed = crewList();
+        return h(CrewView, {
+          thread,
+          colors,
+          choices: listed,
+          defaultId: savedCrews ? defaultChoiceId(listed, savedCrews.defaultCrew) : null,
+          selected: clampIndex(crewIndex, listed.length),
+        });
+      }
       case 'model': {
         const groups = modelGroupsShown(modelPick);
         return h(ModelListView, {
