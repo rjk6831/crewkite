@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { ChatCatalogEntry, ChatFamily, ChatPlan, ChatPlanSlice } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
-import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
+import { assignPlan, hasPlanBlock, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
 import {
   laneCopy,
   laneFolder,
@@ -265,6 +265,10 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
   const block = (body: string) => `Here is the plan.\n\n\`\`\`json plan\n${body}\n\`\`\`\n`;
   const plan = { planId: 'p1', goal: 'Ship it.', slices: [slice(1, 'easy')] };
   assert.deepEqual(parsePlan(block(JSON.stringify(plan))), { plan });
+  // A reply with no plan block answered the person; one with a broken block goes back.
+  assert.equal(hasPlanBlock('Halloween 2027 falls on a Sunday.'), false);
+  assert.equal(hasPlanBlock(block('{')), true);
+  assert.equal(hasPlanBlock('```json plan\n{"planId": "p1"'), true);
   assert.deepEqual(parsePlan('No block.'), {
     error: 'The reply has no fenced json block tagged plan.',
   });

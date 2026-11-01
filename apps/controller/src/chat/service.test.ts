@@ -64,6 +64,7 @@ import {
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
 import { McpRegistry } from './mcp-servers.ts';
+import { parsePlan } from './plan.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
 import { AskingTurnError, answer } from './thread-tools/broker.ts';
@@ -2098,7 +2099,10 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
     },
     {
       name: 'a plan that fails validation goes back once, then stops',
-      plan: [reply('Here is my plan in prose.'), reply('Still prose.')],
+      plan: [
+        reply('```json plan\n{"planId": "p1"}\n```'),
+        reply('```json plan\n{"planId": "p1"}\n```'),
+      ],
       builds: [reply('Unused.')],
       reviews: [reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
@@ -2106,9 +2110,22 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         ['orchestrator', 'openai'],
         ['orchestrator', 'openai'],
       ],
-      line: 'Plan stopped: the plan did not pass validation. The reply has no fenced json block tagged plan.',
+      line: `Plan stopped: the plan did not pass validation. ${(parsePlan('```json plan\n{"planId": "p1"}\n```') as { error: string }).error}`,
       chain: null,
       card: null,
+    },
+    {
+      // A question gets its answer from the orchestrator, with no plan and nothing after it (H13).
+      name: 'an orchestrator that answers directly runs no plan',
+      plan: [reply('Halloween 2027 falls on a Sunday.')],
+      builds: [reply('Unused.')],
+      reviews: [reply('Clean.\nFindings: 0')],
+      autoHandoff: undefined,
+      turns: [['orchestrator', 'openai']],
+      line: 'Halloween 2027 falls on a Sunday.',
+      chain: null,
+      card: null,
+      answered: true,
     },
   ] as const;
   // Each row is a subtest with its own budget, and its thread closes when the row ends.
@@ -2207,12 +2224,16 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
             }),
           );
         };
-      const ended = next(
-        thread,
-        (event) =>
-          event.type === 'conversation.entry' &&
-          /^(Crew|Plan) (finished|stopped)/.test((event.payload as { text: string }).text),
-      );
+      // A direct answer writes no closing line, so the row waits for its reply.
+      const ended =
+        'answered' in row
+          ? settles(thread)
+          : next(
+              thread,
+              (event) =>
+                event.type === 'conversation.entry' &&
+                /^(Crew|Plan) (finished|stopped)/.test((event.payload as { text: string }).text),
+            );
       if (balanced) {
         const proposed = next(
           thread,
@@ -2325,6 +2346,10 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         const asked = adapters.get('openai')?.requests ?? [];
         assert.equal(asked[0]?.role, 'orchestrator', row.name);
         assert.match(asked[0]?.systemContext ?? '', /```json plan/, row.name);
+        if ('answered' in row) {
+          assert.equal(asked.length, 1, row.name);
+          return;
+        }
         if (row.card === null) {
           assert.match(asked[1]?.prompt ?? '', /^The plan did not pass validation\. /, row.name);
           assert.match(asked[1]?.prompt ?? '', /^> Fix the rounding\.$/m, row.name);

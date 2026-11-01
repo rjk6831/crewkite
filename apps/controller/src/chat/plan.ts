@@ -21,6 +21,14 @@ import { familyName } from './prompt.ts';
 const PLAN_FENCE = /^[ \t]*```json[ \t]+plan[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```[ \t]*$/gm;
 
 /**
+ * Whether the orchestrator's reply holds a plan block at all. A reply without one answered the
+ * person directly; a reply with one that does not parse goes back to the orchestrator.
+ */
+export function hasPlanBlock(reply: string): boolean {
+  return [...reply.matchAll(PLAN_FENCE)].length > 0 || /^[ \t]*```json[ \t]+plan\b/m.test(reply);
+}
+
+/**
  * The plan in the orchestrator's reply, or the reason it cannot be used, in words the orchestrator
  * reads on its second try. The last plan block counts, so a reply that corrects itself works.
  */

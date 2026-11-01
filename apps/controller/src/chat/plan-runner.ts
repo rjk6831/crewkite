@@ -18,7 +18,7 @@ import {
 } from '@crewkite/contracts';
 import type { ChecksOutcome } from './checks.ts';
 import { detectType } from './files.ts';
-import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
+import { assignPlan, hasPlanBlock, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
 import {
   laneCopy,
   laneFolder,
@@ -349,7 +349,11 @@ export class PlanRunner {
     if (turn.state !== 'done') return;
     const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
     if (!builder) return;
-    const parsed = parsePlan(this.host.reply(turn) ?? '');
+    const reply = this.host.reply(turn) ?? '';
+    // A reply with no plan block answered the person directly, as the brief asks for a question
+    // or a request that changes no file. Nothing more runs.
+    if (!hasPlanBlock(reply)) return;
+    const parsed = parsePlan(reply);
     if ('error' in parsed) {
       const retried = this.host.message(turn)?.startsWith(PLAN_RETRY);
       if (!retried && !sentMessage(thread) && !thread.activeTurnId) {
