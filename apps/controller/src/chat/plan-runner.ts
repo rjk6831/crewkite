@@ -18,7 +18,14 @@ import {
 } from '@crewkite/contracts';
 import type { ChecksOutcome } from './checks.ts';
 import { detectType } from './files.ts';
-import { assignPlan, hasPlanBlock, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
+import {
+  assignPlan,
+  hasPlanBlock,
+  type PlanFile,
+  type PlanInputs,
+  parsePlan,
+  ruledOut,
+} from './plan.ts';
 import {
   laneCopy,
   laneFolder,
@@ -383,6 +390,8 @@ export class PlanRunner {
       builder,
       fixer: fixer ?? null,
       autoHandoff: thread.autoHandoff,
+      // The message the orchestrator answered, or on its retry the request it quotes.
+      excluded: ruledOut(this.host.message(turn) ?? ''),
       localContext: this.host.localContext(),
       localSliceFits: this.host.localSliceFits,
       files: this.files(task.id, plan),

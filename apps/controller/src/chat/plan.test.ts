@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import type { ChatCatalogEntry, ChatFamily, ChatPlan, ChatPlanSlice } from '@crewkite/contracts';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
-import { assignPlan, hasPlanBlock, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
+import {
+  assignPlan,
+  hasPlanBlock,
+  type PlanFile,
+  type PlanInputs,
+  parsePlan,
+  ruledOut,
+} from './plan.ts';
 import {
   laneCopy,
   laneFolder,
@@ -85,6 +92,7 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
     fixer?: PlanInputs['fixer'];
     families?: ChatCatalogEntry[];
     autoHandoff?: boolean;
+    excluded?: ChatFamily[];
     want: ([string, string, string] | string)[];
     candidates?: string[][];
   }[] = [
@@ -179,6 +187,40 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
       ],
     },
     {
+      // "Do not assign anything to Local AI" rules Local out, crew role or not (H15).
+      name: 'a family the message rules out takes no slice',
+      slices: [slice(1, 'easy', ['src/small.ts'])],
+      builder: local,
+      fixer: anthropic,
+      excluded: ['local'],
+      want: [
+        [
+          'anthropic',
+          'anthropic-model',
+          'Slice 1 (easy) assigned to Anthropic (anthropic): Fixer, since your message rules out Local.',
+        ],
+      ],
+      candidates: [['anthropic']],
+    },
+    {
+      name: 'the handoff rule skips a family the message rules out',
+      slices: [slice(1, 'medium')],
+      families: [
+        pinned(entry('openai', 0, 10), 'openai-pinned'),
+        entry('anthropic', 40, 2),
+        entry('google', 80, 10),
+      ],
+      autoHandoff: true,
+      excluded: ['google'],
+      want: [
+        [
+          'anthropic',
+          'anthropic-model',
+          'Slice 1 (medium) assigned to Anthropic (anthropic): Continue on another provider, since OpenAI has no allowance left. Ranked 1 of 1 by Most allowance left.',
+        ],
+      ],
+    },
+    {
       name: 'on a limit with Continue on another provider on, the handoff rule moves the slice',
       slices: [slice(1, 'medium')],
       families: [
@@ -233,6 +275,7 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
       builder: row.builder ?? openai,
       fixer: row.fixer ?? null,
       autoHandoff: row.autoHandoff ?? false,
+      excluded: row.excluded ?? [],
       localContext: 8192,
       localSliceFits: fits,
       files,
@@ -265,6 +308,14 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
   const block = (body: string) => `Here is the plan.\n\n\`\`\`json plan\n${body}\n\`\`\`\n`;
   const plan = { planId: 'p1', goal: 'Ship it.', slices: [slice(1, 'easy')] };
   assert.deepEqual(parsePlan(block(JSON.stringify(plan))), { plan });
+  // A provider the message rules out, and words that rule nothing out.
+  assert.deepEqual(ruledOut('Do not assign anything to Local AI.'), ['local']);
+  assert.deepEqual(ruledOut("Split it in four, but don't use Google or OpenAI."), [
+    'google',
+    'openai',
+  ]);
+  assert.deepEqual(ruledOut('Run it without LM Studio.'), ['local']);
+  assert.deepEqual(ruledOut('Use Local for the small parts. OpenAI takes the rest.'), []);
   // A reply with no plan block answered the person; one with a broken block goes back.
   assert.equal(hasPlanBlock('Halloween 2027 falls on a Sunday.'), false);
   assert.equal(hasPlanBlock(block('{')), true);
