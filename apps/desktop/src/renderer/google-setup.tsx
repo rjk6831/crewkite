@@ -100,6 +100,8 @@ const refusalText: Record<string, string> = {
   'acp-capability-missing':
     'The client did not report the model choices CrewKite needs. Press Try again.',
   'authentication-required': 'The Google sign-in did not finish. Press Try again to sign in.',
+  'google-status-unreadable':
+    'Setup status could not be read three times in a row, so Connect paused. Press it again to continue.',
   'google-connect-limit':
     'Connect did not finish within 20 minutes. Press Try again to continue from this step.',
 };
@@ -151,6 +153,8 @@ export function GoogleSetup({
   const [requested, setRequested] = useState<GoogleSetupStage | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [pollTimedOut, setPollTimedOut] = useState(false);
+  // A follow that could not read the status three times in a row stays off until the card opens again.
+  const [pollUnreadable, setPollUnreadable] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [termsChecked, setTermsChecked] = useState(false);
   const pollAbort = useRef<AbortController | null>(null);
@@ -182,8 +186,9 @@ export function GoogleSetup({
   // Follow it, so the card shows the step and turns Connect off until it ends.
   useEffect(() => {
     // After a 15-minute follow times out the card stops reading every second and says so.
-    if (!(active || installing) || requested || pollAbort.current || pollTimedOut) return;
-    startPolling(generation.current);
+    if (!(active || installing) || requested || pollAbort.current || pollTimedOut || pollUnreadable)
+      return;
+    startPolling(generation.current, false);
   });
 
   function stopPolling() {
@@ -192,7 +197,11 @@ export function GoogleSetup({
     pollAbort.current = null;
   }
 
-  function startPolling(currentGeneration: number) {
+  /**
+   * Reads the status each second so the card follows a running step. During a Connect the flow
+   * reads the state itself and decides when to pause, so a poll that cannot read leaves it alone.
+   */
+  function startPolling(currentGeneration: number, connecting: boolean) {
     const controller = new AbortController();
     pollAbort.current = controller;
     void pollGoogleSetupStatus({
@@ -212,21 +221,17 @@ export function GoogleSetup({
       active: () =>
         mounted.current && generation.current === currentGeneration && !controller.signal.aborted,
       attempts: POLL_ATTEMPTS,
-    })
-      .then((result) => {
-        if (pollAbort.current === controller) pollAbort.current = null;
-        if (result === 'timeout' && mounted.current && generation.current === currentGeneration) {
-          setPollTimedOut(true);
-        }
-      })
-      .catch(() => {
-        if (!mounted.current || generation.current !== currentGeneration) return;
-        generation.current += 1;
-        controller.abort();
-        if (pollAbort.current === controller) pollAbort.current = null;
-        setRequested(null);
-        setMessage('Setup status could not be read. Automatic setup is paused.');
-      });
+    }).then((result) => {
+      if (pollAbort.current === controller) pollAbort.current = null;
+      if (!mounted.current || generation.current !== currentGeneration) return;
+      if (result === 'timeout') setPollTimedOut(true);
+      if (result === 'unreadable' && !connecting) {
+        setPollUnreadable(true);
+        setMessage(
+          'Setup status could not be read three times in a row. Open Settings again to read it.',
+        );
+      }
+    });
   }
 
   async function connectGoogle() {
@@ -235,7 +240,8 @@ export function GoogleSetup({
     const currentGeneration = generation.current;
     setMessage(null);
     setPollTimedOut(false);
-    startPolling(currentGeneration);
+    setPollUnreadable(false);
+    startPolling(currentGeneration, true);
     try {
       const result = await runGoogleSetupFlow({
         read: workspace.refresh,
