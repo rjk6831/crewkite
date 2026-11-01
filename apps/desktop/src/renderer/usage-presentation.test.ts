@@ -10,6 +10,7 @@ import {
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
 import { formatSize } from './format-size.ts';
 import {
+  anthropicReadReason,
   anthropicUsageCard,
   gaugeAge,
   gaugeColor,
@@ -474,4 +475,12 @@ test('usage windows show plain names, and an unknown ID reads as words', () => {
     ['---', '---'],
   ];
   for (const [id, name] of rows) assert.equal(windowLabel(id), name, id);
+});
+
+test('an Anthropic read that worked leaves no status line, and a failed one says what to do', () => {
+  assert.equal(anthropicReadReason('reported', '2.4.0'), null);
+  assert.match(
+    anthropicReadReason('client-error', '2.4.0') ?? '',
+    /^Last refresh failed\. .*Check the Anthropic sign-in/,
+  );
 });

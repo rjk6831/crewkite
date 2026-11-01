@@ -305,10 +305,10 @@ const nextSteps = new Map([
   ['unreadable-output', 'Refresh to read it again.'],
 ]);
 
-/** The status line for the last Anthropic usage read. */
-export function anthropicReadReason(reason: string, clientVersion: string): string {
+/** The status line for a failed Anthropic usage read. Null when the read did not fail. */
+export function anthropicReadReason(reason: string, clientVersion: string): string | null {
   const failed = failedReads.get(reason);
-  if (!failed) return `Last refresh: ${reason}.`;
+  if (!failed) return null;
   const version = clientVersion === 'unknown' ? 'the client version' : `client ${clientVersion}`;
   return `Last refresh failed. ${failed} ${nextSteps.get(reason) ?? `Update CrewKite or report ${version}.`}`;
 }

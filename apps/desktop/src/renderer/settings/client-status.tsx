@@ -2,9 +2,8 @@ import type { WorkspaceState } from '@crewkite/contracts';
 import { RefreshCw } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Fact } from '../components.tsx';
-import { formatLocalTime } from '../format-time.ts';
 import type { Workspace } from '../source.ts';
-import { nativeUsageClients } from '../usage-presentation.ts';
+import { nativeUsageClients, readAgo } from '../usage-presentation.ts';
 import type { ProviderActions } from './provider-actions.ts';
 
 type Family = 'openai' | 'anthropic' | 'google';
@@ -63,14 +62,10 @@ export function ClientStatus({
     (!!header.googleAcpSetup?.operationId ||
       !!header.googleAcpInstall?.operationId ||
       (googleState !== undefined && googleSettling.has(googleState)));
-  const quota =
-    family === 'anthropic' && reader?.reading
-      ? `Received ${new Date(reader.reading.receivedAt).toLocaleTimeString()} · age unknown`
-      : reader?.lastObservedAt
-        ? 'Reported'
-        : reader?.available
-          ? 'Reader ready, not read'
-          : 'Unknown';
+  // The Anthropic report carries no time of its own, so its age runs from when CrewKite received it.
+  const lastRead =
+    readAgo(family === 'anthropic' ? reader?.reading?.receivedAt : reader?.lastObservedAt, now) ??
+    'Not read yet';
   return (
     <section className="st-block" aria-label={`${label} client status`}>
       <div className="st-subhead">
@@ -94,7 +89,7 @@ export function ClientStatus({
       {facts && (
         <div className="facts-grid compact">
           <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
-          <Fact label="Quota available" value={quota} />
+          <Fact label="Last read" value={lastRead} />
         </div>
       )}
       {children}
@@ -121,9 +116,6 @@ export function QuotaRefresh({
   const message = actions.messages[family];
   return (
     <>
-      <p className="st-note">
-        Reads account quota through the supported native client. No model request.
-      </p>
       <div className="st-actions">
         <button
           type="button"
@@ -141,19 +133,11 @@ export function QuotaRefresh({
           <RefreshCw size={14} /> Refresh {label} quota
         </button>
       </div>
-      {family === 'openai' &&
-        reader?.readState === 'quiescent' &&
-        reader.readReason === 'observed' && <p role="status">Latest quota read successful.</p>}
-      <p className="st-note">
-        Reader status: {reader?.reason ?? 'unavailable'}. Updated:{' '}
-        {formatLocalTime(reader?.lastObservedAt) ?? 'Not observed'}.
-      </p>
-      {reader?.readState && (
-        <p className="st-note">
-          Read state: {reader.readState}. Result: {reader.readReason ?? 'No completed result'}.
-          {reader.lastRequest ? ` Last request: ${reader.lastRequest}.` : ''}
-        </p>
-      )}
+      {reader?.readState === 'quiescent' &&
+        reader.readReason &&
+        reader.readReason !== 'observed' && (
+          <p className="st-note">The last read failed: {reader.readReason.replaceAll('-', ' ')}.</p>
+        )}
       {cooldownSeconds > 0 && (
         <p className="st-note">Refresh available in {cooldownSeconds}s. Failed reads also count.</p>
       )}
