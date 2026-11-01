@@ -196,6 +196,14 @@ test('native usage gauges show the remaining percent without inventing freshness
   const before = JSON.stringify(reader);
   const card = anthropicUsageCard({ usageReaders: [reader] });
   assert(card);
+  // The client's extra-usage flag disagreed with the account, so no row shows either value.
+  for (const is_enabled of [false, true])
+    assert.deepEqual(
+      anthropicUsageCard({
+        usageReaders: [{ ...reader, reading: { ...reader.reading, extraUsage: { is_enabled } } }],
+      })?.credits,
+      [],
+    );
   const rows = [...card.primary, ...(card.auxiliary ?? [])];
   assert.deepEqual(
     rows.map((row) => [row.label, row.remaining?.value]),
