@@ -18,6 +18,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import type { ArtifactFiles } from '../../artifacts/index.ts';
 import type { CatalogObservation } from '../../chat/catalog.ts';
+import { redactDiagnosticText } from '../../diagnostics/redact.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import type { Store } from '../../store/index.ts';
 import { clientStatusReason } from '../client-versions.ts';
@@ -524,7 +525,7 @@ export class AnthropicUsageRefresh {
               : 'blocked',
           reason: !known ? 'anthropic-metadata-ownership-unknown' : record.reason,
         };
-      } catch {
+      } catch (error) {
         active.handle?.stop();
         // A launch that threw before its owner reported a group started no process. A group it
         // did report must be gone before the read counts as settled.
@@ -532,6 +533,10 @@ export class AnthropicUsageRefresh {
         if (active.handle) known = (await active.handle.result).quiescent;
         record.state = known ? 'quiescent' : 'unknown';
         record.reason = 'usage-read-failed';
+        // The refusal says which check stopped the launch. Without it the card shows only that
+        // the read failed.
+        record.detail =
+          error instanceof Error ? redactDiagnosticText(error.message).slice(0, 200) : null;
         this.save(record, 'failed');
         result = {
           outcome: known ? 'blocked' : 'outcome-unknown',
