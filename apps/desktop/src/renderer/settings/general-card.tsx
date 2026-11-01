@@ -266,7 +266,8 @@ export function GeneralCard({
             <span className="st-field" id="settings-welcome">
               <span className="st-name">Welcome</span>
               <small className="st-hint">
-                The first-run steps: connect a provider, add a project and start a thread.
+                The first-run steps: connect a provider, pick a crew, add a project and start a
+                thread.
               </small>
             </span>
             <div className="st-controls">

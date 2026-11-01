@@ -72,11 +72,12 @@ These steps add to the walkthrough. Each is optional and can be tried in any ord
 
 ## The welcome on first launch
 
-A first launch opens a three step welcome in place of the empty workspace. It covers steps 1 to 3 of the walkthrough above in one flow, and it uses the same settings cards and the same project picker.
+A first launch opens a four step welcome in place of the empty workspace: Provider, Crew, Project and First message. It covers steps 1 to 3 of the walkthrough above and the default crew from step 10 in one flow, and it uses the same settings cards, the same Crew Constructor and the same project picker.
 
 1. Connect a provider. The four families show their setup state. Press Set up on a family to open the same card Settings has, with its own connect steps. Google keeps its terms summary and the acknowledgement box, and Connect stays off until you tick it. Google counts as ready only after the acknowledgement is stored. Local shows its loopback setup. Continue turns on once one family is ready. With none ready, the button beside the title reads Skip for now.
-2. Add a project. Add project opens the folder picker and registers the repository. With projects already added, a menu picks one and Add another project adds more.
-3. Open the composer. The last step shows a suggested first message, "Give me a short tour of this repository and suggest one small first change." Open the composer starts a new thread in the project with that text in the box. CrewKite never sends it for you.
+2. Pick a crew. Default crew lists the Solo, Pair and Full crew presets and any crew you saved, and shows what the chosen one holds. Build a crew opens the Crew Constructor, and the crew you save becomes the default. The step says you can change the crew per project or per thread at any time, in Settings > Crews or the inspector's Crew tab.
+3. Add a project. Add project opens the folder picker and registers the repository. With projects already added, a menu picks one and Add another project adds more.
+4. Open the composer. The last step shows a suggested first message, "Give me a short tour of this repository and suggest one small first change." Open the composer starts a new thread in the project with that text in the box. CrewKite never sends it for you.
 
 Skip is on every step and ends the welcome for good. The desktop keeps that flag in its profile, so the welcome does not come back after a restart. It does not show for anyone who already has a project. After Skip, focus moves to New thread in the left rail. Settings > General has Show the welcome again. Each step moves focus to its heading, and every control is a button, a menu or a checkbox that the keyboard reaches.
 
