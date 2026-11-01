@@ -245,6 +245,16 @@ test('the orchestrator brief names the slices as the parallel workers and keeps 
   );
   assert.match(brief, /does not repeat its JSON/);
   assert.doesNotMatch(brief, /one at a time in dependency order/);
+  // Slices stay inside the crew, and the handoff rule still applies on a limit (H1).
+  assert.match(
+    brief,
+    /every slice runs on the crew builder, and a hard slice runs on the crew fixer/,
+  );
+  assert.match(brief, /No provider outside the crew takes a slice/);
+  assert.match(
+    brief,
+    /Continue on another provider is on, the handoff rule may still move a slice/,
+  );
 });
 
 test('a read-only slice brief asks for reads and searches', () => {

@@ -90,3 +90,19 @@ Consequences of this amendment:
 2026-10-31: A slice's own changes are the paths its builder and its fixes changed in its copy. The replay leaves out a path only a review changed, such as another slice's merged work in that copy, and the finished line names what it left out. The writer side is confined the same way, at the copy and at replay, so the reviewer is confined at replay too. A read-only slice's packet lists its own copy's diff against the base.
 
 2026-10-31: A request for agents or subagents in a crew with an orchestrator is met by the plan. The slices are the parallel workers: slices whose dependencies are done start together, with one turn per family at a time, and the orchestrator's own turn only reads and plans. The orchestrator brief tells it to split the work into as many slices as the person asked for where the work divides that way, to leave the independent ones without dependencies and to say in its summary which run side by side. The brief no longer says the slices run one at a time. The reply keeps the plan block, which the controller reads, and the thread shows the reply without it, since the plan card shows the same plan. A slice that writes runs as the builder, so its client starts subagents when the builder's switch allows them.
+
+## Amendment, 2026-11-01: slices stay inside the crew
+
+The assignment rule in the Decision section ranked every connected family for each slice. Easy slices went to Local first, and medium and hard slices left the builder whenever its family did not rank. In a d3-rc5 run on a crew with no Local role, three slices went to Local and one to OpenAI by allowance, so the plan ran on models I had not put in the crew. This amendment replaces the assignment bullets and the hint bullet.
+
+- A slice runs on the crew builder's model and effort.
+- A hard slice runs on the crew fixer's model and effort when the crew has a fixer on a model other than the builder's.
+- When the first choice cannot take the slice, the other of the two takes it. A model cannot take a slice when its family is not connected or has no allowance left, and Local cannot take one with an image, without a context length or with files over its prompt room.
+- No family outside the crew takes a slice, and Local takes one only as a crew role.
+- The handoff rule still applies. When neither crew model can take a slice and Continue on another provider is on, the slice goes to the family the thread's handoff mode ranks first, with that family's default model, and `hint.family` breaks a tie there only. With Continue on another provider off, the slice has no model, and the thread writes one line that says why.
+- The reason on the card names the role and why, for example "Slice 2 (hard) assigned to Anthropic (Fable 5.1): Fixer, hard slice." or "Slice 1 (medium) assigned to OpenAI (the builder model): Builder, the crew's model."
+- Balanced lists the crew's models that can take the slice as its candidates, and after a handoff the families the handoff mode ranks.
+
+I put the models in the crew on purpose, and a plan that spends a subscription I left out of the crew breaks that choice. The handoff switch is the one place I already said another family may take over, so it stays the only way out of the crew. The fixer takes hard slices because a crew with its own fixer model names the model I trust with the hard part.
+
+The Easy-slice paragraph under Why and the Local consequence no longer hold. Local takes easy work when I make Local a member of the crew.
