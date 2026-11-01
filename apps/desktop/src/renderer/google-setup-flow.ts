@@ -29,27 +29,89 @@ export type GoogleSetupFlowResult =
 const applied = (result: CommandResult) =>
   result.outcome === 'applied' || result.outcome === 'already-applied';
 
-/** Tries per step: the first and up to two more when the step ends by timeout or stall. */
+/** Tries per step: the first and up to two more when the step ends by a transient failure. */
 export const GOOGLE_STEP_TRIES = 3;
-// A step the controller started on its own, such as the initialize after the terms, runs while
-// the flow reads. The flow waits for it, one read a second for up to 15 minutes.
-const RUNNING_WAITS = 900;
-// A quota read or the controller's own step can hold the Google journal when a step is sent. The
-// step is sent again a second later, for up to a minute, and that costs none of its tries.
-const BUSY_WAITS = 60;
+/** One Connect runs for at most this long, whatever it waits on. */
+export const GOOGLE_CONNECT_LIMIT_MS = 20 * 60_000;
 
 /**
- * True when the step ended by timeout or stall, which another try can fix. A Stop, a refused
- * sign-in, the terms and every other refusal wait for the person.
+ * Reasons another try of the same step can clear with nothing done by the person: a stall or a
+ * timeout, a download that broke, a signature or unpack check that did not finish (each try runs
+ * every check again from the start), a client that ended the step early, and an initialize or
+ * discovery that reported no capabilities yet.
  */
-export function retryableGoogleFailure(result: CommandResult): boolean {
-  if (result.outcome !== 'blocked') return false;
-  if (result.reason === 'acp-setup-timeout' || result.reason === 'stalled') return true;
-  if (result.reason !== 'acp-setup-failed') return false;
-  // The client ended the step early. A sign-in the person cancelled or refused ends it too, and
-  // the setup then says the sign-in is still required.
-  const data = result.data;
-  return !(data?.kind === 'google-acp-setup' && data.setup.reason === 'authentication-required');
+const TRANSIENT_REASONS = new Set([
+  // Install
+  'stalled',
+  'download-unavailable',
+  'archive-refused',
+  'invalid-import',
+  'install-unavailable',
+  'signature-timeout',
+  'signature-refused',
+  'google-install-interrupted',
+  'google-install-busy',
+  // Setup steps
+  'acp-setup-timeout',
+  'acp-setup-failed',
+  'acp-setup-interrupted',
+  'acp-capability-missing',
+  'acp-proof-unavailable',
+  'acp-setup-not-current',
+  // The command got no answer. The step itself may have ended either way, and the state says how.
+  'response-timeout',
+  'connection-lost',
+]);
+/**
+ * Reasons that wait for the person and are never retried: their own Stop, a terms
+ * acknowledgement the controller refused, a sign-in cancelled or refused in the browser, a
+ * different client in this home, a Mac the client does not run on, and a step whose process may
+ * still run. Every reason not listed as transient waits for the person too.
+ */
+const PERSON_REASONS = new Set([
+  'acp-setup-stopped',
+  'cancelled',
+  'authentication-required',
+  'consent-required',
+  'google-terms-not-acknowledged',
+  'pin-conflict',
+  'unsupported-platform',
+  'google-ownership-unknown',
+  'google-install-ownership-unknown',
+]);
+// Another Google step holds the journal, such as a coding turn. The step is sent again a second
+// later, and that costs none of its tries.
+const BUSY_REASONS = new Set(['google-operation-active', 'google-install-active']);
+
+export type GoogleFailure = 'transient' | 'person';
+
+/**
+ * Whether a step that ended without moving the setup on can run again by itself. The command
+ * result names the failure when it has one. A step that applied, or got no answer, leaves the
+ * reason in the state it saved.
+ */
+export function classifyGoogleFailure(
+  stage: GoogleSetupStage,
+  result: CommandResult | undefined,
+  state: GoogleState,
+): GoogleFailure {
+  const saved = stage === 'install' ? state.googleAcpInstall?.reason : state.googleAcpSetup?.reason;
+  const data = result?.data;
+  const reported =
+    data?.kind === 'google-acp-setup'
+      ? data.setup.reason
+      : data?.kind === 'google-acp-install'
+        ? data.install.reason
+        : null;
+  // A sign-in the person cancelled or refused ends the step early too, and the setup then says the
+  // sign-in is still required.
+  if ([saved, reported].includes('authentication-required')) return 'person';
+  const reason =
+    result && !applied(result) && result.outcome !== 'outcome-unknown'
+      ? result.reason
+      : (saved ?? result?.reason);
+  if (!reason || PERSON_REASONS.has(reason)) return 'person';
+  return TRANSIENT_REASONS.has(reason) ? 'transient' : 'person';
 }
 
 const stepRunning = (state: GoogleState) =>
@@ -75,7 +137,7 @@ export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' 
   if (setup.state === 'discovery-required') {
     return setup.proofId && setup.auth.status === 'authenticated' ? 'discover' : null;
   }
-  // A blocked setup retries the step its saved proof reached, one attempt per click.
+  // A blocked setup resumes at the step its saved proof reached.
   if (setup.state === 'blocked') {
     if (!setup.proofId) return 'initialize';
     return setup.auth.status === 'authenticated' ? 'discover' : 'authenticate';
@@ -83,6 +145,14 @@ export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' 
   return null;
 }
 
+/**
+ * One Connect: the terms, then install, initialize, sign-in and discovery in order until the
+ * setup is ready. The step to take always comes from the saved state, so a Connect pressed again
+ * resumes at the step that failed. Sign-in is an ordinary step; the client opens the browser.
+ * A step that ends by a transient failure runs again from that step, up to three tries, with no
+ * word to the person. A step whose command gets no answer is followed in the state, never sent
+ * again blind. The whole Connect stops after 20 minutes.
+ */
 export async function runGoogleSetupFlow({
   read,
   command,
@@ -90,21 +160,33 @@ export async function runGoogleSetupFlow({
   onStage,
   onRetry,
   wait = () => new Promise((resolve) => setTimeout(resolve, 1_000)),
+  now = Date.now,
 }: {
   read: () => Promise<GoogleState>;
   command: (input: GoogleCommand) => Promise<CommandResult>;
   active: () => boolean;
   onStage: (stage: GoogleSetupStage) => void;
-  /** A step failed by timeout or stall and starts again: this is try `attempt` of `tries`. */
+  /** A step failed by a transient failure and starts again: this is try `attempt` of `tries`. */
   onRetry?: (stage: GoogleSetupStage, attempt: number, tries: number) => void;
   wait?: () => Promise<void>;
+  now?: () => number;
 }): Promise<GoogleSetupFlowResult> {
-  const attempted = new Set<GoogleSetupStage>();
+  const deadline = now() + GOOGLE_CONNECT_LIMIT_MS;
   const tries = new Map<GoogleSetupStage, number>();
-  let waits = 0;
-  let busy = 0;
+  // The last step sent and what its command answered. When the next read asks for the same step
+  // again, that step ended without moving the setup on.
+  let last = null as { stage: GoogleSetupStage; result: CommandResult } | null;
   let acknowledged = false;
+  const limit = (): GoogleSetupFlowResult => ({
+    kind: 'blocked',
+    result: { outcome: 'blocked', reason: 'google-connect-limit' },
+  });
+  const pause = async () => {
+    await wait();
+    return active();
+  };
   for (;;) {
+    if (now() >= deadline) return limit();
     const state = await read();
     if (!active()) return { kind: 'stopped' };
     // The person ticked the box in this click. The controller stores it and refuses every
@@ -122,43 +204,70 @@ export async function runGoogleSetupFlow({
     }
     const stage = nextGoogleStage(state);
     if (stage === 'ready') return { kind: 'ready' };
-    // The acknowledgement and the install start the initialize in the controller. The flow
-    // follows it to its end and then takes the next step.
-    if (!stage && stepRunning(state) && waits++ < RUNNING_WAITS) {
-      await wait();
-      if (!active()) return { kind: 'stopped' };
+    // A step runs in the controller: one this flow sent and is still waiting on, or one the
+    // controller started on its own, such as the initialize after the install. Follow it.
+    if (!stage) {
+      if (stepRunning(state)) {
+        if (!(await pause())) return { kind: 'stopped' };
+        continue;
+      }
+      return { kind: 'blocked', ...(last ? { result: last.result } : {}) };
+    }
+    const attempt = (tries.get(stage) ?? 0) + 1;
+    if (last?.stage === stage) {
+      const failure = classifyGoogleFailure(stage, last.result, state);
+      if (failure === 'person' || attempt > GOOGLE_STEP_TRIES) {
+        const saved =
+          stage === 'install' ? state.googleAcpInstall?.reason : state.googleAcpSetup?.reason;
+        const result =
+          applied(last.result) && saved
+            ? { outcome: 'blocked' as const, reason: saved }
+            : last.result;
+        return { kind: 'blocked', result };
+      }
+      onRetry?.(stage, attempt, GOOGLE_STEP_TRIES);
+    }
+    tries.set(stage, attempt);
+    onStage(stage);
+    const input = googleStepCommand(stage, state);
+    if (!input) return { kind: 'blocked' };
+    const result = await command(input);
+    if (!active()) return { kind: 'stopped' };
+    if (BUSY_REASONS.has(result.reason ?? '')) {
+      tries.set(stage, attempt - 1);
+      last = null;
+      if (!(await pause())) return { kind: 'stopped' };
       continue;
     }
-    if (!stage || attempted.has(stage)) return { kind: 'blocked' };
-    attempted.add(stage);
-    const attempt = (tries.get(stage) ?? 0) + 1;
-    tries.set(stage, attempt);
-    if (attempt > 1) onRetry?.(stage, attempt, GOOGLE_STEP_TRIES);
-    onStage(stage);
-    const setup = state.googleAcpSetup;
-    let input: GoogleCommand;
-    if (stage === 'clear') {
-      if (!setup?.operationId) return { kind: 'blocked' };
-      input = {
-        command: 'StopGoogleAcpSetup',
-        expectedRevision: setup.revision,
-        payload: { profileId: 'google-acp-v1', operationId: setup.operationId },
-      };
-    } else if (stage === 'install') {
-      input = {
-        command: 'InstallGoogleAcp',
-        expectedRevision: 0,
-        payload: { profileId: 'google-acp-v1', consent: 'explicit' },
-      };
-    } else if (stage === 'initialize') {
-      input = {
-        command: 'InitializeGoogleAcp',
-        expectedRevision: setup?.revision ?? 0,
-        payload: { profileId: 'google-acp-v1', consent: 'explicit' },
-      };
-    } else if (stage === 'authenticate') {
-      if (!setup?.proofId) return { kind: 'blocked' };
-      input = {
+    last = { stage, result };
+  }
+}
+
+function googleStepCommand(stage: GoogleSetupStage, state: GoogleState): GoogleCommand | null {
+  const setup = state.googleAcpSetup;
+  if (stage === 'clear')
+    return setup?.operationId
+      ? {
+          command: 'StopGoogleAcpSetup',
+          expectedRevision: setup.revision,
+          payload: { profileId: 'google-acp-v1', operationId: setup.operationId },
+        }
+      : null;
+  if (stage === 'install')
+    return {
+      command: 'InstallGoogleAcp',
+      expectedRevision: 0,
+      payload: { profileId: 'google-acp-v1', consent: 'explicit' },
+    };
+  if (stage === 'initialize')
+    return {
+      command: 'InitializeGoogleAcp',
+      expectedRevision: setup?.revision ?? 0,
+      payload: { profileId: 'google-acp-v1', consent: 'explicit' },
+    };
+  if (!setup?.proofId) return null;
+  return stage === 'authenticate'
+    ? {
         command: 'AuthenticateGoogleAcp',
         expectedRevision: setup.revision,
         payload: {
@@ -167,36 +276,12 @@ export async function runGoogleSetupFlow({
           method: 'oauth-personal',
           consent: 'explicit',
         },
-      };
-    } else {
-      if (!setup?.proofId) return { kind: 'blocked' };
-      input = {
+      }
+    : {
         command: 'DiscoverGoogleAcp',
         expectedRevision: setup.revision,
-        payload: {
-          profileId: 'google-acp-v1',
-          proofId: setup.proofId,
-          consent: 'explicit',
-        },
+        payload: { profileId: 'google-acp-v1', proofId: setup.proofId, consent: 'explicit' },
       };
-    }
-    const result = await command(input);
-    if (!active()) return { kind: 'stopped' };
-    if (applied(result)) continue;
-    if (result.reason === 'google-operation-active' && busy++ < BUSY_WAITS) {
-      attempted.delete(stage);
-      tries.set(stage, attempt - 1);
-      await wait();
-      if (!active()) return { kind: 'stopped' };
-      continue;
-    }
-    // The next read finds the step blocked, and the flow starts it again from there.
-    if (attempt < GOOGLE_STEP_TRIES && retryableGoogleFailure(result)) {
-      attempted.delete(stage);
-      continue;
-    }
-    return { kind: 'blocked', result };
-  }
 }
 
 export async function pollGoogleSetupStatus({

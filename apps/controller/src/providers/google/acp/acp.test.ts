@@ -38,7 +38,7 @@ import {
   AcpStderrClassifier,
   AcpStderrSummarySchema,
 } from './client.ts';
-import { type AcpImportDependencies, importGoogleAcp } from './import.ts';
+import { ACP_SIGNATURE_MS, type AcpImportDependencies, importGoogleAcp } from './import.ts';
 import {
   ACP_SESSION_MODELS,
   type AcpReviewMapping,
@@ -274,6 +274,29 @@ function writer(
   });
 }
 
+test('discovery reads config options that arrive after the session reply', async () => {
+  // A client that reports its options in an update after the session reply is read in full.
+  // Closing the session at once read nothing and blocked Connect with a missing capability.
+  const lateConfig = fixture('late-config');
+  try {
+    const observed = await startGoogleAcpSetup({
+      client: lateConfig.client,
+      directory: lateConfig.directory(),
+      environment,
+      operation: 'discover',
+      priorProof: lateConfig.proof,
+      lifecycle: lateConfig.lifecycle,
+      reviewMappings: [lateConfig.mapping],
+      spawn: spawnCheckChild as AcpSpawn,
+    }).result;
+    assert.equal(observed.reason, null);
+    assert(observed.metadata?.configOptions);
+    assert(observed.metadata?.reviewMode);
+  } finally {
+    lateConfig.dispose();
+  }
+});
+
 test('the acp writer binds an imported client and observed configuration before one prompt', {
   skip: process.platform !== 'darwin' && 'the ACP client bundle is the signed macOS arm64 build',
 }, async () => {
@@ -454,6 +477,7 @@ test('the acp writer binds an imported client and observed configuration before 
       'parent-mutation',
       'deadline',
       'bundle-deadline',
+      'slow-checks',
       'missing-harness',
       'harness-digest',
       'harness-signature',
@@ -470,7 +494,11 @@ test('the acp writer binds an imported client and observed configuration before 
         failure === 'live-at-cutoff' ||
         failure.startsWith('late-kill');
       // The signature phase runs only where codesign does.
-      if (held && (process.platform !== 'darwin' || process.arch !== 'arm64')) continue;
+      if (
+        (held || failure === 'slow-checks') &&
+        (process.platform !== 'darwin' || process.arch !== 'arm64')
+      )
+        continue;
       const row = fixture('complete');
       const exits: Array<Promise<unknown>> = [];
       try {
@@ -493,6 +521,7 @@ test('the acp writer binds an imported client and observed configuration before 
           },
         );
         let clock = 0;
+        let closes = 0;
         const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
         let capture = true;
         const ready = Promise.withResolvers<void>();
@@ -506,7 +535,10 @@ test('the acp writer binds an imported client and observed configuration before 
           timer.work();
         };
         const mutation: AcpImportDependencies =
-          failure === 'deadline' || failure === 'bundle-deadline' || held
+          failure === 'deadline' ||
+          failure === 'bundle-deadline' ||
+          failure === 'slow-checks' ||
+          held
             ? {
                 now: () => clock,
                 schedule: held
@@ -556,9 +588,18 @@ test('the acp writer binds an imported client and observed configuration before 
                       );
                       closed.resolve();
                     });
-                  } else
+                  }
+                  // Each file has its own window. The bundle row spends the second one.
+                  else
                     child.once('close', () => {
-                      clock = failure === 'deadline' ? 5000 : clock + 2500;
+                      // A first check after the unpack can take seconds. Five each used to
+                      // spend the one shared window.
+                      clock +=
+                        failure === 'slow-checks'
+                          ? 5000
+                          : failure === 'deadline' || closes++ > 0
+                            ? ACP_SIGNATURE_MS
+                            : 2500;
                     });
                   return child;
                 },
@@ -604,7 +645,7 @@ test('the acp writer binds an imported client and observed configuration before 
           // A child that fails to start or exits early rejects here, and an import that settles
           // first fails the timer lookup below.
           await Promise.race([ready.promise, pending]);
-          fire(4000);
+          fire(ACP_SIGNATURE_MS - 1000);
           if (failure === 'queued-close') {
             // The group is gone when the cutoff runs, but its close event is still queued.
             clock = 2000;
@@ -624,13 +665,17 @@ test('the acp writer binds an imported client and observed configuration before 
           } else {
             // A blocked loop runs the stop timers in one pass. Node runs one duration list at a
             // time, so the 1000 ms cutoff list can reach the cutoff before the 250 ms kill.
-            clock = failure === 'late-kill-near-deadline' ? 4500 : 2000;
+            clock = failure === 'late-kill-near-deadline' ? ACP_SIGNATURE_MS - 500 : 2000;
             capture = false;
             for (const delay of failure === 'late-kill-reversed' ? [1000, 250] : [250, 1000])
               fire(delay);
           }
         }
         const result = await pending;
+        if (failure === 'slow-checks') {
+          assert.equal(result.reason, 'imported', failure);
+          continue;
+        }
         if (failure === 'live-at-cutoff')
           for (const group of row.groups) process.kill(-group, 'SIGKILL');
         if (held) await closed.promise;
@@ -640,7 +685,8 @@ test('the acp writer binds an imported client and observed configuration before 
         if (held) {
           assert.equal(
             result.reason,
-            failure === 'live-at-cutoff' ? 'ownership' : 'signature-refused',
+            // The window ran out in every held row, which is a timeout and can run again.
+            failure === 'live-at-cutoff' ? 'ownership' : 'signature-timeout',
             failure,
           );
           if (failure === 'queued-close')
@@ -2378,6 +2424,77 @@ test('a controller that registers the Google client sets it up at launch and lea
   } finally {
     await controller.close();
     f.dispose();
+  }
+});
+
+test('an initialize with no sign-in method retries initialize and a cancelled sign-in waits', async () => {
+  const cleanups: (() => Promise<void>)[] = [];
+  const run = async (scenario: 'no-sign-in' | 'sign-in-cancelled') => {
+    const f = fixture(scenario);
+    const clock = createTestClock();
+    const id = createTestIds();
+    const client = { HOME: userInfo().homedir, PATH: process.env.PATH };
+    const controller = new Controller({
+      home: join(f.home, 'controller'),
+      now: clock.now,
+      id,
+      registerGoogleAcp: true,
+      googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
+      googleAcp: {
+        reviewMappings: [f.mapping],
+        spawn: spawnCheckChild as AcpSpawn,
+        resolve: (proof) => ({
+          ...resolveGoogleAcpProfile({ home: f.home, proof, environment: client }),
+          client: f.client,
+          environment: client,
+        }),
+      },
+    });
+    const command = (name: string, payload: object) =>
+      controller.execute(
+        CommandSchema.parse({
+          protocol: 1,
+          key: id('cmd'),
+          actor: { id: 'terminal', kind: 'cli' },
+          command: name,
+          expectedRevision: controller.store.googleAcpSetup().revision,
+          payload,
+        }),
+        'local-owner',
+      );
+    cleanups.push(async () => {
+      await controller.close();
+      f.dispose();
+    });
+    await command('AcknowledgeGoogleTerms', { textVersion: GOOGLE_TERMS_VERSION });
+    await controller.googleAcpPreparation;
+    return { command, setup: () => controller.store.googleAcpSetup() };
+  };
+  try {
+    // The reply named no personal sign-in. No proof is kept, so the next step is initialize again,
+    // never a sign-in the client would refuse as if the person had.
+    const missing = await run('no-sign-in');
+    assert.deepEqual(
+      [missing.setup().state, missing.setup().reason, missing.setup().proofId],
+      ['blocked', 'acp-capability-missing', null],
+    );
+    // A sign-in the client answers with an error is the person's, and reads as still required.
+    const cancelled = await run('sign-in-cancelled');
+    const before = cancelled.setup();
+    assert.equal(before.state, 'authentication-required');
+    const result = await cancelled.command('AuthenticateGoogleAcp', {
+      profileId: 'google-acp-v1',
+      proofId: before.proofId,
+      method: 'oauth-personal',
+      consent: 'explicit',
+    });
+    assert.equal(result.reason, 'acp-setup-failed');
+    assert.deepEqual(
+      [cancelled.setup().state, cancelled.setup().reason],
+      ['blocked', 'authentication-required'],
+    );
+  } finally {
+    for (const cleanup of cleanups) await cleanup();
   }
 });
 
