@@ -6,6 +6,7 @@ import {
   onboardingView,
   type SetupState,
   stepAfter,
+  stepBefore,
 } from './flow.ts';
 
 const setup = (
@@ -85,6 +86,16 @@ test('the welcome shows the step the setup allows and ends for anyone who alread
       { step: 'provider', canContinue: false, skip: 'Skip for now' },
     ],
     [
+      'on the crew step with a ready family',
+      { setup: setup(['openai']), reached: 'crew', engaged: true },
+      { step: 'crew', canContinue: true, skip: 'Skip' },
+    ],
+    [
+      'on the crew step after the family disconnects',
+      { setup: setup([]), reached: 'crew', engaged: true },
+      { step: 'provider', canContinue: false, skip: 'Skip for now' },
+    ],
+    [
       'on the project step with a ready family and no project',
       { setup: setup(['openai']), reached: 'project', engaged: true },
       { step: 'project', canContinue: false, skip: 'Skip' },
@@ -121,6 +132,8 @@ test('the welcome shows the step the setup allows and ends for anyone who alread
     assert.equal(view.canContinue, expected.canContinue, name);
     assert.equal(view.skipLabel, expected.skip, name);
   }
-  assert.equal(stepAfter('provider'), 'project');
+  assert.equal(stepAfter('provider'), 'crew');
+  assert.equal(stepAfter('crew'), 'project');
   assert.equal(stepAfter('message'), 'message');
+  assert.equal(stepBefore('project'), 'crew');
 });
