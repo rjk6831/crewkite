@@ -32,6 +32,8 @@ import {
   ProjectNotesReadSchema,
   type ProjectPage,
   type ProjectPageRequest,
+  type SavedCrewsRead,
+  SavedCrewsReadSchema,
   type SavedPrompts,
   SavedPromptsSchema,
   type Task,
@@ -168,6 +170,8 @@ export function chatClient(
     exportThread: (taskId: string, format: ExportFormat): Promise<ChatExport> =>
       read('ExportChatThread', { taskId, format }, ChatExportSchema),
     readPrompts: (): Promise<SavedPrompts> => read('ReadChatPrompts', {}, SavedPromptsSchema),
+    /** The crews saved in the desktop's Settings and the default. The desktop edits them. */
+    readCrews: (): Promise<SavedCrewsRead> => read('ReadSavedCrews', {}, SavedCrewsReadSchema),
     readNotes: (projectId: string): Promise<ProjectNotesRead> =>
       read('ReadProjectNotes', { projectId }, ProjectNotesReadSchema),
     /** A note change answers with a small record, so these read the list again. */
