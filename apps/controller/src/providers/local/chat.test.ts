@@ -5,141 +5,21 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { type AgentEvent, AgentEventSchema } from '@crewkite/contracts';
-import type {
-  ChatInput,
-  ChatMessage,
-  FileHandle,
-  GuardToolCallController,
-  LLM,
-  LLMPredictionStats,
-  PredictionResult,
-  RawFunctionTool,
-  Tool,
-} from '@lmstudio/sdk';
+import type { FileHandle, LLM } from '@lmstudio/sdk';
 import type { ChatHistoryEntry, ChatTurnHandle, ChatTurnRequest } from '../../chat/adapter.ts';
 import { byteSize } from '../../chat/prompt.ts';
 import { localSliceFits } from './budget.ts';
-import { type LoadedModelLike, localChatAdapter, parseTextToolCalls } from './chat.ts';
-
-// Frames assumed from @lmstudio/sdk 2.1.0, `LLMDynamicHandle.act` and `internalAct` in
-// dist/index.mjs. A live run against LM Studio confirms them.
-// - onPredictionFragment({ roundIndex, content, tokensCount, containsDrafted, reasoningType,
-//   isStructural }), reasoningType one of none, reasoning, reasoningStartTag, reasoningEndTag.
-// - Each parsed tool call: guardToolCall(roundIndex, callId, controller) with
-//   controller.toolCallRequest = { type: 'function', name, arguments }. The guard calls allow()
-//   or deny(reason). An allowed call then runs tool.implementation(arguments, { callId, signal,
-//   status, warn }), one call at a time.
-// - onPredictionCompleted(result) once per round. result.stats carries stopReason,
-//   promptTokensCount, predictedTokensCount, timeToFirstTokenSec and tokensPerSecond.
-// - onRoundEnd(roundIndex) after the round's tool calls finish. Tool results start a new round.
-// - Aborting options.signal sends `cancel` on the predict channel, and act rejects.
+import {
+  isLocalFitFailure,
+  type LoadedModelLike,
+  localChatAdapter,
+  parseTextToolCalls,
+} from './chat.ts';
 
 // The SDK's loaded model must keep fitting the adapter's interface across SDK upgrades.
 const sdkModelFits: LLM extends LoadedModelLike ? true : false = true;
 
-const SUMMARY = 'Renaming n to count in src/a.ts was agreed.';
-// `tokens` is the fragment's token count as the runtime reports it, one when left out.
-type Step =
-  | { text: string; tokens?: number }
-  | { reasoning: string; tokens?: number }
-  | { call: string; args: Record<string, unknown> }
-  | { wait: () => void };
-type Round = { steps: Step[]; stats: Partial<LLMPredictionStats> };
-
-// The scripted rounds run across `act` calls, the way one model keeps answering a growing chat.
-function fakeModel(
-  rounds: Round[],
-  clock: { now: number },
-  countTokens: (text: string) => number = (text) => Math.ceil(text.length / 4),
-) {
-  const calls: {
-    chat: ChatInput;
-    tools: Tool[];
-    signal?: AbortSignal;
-    maxTokens?: number | false;
-    reasoningBudget?: number | false;
-  }[] = [];
-  let next = 0;
-  let callId = 0;
-  const model: LoadedModelLike = {
-    countTokens: async (text) => countTokens(text),
-    async act(chat, tools, options) {
-      calls.push({
-        chat,
-        tools,
-        signal: options.signal,
-        maxTokens: options.maxTokens,
-        reasoningBudget: options.reasoningBudget,
-      });
-      if (!tools.length) {
-        const stats = { stopReason: 'eosFound' };
-        options.onPredictionCompleted?.({
-          nonReasoningContent: SUMMARY,
-          stats,
-        } as PredictionResult);
-        return;
-      }
-      for (let roundIndex = 0; next < rounds.length; roundIndex++) {
-        const round = rounds[next++];
-        let content = '';
-        let native = false;
-        for (const step of round.steps) {
-          options.signal?.throwIfAborted();
-          if ('text' in step || 'reasoning' in step) {
-            const fragment = 'text' in step ? step.text : step.reasoning;
-            content += fragment;
-            options.onPredictionFragment?.({
-              roundIndex,
-              content: fragment,
-              reasoningType: 'text' in step ? 'none' : 'reasoning',
-              tokensCount: step.tokens ?? 1,
-              containsDrafted: false,
-              isStructural: false,
-            });
-          } else if ('wait' in step)
-            await new Promise((_, reject) => {
-              options.signal?.addEventListener('abort', () => reject(new Error('cancelled')));
-              step.wait();
-            });
-          else {
-            native = true;
-            const tool = tools.find((candidate) => candidate.name === step.call) as RawFunctionTool;
-            const id = callId++;
-            let allowed = false;
-            await options.guardToolCall?.(roundIndex, id, {
-              toolCallRequest: { type: 'function', name: step.call, arguments: step.args },
-              tool,
-              allow: () => {
-                allowed = true;
-              },
-              deny: () => {},
-            } as unknown as GuardToolCallController);
-            if (allowed)
-              await tool.implementation(step.args, {
-                callId: id,
-                signal: new AbortController().signal,
-                status: () => {},
-                warn: () => {},
-              });
-          }
-        }
-        clock.now += 1000;
-        const stats = { stopReason: 'eosFound', ...round.stats };
-        options.onPredictionCompleted?.({ stats } as PredictionResult);
-        options.onMessage?.({
-          getRole: () => 'assistant',
-          getText: () => content,
-          getToolCallRequests: () => [],
-          getToolCallResults: () => [],
-        } as unknown as ChatMessage);
-        options.onRoundEnd?.(roundIndex);
-        // The runtime ends `act` after a round without a native call.
-        if (!native) return;
-      }
-    },
-  };
-  return { model, calls };
-}
+import { fakeModel, type Round, SUMMARY } from './chat-fake.ts';
 
 const turnIds = ['trn_01J00000000000000000000000', 'trn_01J00000000000000000000001'];
 const taskId = 'tsk_01J00000000000000000000000';
@@ -959,6 +839,198 @@ test('a command the local model runs holds Git to the scratch copy', async () =>
       event.type === 'tool.output' ? [event.chunk] : [],
     );
     assert(output.join('').includes(`<${realpathSync.native(root)}>`), output.join(''));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+// A file of 120 lines of about 80 characters, the most one read returns: about 10 KB.
+const largeFile = (name: string) =>
+  Array.from({ length: 120 }, (_, line) => `export const ${name}${line} = '${'x'.repeat(60)}';`)
+    .join('\n')
+    .concat('\n');
+const BRIEF =
+  'Goal: Add tax to the order total.\n\nTask: Use TAX_RATE in orderTotal and round to the cent.\n\nFiles:\nsrc/f1.ts\nsrc/f2.ts\nsrc/f3.ts\nsrc/f4.ts';
+const readOf = (file: number): Round['steps'][number] => ({
+  call: 'read_range',
+  args: { path: `src/f${file}.ts`, start: 1, end: 120 },
+});
+
+test('a slice that reads past an 8,192 context folds its reads into the summary and still answers', async () => {
+  const { root, scratch, home, clock, request } = fixture();
+  try {
+    for (const file of [1, 2, 3, 4])
+      writeFileSync(join(scratch, `src/f${file}.ts`), largeFile(`f${file}_`));
+    // Four whole-file reads, then the reasoning runs into the end of the window, as on Flint.
+    const { model, calls } = fakeModel(
+      [
+        {
+          steps: [{ reasoning: 'Read the four files.', tokens: 300 }, readOf(1)],
+          stats: { promptTokensCount: 900, predictedTokensCount: 320 },
+        },
+        { steps: [readOf(2)], stats: { promptTokensCount: 4200, predictedTokensCount: 20 } },
+        { steps: [readOf(3)], stats: { promptTokensCount: 7500, predictedTokensCount: 20 } },
+        { steps: [readOf(4)], stats: { promptTokensCount: 7900, predictedTokensCount: 20 } },
+        {
+          steps: [{ reasoning: 'Weigh every file.', tokens: 2160 }],
+          stats: {
+            stopReason: 'contextLengthReached',
+            promptTokensCount: 7900,
+            predictedTokensCount: 292,
+          },
+        },
+        {
+          steps: [{ text: 'orderTotal now applies TAX_RATE and rounds to the cent.', tokens: 40 }],
+          stats: { promptTokensCount: 1400, predictedTokensCount: 40 },
+        },
+      ],
+      clock,
+    );
+    const turn = start(model, 8192, request(0, { prompt: BRIEF, slice: 3 }), {
+      reasoningBudget: true,
+    });
+    const result = await turn.handle.result;
+    const { events } = turn;
+
+    assert.equal(result.stopReason, 'done');
+    assert.equal(result.failure, null);
+    assert.equal(result.assistantText, 'orderTotal now applies TAX_RATE and rounds to the cent.');
+    // The turn call, the fold of the four reads, and the turn again on the folded prompt.
+    assert.deepEqual(
+      calls.map((call) => call.tools.length > 0),
+      [true, false, true],
+    );
+    // Each call to the turn asks for R of its own prompt, and half of R for reasoning.
+    for (const call of [calls[0], calls[2]]) {
+      assert.equal(typeof call.maxTokens, 'number');
+      assert.ok((call.maxTokens as number) >= 2458);
+      assert.equal(call.reasoningBudget, Math.floor((call.maxTokens as number) / 2));
+    }
+    const folded = calls[1].chat.at(-1)?.content ?? '';
+    assert.match(folded, /^Request:\nGoal: Add tax to the order total\./);
+    for (const file of [1, 2, 3, 4]) assert.ok(folded.includes(`Read src/f${file}.ts:1-120:\n`));
+    // The turn goes on with the summary in place of the raw results.
+    const again = calls[2].chat;
+    assert.equal(again.length, 2);
+    assert.ok(again[0].content?.includes(`Summary of earlier turns in this thread:\n${SUMMARY}`));
+    assert.ok(again[1].content?.startsWith(BRIEF));
+    assert.ok(
+      again[1].content?.endsWith('Go on from it: read only what is still missing, then answer.'),
+    );
+    assert.ok(!again.some((entry) => entry.content?.includes("export const f1_0 = '")));
+    const compacted = events.findIndex((event) => event.type === 'context.compacted');
+    const answered = events.findIndex((event) => event.type === 'text.delta');
+    assert.ok(compacted >= 0 && compacted < answered);
+    assert.deepEqual(events[compacted], {
+      type: 'context.compacted',
+      turnId: turnIds[0],
+      summaries: 1,
+      coveredTurns: 1,
+      usedTokens: 8192,
+      capacityTokens: 8192,
+    });
+    const stats = events.find((event) => event.type === 'turn.stats');
+    assert.equal(stats?.type === 'turn.stats' && stats.stats.summaries, 1);
+    // The next turn reads the same summary.
+    const saved = JSON.parse(
+      readFileSync(join(home, 'chat', taskId, 'local-summary.json'), 'utf8'),
+    );
+    assert.deepEqual([saved.covered, saved.summary, saved.count], [0, SUMMARY, 1]);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('without a reasoning budget a read gets only the room above the reply floor, then the model answers', async () => {
+  const { root, scratch, clock, request } = fixture();
+  try {
+    for (const file of [1, 2, 3, 4])
+      writeFileSync(join(scratch, `src/f${file}.ts`), largeFile(`f${file}_`));
+    const { model, calls } = fakeModel(
+      [
+        {
+          steps: [{ reasoning: 'Read the files.', tokens: 20 }, readOf(1)],
+          stats: { promptTokensCount: 900, predictedTokensCount: 320 },
+        },
+        { steps: [readOf(2)], stats: { promptTokensCount: 4300, predictedTokensCount: 20 } },
+        { steps: [readOf(3)], stats: { promptTokensCount: 5400, predictedTokensCount: 20 } },
+        {
+          steps: [{ text: 'f1 holds the first rows and f2 starts the second set.', tokens: 20 }],
+          stats: { promptTokensCount: 5450, predictedTokensCount: 20 },
+        },
+      ],
+      clock,
+    );
+    const turn = start(model, 8192, request(0, { prompt: BRIEF, slice: 3 }));
+    const result = await turn.handle.result;
+    const { events } = turn;
+
+    assert.equal(result.stopReason, 'done');
+    assert.equal(result.assistantText, 'f1 holds the first rows and f2 starts the second set.');
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].reasoningBudget, undefined);
+    const outputs = events.flatMap((event) => (event.type === 'tool.output' ? [event.chunk] : []));
+    // The first read fits whole, the second is cut to the room left, and the third never runs.
+    assert.equal(outputs.length, 2);
+    assert.ok(outputs[0].endsWith(`export const f1_119 = '${'x'.repeat(60)}';`));
+    assert.ok(outputs[1].endsWith('\n[cut to fit the Local context; ask for less]'));
+    const completed = events.flatMap((event) => (event.type === 'tool.completed' ? [event] : []));
+    assert.deepEqual(
+      completed.map((event) => [event.status, event.summary]),
+      [
+        ['ok', 'src/f1.ts lines 1-120 of 120'],
+        ['ok', 'src/f2.ts lines 1-120 of 120'],
+        ['denied', 'The context is full. The model answers now.'],
+      ],
+    );
+    assert.ok(!events.some((event) => event.type === 'context.compacted'));
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('a Local slice that cannot fit fails with the counts, and an ordinary turn still gets the line', async () => {
+  const { root, scratch, clock, request } = fixture();
+  try {
+    for (const file of [1, 2, 3, 4])
+      writeFileSync(join(scratch, `src/f${file}.ts`), largeFile(`f${file}_`));
+    // The brief alone leaves less than the reply floor.
+    const huge = (text: string) => (text.startsWith('Goal:') ? 7000 : Math.ceil(text.length / 4));
+    for (const slice of [3, undefined]) {
+      const { model, calls } = fakeModel([], clock, huge);
+      const turn = start(model, 8192, request(0, { prompt: BRIEF, slice }));
+      const result = await turn.handle.result;
+      assert.equal(calls.length, 0);
+      if (slice === undefined) {
+        assert.equal(result.stopReason, 'done');
+        assert.match(result.assistantText, /Send a smaller first step/);
+        continue;
+      }
+      assert.equal(result.stopReason, 'error');
+      assert.ok(isLocalFitFailure(result.failure));
+      assert.match(
+        result.failure?.message ?? '',
+        /^This request takes 7,\d{3} tokens of the Local model's 8,192 token context and leaves \d+ for the reply, short of the 2,458 it needs\.$/,
+      );
+    }
+    // Reads that fill the window again after both folds end the slice the same way.
+    const filling = (file: number): Round[] => [
+      { steps: [readOf(file)], stats: {} },
+      {
+        steps: [{ reasoning: 'More.', tokens: 2000 }],
+        stats: { stopReason: 'contextLengthReached' },
+      },
+    ];
+    const { model, calls } = fakeModel([...filling(1), ...filling(2), ...filling(3)], clock);
+    const turn = start(model, 8192, request(1, { prompt: BRIEF, slice: 3 }), {
+      reasoningBudget: true,
+    });
+    const result = await turn.handle.result;
+    assert.equal(calls.filter((call) => call.tools.length === 0).length, 2);
+    assert.equal(result.stopReason, 'error');
+    assert.ok(isLocalFitFailure(result.failure));
+    assert.equal(result.failure?.message, "The turn filled the Local model's 8,192 token context.");
+    assert.equal(turn.events.filter((event) => event.type === 'context.compacted').length, 2);
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

@@ -16,6 +16,7 @@ import {
   type Task,
   writesScratch,
 } from '@crewkite/contracts';
+import { isLocalFitFailure } from '../providers/local/chat.ts';
 import type { ChecksOutcome } from './checks.ts';
 import { detectType } from './files.ts';
 import { assignPlan, type PlanFile, type PlanInputs, parsePlan } from './plan.ts';
@@ -30,7 +31,14 @@ import {
   replayLane,
   resolveBrief,
 } from './plan-lanes.ts';
-import { familyName, fixerBrief, PLAN_RETRY, planRetryText, sliceBrief } from './prompt.ts';
+import {
+  familyName,
+  fixerBrief,
+  localSliceBrief,
+  PLAN_RETRY,
+  planRetryText,
+  sliceBrief,
+} from './prompt.ts';
 
 type Payload<C extends Command['command']> = Extract<Command, { command: C }>['payload'];
 type Effects = (() => void)[];
@@ -406,6 +414,7 @@ export class PlanRunner {
   private step(task: Task, thread: ChatThread, plan: ChatPlanState, slice: Slice, turn: ChatTurn) {
     const lane = slice.lane as Lane;
     const id = slice.id;
+    if (turn.state !== 'done' && this.handOn(task, thread, plan, slice, turn)) return true;
     if (turn.state !== 'done') {
       const stopped = turn.state === 'stopped';
       const status = lane.step === 'resolve' ? 'blocked' : stopped ? 'not-run' : 'failed';
@@ -471,6 +480,49 @@ export class PlanRunner {
       thread,
       plan,
       next(fix ? { step: 'fix', pending: true, rounds } : { ...merge, rounds }),
+    );
+    return true;
+  }
+
+  /**
+   * A Local slice whose work did not fit the window goes to the crew builder, once, when the crew
+   * runs on its own. The slice starts over from a fresh copy. True when it was handed on.
+   */
+  private handOn(
+    task: Task,
+    thread: ChatThread,
+    plan: ChatPlanState,
+    slice: Slice,
+    turn: ChatTurn,
+  ) {
+    const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
+    if (
+      turn.state !== 'failed' ||
+      slice.lane?.step !== 'build' ||
+      turn.selection.family !== 'local' ||
+      !isLocalFitFailure(turn.failure) ||
+      thread.flightMode === 'manual' ||
+      sentMessage(thread) ||
+      !builder ||
+      builder.family === 'local'
+    )
+      return false;
+    const name = familyName[builder.family];
+    this.put(task, thread, plan, {
+      [slice.id]: {
+        status: 'queued',
+        turnId: null,
+        lane: undefined,
+        assignment: {
+          family: builder.family,
+          model: builder.model,
+          reason: `Slice ${slice.id} (${slice.difficulty}) assigned to ${name}: it did not fit Local's context.`,
+        },
+      },
+    });
+    this.host.line(
+      task,
+      `Slice ${slice.id} did not fit on Local, so the builder on ${name} takes it. ${turn.failure?.message ?? ''}`.trim(),
     );
     return true;
   }
@@ -577,7 +629,11 @@ export class PlanRunner {
         this.halt(task, `the orchestrator's reply for slice ${id} is gone`, true);
         return this.host.thread(task.id);
       }
-      text = sliceBrief(source, brief, slice.assignment.reason);
+      // Local gets the compact brief, since its window has to hold the files as well.
+      text =
+        selection.family === 'local'
+          ? localSliceBrief(source, brief)
+          : sliceBrief(source, brief, slice.assignment.reason);
     } else if (lane.step === 'review') text = this.host.reviewBrief;
     else if (lane.step === 'fix') {
       const last = slice.turnId ? this.host.turn(slice.turnId) : undefined;

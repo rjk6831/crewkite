@@ -1923,6 +1923,7 @@ export class ChatService {
       // A reviewer or advisor reads only, so what the thread allowed does not reach it.
       permissionGrants,
       readOnly: !writer,
+      ...(turn.slice === undefined ? {} : { slice: turn.slice }),
       subagents: turnAllowsSubagents(thread.crew, turn.role, turn.selection.family),
       allowanceLeft: this.allowanceLeft(task.id, turn.selection),
       // Decided with the thread tools above: the person's servers a turn starts follow this turn's
