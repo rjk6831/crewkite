@@ -151,6 +151,35 @@ export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' 
 }
 
 /**
+ * The step a Connect press shows at once, before its first status read lands: the step the saved
+ * state names next, or the download when it names none.
+ */
+export function startingGoogleStage(state: GoogleState): GoogleSetupStage {
+  const next = nextGoogleStage(state);
+  return next && next !== 'ready' ? next : 'install';
+}
+
+/**
+ * The primary button. It stays in its place, off, while a Connect runs, so a second press lands
+ * on it and never on Cancel, which shows beside it.
+ */
+export function googleConnectButton({
+  working,
+  running,
+  cancelling,
+  label,
+}: {
+  working: boolean;
+  /** The controller reports a step of this connect running. */
+  running: boolean;
+  cancelling: boolean;
+  label: string;
+}): { label: string; disabled: boolean } {
+  if (!working) return { label, disabled: false };
+  return { label: cancelling ? label : running ? 'Connecting…' : 'Starting…', disabled: true };
+}
+
+/**
  * One Connect: the terms, then install, initialize, sign-in and discovery in order until the
  * setup is ready. The step to take always comes from the saved state, so a Connect pressed again
  * resumes at the step that failed. Sign-in is an ordinary step; the client opens the browser.
