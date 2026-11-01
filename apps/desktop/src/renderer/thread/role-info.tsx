@@ -29,7 +29,7 @@ export const roleInfo = {
     text: 'Reads the request and proposes a plan of up to 8 slices. The controller assigns each slice to a connected provider and shows the plan before it runs.',
   },
   ask: {
-    name: 'Ask',
+    name: 'Side question',
     text: "Answers a side question from the project files. It never edits files and leaves the thread's model as it is.",
   },
 } as const;

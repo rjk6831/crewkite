@@ -71,7 +71,7 @@ const SLASH_LABELS: Record<SlashName, string> = {
   provider: 'Pick a provider',
   crew: 'Show the crew',
   plan: 'Show the plan',
-  ask: 'Ask another model',
+  ask: 'Quick question',
   handoff: 'Move the thread to another provider',
   changes: 'Show changes',
   accept: 'Accept changes',

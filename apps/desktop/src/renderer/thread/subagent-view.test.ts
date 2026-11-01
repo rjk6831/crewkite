@@ -62,12 +62,12 @@ test('a plan slice turn names its slice, and a read-only slice reads as the buil
   assert.equal(read.role, 'Builder');
   assert.equal(read.slice, 'Slice 2');
   assert.equal(turnChip({ ...base, role: 'reviewer', slice: 3 }).role, 'Reviewer');
-  assert.equal(turnChip({ ...base, role: 'ask' }).role, 'Ask');
+  assert.equal(turnChip({ ...base, role: 'ask' }).role, 'Side question');
   assert.equal(turnChip({ ...base, role: 'ask' }).slice, null);
   assert.equal(replyLabel({ ...base, role: 'ask', slice: 2 }), 'Slice 2');
   assert.equal(replyLabel({ ...base, role: 'reviewer', slice: 2 }), 'Slice 2 reviewer');
   assert.equal(replyLabel({ ...base, role: 'assistant', slice: 1 }), 'Slice 1');
-  assert.equal(replyLabel({ ...base, role: 'ask' }), 'Ask');
+  assert.equal(replyLabel({ ...base, role: 'ask' }), 'Side question');
 });
 
 test('the chip shows the picker label for a listed model and the ID for one it does not list', () => {

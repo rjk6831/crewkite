@@ -131,7 +131,7 @@ export const roleLabels: Record<ChatRole, string | null> = {
   challenger: 'Challenger',
   fixer: 'Fixer',
   orchestrator: 'Orchestrator',
-  ask: 'Ask',
+  ask: 'Side question',
 };
 
 /**

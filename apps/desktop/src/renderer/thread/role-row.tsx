@@ -11,7 +11,7 @@ import { askFamily, sendMessage, type ThreadSource } from './commands.ts';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 
 export type RoleAction = Exclude<ChatRole, 'assistant' | 'fixer' | 'orchestrator' | 'ask'>;
-/** The actions the row can open: the three role runs, and Ask for a side question. */
+/** The actions the row can open: the three role runs, and Quick question for a side question. */
 export type RowAction = RoleAction | 'ask';
 export const roleActions: Record<RoleAction, { label: string; prompt: string }> = {
   reviewer: { label: 'Review changes', prompt: 'Review the current changes.' },
@@ -23,9 +23,11 @@ export const roleActions: Record<RoleAction, { label: string; prompt: string }> 
 };
 
 export const ASK_NEEDS_TEXT = 'Type the question in the box first.';
-/** The Ask button names the family it will ask. */
+/** The composer action that opens the side question row. */
+export const QUICK_QUESTION = 'Quick question';
+/** The row's send button names the provider the question goes to. */
 export const askLabel = (selection: ChatModelSelection | null) =>
-  selection ? `Ask ${familyName(selection.family)}` : 'Ask another model';
+  selection ? `Send to ${familyName(selection.family)}` : 'Send the question';
 
 // The default is a family other than the one that answered last, so the second look is
 // independent. With one connected family, that family is the only choice.
@@ -37,10 +39,11 @@ function roleDefault(
 }
 
 /**
- * The Review changes, Second opinion and Challenge assumptions actions, and Ask. `row` is the
- * one-line picker under the text box while an action is open. The model is picked for this one turn
- * and the thread keeps its own. Ask sends the text in the box as a read-only question to the picked
- * family and posts the answer as a side reply, so it also works while a turn runs.
+ * The Review changes, Second opinion and Challenge assumptions actions, and Quick question. `row`
+ * is the one-line picker under the text box while an action is open. The model is picked for this
+ * one turn and the thread keeps its own. Quick question sends the text in the box as a read-only
+ * side question to the picked provider and posts the answer as a side reply, so it also works
+ * while a turn runs. It never starts the crew.
  */
 export function useRoleRun({
   source,
@@ -142,7 +145,7 @@ export function useRoleRun({
           nowMs={Date.now()}
           onOpen={onOpenCatalog}
           onSelect={setPick}
-          label={`${role === 'ask' ? askLabel(picked) : roleActions[role].label}: provider and model`}
+          label={`${role === 'ask' ? QUICK_QUESTION : roleActions[role].label}: provider and model`}
         />
         {role === 'ask' ? (
           <button
@@ -167,5 +170,7 @@ export function useRoleRun({
         </button>
       </div>
     ) : null;
-  return { role, why, toggle, row, askLabel: askLabel(picked) };
+  /** Send the box as the side question, when the Quick question row is open. */
+  const ask = role === 'ask' ? run : null;
+  return { role, why, toggle, row, ask };
 }

@@ -53,7 +53,13 @@ import { deliveryNote, deliveryOf } from './file-fit.ts';
 import { InstructionChip } from './instruction-chip.tsx';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
 import { NotesChip } from './project-notes.tsx';
-import { type RoleAction, roleActions, useRoleRun } from './role-row.tsx';
+import {
+  ASK_NEEDS_TEXT,
+  QUICK_QUESTION,
+  type RoleAction,
+  roleActions,
+  useRoleRun,
+} from './role-row.tsx';
 import { clearsDraft, slashEffect } from './slash-actions.ts';
 
 /**
@@ -318,6 +324,22 @@ export function Composer({
     const slash = files.length === 0 ? parseSlash(body) : null;
     if (slash) {
       void runSlash(slash.name, slash.argument);
+      return;
+    }
+    // With the Quick question row open, Send and Enter send the box as the side question to the
+    // provider picked there. It never goes to the thread as a message, so the crew does not start.
+    if (roles.ask) {
+      if (files.length > 0) {
+        setNote(
+          'A quick question takes text only. Remove the files, or close the row to send them.',
+        );
+        return;
+      }
+      if (body === '') {
+        setNote(ASK_NEEDS_TEXT);
+        return;
+      }
+      await roles.ask();
       return;
     }
     if (!canSend({ text: body, files: files.length, blocked, adding })) return;
@@ -649,11 +671,11 @@ export function Composer({
               disabled={roles.why('ask') !== null}
               title={
                 roles.why('ask') ??
-                'Ask one family a read-only question. The answer posts beside the thread.'
+                'Ask one provider a side question. The answer posts beside the thread and changes nothing.'
               }
               onClick={() => roles.toggle('ask')}
             >
-              {roles.askLabel}
+              {QUICK_QUESTION}
             </button>
           </div>
         )}

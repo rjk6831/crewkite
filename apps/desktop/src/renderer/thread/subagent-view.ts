@@ -13,7 +13,7 @@ const chipRoles: Record<ChatRole, string> = {
   challenger: 'Challenger',
   fixer: 'Fixer',
   orchestrator: 'Orchestrator',
-  ask: 'Ask',
+  ask: 'Side question',
 };
 
 export type TurnChip = {
