@@ -19,6 +19,7 @@ import { familyName } from '../components.tsx';
 import { formatSpan } from '../usage-gauges.tsx';
 import type { TryWithChoice } from './file-fit.ts';
 import { ModelPicker } from './model-picker.tsx';
+import { projectRelative } from './scratch-paths.ts';
 import { spawnCardBadge, subagentRows, unlistedLine } from './subagent-view.ts';
 import { SubagentBadge } from './turn-chip.tsx';
 import {
@@ -173,8 +174,8 @@ export function ToolCard({
         onClick={() => setOverride(!open)}
       >
         <Icon size={14} aria-hidden="true" />
-        <span className="th-card-title" title={block.title}>
-          {block.title}
+        <span className="th-card-title" title={projectRelative(block.title)}>
+          {projectRelative(block.title)}
         </span>
         {badge && <SubagentBadge badge={badge} />}
         <span className="th-tool-status">
