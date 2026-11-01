@@ -493,13 +493,13 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
 test('usage windows show plain names, and an unknown ID reads as words', () => {
   const rows = [
     ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
-    ['3p-5h', 'Third-party 5 h'],
-    ['3p-weekly', 'Third-party weekly'],
+    ['3p-5h', 'Non-Gemini models, 5 h'],
+    ['3p-weekly', 'Non-Gemini models, weekly'],
     ['weekly-fable', 'Fable, weekly'],
     ['weekly', 'Weekly'],
     ['five-hour', 'Five-hour'],
     ['gemini-pro_24h', 'Gemini pro 24 h'],
-    ['3p-daily', 'Third-party daily'],
+    ['3p-daily', 'Non-Gemini models daily'],
     ['---', '---'],
   ];
   for (const [id, name] of rows) assert.equal(windowLabel(id), name, id);

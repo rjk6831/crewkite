@@ -123,11 +123,13 @@ const windowNames = new Map([
   ['gemini-weekly', 'Weekly'],
   ['gemini-5h', 'Five-hour'],
   ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
-  ['3p-5h', 'Third-party 5 h'],
-  ['3p-weekly', 'Third-party weekly'],
+  // Google keeps a separate allowance, reported as 3p, for the other vendors' models it serves.
+  // The gemini windows above are the Gemini models' own.
+  ['3p-5h', 'Non-Gemini models, 5 h'],
+  ['3p-weekly', 'Non-Gemini models, weekly'],
 ]);
 const windowWords = new Map([
-  ['3p', 'third-party'],
+  ['3p', 'Non-Gemini models'],
   ['wtu', ''],
 ]);
 
