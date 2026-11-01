@@ -43,11 +43,11 @@ export const subagentActivityFields = {
  */
 export const AllowSubagentsSchema = z.boolean().optional();
 /**
- * Families whose subagents stay off until the person turns them on for a role. OpenAI child
- * approvals rely on the client passing the turn's approval policy to each child, which a live
- * check has yet to confirm.
+ * Families whose subagents stay off until the person turns them on for a role. None today: OpenAI
+ * joined the others once the d3-rc4 live check showed its subagent commands following the
+ * thread's approval policy.
  */
-export const SUBAGENTS_OFF_UNLESS_ALLOWED: readonly string[] = ['openai'];
+export const SUBAGENTS_OFF_UNLESS_ALLOWED: readonly string[] = [];
 export const allowsSubagents = (
   member: { allowSubagents?: boolean } | null | undefined,
   family?: string,
