@@ -111,6 +111,7 @@ export function Composer({
   onOpenCrew,
   onCatalog,
   localState,
+  startSelection = null,
   lastMessage = null,
   onNewThread,
   onOpenSettings,
@@ -135,6 +136,8 @@ export function Composer({
   onCatalog?: (catalog: ChatCatalogRead) => void;
   /** The saved Local setup, and a workspace read to get its current revision. */
   localState?: { setup: LocalSetup | null | undefined; refresh: () => Promise<WorkspaceState> };
+  /** The model the first message went to, while the new thread's record is on its way. */
+  startSelection?: ChatModelSelection | null;
   /** The newest message the person sent. Up in an empty box loads it back for editing. */
   lastMessage?: { text: string; files: readonly ChatAttachment[] } | null;
   /** The slash commands that move around the app. A view that cannot do one leaves it out. */
@@ -210,7 +213,15 @@ export function Composer({
   useEffect(() => {
     if (thread?.selection) setSelection(thread.selection);
   }, [thread?.selection]);
-  const chosen = selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
+  // A thread with a crew offers its builder before any catalog default, so the pick never floats
+  // with the allowance readings while an orchestrator or a plan answers.
+  const builder = thread?.crew?.members.find((member) => member.role === 'builder')?.selection;
+  const chosen =
+    selection ??
+    builder ??
+    startSelection ??
+    preferredSelection(catalog) ??
+    defaultSelection(catalog);
   // An unfinished @ mention at the caret, or a slash command name at the start of the box.
   const trigger = taskId ? findMentionTrigger(text, caret) : null;
   const triggerQuery = trigger?.query;

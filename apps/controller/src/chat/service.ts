@@ -2978,11 +2978,19 @@ export class ChatService {
     });
     this.putTurn(task, turn);
     // A fixer runs on the crew's pick, so the thread keeps the person's own. Plan slices run side
-    // by side, and the thread names one of them as its running turn.
+    // by side, and the thread names one of them as its running turn. An orchestrator answers in
+    // place of the builder, so a thread with no pick yet takes the crew builder: the composer then
+    // offers the builder for the next message, not a catalog default.
+    const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
     this.putThread(task, {
       ...thread,
       base,
-      selection: role === 'assistant' && slice === undefined ? selection : thread.selection,
+      selection:
+        role === 'assistant' && slice === undefined
+          ? selection
+          : role === 'orchestrator' && slice === undefined
+            ? (thread.selection ?? builder ?? null)
+            : thread.selection,
       activeTurnId: slice !== undefined && thread.activeTurnId ? thread.activeTurnId : turn.id,
     });
     effects.push(() => this.launch(turn));
