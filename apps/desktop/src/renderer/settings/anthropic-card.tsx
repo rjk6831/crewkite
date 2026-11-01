@@ -14,7 +14,7 @@ const signInText = (state: string | undefined) =>
 
 export function AnthropicCard({ header, workspace, entry, now, actions, scopes }: CardProps) {
   const connection = header.nativeConnections.find(({ family }) => family === 'anthropic');
-  const { reader, profiles, nextReadAt, cooldownSeconds } = clientFor(header, 'anthropic', now);
+  const { reader, clientReady, nextReadAt, cooldownSeconds } = clientFor(header, 'anthropic', now);
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const busy = actions.busy.anthropic;
   const message = actions.messages.anthropic;
@@ -39,12 +39,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
             <button
               type="button"
               className="button secondary"
-              disabled={
-                !connected ||
-                !profiles.some((profile) => profile.available) ||
-                busy ||
-                connection?.state === 'checking'
-              }
+              disabled={!connected || !clientReady || busy || connection?.state === 'checking'}
               onClick={() => void actions.checkAnthropic()}
             >
               Check Anthropic sign-in

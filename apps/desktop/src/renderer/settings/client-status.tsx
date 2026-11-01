@@ -35,6 +35,10 @@ export function clientFor(header: WorkspaceState, family: Family, now: number) {
         ? Math.max(1, Math.ceil((nextReadAt - now) / 1000))
         : 0,
     codingReady: profiles.some((profile) => profile.available),
+    // Anthropic chat, its quota reader and its sign-in check run the client found by version
+    // range. The pinned writer profiles are a separate route and go unavailable on any update.
+    clientReady:
+      family === 'anthropic' ? !!reader?.available : profiles.some((profile) => profile.available),
   };
 }
 
@@ -52,7 +56,7 @@ export function ClientStatus({
   facts?: boolean;
   children: ReactNode;
 }) {
-  const { label, reader, codingReady } = clientFor(header, family, now);
+  const { label, reader, codingReady, clientReady } = clientFor(header, family, now);
   // While Google setup is still working, its client line would read as a failure. It shows once
   // discovery has ended.
   const googleState = header.googleAcpSetup?.state;
@@ -71,13 +75,16 @@ export function ClientStatus({
       <div className="st-subhead">
         <h3>Client</h3>
         {!settling && (
-          <span>{codingReady ? 'Supported client present' : 'Supported client unavailable'}</span>
+          <span>{clientReady ? 'Supported client present' : 'Supported client unavailable'}</span>
         )}
       </div>
       {/* Profile codes read as errors here. The diagnostics export keeps them for a bug report. */}
       {facts && (
         <div className="facts-grid compact">
-          <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
+          {/* The Anthropic writer profiles are a separate route, so its card leaves this out. */}
+          {family !== 'anthropic' && (
+            <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
+          )}
           <Fact label="Last read" value={lastRead} />
         </div>
       )}
