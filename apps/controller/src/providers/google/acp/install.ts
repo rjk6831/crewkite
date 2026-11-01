@@ -20,7 +20,7 @@ import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createInflateRaw } from 'node:zlib';
 import { type AcpImportDependencies, type AcpImportResult, importGoogleAcp } from './import.ts';
-import { readGoogleAcpPin, validateAcpDirectory } from './profile.ts';
+import { readGoogleAcpPinAsync, validateAcpDirectory } from './profile.ts';
 
 type ReleaseFile = { name: string; bytes: number; compressed: number; sha256: string };
 type Release = { url: string; bytes: number; sha256: string; files: readonly ReleaseFile[] };
@@ -354,7 +354,7 @@ export async function installGoogleAcp(
       validateAcpDirectory(options.home);
       if (existsSync(join(options.home, 'providers/google-acp-v1/pin.json'))) {
         try {
-          const client = readGoogleAcpPin(options.home);
+          const client = await readGoogleAcpPinAsync(options.home);
           return client.version === '1.4.0' &&
             client.signerTeamId === 'EQHXZ8M8AV' &&
             client.sha256 === expected.files[0]?.sha256 &&

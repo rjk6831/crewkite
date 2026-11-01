@@ -7,7 +7,9 @@ import {
   openSync,
   readdirSync,
   readSync,
+  type Stats,
 } from 'node:fs';
+import { lstat, open } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import {
@@ -138,25 +140,49 @@ export function acpReviewMappingMatchesClient(
   );
 }
 
-/** Spawn keeps the default full hash. Only profile resolution reuses a matching digest. */
-export function validateAcpClientIdentity(
-  client: AcpClientIdentity,
-  reuse = false,
-): AcpClientIdentity {
+function parseAcpClientIdentity(client: AcpClientIdentity): AcpClientIdentity {
   const parsed = z
     .strictObject({ ...AcpImportIdentitySchema.shape, executable: z.string().min(1).max(4096) })
     .parse(client);
   if (!isAbsolute(parsed.executable) || resolve(parsed.executable) !== parsed.executable)
     throw new Error('Invalid managed executable path.');
+  return parsed;
+}
+
+const harnessPath = (executable: string) => join(dirname(executable), 'localharness_external');
+
+/** Spawn keeps the default full hash. Only profile resolution reuses a matching digest. */
+export function validateAcpClientIdentity(
+  client: AcpClientIdentity,
+  reuse = false,
+): AcpClientIdentity {
+  const parsed = parseAcpClientIdentity(client);
   if (hashAcpPrivateFile(parsed.executable, AcpServerMaximumBytes, true, reuse) !== parsed.sha256)
     throw new Error('Managed executable changed.');
   if (
-    hashAcpPrivateFile(
-      join(dirname(parsed.executable), 'localharness_external'),
+    hashAcpPrivateFile(harnessPath(parsed.executable), AcpHarnessMaximumBytes, true, reuse) !==
+    parsed.harnessSha256
+  )
+    throw new Error('Managed harness changed.');
+  return parsed;
+}
+
+/** The same full check, read in pieces that let other work run between them. */
+export async function validateAcpClientIdentityAsync(
+  client: AcpClientIdentity,
+): Promise<AcpClientIdentity> {
+  const parsed = parseAcpClientIdentity(client);
+  if (
+    (await hashAcpPrivateFileAsync(parsed.executable, AcpServerMaximumBytes, true)) !==
+    parsed.sha256
+  )
+    throw new Error('Managed executable changed.');
+  if (
+    (await hashAcpPrivateFileAsync(
+      harnessPath(parsed.executable),
       AcpHarnessMaximumBytes,
       true,
-      reuse,
-    ) !== parsed.harnessSha256
+    )) !== parsed.harnessSha256
   )
     throw new Error('Managed harness changed.');
   return parsed;
@@ -227,24 +253,48 @@ export function validateAcpDirectory(directory: string, privateRoot?: string): s
   return directory;
 }
 
+const privateFlags = constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK;
+
+function checkPrivateFile(state: Stats, maximum: number, executable: boolean) {
+  if (
+    !state.isFile() ||
+    state.nlink !== 1 ||
+    state.uid !== process.getuid?.() ||
+    state.size < 1 ||
+    state.size > maximum ||
+    (state.mode & 0o7077) !== 0 ||
+    (executable && (state.mode & 0o700) !== 0o500)
+  )
+    throw new Error('Invalid private file.');
+}
+
+function checkPrivateFileHeld(before: Stats, after: Stats, trailing: number, current: Stats) {
+  if (
+    trailing !== 0 ||
+    before.ino !== after.ino ||
+    before.dev !== after.dev ||
+    before.size !== after.size ||
+    before.mtimeMs !== after.mtimeMs ||
+    before.ctimeMs !== after.ctimeMs
+  )
+    throw new Error('Private file changed while reading.');
+  if (current.ino !== after.ino || current.dev !== after.dev || current.isSymbolicLink())
+    throw new Error('Private file was replaced.');
+}
+
+/**
+ * The managed client is about 400 MB. One read of the whole file into one buffer, then one hash of
+ * it, held the event loop for seconds, and every socket in the controller waited. Reads of large
+ * files go in pieces of this size, which take a few milliseconds each.
+ */
+export const ACP_READ_PIECE_BYTES = 8 * 1024 * 1024;
+
 export function readAcpPrivateFile(path: string, maximum: number, executable = false): Buffer {
   validateAcpDirectory(dirname(path));
-  const descriptor = openSync(
-    path,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
+  const descriptor = openSync(path, privateFlags);
   try {
     const before = fstatSync(descriptor);
-    if (
-      !before.isFile() ||
-      before.nlink !== 1 ||
-      before.uid !== process.getuid?.() ||
-      before.size < 1 ||
-      before.size > maximum ||
-      (before.mode & 0o7077) !== 0 ||
-      (executable && (before.mode & 0o700) !== 0o500)
-    )
-      throw new Error('Invalid private file.');
+    checkPrivateFile(before, maximum, executable);
     const bytes = Buffer.alloc(before.size);
     let offset = 0;
     while (offset < bytes.length) {
@@ -253,21 +303,76 @@ export function readAcpPrivateFile(path: string, maximum: number, executable = f
       offset += count;
     }
     const after = fstatSync(descriptor);
-    if (
-      readSync(descriptor, Buffer.alloc(1), 0, 1, null) !== 0 ||
-      before.ino !== after.ino ||
-      before.dev !== after.dev ||
-      before.size !== after.size ||
-      before.mtimeMs !== after.mtimeMs ||
-      before.ctimeMs !== after.ctimeMs
-    )
-      throw new Error('Private file changed while reading.');
-    const current = lstatSync(path);
-    if (current.ino !== after.ino || current.dev !== after.dev || current.isSymbolicLink())
-      throw new Error('Private file was replaced.');
+    const trailing = readSync(descriptor, Buffer.alloc(1), 0, 1, null);
+    checkPrivateFileHeld(before, after, trailing, lstatSync(path));
     return bytes;
   } finally {
     closeSync(descriptor);
+  }
+}
+
+/** The sha256 of a private file, read with the same checks as `readAcpPrivateFile`. */
+function digestAcpPrivateFile(path: string, maximum: number, executable: boolean): string {
+  validateAcpDirectory(dirname(path));
+  const descriptor = openSync(path, privateFlags);
+  try {
+    const before = fstatSync(descriptor);
+    checkPrivateFile(before, maximum, executable);
+    const hash = createHash('sha256');
+    const piece = Buffer.allocUnsafe(Math.min(before.size, ACP_READ_PIECE_BYTES));
+    let offset = 0;
+    while (offset < before.size) {
+      const count = readSync(
+        descriptor,
+        piece,
+        0,
+        Math.min(piece.length, before.size - offset),
+        null,
+      );
+      if (count === 0) throw new Error('Private file changed while reading.');
+      hash.update(piece.subarray(0, count));
+      offset += count;
+    }
+    const after = fstatSync(descriptor);
+    const trailing = readSync(descriptor, Buffer.alloc(1), 0, 1, null);
+    checkPrivateFileHeld(before, after, trailing, lstatSync(path));
+    return hash.digest('hex');
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+/** The same digest, one awaited piece at a time, so sockets and timers run between pieces. */
+async function digestAcpPrivateFileAsync(
+  path: string,
+  maximum: number,
+  executable: boolean,
+): Promise<string> {
+  validateAcpDirectory(dirname(path));
+  const file = await open(path, privateFlags);
+  try {
+    const before = await file.stat();
+    checkPrivateFile(before, maximum, executable);
+    const hash = createHash('sha256');
+    const piece = Buffer.allocUnsafe(Math.min(before.size, ACP_READ_PIECE_BYTES));
+    let offset = 0;
+    while (offset < before.size) {
+      const { bytesRead } = await file.read(
+        piece,
+        0,
+        Math.min(piece.length, before.size - offset),
+        null,
+      );
+      if (bytesRead === 0) throw new Error('Private file changed while reading.');
+      hash.update(piece.subarray(0, bytesRead));
+      offset += bytesRead;
+    }
+    const after = await file.stat();
+    const { bytesRead: trailing } = await file.read(Buffer.alloc(1), 0, 1, null);
+    checkPrivateFileHeld(before, after, trailing, await lstat(path));
+    return hash.digest('hex');
+  } finally {
+    await file.close();
   }
 }
 
@@ -302,14 +407,26 @@ export function hashAcpPrivateFile(
   const key = digestKey(path, maximum, executable);
   const known = digests.get(path);
   if (reuse && known?.key === key) return known.sha256;
-  const sha256 = createHash('sha256')
-    .update(readAcpPrivateFile(path, maximum, executable))
-    .digest('hex');
+  const sha256 = digestAcpPrivateFile(path, maximum, executable);
   if (digestKey(path, maximum, executable) === key) digests.set(path, { key, sha256 });
   return sha256;
 }
 
-export function readGoogleAcpPin(home: string, reuse = false): AcpClientIdentity {
+/** A full hash that never reuses a digest. It leaves one behind for profile resolution. */
+export async function hashAcpPrivateFileAsync(
+  path: string,
+  maximum: number,
+  executable = false,
+): Promise<string> {
+  validateAcpDirectory(dirname(path));
+  const key = digestKey(path, maximum, executable);
+  const sha256 = await digestAcpPrivateFileAsync(path, maximum, executable);
+  if (digestKey(path, maximum, executable) === key) digests.set(path, { key, sha256 });
+  return sha256;
+}
+
+/** The pinned identity, checked against its receipts and layout. The files are not hashed yet. */
+function readGoogleAcpPinRecord(home: string): AcpClientIdentity {
   validateAcpDirectory(home);
   const root = join(home, 'providers/google-acp-v1');
   validateAcpDirectory(root, home);
@@ -332,14 +449,16 @@ export function readGoogleAcpPin(home: string, reuse = false): AcpClientIdentity
     JSON.stringify(['agy_acp_server.par', 'localharness_external'])
   )
     throw new Error('Managed bundle contains unexpected files.');
-  return validateAcpClientIdentity(
-    {
-      ...pin.client,
-      harnessSha256: pin.harness.sha256,
-      executable,
-    },
-    reuse,
-  );
+  return { ...pin.client, harnessSha256: pin.harness.sha256, executable };
+}
+
+export function readGoogleAcpPin(home: string, reuse = false): AcpClientIdentity {
+  return validateAcpClientIdentity(readGoogleAcpPinRecord(home), reuse);
+}
+
+/** The full check of `readGoogleAcpPin`, for callers that can wait for it. */
+export async function readGoogleAcpPinAsync(home: string): Promise<AcpClientIdentity> {
+  return validateAcpClientIdentityAsync(readGoogleAcpPinRecord(home));
 }
 
 export type AcpProfileResolution = {

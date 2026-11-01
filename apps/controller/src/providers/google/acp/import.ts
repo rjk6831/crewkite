@@ -1,5 +1,4 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -12,10 +11,12 @@ import {
   readdirSync,
   writeFileSync,
 } from 'node:fs';
+import { open } from 'node:fs/promises';
 import { basename, dirname, join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { groupAbsent, type Schedule } from '../../../host/worker.ts';
 import {
+  ACP_READ_PIECE_BYTES,
   type AcpClientIdentity,
   type AcpClientPin,
   AcpHarnessMaximumBytes,
@@ -24,8 +25,9 @@ import {
   AcpServerMaximumBytes,
   acpClientPin,
   googleAcpDeveloperIdRequirement,
+  hashAcpPrivateFileAsync,
   readAcpPrivateFile,
-  readGoogleAcpPin,
+  readGoogleAcpPinAsync,
   validateAcpDirectory,
 } from './profile.ts';
 
@@ -290,6 +292,52 @@ function writePrivate(path: string, bytes: Buffer, mode: number) {
   }
 }
 
+/**
+ * Copies a staged client file into the managed folder one piece at a time, then syncs it and its
+ * folder. The caller hashes the copy before trusting it.
+ */
+async function copyPrivate(source: string, path: string, maximum: number, mode: number) {
+  const input = await open(
+    source,
+    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
+  );
+  try {
+    const output = await open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    try {
+      const piece = Buffer.allocUnsafe(ACP_READ_PIECE_BYTES);
+      let total = 0;
+      for (;;) {
+        const { bytesRead } = await input.read(piece, 0, piece.length, null);
+        if (bytesRead === 0) break;
+        total += bytesRead;
+        if (total > maximum) throw new Error('Invalid private file.');
+        let written = 0;
+        while (written < bytesRead)
+          written += (await output.write(piece, written, bytesRead - written)).bytesWritten;
+      }
+      await output.chmod(mode);
+      await output.sync();
+    } finally {
+      await output.close();
+    }
+  } finally {
+    await input.close();
+  }
+  const directory = await open(
+    dirname(path),
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
+}
+
 function managedSnapshot(home: string, executable: string): string {
   validateAcpDirectory(dirname(executable), home);
   const paths = [home];
@@ -355,20 +403,20 @@ export async function importGoogleAcp(
         sha256: identity.harnessSha256,
         maximum: AcpHarnessMaximumBytes,
       },
-    ].map((file) => ({
-      ...file,
-      source: join(staging, file.name),
-      bytes: readAcpPrivateFile(join(staging, file.name), file.maximum),
-    }));
-    if (files.some((file) => createHash('sha256').update(file.bytes).digest('hex') !== file.sha256))
-      return refused('invalid-import');
+    ].map((file) => ({ ...file, source: join(staging, file.name) }));
+    // The client files are hashed and copied in pieces. A Local connect or any other socket in the
+    // controller keeps running while the import reads about 400 MB several times.
+    const holds = async (path: string, file: (typeof files)[number], executable = false) =>
+      (await hashAcpPrivateFileAsync(path, file.maximum, executable)) === file.sha256;
+    for (const file of files)
+      if (!(await holds(file.source, file))) return refused('invalid-import');
     const root = join(options.home, 'providers/google-acp-v1');
     const pinPath = join(root, 'pin.json');
     const matchesIdentity = (current: AcpClientIdentity) =>
       JSON.stringify(acpClientPin(current)) === JSON.stringify(client) &&
       current.harnessSha256 === identity.harnessSha256;
     if (existsSync(pinPath)) {
-      const current = readGoogleAcpPin(options.home);
+      const current = await readGoogleAcpPinAsync(options.home);
       return matchesIdentity(current)
         ? { imported: true, reason: 'already-imported', client: current }
         : refused('pin-conflict');
@@ -379,9 +427,9 @@ export async function importGoogleAcp(
     privateDirectory(managed, options.home);
     for (const file of files) {
       const destination = join(managed, file.name);
-      if (!existsSync(destination)) writePrivate(destination, file.bytes, 0o500);
-      if (!readAcpPrivateFile(destination, file.maximum, true).equals(file.bytes))
-        return refused('invalid-import');
+      if (!existsSync(destination))
+        await copyPrivate(file.source, destination, file.maximum, 0o500);
+      if (!(await holds(destination, file, true))) return refused('invalid-import');
     }
     if (
       JSON.stringify(readdirSync(managed).sort()) !== JSON.stringify(files.map((file) => file.name))
@@ -406,14 +454,15 @@ export async function importGoogleAcp(
         )
           return refused('signature-refused');
         receipts.push(receipt);
+        if (managedSnapshot(options.home, executable) !== snapshot)
+          return refused('invalid-import');
+        for (const entry of files)
+          if (
+            !(await holds(join(managed, entry.name), entry, true)) ||
+            !(await holds(entry.source, entry))
+          )
+            return refused('invalid-import');
         if (
-          managedSnapshot(options.home, executable) !== snapshot ||
-          !files.every(
-            (entry) =>
-              readAcpPrivateFile(join(managed, entry.name), entry.maximum, true).equals(
-                entry.bytes,
-              ) && readAcpPrivateFile(entry.source, entry.maximum).equals(entry.bytes),
-          ) ||
           !readAcpPrivateFile(join(staging, 'identity.json'), 4096).equals(identityBytes) ||
           managedSnapshot(options.home, executable) !== snapshot
         )
@@ -444,7 +493,7 @@ export async function importGoogleAcp(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
-    const current = readGoogleAcpPin(options.home);
+    const current = await readGoogleAcpPinAsync(options.home);
     if (!matchesIdentity(current)) return refused('pin-conflict');
     return { imported: true, reason: 'imported', client: current };
   } catch {
