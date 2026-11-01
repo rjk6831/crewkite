@@ -101,40 +101,6 @@
   justify-self: start;
 }
 
-/* The crew picker: one button per preset, the thread's own crew pressed. Solo and Pair are the
-   way back from Full crew. */
-.th-crew-presets {
-  display: grid;
-  gap: 6px;
-  min-width: 0;
-  margin: 0;
-  padding: 0;
-  border: 0;
-}
-.th-crew-presets legend {
-  margin-bottom: 6px;
-  padding: 0;
-  color: var(--text-dim);
-  font-size: 12px;
-}
-.th-crew-preset-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-.th-crew-preset-row .th-pill {
-  height: 28px;
-  padding: 0 10px;
-}
-.th-crew-preset-row .th-pill[aria-pressed="true"] {
-  border-color: var(--accent);
-  background: var(--surface-hover);
-  color: var(--text);
-  font-weight: 600;
-}
-.th-crew-presets:disabled .th-pill {
-  opacity: 0.55;
-}
 /* Done closes the panel. */
 .th-crew-done {
   display: flex;
@@ -142,4 +108,84 @@
 }
 .th-crew-done .th-button {
   margin-top: 0;
+}
+
+/* The Crew Constructor dialog in Settings > Crews. */
+.crew-dialog-body {
+  display: grid;
+  gap: 18px;
+  padding: 20px 24px;
+}
+.crew-dialog-field {
+  display: grid;
+  gap: 6px;
+}
+.crew-dialog-field input,
+.crew-dialog-field select {
+  max-width: 360px;
+}
+.crew-dialog-problem {
+  color: var(--red);
+  font-size: 11px;
+}
+.crew-dialog-roles {
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.crew-dialog-roles legend {
+  margin-bottom: 4px;
+  padding: 0;
+}
+.crew-dialog-role {
+  display: grid;
+  grid-template-columns: 140px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+}
+.crew-dialog-role .role-name {
+  padding-top: 6px;
+}
+.crew-dialog-role > .st-hint {
+  padding-top: 7px;
+}
+
+/* Saved crews in Settings > Crews. */
+.st-saved-crews {
+  flex-direction: column;
+  align-items: flex-start;
+}
+.st-saved-list {
+  display: grid;
+  gap: 8px;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.st-saved-list li {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.st-saved-list .st-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+.st-project-crew {
+  grid-template-columns: minmax(84px, 180px) auto;
+  justify-content: start;
+}
+.st-project-crew label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

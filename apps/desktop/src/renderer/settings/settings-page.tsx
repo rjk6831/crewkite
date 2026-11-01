@@ -4,6 +4,7 @@ import { useEffect } from 'react';
 import type { Workspace } from '../source.ts';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { AnthropicCard } from './anthropic-card.tsx';
+import { CrewsCard } from './crews-card.tsx';
 import { ExtensionsCard } from './extensions-card.tsx';
 import { GeneralCard } from './general-card.tsx';
 import { GoogleCard } from './google-card.tsx';
@@ -100,6 +101,7 @@ export function SettingsPage({
           source={workspace.source}
           threadId={threadId}
         />
+        <CrewsCard catalog={catalog} projects={workspace.projects} />
         <OpenAiCard {...card} entry={entry('openai')} modelRead={modelRead} />
         <AnthropicCard {...card} entry={entry('anthropic')} />
         <GoogleCard {...card} entry={entry('google')} />

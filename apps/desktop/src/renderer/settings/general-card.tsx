@@ -1,44 +1,23 @@
 import type { DesktopSource } from '@crewkite/client';
-import {
-  allowsSubagents,
-  type ChatCatalogRead,
-  type ChatModelSelection,
-} from '@crewkite/contracts';
+import type { ChatCatalogRead, ChatModelSelection } from '@crewkite/contracts';
 import { useState } from 'react';
 import { familyName } from '../components.tsx';
 import { runExport } from '../diagnostics.tsx';
 import { effortLevels, shownEffort } from '../thread/model-groups.ts';
 import { EffortSelect } from '../thread/model-picker.tsx';
-import { RoleInfo } from '../thread/role-info.tsx';
 import {
-  type CrewPreset,
-  crewPresetHints,
-  crewRoleNames,
   handoffModes,
   permissionPolicies,
-  readCrewPresets,
   readThreadDefaults,
   type ThreadDefaults,
-  writeCrewPresets,
   writeThreadDefaults,
 } from './preferences.ts';
-import '../thread/crew.css';
-import { SubagentSwitch } from '../thread/subagent-switch.tsx';
 
 const auto = 'auto';
 const saved_ = 'saved';
 
 type Entry = ChatCatalogRead['families'][number];
 type Choice = { entry: Entry; model: Entry['models'][number] };
-
-const presetId = (name: string) => name.toLowerCase().replace(/\s+/g, '-');
-// The fixer and the orchestrator are the builder's model unless the person pins another.
-const autoLabel = (role: string) =>
-  role === 'builder'
-    ? "The thread's model"
-    : role === 'fixer' || role === 'orchestrator'
-      ? 'Same as the builder'
-      : 'Another connected family';
 
 /** Every connected model as a pick, in catalog order. */
 export const modelChoices = (catalog: ChatCatalogRead | null): Choice[] =>
@@ -179,25 +158,6 @@ export function GeneralCard({
     setSaved(next);
     writeThreadDefaults(next);
   };
-  const [presets, setPresets] = useState<CrewPreset[]>(() => readCrewPresets());
-  const pin = (
-    name: CrewPreset['name'],
-    role: string,
-    change: Partial<Pick<CrewPreset['members'][number], 'selection' | 'allowSubagents'>>,
-  ) => {
-    const next = presets.map((preset) =>
-      preset.name === name
-        ? {
-            ...preset,
-            members: preset.members.map((member) =>
-              member.role === role ? { ...member, ...change } : member,
-            ),
-          }
-        : preset,
-    );
-    setPresets(next);
-    writeCrewPresets(next);
-  };
   const mode = handoffModes.find(({ id }) => id === saved.handoffMode) ?? handoffModes[0];
   const choices = modelChoices(catalog);
   return (
@@ -278,61 +238,6 @@ export function GeneralCard({
                 </option>
               ))}
             </select>
-          </div>
-        </div>
-        {presets.map((preset) => (
-          <div key={preset.name} className="st-row">
-            <span className="st-field">
-              <span className="st-name">Crew preset: {preset.name}</span>
-              <small className="st-hint">
-                {crewPresetHints[preset.name]} A thread picks it under Crew in the inspector.
-              </small>
-            </span>
-            <div className="st-controls st-crew">
-              {preset.members.map((member) => (
-                <div key={member.role} className="st-crew-role">
-                  <span className="role-name">
-                    <label htmlFor={`settings-${presetId(preset.name)}-${member.role}`}>
-                      {crewRoleNames[member.role]}
-                    </label>
-                    <RoleInfo of={member.role} />
-                  </span>
-                  <span className="st-crew-pick">
-                    <SelectionFields
-                      id={`settings-${presetId(preset.name)}-${member.role}`}
-                      effortLabel={`${preset.name} ${crewRoleNames[member.role]} effort`}
-                      choices={choices}
-                      value={member.selection}
-                      autoText={autoLabel(member.role)}
-                      onChange={(selection) => pin(preset.name, member.role, { selection })}
-                    />
-                    <SubagentSwitch
-                      id={`settings-${presetId(preset.name)}-${member.role}-subagents`}
-                      role={`${preset.name} ${crewRoleNames[member.role]}`}
-                      family={member.selection?.family ?? null}
-                      checked={allowsSubagents(member, member.selection?.family)}
-                      onChange={(allowSubagents) =>
-                        pin(preset.name, member.role, { allowSubagents })
-                      }
-                    />
-                  </span>
-                </div>
-              ))}
-            </div>
-          </div>
-        ))}
-        <div className="st-row">
-          <span className="st-field">
-            <span className="st-name">Other roles</span>
-            <small className="st-hint">A thread runs these outside any crew preset.</small>
-          </span>
-          <div className="st-controls st-crew">
-            <span className="role-name">
-              Advisor <RoleInfo of="advisor" />
-            </span>
-            <span className="role-name">
-              Ask <RoleInfo of="ask" />
-            </span>
           </div>
         </div>
         <div className="st-row">

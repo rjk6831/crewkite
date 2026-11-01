@@ -32,18 +32,17 @@ import {
   useExtensions,
 } from '../extension-slots.tsx';
 import { clientFor } from '../settings/client-status.tsx';
+import { CrewSelect, useCrewChoices } from '../settings/crews-card.tsx';
 import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
 import { McpThreadMenu } from '../settings/mcp-card.tsx';
 import {
+  choiceNamed,
   crewFromPreset,
-  crewPresetHints,
-  crewPresetNames,
   crewRoleNames,
   flightModes,
   flightPreset,
   handoffModes,
   permissionPolicies,
-  readCrewPresets,
 } from '../settings/preferences.ts';
 import { useProviderActions } from '../settings/provider-actions.ts';
 import { useCatalog } from '../settings/use-catalog.ts';
@@ -567,7 +566,9 @@ function CrewTab({
   const [note, setNote] = useState<string | null>(null);
   const crew = thread?.crew ?? null;
   const mode = flightModes.find(({ id }) => id === thread?.flightMode) ?? flightModes[0];
-  const choices = modelChoices(catalog);
+  const models = modelChoices(catalog);
+  const { choices } = useCrewChoices();
+  const current = choiceNamed(choices, crew?.name);
   const idBase = useId();
   // Builder turns run on the thread's selection, which the composer follows. Moving it in the same
   // configure call keeps the builder row and the composer on one model.
@@ -610,11 +611,13 @@ function CrewTab({
       },
     });
   }
-  // A preset replaces the whole crew, so Solo or Pair is the way back from Full crew. The flight
-  // mode travels in the same call when the person picked one before the thread had a crew.
-  function start(name: string, flightMode?: ChatFlightMode) {
-    const preset = readCrewPresets().find((value) => value.name === name);
-    if (!preset || !thread) return;
+  // A crew replaces the whole crew, so Solo or Pair is the way back from Full crew. A saved crew
+  // brings its own flight mode. A mode the person picked before the thread had a crew travels in
+  // the same call.
+  function start(id: string, flightMode?: ChatFlightMode) {
+    const choice = choices.find((value) => value.id === id);
+    const preset = choice?.template;
+    if (!choice || !preset || !thread) return;
     const next = catalog && crewFromPreset(preset, catalog, thread.selection, thread.handoffMode);
     setNote(next ? null : 'Connect a provider in Settings, then pick a crew.');
     if (!next) return;
@@ -624,50 +627,46 @@ function CrewTab({
       (builder.family !== thread.selection?.family ||
         builder.model !== thread.selection?.model ||
         builder.effort !== thread.selection?.effort);
+    const mode = flightMode ?? choice.flightMode;
     onConfigure({
       crew: next,
       ...(moved ? { selection: builder } : {}),
-      ...(flightMode ? { flightMode } : {}),
+      ...(mode ? { flightMode: mode } : {}),
     });
   }
   // Balanced or Glide on a thread with no crew starts Solo with that mode. See flightPreset.
   function fly(next: ChatFlightMode) {
     const preset = flightPreset(crew !== null, next);
-    if (preset) start(preset, next);
+    if (preset) start(`preset:${preset}`, next);
     else onConfigure({ flightMode: next });
   }
   return (
     <div className="th-facts">
       <dl>
-        <dt>Crew</dt>
-        <dd>{crew?.name ?? 'None yet'}</dd>
         <dt>Chain</dt>
         <dd>{chainLine(thread?.crewChain ?? null)}</dd>
       </dl>
-      <fieldset className="th-crew-presets" disabled={!thread}>
-        <legend>Crew</legend>
-        <div className="th-crew-preset-row">
-          {crewPresetNames.map((name) => (
-            <button
-              key={name}
-              type="button"
-              className="th-pill th-outline"
-              aria-pressed={crew?.name === name}
-              title={crewPresetHints[name]}
-              onClick={() => start(name)}
-            >
-              {name}
-            </button>
-          ))}
-        </div>
-      </fieldset>
+      <label htmlFor={`${idBase}-crew`}>
+        Crew
+        <CrewSelect
+          id={`${idBase}-crew`}
+          value={current?.id ?? ''}
+          placeholder={crew ? `${crew.name} (no longer saved)` : 'None yet'}
+          choices={choices}
+          disabled={!thread}
+          onChange={(id) => start(id)}
+        />
+      </label>
+      <p className="th-muted">
+        {current?.hint ?? 'Pick a preset or a crew you saved in Settings > Crews.'}
+      </p>
       <ul className="th-crew-roles" aria-label="Roles">
         {ChatCrewRoleSchema.options.map((role) => {
           const member = crew?.members.find((value) => value.role === role);
           // The fixer is the builder again unless the crew names its own.
           const fallback = role === 'fixer' && crew ? 'The builder, with the findings' : null;
           // A role stays read only until the catalog arrives, so its select never shows a gap.
-          const editable = member && choices.length > 0;
+          const editable = member && models.length > 0;
           return (
             <li key={role}>
               <span className="role-name">
@@ -685,7 +684,7 @@ function CrewTab({
                   <SelectionFields
                     id={`${idBase}-${role}`}
                     effortLabel={`${crewRoleNames[role]} effort`}
-                    choices={choices}
+                    choices={models}
                     value={member.selection}
                     onChange={(selection) => assign(role, selection)}
                   />
