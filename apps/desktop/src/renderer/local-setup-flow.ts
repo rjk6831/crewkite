@@ -40,8 +40,6 @@ export const WITHOUT_TOKEN = 'Connected without a token. The runtime has auth of
 
 /** The line while a Connect waits for the connection and the first model read. */
 export const WAITING_LINE = 'Waiting for the connection and model metadata.';
-/** The line when an action meets a model read the card started on its own. */
-export const READING_LINE = 'Local is reading its models. Try again in a moment.';
 
 const ready = (
   setup:
@@ -53,14 +51,13 @@ const ready = (
 /**
  * The notices under the status line, kept to what is true now. The line from the last action
  * goes when its condition ends: the waiting line once the connection is read or the follow
- * stops, the reading line once that read ends. The last-seen age shows while the list is not
- * being read again, and the no-token line once a Connect has finished.
+ * stops. The last-seen age shows while the list is not being read again, and the no-token line
+ * once a Connect has finished.
  */
 export function localNotices({
   setup,
   message,
   following,
-  reading,
   connected,
   stamp,
 }: {
@@ -74,8 +71,6 @@ export function localNotices({
   message: string | null;
   /** A Connect is following the connection to its first read. */
   following: boolean;
-  /** A model read the card started on its own is running. */
-  reading: boolean;
   /** The connection the card counts as up. */
   connected: boolean;
   stamp: string | null;
@@ -83,10 +78,7 @@ export function localNotices({
   const done = ready(setup);
   const settling = (following && !done) || !!setup?.operation;
   return {
-    message:
-      (message === WAITING_LINE && (!following || done)) || (message === READING_LINE && !reading)
-        ? null
-        : message,
+    message: message === WAITING_LINE && (!following || done) ? null : message,
     stamp: stamp && !(connected && settling) ? stamp : null,
     withoutToken: connected && setup?.connectedWithoutToken === true && !settling,
   };
@@ -314,15 +306,41 @@ const applied = (result: CommandResult) =>
 export async function connectLocalFlow({
   setup,
   endpoint,
-  command,
+  command: send,
   active,
+  wait,
+  tries = 30,
 }: {
   setup: LocalSetup;
   endpoint: string;
   command: (input: DesktopCommand) => Promise<CommandResult>;
   active: () => boolean;
+  /**
+   * Pause before a command the controller refused because a model read runs. Without it the
+   * refusal ends the connect.
+   */
+  wait?: () => Promise<void>;
+  tries?: number;
 }): Promise<LocalConnectResult> {
   let revision = setup.revision;
+  // A model read started elsewhere holds the runtime until it ends. Connect waits for it and
+  // then goes on, on the revision the read left.
+  const command = async (
+    input: Extract<DesktopCommand, { command: 'ConfigureLocal' | 'BeginLocalConnectionInput' }>,
+  ) => {
+    let result = await send(input);
+    for (let attempt = 1; wait && attempt < tries; attempt++) {
+      if (result.reason !== 'local-operation-active' || !active()) break;
+      await wait();
+      if (!active()) break;
+      result = await send({ ...input, expectedRevision: result.revision ?? revision });
+      if (result.outcome === 'stale-revision' && result.revision !== undefined) {
+        revision = result.revision;
+        result = await send({ ...input, expectedRevision: revision });
+      }
+    }
+    return result;
+  };
   const saved = setup.authMode ?? 'token';
   const configure = async (authMode: 'token' | 'none') => {
     const result = await command({
