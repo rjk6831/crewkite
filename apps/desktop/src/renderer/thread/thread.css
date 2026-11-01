@@ -697,6 +697,11 @@
   line-height: 1.5;
   white-space: pre-wrap;
 }
+/* A command line wraps at any point, so a long one never needs a sideways scroll. */
+.th-permission pre {
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
+}
 /* A folded run of reads and searches. The summary reads as a sentence, the cards inside keep paths. */
 .th-run {
   display: grid;
