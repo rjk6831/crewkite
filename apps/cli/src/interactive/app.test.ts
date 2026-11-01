@@ -150,7 +150,7 @@ test('the interactive app sends a typed message, answers a permission by digit a
   assert.equal(saved, 0);
 });
 
-test('the interactive app lets /provider and /model set the first turn before any message is sent', {
+test('the interactive app lets /provider, the /model list and /model id set the first turn', {
   timeout: 60_000,
 }, async (t) => {
   const { home, repository } = await startScriptedController(t, [
@@ -184,26 +184,52 @@ test('the interactive app lets /provider and /model set the first turn before an
   await screen.shows('/provider anthropic');
   screen.type('\r');
   await screen.shows('First message: Anthropic');
-  const firstDefault = /First message: Anthropic (\S+)\./.exec(screen.stdout.screen)?.[1];
+  const firstDefault = /First message: Anthropic ([^\s.]+)/.exec(screen.stdout.screen)?.[1];
   assert.equal((await client.listThreads()).threads.length, 0);
-  // An unknown model lists the choices, and naming one of them sets the first turn.
+  // An ID no family lists opens the model list filtered by it, with nothing matching.
   screen.type('/model none');
   await screen.shows('/model none');
   screen.type('\r');
-  await screen.shows('Models: ');
-  const listed = /Models: ([^\n]+)/.exec(screen.stdout.screen)?.[1]?.split(', ') ?? [];
-  const chosen = listed.find((model) => model !== firstDefault);
-  assert.ok(chosen);
-  screen.type(`/model ${chosen}`);
-  await screen.shows(`/model ${chosen}`);
+  await screen.shows('No connected model matches.');
+  await screen.shows('No connected provider lists none.');
+  for (let i = 0; i < 4; i++) screen.type('\u007f');
+  await screen.shows('A Anthropic');
+  // Typing filters the list, Right moves the row's effort and Enter picks it.
+  const models = (await client.readCatalog()).families.find(
+    (entry) => entry.family === 'anthropic',
+  )?.models;
+  const target = models?.find((model) => model.model !== firstDefault);
+  assert.ok(target);
+  const levels = target.efforts.filter((effort) => effort !== 'default');
+  screen.type(target.model);
+  await screen.shows(`matching ${target.model}`);
+  await screen.shows(`› ${target.model}`);
+  screen.type('\u001b[C');
+  const effort =
+    levels.length === 0
+      ? target.defaultEffort
+      : levels[Math.min(levels.indexOf(target.defaultEffort) + 1, levels.length - 1)];
+  if (levels.length > 0) await screen.shows(`[${effort}]`);
   screen.type('\r');
-  await screen.shows(`First message: Anthropic ${chosen}.`);
+  await screen.shows(`First message: Anthropic ${target.model}`);
+  // An ID typed after /model, with an effort after a colon, still applies at once.
+  const direct = models?.find((model) => model.efforts.includes('high'));
+  assert.ok(direct);
+  screen.type(`/model ${direct.model}:high`);
+  await screen.shows(`/model ${direct.model}:high`);
+  screen.type('\r');
+  await screen.shows(`First message: Anthropic ${direct.model} high.`);
+  const chosen = direct.model;
   screen.type('Hello there');
   await screen.shows('Hello there');
   screen.type('\r');
   await screen.shows('Done.');
   const [thread] = (await client.listThreads()).threads;
-  assert.equal((await client.readThread(thread.id)).thread.selection?.model, chosen);
+  assert.deepEqual((await client.readThread(thread.id)).thread.selection, {
+    family: 'anthropic',
+    model: chosen,
+    effort: 'high',
+  });
   screen.type('\u0003');
   await app.waitUntilExit();
 });
