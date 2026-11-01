@@ -2729,6 +2729,50 @@ test('plan slices run side by side in their own copies, merge in plan order and 
   }
 });
 
+// A new thread's first message goes to the orchestrator. The thread then holds the crew builder
+// as its pick, so the composer offers the builder for the next message (H2).
+test('the first message to an orchestrator leaves the crew builder as the thread pick', {
+  timeout: 30000,
+}, async (t) => {
+  const builder: ChatModelSelection = { family: 'openai', model: 'openai-model', effort: 'high' };
+  const orchestrator: ChatModelSelection = {
+    family: 'anthropic',
+    model: 'anthropic-model',
+    effort: 'medium',
+  };
+  const thread = standalone(t, {
+    adapters: new Map([
+      [
+        'anthropic',
+        createScriptedChatAdapter({
+          family: 'anthropic',
+          turns: [[{ kind: 'text', itemId: 'r', chunks: ['No plan needed.'] }]],
+        }),
+      ],
+    ]),
+  });
+  const { store, service, taskId } = thread;
+  const crew: ChatCrew = {
+    name: 'Plan crew',
+    members: [
+      { role: 'builder', selection: builder },
+      { role: 'orchestrator', selection: orchestrator },
+    ],
+  };
+  store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+  assert.equal(thread.read().thread.selection, null);
+  const idle = settles(thread);
+  thread.send('What does this do?', builder);
+  await idle;
+  const read = thread.read();
+  assert.deepEqual(read.turns[0] && [read.turns[0].role, read.turns[0].selection.family], [
+    'orchestrator',
+    'anthropic',
+  ]);
+  assert.deepEqual(read.thread.selection, builder);
+  await service.close();
+});
+
 // Startup recovery stops a plan whose slice was mid-review with one plain line.
 test('a restart during a plan shows the plan stopped with a line', {
   timeout: 30000,

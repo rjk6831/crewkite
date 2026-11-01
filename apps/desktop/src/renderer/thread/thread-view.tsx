@@ -570,6 +570,7 @@ function ThreadBody({
             onCatalog={setCatalog}
             localState={refresh ? { setup: header?.localSetup, refresh } : undefined}
             lastMessage={lastMessage}
+            startSelection={firstSend?.selection ?? null}
             onNewThread={onNewThread}
             onOpenSettings={onOpenSettings}
             onOpenChanges={() => setInspector({ open: true, tab: 'changes', focus: null })}
