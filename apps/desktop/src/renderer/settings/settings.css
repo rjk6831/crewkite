@@ -159,11 +159,6 @@
   border: 0;
   background: none;
 }
-.st-card .card .dialog-footer {
-  justify-content: flex-start;
-  padding: 0;
-  border-top: 0;
-}
 
 /* Models */
 .st-models {

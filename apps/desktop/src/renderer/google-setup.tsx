@@ -437,7 +437,7 @@ export function GoogleSetup({
         <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
         <Fact label="Quota available" value={quotaAvailable} />
       </div>
-      <div className="dialog-footer">
+      <div className="gs-actions">
         {!ready && !working && !installUnknown && (
           <button
             className="button primary"

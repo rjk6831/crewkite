@@ -65,6 +65,16 @@
 .gs-progress-steps li.is-done .gs-progress-mark::before {
   content: none;
 }
+/* The connect actions sit in the card flow and scroll with the text around them. */
+.gs-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+}
+.gs-actions:empty {
+  display: none;
+}
 .gs-sr-only {
   position: absolute;
   width: 1px;
