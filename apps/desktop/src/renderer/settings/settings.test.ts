@@ -2,7 +2,10 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatCatalogRead } from '@crewkite/contracts';
 import {
+  applyDraft,
   crewFromPreset,
+  draftConfigure,
+  draftSettings,
   familyModel,
   flightPreset,
   preferredSelection,
@@ -214,4 +217,40 @@ test('Balanced and Glide start the Solo crew on a thread with none, and keep a c
   assert.equal(flightPreset(false, 'glide'), 'Solo');
   assert.equal(flightPreset(false, 'manual'), null);
   assert.equal(flightPreset(true, 'glide'), null);
+});
+
+// Claim: a new thread's side panel follows the controller's rules before the thread exists, and
+// the first send applies only what differs from a just created thread.
+test('new thread settings follow the controller rules and configure only what changed', () => {
+  const values = new Map<string, string>();
+  const store = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => void values.set(key, value),
+  };
+  const fresh = draftSettings(store);
+  assert.deepEqual(draftConfigure(fresh), []);
+  writeThreadDefaults(
+    { selection: null, permissionPolicy: 'allow-edits', handoffMode: 'even-spend' },
+    store,
+  );
+  const saved = draftSettings(store);
+  assert.deepEqual(draftConfigure(saved), [
+    { permissionPolicy: 'allow-edits', handoffMode: 'even-spend' },
+  ]);
+  const selection = { family: 'openai', model: 'large-1', effort: 'low' } as const;
+  const crew = { name: 'Solo', members: [{ role: 'builder' as const, selection }] };
+  // No crew keeps the thread manual.
+  assert.equal(applyDraft(fresh, { flightMode: 'glide' }).flightMode, 'manual');
+  // Entering Glide turns automatic handoff on, and turning it off afterwards takes a second call.
+  const glide = applyDraft(fresh, { crew, flightMode: 'glide', selection });
+  assert.equal(glide.autoHandoff, true);
+  assert.deepEqual(glide.selection, selection);
+  assert.deepEqual(draftConfigure(glide), [{ crew, flightMode: 'glide' }]);
+  const off = applyDraft(glide, { autoHandoff: false });
+  assert.deepEqual(draftConfigure(off), [{ crew, flightMode: 'glide' }, { autoHandoff: false }]);
+  // Clearing the crew goes back to manual.
+  assert.equal(applyDraft(glide, { crew: null }).flightMode, 'manual');
+  assert.deepEqual(draftConfigure(applyDraft(fresh, { autoHandoff: true })), [
+    { autoHandoff: true },
+  ]);
 });
