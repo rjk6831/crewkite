@@ -63,7 +63,7 @@ import {
   turnFiles,
 } from './thread-state.ts';
 import { ThreadTitle } from './thread-title.tsx';
-import type { TurnView } from './turn-fold.ts';
+import type { TurnIdentity, TurnView } from './turn-fold.ts';
 import { useReveal } from './use-reveal.ts';
 import { useThread } from './use-thread.ts';
 import './thread.css';
@@ -79,6 +79,8 @@ export type FirstSend = {
   text: string;
   files: ChatAttachment[];
   selection: ChatModelSelection | null;
+  /** Who answers the message: the orchestrator when the crew has one, else the builder. */
+  answeredBy: TurnIdentity | null;
   at: string;
 };
 
@@ -194,9 +196,7 @@ function ThreadBody({
     firstSend &&
     !items.some((item) => item.kind === 'turn' || item.kind === 'failure') &&
     (!state.loaded || activeTurn !== null) ? (
-      <StartingTurn
-        identity={firstSend.selection ? { ...firstSend.selection, role: 'assistant' } : null}
-      />
+      <StartingTurn identity={firstSend.answeredBy} />
     ) : null;
   const changesKey = useMemo(() => changeCount(items), [items]);
   const turns = useMemo(() => Object.values(state.turnMeta), [state.turnMeta]);

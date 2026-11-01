@@ -262,6 +262,21 @@ export function draftConfigure(draft: DraftSettings): ThreadSettings[] {
   return calls;
 }
 
+/**
+ * The role and model that answer a new thread's first message, for the starting chip. With an
+ * orchestrator in the crew, Balanced and Glide send the message to it, as the controller routes
+ * it. Otherwise the builder answers on the model the message went to.
+ */
+export function firstAnswer(
+  draft: Pick<DraftSettings, 'crew' | 'flightMode'>,
+  selection: ChatModelSelection | null,
+): (ChatModelSelection & { role: 'assistant' | 'orchestrator' }) | null {
+  const orchestrator = draft.crew?.members.find((member) => member.role === 'orchestrator');
+  if (orchestrator && draft.flightMode !== 'manual')
+    return { ...orchestrator.selection, role: 'orchestrator' };
+  return selection ? { ...selection, role: 'assistant' } : null;
+}
+
 // Crew presets keep only the roles the person pinned to a model and effort. Every other role is
 // picked when a thread starts from the preset, so a preset still works after a family disconnects.
 const presetKey = 'crewkite-crew-presets-v1';

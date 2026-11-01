@@ -18,6 +18,7 @@ import {
   type DraftSettings,
   draftConfigure,
   draftSettings,
+  firstAnswer,
   preferredSelection,
 } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
@@ -231,6 +232,7 @@ export function NewThread({
       text,
       files: stored,
       selection,
+      answeredBy: firstAnswer(draft, selection),
       at: new Date().toISOString(),
     });
   }
