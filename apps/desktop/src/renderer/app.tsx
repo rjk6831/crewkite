@@ -754,20 +754,30 @@ export function App() {
           <SquarePen size={16} aria-hidden="true" />
           <span className="nav-text">New thread</span>
         </button>
-        <button
-          ref={searchButton}
-          type="button"
-          className="search-button"
-          onClick={() => setPalette(true)}
-          aria-label="Search threads and commands"
-          aria-keyshortcuts="Meta+K Control+K"
-          data-tooltip="Search"
-        >
-          <Search size={14} aria-hidden="true" />
-          <span className="nav-text">Search</span>
-          <kbd>{searchHint(isMacPlatform())}</kbd>
-        </button>
-        {threadSource && !collapsed && <RailSearch source={threadSource} onOpen={openFind} />}
+        {/* The expanded rail has one search field. Its palette button carries the shortcut hint. */}
+        {threadSource && !collapsed ? (
+          <RailSearch
+            source={threadSource}
+            onOpen={openFind}
+            onPalette={() => setPalette(true)}
+            paletteHint={searchHint(isMacPlatform())}
+            paletteButton={searchButton}
+          />
+        ) : (
+          <button
+            ref={searchButton}
+            type="button"
+            className="search-button"
+            onClick={() => setPalette(true)}
+            aria-label="Search threads and commands"
+            aria-keyshortcuts="Meta+K Control+K"
+            data-tooltip="Search"
+          >
+            <Search size={14} aria-hidden="true" />
+            <span className="nav-text">Search</span>
+            <kbd>{searchHint(isMacPlatform())}</kbd>
+          </button>
+        )}
         {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
         <div className="nav-scroll" hidden={collapsed}>
           <div className="nav-label">PROJECTS</div>
