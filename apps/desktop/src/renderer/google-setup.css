@@ -65,6 +65,32 @@
 .gs-progress-steps li.is-done .gs-progress-mark::before {
   content: none;
 }
+/* The terms summary and its acknowledgement stand out from the rest of the card. */
+.gs-terms {
+  display: grid;
+  gap: 8px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.gs-terms p {
+  margin: 0;
+}
+.gs-terms-check {
+  color: var(--text);
+  font-weight: 600;
+}
+/* How Connect works folds away under one small line. */
+.gs-how summary {
+  color: var(--text-dim);
+  font-size: 12px;
+  cursor: pointer;
+}
+.gs-how p {
+  margin: 6px 0 0;
+}
 /* The connect actions sit in the card flow and scroll with the text around them. */
 .gs-actions {
   display: flex;
