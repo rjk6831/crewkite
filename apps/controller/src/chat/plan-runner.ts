@@ -138,6 +138,8 @@ export class PlanRunner {
    * checks, then `chain` while the fix or the challenge after them runs on the thread copy.
    */
   private readonly closing = new Map<string, 'checks' | 'chain'>();
+  /** The model and effort a Retry picked for a slice, by task and slice, until the slice starts. */
+  private readonly retried = new Map<string, ChatModelSelection>();
 
   constructor(host: PlanHost) {
     this.host = host;
@@ -255,8 +257,45 @@ export class PlanRunner {
     }
   }
 
+  /**
+   * Retry under a failed slice turn runs that slice again, on the model the person picked, the
+   * crew builder unless they picked another. In Balanced and Glide the plan goes on from there:
+   * the slices not done queue behind it. Manual runs the one slice.
+   */
+  retrySlice(
+    task: Task,
+    turn: ChatTurn,
+    picked: ChatModelSelection | undefined,
+    effects: Effects,
+  ): CommandResult {
+    const thread = this.host.thread(task.id);
+    const plan = thread.plan;
+    const slice = plan && turn.slice !== undefined ? find(plan, turn.slice) : undefined;
+    if (!plan || !slice)
+      return blocked('plan-not-found', 'Refresh the thread and use the plan card shown.');
+    const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
+    const selection = picked ?? builder;
+    if (!selection) return blocked('selection-unavailable', 'Pick a provider and model.');
+    const listed = this.host
+      .catalog(task.id)
+      .families.find((entry) => entry.family === selection.family && entry.connected)
+      ?.models.some((model) => model.model === selection.model);
+    if (!listed)
+      return blocked('selection-unavailable', 'Pick a model a connected provider lists.');
+    const own = selection.family === builder?.family && selection.model === builder.model;
+    const reason = `Slice ${slice.id} (${slice.difficulty}) assigned to ${familyName[selection.family]} (${selection.model}): ${own ? "Builder, the crew's model" : 'picked on Retry'}.`;
+    return this.run({ taskId: task.id, planId: plan.planId, sliceId: slice.id }, effects, {
+      assignment: { family: selection.family, model: selection.model, reason },
+      selection,
+    });
+  }
+
   /** Run a proposed plan, or one slice of it. */
-  run(payload: Payload<'RunChatPlan'>, effects: Effects): CommandResult {
+  run(
+    payload: Payload<'RunChatPlan'>,
+    effects: Effects,
+    retry?: { assignment: NonNullable<Slice['assignment']>; selection: ChatModelSelection },
+  ): CommandResult {
     const task = this.host.task(payload.taskId);
     if (!task) return blocked('task-not-found');
     const thread = this.host.thread(task.id);
@@ -302,11 +341,17 @@ export class PlanRunner {
       changes[slice.id] = { assignment: { ...candidate, reason } };
       picked.push(reason);
     }
-    // One slice runs alone, so every other slice that is not done waits as not run. A blocked
-    // slice runs again from a fresh copy.
+    if (retry && one) {
+      changes[one.id] = { assignment: retry.assignment };
+      this.retried.set(`${task.id}:${one.id}`, retry.selection);
+    }
+    // One slice runs alone, so every other slice that is not done waits as not run. A retry in
+    // Balanced or Glide goes on with the plan, so the rest queue behind it. A blocked slice runs
+    // again from a fresh copy.
+    const continues = !!retry && thread.flightMode !== 'manual';
     for (const slice of plan.slices)
       if (slice.status !== 'done') {
-        const runs = !one || slice.id === one.id;
+        const runs = !one || slice.id === one.id || continues;
         changes[slice.id] = {
           ...changes[slice.id],
           status: runs ? 'queued' : 'not-run',
@@ -558,7 +603,14 @@ export class PlanRunner {
     }
     const lane: Lane = { step: 'build', pending: true, rounds: 0, fixes: 0, build: null };
     const saved = this.put(task, thread, plan, { [slice.id]: { status: 'running', lane } });
-    const selection = this.selection(task.id, saved, slice.assignment);
+    // A Retry keeps the effort the person picked with the model.
+    const key = `${task.id}:${slice.id}`;
+    const chosen = this.retried.get(key);
+    this.retried.delete(key);
+    const selection =
+      chosen && chosen.family === slice.assignment.family && chosen.model === slice.assignment.model
+        ? chosen
+        : this.selection(task.id, saved, slice.assignment);
     return this.openStep(task, saved, { ...slice, status: 'running', lane }, selection, effects);
   }
 

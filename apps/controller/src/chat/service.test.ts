@@ -2086,8 +2086,12 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
             failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
           },
         ],
+        // Retry under the failed slice runs it again, and the plan goes on to slice 2 (H9).
+        reply('Built 1.'),
+        reply('Built 2.'),
       ],
-      reviews: [reply('Clean.\nFindings: 0')],
+      retry: true,
+      reviews: [reply('Clean.\nFindings: 0'), reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
       turns: [
         ['orchestrator', 'openai'],
@@ -2343,6 +2347,62 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           row.card,
           row.name,
         );
+        if ('retry' in row) {
+          const failed = read.turns.find((turn) => turn.slice === 1);
+          const finished = next(
+            thread,
+            (event) =>
+              event.type === 'conversation.entry' &&
+              /^Crew finished/.test((event.payload as { text: string }).text),
+          );
+          // A slice turn takes no Regenerate, and Retry runs only the slice, not a new message.
+          assert.equal(
+            act(store, (effects) =>
+              service.retryTurn(
+                { taskId, turnId: failed?.id as string, mode: 'regenerate' },
+                effects,
+              ),
+            ).reason,
+            'slice-turn',
+            row.name,
+          );
+          assert.equal(
+            act(store, (effects) =>
+              service.retryTurn({ taskId, turnId: failed?.id as string, mode: 'retry' }, effects),
+            ).outcome,
+            'applied',
+            row.name,
+          );
+          await finished;
+          const again = thread.read();
+          const plan = again.thread.plan;
+          assert.deepEqual(
+            plan ? [plan.phase, ...plan.slices.map((value) => value.status)] : null,
+            ['finished', 'done', 'done'],
+            row.name,
+          );
+          assert.equal(
+            plan?.slices[0].assignment?.reason,
+            "Slice 1 (medium) assigned to OpenAI (openai-model): Builder, the crew's model.",
+            row.name,
+          );
+          // No turn ran outside the plan: every turn after the orchestrator is a slice or the
+          // challenge after the last one.
+          assert.deepEqual(
+            again.turns.map((turn) => [turn.role, turn.slice ?? null]),
+            [
+              ['orchestrator', null],
+              ['assistant', 1],
+              ['assistant', 1],
+              ['reviewer', 1],
+              ['assistant', 2],
+              ['reviewer', 2],
+              ['challenger', null],
+            ],
+            row.name,
+          );
+          return;
+        }
         const asked = adapters.get('openai')?.requests ?? [];
         assert.equal(asked[0]?.role, 'orchestrator', row.name);
         assert.match(asked[0]?.systemContext ?? '', /```json plan/, row.name);

@@ -119,3 +119,7 @@ A message the person sent while a plan ran stopped the plan with "Plan stopped: 
 ## Amendment, 2026-11-01: the orchestrator reads the earlier plans
 
 An orchestrator turn started cold with the person's message alone, so a second message about the first plan got "I couldn't find an earlier plan in this thread". An orchestrator turn now carries the thread packet, as a side question does: the conversation with the earlier plan replies, slice briefs and slice answers, the changed files, and the thread's last plan in words, with its goal, its phase and each slice's status and model.
+
+## Amendment, 2026-11-01: Retry under a failed slice
+
+Retry under a failed slice turn ran the slice brief again as a new message to the thread, on whatever provider the picker showed. Retry on a slice turn now runs that slice again from the plan, on the crew builder unless the person picks another model in Retry's picker, and the card line says which. In Balanced and Glide the plan goes on from there: the slices not done queue behind it and run as their dependencies finish. Manual runs the one slice, as the card's Run does. Regenerate and Continue do not apply to a slice turn.

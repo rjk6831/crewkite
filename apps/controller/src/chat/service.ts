@@ -954,6 +954,12 @@ export class ChatService {
     if (left.length) return ownershipUnknown(left, action);
     const turn = this.turn(payload.turnId);
     if (!turn || turn.taskId !== task.id) return blocked('turn-not-found');
+    // A plan slice runs again as that slice, never as a new message to the thread (H9).
+    if (turn.slice !== undefined) {
+      if (payload.mode !== 'retry')
+        return blocked('slice-turn', 'Retry runs a slice again from the plan.');
+      return this.plans.retrySlice(task, turn, payload.selection, effects);
+    }
     if (turn.id !== this.newestTurn(task.id)?.id)
       return blocked(
         'turn-not-latest',
