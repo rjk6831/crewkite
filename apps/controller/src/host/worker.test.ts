@@ -1,10 +1,24 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, realpathSync, rmSync } from 'node:fs';
+import {
+  chmodSync,
+  closeSync,
+  ftruncateSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
-import { OwnedCommand, type OwnedCommandLaunch, type OwnedCommandLifecycle } from './worker.ts';
+import {
+  OwnedCommand,
+  type OwnedCommandLaunch,
+  type OwnedCommandLifecycle,
+  verifyOwnedCommandExecutable,
+} from './worker.ts';
 
 const chunkBytes = 64 * 1024;
 
@@ -345,5 +359,27 @@ test('owned commands stream bounded output and keep cancellation owned through c
         lifecycle: ownership([]),
       }),
     /identity changed/,
+  );
+});
+
+test('an owned command accepts a client build up to 512 MiB and refuses a larger one', (t) => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-worker-size-')));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const sized = (name: string, bytes: number) => {
+    const path = join(directory, name);
+    const file = openSync(path, 'w');
+    ftruncateSync(file, bytes);
+    closeSync(file);
+    chmodSync(path, 0o755);
+    return path;
+  };
+  // The Anthropic client 2.1.316 is larger than 256 MiB.
+  const large = sized('large-client', 300 * 1024 * 1024);
+  const digest = createHash('sha256').update(readFileSync(large)).digest('hex');
+  assert.doesNotThrow(() => verifyOwnedCommandExecutable(large, digest));
+  const oversized = sized('oversized-client', 512 * 1024 * 1024 + 1);
+  assert.throws(
+    () => verifyOwnedCommandExecutable(oversized, digest),
+    /Command executable identity is invalid/,
   );
 });
