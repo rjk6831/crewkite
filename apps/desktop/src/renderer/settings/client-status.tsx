@@ -52,7 +52,7 @@ export function ClientStatus({
   facts?: boolean;
   children: ReactNode;
 }) {
-  const { label, profiles, reader, codingReady } = clientFor(header, family, now);
+  const { label, reader, codingReady } = clientFor(header, family, now);
   // While Google setup is still working, its client line would read as a failure. It shows once
   // discovery has ended.
   const googleState = header.googleAcpSetup?.state;
@@ -74,18 +74,7 @@ export function ClientStatus({
           <span>{codingReady ? 'Supported client present' : 'Supported client unavailable'}</span>
         )}
       </div>
-      {profiles.length > 0 && (
-        // Profile codes help a bug report and mean little in daily use, so they stay folded.
-        <details className="st-note">
-          <summary>Profile details</summary>
-          {profiles.map((profile) => (
-            <p className="st-note" key={profile.id}>
-              {profile.id}: {profile.reason}
-            </p>
-          ))}
-        </details>
-      )}
-      {profiles.length === 0 && <p className="st-note">No native profile is registered.</p>}
+      {/* Profile codes read as errors here. The diagnostics export keeps them for a bug report. */}
       {facts && (
         <div className="facts-grid compact">
           <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
