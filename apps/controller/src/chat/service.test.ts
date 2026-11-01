@@ -2820,6 +2820,17 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         row.name,
       );
       assert.ok(lines.includes('Slice 2 started on Local (local-model).'), row.name);
+      // Each start line sits just before its slice's brief, so it reads ahead of the turn.
+      for (const turn of read.turns.filter(
+        (value) => value.slice !== undefined && value.role === 'assistant',
+      )) {
+        const brief = read.messages.findIndex((message) => message.id === turn.userMessageId);
+        assert.match(
+          read.messages[brief - 1]?.text ?? '',
+          new RegExp(`^Slice ${turn.slice} started on `),
+          row.name,
+        );
+      }
     }
     if ('conflict' in row) {
       const blocked = cards.find((value) => value.plan?.slices[1]?.status === 'blocked')?.plan;

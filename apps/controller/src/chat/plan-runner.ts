@@ -79,13 +79,15 @@ export type PlanHost = {
   begin: (task: Task, thread: ChatThread, input: Message, effects: Effects) => CommandResult;
   /**
    * Open a turn in a slice's lane. It leaves the thread's pick, its handoff and its sessions
-   * alone. Returns the new turn's ID, or the refusal.
+   * alone. Returns the new turn's ID, or the refusal. `line` goes into the thread just before the
+   * turn's brief, so it reads ahead of the turn's output, and only when the turn opens.
    */
   beginLane: (
     task: Task,
     thread: ChatThread,
     input: Message & { slice: number },
     effects: Effects,
+    line?: string,
   ) => string | CommandResult;
   /** Start a crew step on the thread copy. A fix step answers `brief`. */
   crewStep: (
@@ -717,6 +719,9 @@ export class PlanRunner {
       thread,
       { text, role, selection, attachments: [], files: [], slice: id },
       effects,
+      lane.step === 'build'
+        ? `Slice ${id} started on ${familyName[selection.family]} (${selection.model}).`
+        : undefined,
     );
     const after = this.host.thread(task.id);
     if (typeof started !== 'string') {
@@ -733,11 +738,6 @@ export class PlanRunner {
     const saved = this.put(task, after, after.plan as ChatPlanState, {
       [id]: { turnId: started, lane: { ...lane, pending: false, build } },
     });
-    if (lane.step === 'build')
-      this.host.line(
-        task,
-        `Slice ${id} started on ${familyName[selection.family]} (${selection.model}).`,
-      );
     return saved;
   }
 
