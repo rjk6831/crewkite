@@ -36,6 +36,7 @@ import {
   startAcpProcess,
 } from './acp/client.ts';
 import { ACP_SESSION_MODELS, type AcpClientIdentity } from './acp/profile.ts';
+import { permissionDetail } from './permission-detail.ts';
 
 // One chat turn on the published ACP agent. The connection, process ownership and stop
 // handling come from acp/client.ts. This file translates between the protocol and AgentEvents.
@@ -1154,12 +1155,7 @@ export function googleChatAdapter(deps: {
             : undefined;
         const automatic = refuses ? reject : (granted ?? permitted);
         const requestId = `${turnId}:permission:${++permissionCount}`;
-        const detail = [
-          call.paths.size ? `Paths: ${[...call.paths].join(', ')}` : '',
-          call.rawInput === undefined ? '' : clip(JSON.stringify(call.rawInput), 4000),
-        ]
-          .filter(Boolean)
-          .join('\n');
+        const detail = permissionDetail(call.rawInput, call.paths, scratch);
         if (!automatic)
           pending.set(requestId, {
             rpc: id,
@@ -1179,7 +1175,7 @@ export function googleChatAdapter(deps: {
               : 'Allow this action?',
             4000,
           ),
-          detail: detail || null,
+          detail,
           options,
           ...(call.deletes ? { deletes: true as const } : {}),
         });
