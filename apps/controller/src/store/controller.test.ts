@@ -4160,6 +4160,27 @@ if(value==='submit')finish({type:'terminal',terminal:{kind:'completed',binding:p
   };
 }
 
+test('a Local read selects the one eligible loaded model when none is picked', async (t) => {
+  const context = await localControllerFixture(t);
+  // Disconnect forgets the pick. The next connect and read find one eligible model and take it.
+  await context.local('DisconnectLocal');
+  assert.equal(context.setupState()?.selection, null);
+  await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
+  await context.operationDone();
+  assert.equal(context.setupState()?.selection, null, 'a connect alone picks nothing');
+  await context.local('RefreshLocalModels', { consent: 'explicit' });
+  await context.operationDone();
+  const read = context.setupState();
+  assert.equal(read?.selection?.selectionId, context.choice.selectionId);
+  assert.equal(read?.selection?.observationHash, read?.observation?.observationHash);
+  assert.equal(read?.reason, 'qualification-pending');
+  // A pick that is gone stays cleared on that read, so the card can say which model left.
+  context.mode('discovery-model-changed');
+  await context.local('RefreshLocalModels', { consent: 'explicit' });
+  await context.operationDone();
+  assert.equal(context.setupState()?.selection, null);
+});
+
 test('Local reads keep the selection while its model key is loaded and clear it otherwise', async (t) => {
   const context = await localControllerFixture(t);
   const selected = context.setupState();
