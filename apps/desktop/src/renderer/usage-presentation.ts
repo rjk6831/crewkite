@@ -124,17 +124,25 @@ const windowNames = new Map([
   ['gemini-5h', 'Five-hour'],
   ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
   ['3p-5h', 'Third-party 5 h'],
-  ['3p-weekly', 'Weekly'],
+  ['3p-weekly', 'Third-party weekly'],
 ]);
 const windowWords = new Map([
   ['3p', 'third-party'],
   ['wtu', ''],
 ]);
 
+// A per-model window, such as weekly-fable, names the model first: "Fable, weekly".
+const modelWindow = /^(weekly|five-hour)-([a-z][a-z0-9.-]*)$/;
+
 /** The name a usage window shows, from its reader's window ID. */
 export function windowLabel(windowId: string): string {
   const known = windowNames.get(windowId);
   if (known) return known;
+  const model = modelWindow.exec(windowId.toLowerCase());
+  if (model) {
+    const name = model[2].replace(/-/g, ' ');
+    return `${name[0].toUpperCase()}${name.slice(1)}, ${model[1] === 'weekly' ? 'weekly' : 'five-hour'}`;
+  }
   const words = windowId
     .split(/[-_\s]+/)
     .map((part) => {
@@ -338,6 +346,12 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     note: `Read when CrewKite received the report. The report gives no observation time or cache age. Report scope ${scope}.`,
   }));
   const primary = primaryWindows.flatMap((id) => rows.filter((row) => row.windowId === id));
+  // A single per-model window, such as weekly-fable, sits between the two main gauges as a smaller
+  // one, the way the Google card shows its model window.
+  const models = rows.filter(
+    (row) => !primary.includes(row) && modelWindow.test(row.windowId ?? ''),
+  );
+  const featured = models.length === 1 ? models[0] : null;
   return {
     id: 'native-quota:anthropic',
     title: 'Anthropic subscription',
@@ -346,7 +360,8 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     // Each gauge says how long ago CrewKite read the report. Details say the report has no time of its own.
     notice: reading ? undefined : 'Refresh Anthropic quota to read the native report.',
     primary,
-    auxiliary: rows.filter((row) => !primary.includes(row)),
+    featured,
+    auxiliary: rows.filter((row) => !primary.includes(row) && row !== featured),
     // The client reports extra usage as on only while the account holds a credit balance; with the
     // switch on and no balance it reports off. So the card shows the row when the report says on
     // and leaves it out otherwise, since off can mean either.

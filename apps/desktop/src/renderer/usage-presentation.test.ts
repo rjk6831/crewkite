@@ -196,6 +196,23 @@ test('native usage gauges show the remaining percent without inventing freshness
   const before = JSON.stringify(reader);
   const card = anthropicUsageCard({ usageReaders: [reader] });
   assert(card);
+  // A single per-model window sits between the main gauges as the smaller featured one.
+  const withModel = anthropicUsageCard({
+    usageReaders: [
+      {
+        ...reader,
+        reading: {
+          ...reader.reading,
+          windows: [
+            ...reader.reading.windows,
+            { windowId: 'weekly-fable', remaining: { unit: 'percent', value: 89 }, resetsAt: null },
+          ],
+        },
+      },
+    ],
+  });
+  assert.equal(withModel?.featured?.label, 'Fable, weekly');
+  assert.ok(!withModel?.auxiliary?.some((row) => row.windowId === 'weekly-fable'));
   // Off can mean no balance on an account with the switch on, so only on shows a row.
   const credits = (is_enabled: boolean) =>
     anthropicUsageCard({
@@ -477,7 +494,8 @@ test('usage windows show plain names, and an unknown ID reads as words', () => {
   const rows = [
     ['gemini-argon-wtu-weekly', 'Gemini 4 Argon, weekly'],
     ['3p-5h', 'Third-party 5 h'],
-    ['3p-weekly', 'Weekly'],
+    ['3p-weekly', 'Third-party weekly'],
+    ['weekly-fable', 'Fable, weekly'],
     ['weekly', 'Weekly'],
     ['five-hour', 'Five-hour'],
     ['gemini-pro_24h', 'Gemini pro 24 h'],
