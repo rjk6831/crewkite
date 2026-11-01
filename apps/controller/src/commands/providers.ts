@@ -461,15 +461,22 @@ export class ProviderCommands {
           client = setup.client,
           auth = setup.auth;
         let ready = false;
+        // An initialize whose reply named no personal sign-in has nothing to sign in with. Its
+        // proof is not kept, so the next Connect step is another initialize, never a sign-in that
+        // the client would refuse as if the person had.
+        let incomplete = false;
         if (known && !revoked && !outcome.reason && outcome.metadata) {
           const proof = validateAcpSetupProof(
             outcome.metadata,
             resolution.client as AcpClientIdentity,
             this.options.googleAcp?.reviewMappings,
           );
-          proofId = this.nativeArtifact(proof).id;
+          incomplete =
+            operation === 'initialize' &&
+            !proof.capabilities.authMethods.includes('oauth-personal');
+          proofId = incomplete ? null : this.nativeArtifact(proof).id;
           client = proof.client;
-          auth = proof.auth;
+          auth = incomplete ? setup.auth : proof.auth;
           ready =
             !!proof.reviewMode && !!proof.configOptions && proof.auth.status === 'authenticated';
         }
@@ -480,7 +487,7 @@ export class ProviderCommands {
             ? 'unknown'
             : ready
               ? 'ready'
-              : !revoked && !outcome.reason && operation === 'initialize'
+              : !revoked && !outcome.reason && operation === 'initialize' && !incomplete
                 ? 'authentication-required'
                 : !revoked &&
                     !outcome.reason &&
@@ -498,7 +505,7 @@ export class ProviderCommands {
               ? 'acp-setup-timeout'
               : outcome.reason === 'authentication'
                 ? 'authentication-required'
-                : !revoked && operation === 'discover'
+                : !revoked && (operation === 'discover' || incomplete)
                   ? 'acp-capability-missing'
                   : null,
         });

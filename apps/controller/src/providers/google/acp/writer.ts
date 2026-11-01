@@ -15,6 +15,7 @@ import {
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { withGitCeiling } from '../../../host/git-ceiling.ts';
+import { defaultSchedule } from '../../../host/worker.ts';
 import {
   type AcpConnection,
   type AcpDiagnostic,
@@ -256,6 +257,18 @@ async function closeSession(connection: AcpConnection, proof: AcpSetupProof, ses
     );
   }
 }
+/**
+ * How long discovery waits for the session's config options after the session reply. The client
+ * may report its model choices and modes in a session update a moment after it answers
+ * session/new. A discovery that closed the session at once read none of them and reported the
+ * capability as missing, and a later Connect then found them.
+ */
+export const ACP_DISCOVERY_SETTLE_MS = 5000;
+/**
+ * Each setup step's deadline. Sign-in waits on the person in the browser, which can take a few
+ * minutes with a second factor.
+ */
+export const ACP_SETUP_TIMEOUT_MS = { initialize: 30000, authenticate: 300000, discover: 20000 };
 export type AcpSetupOptions = Omit<AcpProcessOptions, 'timeoutMs'> & {
   operation: 'initialize' | 'authenticate' | 'discover';
   priorProof: AcpSetupProof | null;
@@ -269,7 +282,7 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
   return startAcpProcess(
     {
       ...options,
-      timeoutMs: { initialize: 30000, authenticate: 120000, discover: 20000 }[options.operation],
+      timeoutMs: ACP_SETUP_TIMEOUT_MS[options.operation],
     },
     async (connection) => {
       const proof = await initialize(connection, options.client);
@@ -278,12 +291,22 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
         throw new AcpError('permission');
       };
       if (options.operation === 'initialize') return proof;
+      // A reply that names no personal sign-in yet is the client's own state, which another try
+      // can clear. The person refused nothing.
       if (!proof.capabilities.authMethods.includes('oauth-personal'))
-        throw new AcpError('authentication');
+        throw new AcpError('configuration');
       if (options.operation === 'authenticate') {
-        z.object({}).parse(
-          await connection.request('authenticate', { methodId: 'oauth-personal' }),
-        );
+        let reply: unknown;
+        try {
+          reply = await connection.request('authenticate', { methodId: 'oauth-personal' });
+        } catch (error) {
+          // The client answers the sign-in with an error when the person cancels or refuses it
+          // in the browser. That waits for the person, so it reads as a sign-in still required.
+          if (error instanceof AcpError && error.diagnostic?.site === 'rpc-error')
+            throw new AcpError('authentication', error.diagnostic);
+          throw error;
+        }
+        z.object({}).parse(reply);
         return AcpSetupProofSchema.parse({
           ...proof,
           auth: { method: 'oauth-personal', status: 'authenticated' },
@@ -295,6 +318,8 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
         await connection.request('session/new', { cwd: options.directory, mcpServers: [] }),
       );
       let observed = decodeAcpConfiguration(session.configOptions ?? [], session.models);
+      const complete = () => !!observed.configOptions && observed.modeValues.length > 0;
+      let settle: (() => void) | undefined;
       connection.onNotification = (method, params) => {
         if (method !== 'session/update' || params.sessionId !== session.sessionId)
           throw new AcpError('protocol');
@@ -303,8 +328,18 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
           .parse(params.update);
         if (update.sessionUpdate === 'config_option_update')
           observed = decodeAcpConfiguration(update.configOptions);
+        if (complete()) settle?.();
       };
       replay();
+      if (!complete())
+        await new Promise<void>((resolve) => {
+          const cancel = (options.schedule ?? defaultSchedule)(resolve, ACP_DISCOVERY_SETTLE_MS);
+          settle = () => {
+            cancel();
+            resolve();
+          };
+        });
+      settle = undefined;
       const matches = mappings.filter(
         (v) =>
           acpReviewMappingMatchesClient(v, options.client) &&

@@ -86,6 +86,7 @@ const failureText: Partial<Record<string, string>> = {
   'download-unavailable': 'The download could not start. Check the connection and try again.',
   'archive-refused': 'The downloaded client did not match the reviewed release. Try again.',
   'signature-refused': 'The Google signature check on the client failed.',
+  'signature-timeout': 'The Google signature check did not finish in time. Try again.',
   'pin-conflict': 'A different Google client is already installed in this home.',
   'invalid-import': 'The unpacked client did not pass its checks. Try again.',
 };
