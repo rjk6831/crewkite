@@ -16,8 +16,8 @@ import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
 import { createTestClock, createTestIds } from '@crewkite/testkit';
 import type { ArtifactFiles } from '../../artifacts/index.ts';
 import { Controller } from '../../commands/controller.ts';
-import type { StreamingCommandOptions } from '../../host/worker.ts';
-import { clientVersionStatus } from '../client-versions.ts';
+import { OwnedCommand, type StreamingCommandOptions } from '../../host/worker.ts';
+import { clientVersionStatus, findClient } from '../client-versions.ts';
 import type { ChatClientResolution, NativeProfileResolution } from '../openai/profile.ts';
 import {
   type AnthropicUsageReaderTrust,
@@ -880,6 +880,15 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
         (await f.controller.execute(f.command(), 'local-owner')).reason,
         'anthropic-metadata-ownership-unknown',
       );
+      // A read an earlier controller left unknown with no saved intent never started a process,
+      // as when a client update made its launch throw, so it settles on reopen.
+      f.controller.store.db
+        .prepare("DELETE FROM receipts WHERE command_key LIKE 'anthropic-usage:%:intent-%'")
+        .run();
+      await f.reopen();
+      assert.equal(f.status()?.readState, 'quiescent');
+      assert.equal(f.status()?.readReason, 'usage-read-interrupted');
+      assert.equal(f.controller.anthropicUsage().blocker(), undefined);
     } else
       assert.equal(
         (await f.controller.execute(f.command(), 'local-owner')).reason,
@@ -887,6 +896,190 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
       );
     assert.equal(f.calls(), 1);
   }
+});
+
+/**
+ * A real client file on disk, found by version range as the chat path finds it, and the real owned
+ * launch. `replaceOnLaunch` swaps the file for another build in range as the next read starts,
+ * which is where a client update lands between the read's resolution and its launch.
+ */
+function updateFixture(t: TestContext) {
+  const root = mkdtempSync(join(realpathSync(tmpdir()), 'ck-usage-update-'));
+  const bin = join(root, 'bin');
+  mkdirSync(bin, { mode: 0o700 });
+  const executable = join(bin, 'claude');
+  const path = `${dirname(process.execPath)}:/usr/bin:/bin`;
+  const fixture = new URL('./usage-fixture.jsonl', import.meta.url).pathname;
+  // The build prints its version for --version and otherwise the fixture, under the session the
+  // launch selected.
+  const install = (version: string) => {
+    writeFileSync(
+      executable,
+      `#!/usr/bin/env node\n// build ${version}\nconst argv = process.argv;\nif (argv.includes('--version')) { process.stdout.write('${version} (Claude Code)\\n'); process.exit(0); }\nconst session = argv[argv.indexOf('--session-id') + 1];\nconst lines = require('node:fs').readFileSync(${JSON.stringify(fixture)}, 'utf8').trim().split('\\n');\nprocess.stdout.write(lines.map((line) => JSON.stringify({ ...JSON.parse(line), session_id: session })).join('\\n') + '\\n');\n`,
+      { mode: 0o755 },
+    );
+    chmodSync(executable, 0o755);
+  };
+  install('2.1.302');
+  const cache = new Map();
+  const clock = createTestClock(at);
+  const id = createTestIds(at);
+  const periodic: (() => void)[] = [];
+  let launches = 0;
+  let replaceOnLaunch: (() => void) | null = null;
+  const pinned: NativeProfileResolution = {
+    facts: AnthropicNativeProfileSchema.parse({
+      id: 'anthropic-file-v1',
+      family: 'anthropic',
+      displayName: 'Native fixture',
+      clientVersion: '2.1.302',
+      model: 'claude-sonnet-5-5',
+      effort: 'medium',
+      effectiveEffort: 'unknown',
+      accountClass: 'unknown',
+      serviceTier: 'unknown',
+      billingBasis: 'requires-user-attestation',
+      qualifiedAt: null,
+      creditPolicies: ['ordinary'],
+      maximumTaskMs: 300000,
+      maximumFileBytes: 65536,
+      maximumSubmissions: 1,
+      available: true,
+      reason: 'qualification-pending',
+    }),
+    client: { executable, sha256, version: '2.1.302' },
+    environment: { HOME: root, PATH: path },
+    locationHash: '1'.repeat(64),
+  };
+  // The chat resolver: the trust, version range and digest checks of findClient on every call.
+  const chat = (): ChatClientResolution => {
+    const found = findClient('anthropic', { directories: [bin], home: root, path, cache });
+    if (!found.client) return { status: found.status };
+    return {
+      status: found.status,
+      profile: {
+        ...pinned,
+        facts: AnthropicNativeProfileSchema.parse({
+          ...pinned.facts,
+          clientVersion: found.client.version,
+        }),
+        client: found.client,
+      },
+    };
+  };
+  const options = {
+    home: join(root, 'home'),
+    now: clock.now,
+    id,
+    nativeProfiles: () => [pinned],
+    chatClients: { anthropic: chat },
+    googleUsageClient: () => ({ available: false as const, reason: 'client-unavailable' as const }),
+    nativeSpawn() {
+      assert.fail('No native auth or model process is allowed.');
+    },
+    schedule(work: () => void, milliseconds: number) {
+      if (milliseconds >= 60_000) {
+        periodic.push(work);
+        return () => {};
+      }
+      const timer = setTimeout(work, milliseconds);
+      return () => clearTimeout(timer);
+    },
+    anthropicUsageReader: {
+      create(launch: StreamingCommandOptions) {
+        launches++;
+        const replace = replaceOnLaunch;
+        replaceOnLaunch = null;
+        replace?.();
+        return new OwnedCommand(launch);
+      },
+    },
+  };
+  const controller = new Controller(options);
+  t.after(async () => {
+    await controller.close();
+    rmSync(root, { recursive: true, force: true });
+  });
+  const status = () =>
+    controller.workspaceState().usageReaders.find((reader) => reader.family === 'anthropic');
+  const settled = async () => {
+    while (status()?.readState === 'intent' || status()?.readState === 'owned')
+      await new Promise((resolve) => setTimeout(resolve, 5));
+  };
+  return {
+    controller,
+    clock,
+    status,
+    install,
+    launches: () => launches,
+    replaceOnLaunch(replace: () => void) {
+      replaceOnLaunch = replace;
+    },
+    refresh: () =>
+      controller.execute(
+        {
+          protocol: 1,
+          key: id('cmd'),
+          actor: { id: 'usage-fixture', kind: 'cli' },
+          command: 'RefreshAnthropicUsage',
+          payload: {},
+          expectedRevision: 0,
+        },
+        'local-owner',
+      ),
+    async periodicRead() {
+      periodic.at(-1)?.();
+      await new Promise(setImmediate);
+      await settled();
+    },
+    remove: () => rmSync(executable),
+  };
+}
+
+test('a client update inside the range re-binds the quota reader and reads go on', async (t) => {
+  const f = updateFixture(t);
+  assert.equal(f.status()?.clientVersion, '2.1.302');
+  const first = f.status()?.trust?.scopeHash;
+  assert(first);
+  // The update lands as the read starts: the reader resolved 2.1.302 and launches 2.1.316.
+  f.replaceOnLaunch(() => f.install('2.1.316'));
+  const result = await f.refresh();
+  assert.equal(result.outcome, 'applied', JSON.stringify(result));
+  assert.equal(f.status()?.readState, 'quiescent');
+  assert.equal(f.status()?.clientVersion, '2.1.316');
+  assert.deepEqual(f.status()?.reading?.windows, reported);
+  const second = f.status()?.trust?.scopeHash;
+  assert.notEqual(second, first);
+  assert.equal(f.status()?.readingScopeHash, second);
+  // The ten-minute read runs on the new build.
+  const launches = f.launches();
+  f.clock.advance(600_000);
+  await f.periodicRead();
+  assert.equal(f.launches(), launches + 1);
+  assert.equal(f.status()?.readState, 'quiescent');
+  assert.equal(f.status()?.readReason, 'reported');
+});
+
+test('a quota read that started no process ends quiescent and the next read runs', async (t) => {
+  const f = updateFixture(t);
+  // The update removes the build the read resolved, and no build is left to bind to.
+  f.replaceOnLaunch(() => f.remove());
+  const failed = await f.refresh();
+  assert.equal(failed.outcome, 'blocked');
+  assert.equal(failed.reason, 'usage-read-failed');
+  assert.equal(f.status()?.readState, 'quiescent');
+  assert.equal(f.status()?.operationId, null);
+  assert.equal(f.controller.anthropicUsage().blocker(), undefined);
+  // The next build arrives, and the ten-minute read binds to it.
+  f.install('2.1.316');
+  f.clock.advance(600_000);
+  await f.periodicRead();
+  assert.equal(f.status()?.readState, 'quiescent');
+  assert.equal(f.status()?.readReason, 'reported');
+  assert.equal(f.status()?.clientVersion, '2.1.316');
+  // Refresh is open again after its cooldown.
+  f.clock.advance(60_001);
+  assert.equal((await f.refresh()).outcome, 'applied');
 });
 
 test('the gauge reads every ten minutes while no Anthropic turn runs', async (t) => {
