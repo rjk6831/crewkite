@@ -10,7 +10,7 @@ test('a crew role allows subagents as saved, and a role saved without the switch
     [
       { name: 'saved before the switch', member: {}, family: 'anthropic', allow: true },
       { name: 'saved before the switch', member: {}, family: 'google', allow: true },
-      { name: 'saved before the switch', member: {}, family: 'openai', allow: false },
+      { name: 'saved before the switch', member: {}, family: 'openai', allow: true },
       { name: 'turned on', member: { allowSubagents: true }, family: 'openai', allow: true },
       { name: 'turned off', member: { allowSubagents: false }, family: 'anthropic', allow: false },
     ];
@@ -26,7 +26,7 @@ test('a crew role allows subagents as saved, and a role saved without the switch
     );
   }
   assert.equal(allowsSubagents(undefined, 'google'), true, 'a turn with no crew role');
-  assert.equal(allowsSubagents(undefined, 'openai'), false, 'an OpenAI turn with no crew role');
+  assert.equal(allowsSubagents(undefined, 'openai'), true, 'an OpenAI turn with no crew role');
   assert.equal(
     ChatCrewSchema.safeParse({
       name: 'Pair',

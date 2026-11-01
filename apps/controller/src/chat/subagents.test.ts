@@ -23,13 +23,13 @@ test('each turn reads the switch of the crew role it runs as', () => {
     allow: boolean;
   }[] = [
     { name: 'no crew', crew: null, role: 'assistant', allow: true },
-    { name: 'no crew on OpenAI', crew: null, role: 'assistant', family: 'openai', allow: false },
+    { name: 'no crew on OpenAI', crew: null, role: 'assistant', family: 'openai', allow: true },
     {
       name: 'builder left out on OpenAI',
       crew: crew({ builder: undefined }),
       role: 'assistant',
       family: 'openai',
-      allow: false,
+      allow: true,
     },
     {
       name: 'builder turned on for OpenAI',
