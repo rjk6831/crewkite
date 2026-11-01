@@ -1281,8 +1281,8 @@ export class ChatService {
       reply: (turn) => text(turn.taskId, turn.assistantMessageId),
       message: (turn) => text(turn.taskId, turn.userMessageId),
       begin: (task, thread, input, effects) => this.begin(task, thread, input, effects),
-      beginLane: (task, thread, input, effects) => {
-        const started = this.begin(task, thread, input, effects, undefined, input.slice);
+      beginLane: (task, thread, input, effects, line) => {
+        const started = this.begin(task, thread, input, effects, undefined, input.slice, line);
         return started.outcome === 'applied' ? (this.newestTurn(task.id)?.id ?? started) : started;
       },
       crewStep: (task, thread, chain, effects, brief) =>
@@ -2777,6 +2777,7 @@ export class ChatService {
     effects: Effects,
     id?: string,
     slice?: number,
+    line?: string,
   ): CommandResult {
     const selection = this.pick(task, thread, input.selection);
     if ('outcome' in selection) return selection;
@@ -2785,6 +2786,14 @@ export class ChatService {
       return blocked('project-head-unavailable', 'Commit once in this project, then send again.');
     const message = this.draftEntry(task, userEntry(input), id);
     if (!message) return blocked('message-too-large', 'Shorten the message or attach fewer paths.');
+    // A line about this turn, such as a slice start, goes ahead of its message so the thread
+    // shows it before the turn's output.
+    if (line)
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: null },
+        text: fitText(line, 16_384),
+      });
     this.saveEntry(task, message);
     this.openTurn(
       task,
