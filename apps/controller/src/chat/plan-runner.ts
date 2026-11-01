@@ -371,11 +371,14 @@ export class PlanRunner {
       return;
     }
     const plan = parsed.plan;
-    const slices = assignPlan(plan, {
+    const fixer = thread.crew?.members.find((member) => member.role === 'fixer')?.selection;
+    const { rows: slices, unassigned } = assignPlan(plan, {
       families: this.host.catalog(task.id).families,
       mode: thread.handoffMode,
       now: Date.parse(this.host.now()),
       builder,
+      fixer: fixer ?? null,
+      autoHandoff: thread.autoHandoff,
       localContext: this.host.localContext(),
       localSliceFits: this.host.localSliceFits,
       files: this.files(task.id, plan),
@@ -388,14 +391,12 @@ export class PlanRunner {
       slices,
     };
     this.host.putThread(task, { ...thread, plan: state });
-    // The plan card shows each assignment and its reason, so only a slice with no family to run
+    // The plan card shows each assignment and its reason, so only a slice with no model to run
     // on gets a line of its own.
-    for (const slice of slices)
-      if (!slice.assignment)
-        this.host.line(
-          task,
-          `Slice ${slice.id} (${slice.difficulty}) has no family to run on: no connected family has allowance left.`,
-        );
+    for (const slice of slices) {
+      const why = unassigned[slice.id];
+      if (!slice.assignment && why) this.host.line(task, why);
+    }
     if (state.phase === 'running') this.pump(task, effects);
   }
 
@@ -809,14 +810,19 @@ export class PlanRunner {
     return parsed && 'plan' in parsed && parsed.plan.planId === plan.planId ? parsed.plan : null;
   }
 
-  /** The builder's effort on the builder's model, otherwise the model's own default. */
+  /**
+   * The crew member's effort on a crew model, the builder's first, otherwise the model's own
+   * default, as on a slice the handoff rule moved out of the crew.
+   */
   private selection(
     taskId: string,
     thread: ChatThread,
     assignment: NonNullable<Slice['assignment']>,
   ): ChatModelSelection {
-    const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
-    if (builder?.family === assignment.family && builder.model === assignment.model) return builder;
+    const own = ['builder', 'fixer']
+      .map((role) => thread.crew?.members.find((member) => member.role === role)?.selection)
+      .find((value) => value?.family === assignment.family && value.model === assignment.model);
+    if (own) return own;
     const effort = this.host
       .catalog(taskId)
       .families.find((entry) => entry.family === assignment.family)

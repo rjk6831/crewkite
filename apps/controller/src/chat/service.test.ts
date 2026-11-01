@@ -2054,7 +2054,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       readOnlyAt: 2,
     },
     {
-      name: 'balanced waits for Run plan, and an override moves a slice to a ranked family',
+      name: "balanced waits for Run plan, and an override moves a slice to the crew's fixer model",
       plan: [planReply({ ...twoSlices, slices: [twoSlices.slices[0]] })],
       // OpenAI would build the slice without the override.
       builds: [reply('Unused.')],
@@ -2169,6 +2169,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           { role: 'reviewer', selection: pick('anthropic') },
           { role: 'challenger', selection: pick('google') },
           ...(planned ? [{ role: 'orchestrator', selection: pick('openai') } as const] : []),
+          // The card offers the crew's own models, so the override picks the fixer's.
+          ...('balanced' in row ? [{ role: 'fixer', selection: pick('anthropic') } as const] : []),
         ],
       };
       const balanced = 'balanced' in row;
@@ -2232,7 +2234,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           for (const effect of effects) effect();
           return result;
         };
-        // Only a ranked candidate on the card can take a slice.
+        // Only a candidate on the card can take a slice.
         assert.equal(
           run([{ sliceId: 1, family: 'google', model: 'google-unranked' }]).reason,
           'override-not-ranked',
@@ -2416,7 +2418,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
 });
 
 // A plan's slices run side by side, each in its own scratch copy, and merge in plan order.
-// OpenAI takes the medium slices and Local the easy ones, so two families answer at once.
+// The crew builder on OpenAI takes the medium slices and its fixer on Local the hard ones, so two
+// families answer at once.
 test('plan slices run side by side in their own copies, merge in plan order and stop together', {
   timeout: 60000,
 }, async (t) => {
@@ -2439,7 +2442,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     stopReason: 'error',
     failure: chatFailure({ stage: 'stream', kind: 'internal', message: 'Broke.' }),
   };
-  const slice = (id: number, difficulty: 'easy' | 'medium', depends: number[] = []) => ({
+  const slice = (id: number, difficulty: 'hard' | 'medium', depends: number[] = []) => ({
     id,
     title: `Part ${id}`,
     brief: `Do part ${id}.`,
@@ -2456,7 +2459,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
   const rows = [
     {
       name: 'two families at once, a shared family waits, a dependency starts from merged work',
-      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'medium'), slice(4, 'easy', [1])],
+      slices: [slice(1, 'medium'), slice(2, 'hard'), slice(3, 'medium'), slice(4, 'hard', [1])],
       openai: [[park, write('a.txt', 'one\n'), reply('Built 1.')], [write('c.txt', 'three\n')]],
       local: [[write('b.txt', 'two\n')], [write('d.txt', 'four\n')]],
       line: 'Crew finished: 4 slices, 0 reviews, 0 fixes.',
@@ -2465,7 +2468,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     },
     {
       name: 'a conflict blocks the slice and the orchestrator merges it in one turn',
-      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      slices: [slice(1, 'medium'), slice(2, 'hard')],
       openai: [[write('net.mjs', 'one\n')], [write('net.mjs', 'one\ntwo\n'), reply('Merged.')]],
       // The clean c.txt merges only after the resolve turn ends done.
       local: [[write('net.mjs', 'two\n'), write('c.txt', 'clean\n')]],
@@ -2477,7 +2480,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     {
       // No part of the blocked slice reaches the thread copy, its clean c.txt included.
       name: 'a conflict the orchestrator cannot resolve stops the plan with the slice blocked',
-      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      slices: [slice(1, 'medium'), slice(2, 'hard')],
       openai: [[write('net.mjs', 'one\n')], [failed]],
       local: [[write('net.mjs', 'two\n'), write('c.txt', 'clean\n')]],
       line: 'Plan stopped: the orchestrator could not resolve slice 2.',
@@ -2488,7 +2491,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     {
       // Slice 2 finished while slice 1 runs, so it merges before the stop and is not lost.
       name: 'stop ends every running slice and keeps the finished one',
-      slices: [slice(1, 'medium'), slice(2, 'easy'), slice(3, 'easy', [2])],
+      slices: [slice(1, 'medium'), slice(2, 'hard'), slice(3, 'hard', [2])],
       openai: [[{ kind: 'wait' } as const]],
       local: [[write('b.txt', 'two\n')]],
       line: 'Plan stopped: you cancelled it.',
@@ -2499,7 +2502,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     {
       // Slice 2 cannot start, and the slice 1 turn opened in the same step never runs.
       name: 'a slice that cannot start stops the plan before a sibling opened beside it runs',
-      slices: [slice(1, 'medium'), slice(2, 'easy')],
+      slices: [slice(1, 'medium'), slice(2, 'hard')],
       openai: [[write('a.txt', 'one\n')]],
       local: [],
       line: 'Plan stopped: slice 2 could not start. Connect this provider in Settings or pick another.',
@@ -2511,7 +2514,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       // The thread copy replaced a base link, which never reaches a slice copy. The read-only
       // slice's packet lists what its own copy changed against the base, so it lists nothing.
       name: "a read-only slice's packet carries its own copy's diff, not the thread copy's",
-      slices: [{ ...slice(1, 'easy'), readOnly: true }],
+      slices: [{ ...slice(1, 'hard'), readOnly: true }],
       openai: [],
       local: [[reply('Read it.')]],
       line: 'Crew finished: 1 slice, 0 reviews, 0 fixes.',
@@ -2571,6 +2574,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       name: 'Plan crew',
       members: [
         { role: 'builder', selection: pick('openai') },
+        { role: 'fixer', selection: pick('local') },
         { role: 'orchestrator', selection: pick('openai') },
       ],
     };

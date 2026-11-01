@@ -334,12 +334,12 @@ export function challengeContext(
 
 /** The example in the orchestrator brief. A test parses it with the plan schema. */
 export const PLAN_EXAMPLE =
-  '{"planId": "p1", "goal": "Add tax to the order total.", "slices": [{"id": 1, "title": "Add the tax rate", "brief": "Add TAX_RATE to src/config.ts and export it.", "files": ["src/config.ts"], "depends": [], "difficulty": "easy", "readOnly": false}, {"id": 2, "title": "Apply tax in totals", "brief": "Use TAX_RATE in orderTotal in src/totals.ts and round to the cent.", "files": ["src/totals.ts", "src/config.ts"], "depends": [1], "difficulty": "medium", "readOnly": false, "hint": {"family": "openai"}}]}';
+  '{"planId": "p1", "goal": "Add tax to the order total.", "slices": [{"id": 1, "title": "Add the tax rate", "brief": "Add TAX_RATE to src/config.ts and export it.", "files": ["src/config.ts"], "depends": [], "difficulty": "easy", "readOnly": false}, {"id": 2, "title": "Apply tax in totals", "brief": "Use TAX_RATE in orderTotal in src/totals.ts and round to the cent.", "files": ["src/totals.ts", "src/config.ts"], "depends": [1], "difficulty": "medium", "readOnly": false}]}';
 
 /**
  * Brief for an orchestrator turn. It reads, then answers with one plan block the controller
- * validates. The controller picks the model for each slice, so the brief asks for difficulty and
- * leaves the choice of family out.
+ * validates. The controller assigns each slice inside the crew, so the brief asks for difficulty
+ * and leaves the choice of family out.
  */
 export function orchestratorContext(
   projectName: string,
@@ -349,7 +349,7 @@ export function orchestratorContext(
   return [
     `You are the orchestrator in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     readOnlyRules(family, 'plan the work'),
-    'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan and picks the model for each slice. Slices whose dependencies are done start together, each in its own copy of the project, with at most one turn per provider at a time. Each slice that changes files gets a review.',
+    'Split the request into slices that one model can each finish in one turn. CrewKite checks the plan and assigns each slice inside the crew: every slice runs on the crew builder, and a hard slice runs on the crew fixer when the crew has one. No provider outside the crew takes a slice, and Local takes one only when a crew role is Local. When the crew builder reaches its usage limit and Continue on another provider is on, the handoff rule may still move a slice to another provider. Slices whose dependencies are done start together, each in its own copy of the project, with at most one turn per provider at a time. Each slice that changes files gets a review.',
     'The slices are the parallel workers, and CrewKite starts them after your turn. Your own turn only reads and plans, so you start no agent to do the work. When the person asks for a number of agents or subagents, split the work into that many slices where it divides that way, leave the independent ones without depends, and say in your summary which slices run side by side.',
     'Reply with a short summary in plain sentences: what each slice does and which ones run side by side. The person sees the plan as a card, so the summary does not repeat its JSON or list its fields. End the reply with exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
     PLAN_EXAMPLE,
@@ -362,7 +362,7 @@ export function orchestratorContext(
     '- depends: ids of the slices that must finish first. No cycles.',
     '- difficulty: easy for a small change a small local model can make from the named files alone; medium for a change across a few files that needs judgment; hard for design work or a change that needs much of the codebase in view.',
     '- readOnly: true when the slice only reads, such as an investigation, and changes no file.',
-    '- hint is optional. hint.family (openai, anthropic, google or local) only breaks a tie between families CrewKite already ranks.',
+    '- hint is optional and can be left out. hint.family only breaks a tie when the handoff rule moves a slice out of the crew.',
   ].join('\n');
 }
 
