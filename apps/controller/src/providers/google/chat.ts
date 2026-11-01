@@ -36,6 +36,7 @@ import {
   startAcpProcess,
 } from './acp/client.ts';
 import { ACP_SESSION_MODELS, type AcpClientIdentity } from './acp/profile.ts';
+import { permissionDetail } from './permission-detail.ts';
 
 // One chat turn on the published ACP agent. The connection, process ownership and stop
 // handling come from acp/client.ts. This file translates between the protocol and AgentEvents.
@@ -669,6 +670,8 @@ export function googleChatAdapter(deps: {
       let lastPlan = '';
       let usage: ChatTurnResult['usage'] = null;
       let permissionCount = 0;
+      // The thread's policy can narrow during the turn, and later asks follow it.
+      let limit = { policy: request.permissionPolicy, grants: request.permissionGrants ?? [] };
       const pending = new Map<
         string,
         { rpc: RpcId; callId: string; options: Map<string, ChatPermissionOption['kind']> }
@@ -1132,7 +1135,7 @@ export function googleChatAdapter(deps: {
         if (refuses && !reject) return reply(live, id, declined);
         // Edits land only in the scratch copy, so allow-edits and allow-all answer an edit only when
         // it names paths and all of them are inside. allow-all answers every other kind.
-        const policy = request.permissionPolicy;
+        const policy = limit.policy;
         const permitted =
           allow &&
           (call.kind === 'edit'
@@ -1147,17 +1150,12 @@ export function googleChatAdapter(deps: {
         // paths outside the scratch copy is still the person's call. A grant never covers
         // `other`, because that kind says nothing about what the call does.
         const granted =
-          call.kind !== 'other' && request.permissionGrants?.includes(call.kind) && !call.outside
+          call.kind !== 'other' && limit.grants.includes(call.kind) && !call.outside
             ? (options.find((option) => option.kind === 'allow-thread') ?? allow)
             : undefined;
         const automatic = refuses ? reject : (granted ?? permitted);
         const requestId = `${turnId}:permission:${++permissionCount}`;
-        const detail = [
-          call.paths.size ? `Paths: ${[...call.paths].join(', ')}` : '',
-          call.rawInput === undefined ? '' : clip(JSON.stringify(call.rawInput), 4000),
-        ]
-          .filter(Boolean)
-          .join('\n');
+        const detail = permissionDetail(call.rawInput, call.paths, scratch);
         if (!automatic)
           pending.set(requestId, {
             rpc: id,
@@ -1177,7 +1175,7 @@ export function googleChatAdapter(deps: {
               : 'Allow this action?',
             4000,
           ),
-          detail: detail || null,
+          detail,
           options,
           ...(call.deletes ? { deletes: true as const } : {}),
         });
@@ -1559,6 +1557,9 @@ export function googleChatAdapter(deps: {
       return {
         groups,
         result,
+        setPermissionPolicy(policy, grants) {
+          limit = { policy, grants };
+        },
         respondPermission(requestId, choice) {
           const entry = pending.get(requestId);
           const kind = entry?.options.get(choice);

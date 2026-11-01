@@ -6,13 +6,15 @@ import {
   ProjectSchema,
   type WorkspaceState,
 } from '@crewkite/contracts';
-import { ChevronDown, ChevronRight, Folder } from 'lucide-react';
+import { ChevronDown, ChevronRight, Folder, Plus } from 'lucide-react';
 import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { AnthropicCard } from '../settings/anthropic-card.tsx';
+import { CrewDialog, CrewSelect, useCrewChoices } from '../settings/crews-card.tsx';
 import { GoogleCard } from '../settings/google-card.tsx';
 import { LocalCard } from '../settings/local-card.tsx';
 import { OpenAiCard } from '../settings/openai-card.tsx';
+import { readSavedCrews, writeDefaultCrew, writeSavedCrews } from '../settings/preferences.ts';
 import { useProviderActions } from '../settings/provider-actions.ts';
 import type { CardProps, CatalogEntry } from '../settings/provider-card.tsx';
 import { useClock } from '../settings/use-catalog.ts';
@@ -30,6 +32,7 @@ import './onboarding.css';
 
 const stepNames: Record<OnboardingStep, string> = {
   provider: 'Provider',
+  crew: 'Crew',
   project: 'Project',
   message: 'First message',
 };
@@ -173,6 +176,46 @@ function ProviderStep({
   );
 }
 
+function CrewStep({ catalog }: { catalog: ChatCatalogRead | null }) {
+  const { choices, defaultId } = useCrewChoices();
+  const [building, setBuilding] = useState(false);
+  const select = useId();
+  const chosen = choices.find((choice) => choice.id === defaultId);
+  return (
+    <>
+      <p className="onb-lead">
+        A crew is who runs each step of a thread: a builder, and optionally a reviewer, a
+        challenger, a fixer and an orchestrator. Pick the crew new threads start with. You can
+        change it per project or per thread at any time.
+      </p>
+      <div className="onb-field">
+        <label htmlFor={select}>Default crew</label>
+        <CrewSelect id={select} value={defaultId} choices={choices} onChange={writeDefaultCrew} />
+        {chosen && <p className="st-note">{chosen.hint}</p>}
+      </div>
+      <div className="onb-actions">
+        <button type="button" className="button secondary" onClick={() => setBuilding(true)}>
+          <Plus size={14} aria-hidden="true" />
+          Build a crew
+        </button>
+      </div>
+      {building && (
+        <CrewDialog
+          catalog={catalog}
+          initial={null}
+          saved={readSavedCrews()}
+          onClose={() => setBuilding(false)}
+          onSave={(crew) => {
+            writeSavedCrews([...readSavedCrews(), crew]);
+            writeDefaultCrew(`saved:${crew.id}`);
+            setBuilding(false);
+          }}
+        />
+      )}
+    </>
+  );
+}
+
 function ProjectStep({
   workspace,
   projectId,
@@ -253,8 +296,8 @@ function MessageStep() {
 }
 
 /**
- * The first-run welcome: connect a provider, add a project, then open the composer with a first
- * message in it. Every step can be skipped, and Skip ends the welcome for good.
+ * The first-run welcome: connect a provider, pick the default crew, add a project, then open the
+ * composer with a first message in it. Every step can be skipped, and Skip ends the welcome for good.
  */
 export function Onboarding({
   workspace,
@@ -291,6 +334,7 @@ export function Onboarding({
   const index = ONBOARDING_STEPS.indexOf(step);
   const titles: Record<OnboardingStep, string> = {
     provider: 'Connect a provider',
+    crew: 'Pick a crew',
     project: 'Add a project',
     message: 'Start with a message',
   };
@@ -302,7 +346,7 @@ export function Onboarding({
             <p className="onb-eyebrow">Welcome</p>
             <h1 id="onb-title">Welcome to CrewKite</h1>
             <p className="onb-sub">
-              {'Three short steps to your first thread. Settings > General brings this back.'}
+              {'Four short steps to your first thread. Settings > General brings this back.'}
             </p>
           </div>
           <button type="button" className="button secondary" onClick={onSkip}>
@@ -336,6 +380,7 @@ export function Onboarding({
               ready={ready}
             />
           )}
+          {step === 'crew' && <CrewStep catalog={catalog} />}
           {step === 'project' && (
             <ProjectStep
               workspace={workspace}

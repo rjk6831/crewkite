@@ -2,20 +2,33 @@ import {
   type ChatAttachment,
   type ChatCatalogRead,
   ChatFamilySchema,
+  type ChatThread,
   type LocalSetup,
   type Task,
   TaskSchema,
   type WorkspaceState,
 } from '@crewkite/contracts';
-import { Folder } from 'lucide-react';
-import { useEffect, useRef, useState } from 'react';
+import { Folder, PanelRight } from 'lucide-react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
+import {
+  applyDraft,
+  crewForProject,
+  crewFromPreset,
+  type DraftSettings,
+  draftConfigure,
+  draftSettings,
+  preferredSelection,
+} from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
 import type { DesktopCommand } from '../source.ts';
-import { importAttachment, sendMessage, type ThreadSource } from './commands.ts';
+import { configureThread, importAttachment, sendMessage, type ThreadSource } from './commands.ts';
 import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
 import { EmptyThread } from './empty-thread.tsx';
 import { FamilyMark } from './family-mark.tsx';
+import { Inspector, type InspectorTab } from './inspector.tsx';
+import { defaultSelection } from './model-picker.tsx';
+import type { FirstSend } from './thread-view.tsx';
 import './thread.css';
 
 const NO_PROVIDER = 'Connect a provider in Settings';
@@ -58,6 +71,21 @@ function FirstRun({ onOpenSettings }: { onOpenSettings?: () => void }) {
 
 type Project = { id: string; name: string };
 
+/**
+ * The thread record the side panel and the composer read before the first send. It has no task,
+ * scratch copy, sessions or turns; only the settings the person can change are real.
+ */
+const draftThread = (settings: DraftSettings): ChatThread => ({
+  taskId: '',
+  scratchReady: false,
+  base: null,
+  sessions: [],
+  activeTurnId: null,
+  queued: [],
+  crewChain: null,
+  ...settings,
+});
+
 // The first message creates the thread. The task needs an outcome and one criterion, so the message
 // is the outcome and the criterion says what is being asked.
 // A message of files alone has no text, so the thread is named for its files.
@@ -95,7 +123,8 @@ export function NewThread({
   projects: readonly Project[];
   projectId: string;
   onProject: (id: string) => void;
-  onCreated: (taskId: string) => void;
+  /** The thread exists and its first message went. The message opens with it. */
+  onCreated: (taskId: string, first: FirstSend) => void;
   onAddProject: (() => void) | null;
   /** Opens Settings. The first-run card focuses a family's card before calling it. */
   onOpenSettings?: () => void;
@@ -112,6 +141,41 @@ export function NewThread({
   const created = useRef<Task | null>(null);
   const composer = useRef<ComposerHandle>(null);
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
+  // The side panel edits these before the thread exists. The first send applies them once.
+  const [draft, setDraft] = useState<DraftSettings>(() => draftSettings());
+  const pending = useMemo(() => draftThread(draft), [draft]);
+  const configured = useRef(false);
+  // The project's crew, else the default crew, once the catalog says which families are
+  // connected. A crew or mode the person picks in the panel stays, and so does the model picked
+  // in the composer, so this runs once per project.
+  const crewPicked = useRef(false);
+  const crewFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!catalog || crewPicked.current || crewFor.current === projectId) return;
+    crewFor.current = projectId;
+    setDraft((current) => {
+      const choice = crewForProject(projectId);
+      const model = current.selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
+      const crew = choice && crewFromPreset(choice.template, catalog, model, current.handoffMode);
+      const base = applyDraft(current, { crew: null });
+      if (!crew) return base;
+      const builder = crew.members.find((member) => member.role === 'builder')?.selection;
+      return applyDraft(base, {
+        crew,
+        ...(builder ? { selection: builder } : {}),
+        ...(choice.flightMode ? { flightMode: choice.flightMode } : {}),
+      });
+    });
+  }, [catalog, projectId]);
+  const [panel, setPanel] = useState<{ open: boolean; tab: InspectorTab }>({
+    open: false,
+    tab: 'crew',
+  });
+  const toggle = useRef<HTMLButtonElement>(null);
+  const closePanel = useCallback(() => {
+    if (document.activeElement?.closest('.th-inspector')) toggle.current?.focus();
+    setPanel((current) => ({ ...current, open: false }));
+  }, []);
   const project = projects.find(({ id }) => id === projectId);
   // The box is blocked until the project is in the list, and a blocked box takes no focus.
   const ready = !!project;
@@ -145,7 +209,14 @@ export function NewThread({
         throw new Error(result.next ?? result.reason ?? 'The thread could not be created.');
       created.current = saved.data;
     }
-    const taskId = created.current.id;
+    const { id: taskId, title } = created.current;
+    // A failure here stops the send, so the first turn never runs on settings the person did not
+    // pick. A retry applies them again on the same thread.
+    if (!configured.current) {
+      for (const patch of draftConfigure(draft))
+        await configureThread(source, { taskId, ...patch });
+      configured.current = true;
+    }
     const stored: ChatAttachment[] = [];
     for (const item of files)
       stored.push(item.file ?? (await importAttachment(source, taskId, item.path ?? '')));
@@ -155,11 +226,17 @@ export function NewThread({
       files: stored,
       ...(selection ? { selection } : {}),
     });
-    onCreated(taskId);
+    onCreated(taskId, {
+      task: { id: taskId, title, projectId: project.id },
+      text,
+      files: stored,
+      selection,
+      at: new Date().toISOString(),
+    });
   }
 
   return (
-    <div className="thread">
+    <div className={panel.open ? 'thread has-inspector' : 'thread'}>
       <section className="th-main" aria-label="New thread">
         <header className="th-bar">
           <h1 className="th-title">New thread</h1>
@@ -176,6 +253,17 @@ export function NewThread({
               </select>
             </label>
           )}
+          <button
+            ref={toggle}
+            type="button"
+            className="th-icon th-bar-toggle"
+            aria-label="Toggle inspector"
+            aria-pressed={panel.open}
+            title="Inspector"
+            onClick={() => setPanel({ ...panel, open: !panel.open })}
+          >
+            <PanelRight size={16} aria-hidden="true" />
+          </button>
         </header>
         <div className="th-scroll-frame">
           <div className="th-blank">
@@ -200,7 +288,7 @@ export function NewThread({
           ref={composer}
           source={source}
           taskId={null}
-          thread={null}
+          thread={pending}
           running={false}
           context={null}
           currentFamily={null}
@@ -213,10 +301,34 @@ export function NewThread({
           onStop={async () => {}}
           onConfigured={() => {}}
           onHandoff={async () => {}}
+          onOpenCrew={() => setPanel({ open: true, tab: 'crew' })}
           onCatalog={setCatalog}
           localState={refresh ? { setup: localSetup, refresh } : undefined}
         />
       </section>
+      {panel.open && (
+        <Inspector
+          draft
+          source={source}
+          taskId=""
+          title="New thread"
+          thread={pending}
+          turns={[]}
+          messages={[]}
+          loaded
+          header={null}
+          preview={false}
+          tab={panel.tab}
+          onTab={(tab) => setPanel({ ...panel, tab })}
+          onClose={closePanel}
+          changesKey={0}
+          focusPath={null}
+          onConfigure={(patch) => {
+            if (patch.crew !== undefined || patch.flightMode) crewPicked.current = true;
+            setDraft((current) => applyDraft(current, patch));
+          }}
+        />
+      )}
     </div>
   );
 }

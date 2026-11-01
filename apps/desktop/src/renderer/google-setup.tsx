@@ -119,6 +119,15 @@ function installOutcome(result: CommandResult | undefined) {
   );
 }
 
+// What a retry line names: "Retrying sign-in (2 of 3)".
+const retryLabels: Record<GoogleSetupStage, string> = {
+  clear: 'the clear',
+  install: 'the download',
+  initialize: 'initialization',
+  authenticate: 'sign-in',
+  discover: 'discovery',
+};
+
 const stageLabels: Record<GoogleSetupStage, string> = {
   clear: 'Clearing the stuck setup step',
   install: 'Installing and verifying the official client',
@@ -144,6 +153,7 @@ export function GoogleSetup({
   );
   const reader = snapshot.usageReaders.find((value) => value.family === 'google');
   const [requested, setRequested] = useState<GoogleSetupStage | null>(null);
+  const [retry, setRetry] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [pollTimedOut, setPollTimedOut] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
@@ -239,10 +249,15 @@ export function GoogleSetup({
         onStage: (stage) => {
           if (mounted.current && generation.current === currentGeneration) setRequested(stage);
         },
+        onRetry: (stage, attempt, tries) => {
+          if (mounted.current && generation.current === currentGeneration)
+            setRetry(`Retrying ${retryLabels[stage]} (${attempt} of ${tries})`);
+        },
       });
       if (!mounted.current || generation.current !== currentGeneration) return;
       if (result.kind === 'ready') {
-        setMessage('Google coding setup is ready. Quota reporting remains a separate status.');
+        // The heading says Ready, so the card shows no second line for it.
+        setMessage(null);
       } else if (result.kind === 'blocked' && installOutcome(result.result)) {
         // The install line under the progress shows the install outcome once.
         setMessage(null);
@@ -271,6 +286,7 @@ export function GoogleSetup({
         pollAbort.current?.abort();
         pollAbort.current = null;
         setRequested(null);
+        setRetry(null);
         // The poll gives up after 15 minutes, and a browser sign-in can take longer. Once the
         // flow ends, the slow-setup line no longer describes anything.
         setPollTimedOut(false);
@@ -282,6 +298,7 @@ export function GoogleSetup({
     if (!connected || cancelBusy) return;
     stopPolling();
     setRequested(null);
+    setRetry(null);
     setPollTimedOut(false);
     setCancelBusy(true);
     try {
@@ -421,7 +438,7 @@ export function GoogleSetup({
         <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
         <Fact label="Quota available" value={quotaAvailable} />
       </div>
-      <div className="dialog-footer">
+      <div className="gs-actions">
         {!ready && !working && !installUnknown && (
           <button
             className="button primary"
@@ -450,7 +467,7 @@ export function GoogleSetup({
       ) : active ? (
         <p role="status">Google setup is running…</p>
       ) : null}
-      {ready && <p role="status">Google coding setup is ready.</p>}
+      {retry && <p className="muted small">{retry}</p>}
       {pollTimedOut && !ready && (
         <p role="status">Taking longer than expected. Review status before retrying.</p>
       )}
@@ -460,14 +477,12 @@ export function GoogleSetup({
       {installed && !codingReady && !working && profileReason && (
         <p className="muted small">{profileReason}</p>
       )}
-      <p className="muted small">
-        Discovery choices establish configuration facts. A verified review mapping and route
-        qualification remain separate requirements.
-      </p>
-      {profile && (
+      {/* The model list is known once discovery ends. Until then the line would only say unknown. */}
+      {!working && profile?.configOptions && (
         <p className="muted small">
-          Models: {profile.configOptions?.model.supported.join(', ') ?? 'unknown'}. Thought levels:{' '}
-          {profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}.
+          Models: {profile.configOptions.model.supported.join(', ')}.
+          {profile.configOptions.thoughtLevel &&
+            ` Thought levels: ${profile.configOptions.thoughtLevel.supported.join(', ')}.`}
         </p>
       )}
       {needsRepair && (

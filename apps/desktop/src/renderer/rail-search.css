@@ -12,8 +12,10 @@
   border-radius: 5px;
   color: var(--text-dim);
 }
-.rs-field:focus-within {
+.rs-field:has(.rs-input:focus-visible) {
   border-color: var(--accent);
+  outline: 2px solid var(--accent);
+  outline-offset: 0;
 }
 .rs-input {
   flex: 1;
@@ -27,6 +29,20 @@
 }
 .rs-input::placeholder {
   color: var(--text-dim);
+}
+.rs-palette {
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 3px;
+  background: none;
+  cursor: pointer;
+}
+.rs-palette:hover kbd {
+  border-color: var(--text-dim);
+  color: var(--text);
 }
 .rs-clear {
   width: 20px;

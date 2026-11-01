@@ -460,6 +460,9 @@
 .usage-gauges-cluster[data-featured] {
   grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 1fr);
 }
+.usage-gauges-cluster[data-count="3"] {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
 .usage-gauges-cluster[data-count="0"],
 .usage-gauges-cluster[data-count="1"]:not([data-featured]) {
   grid-template-columns: minmax(0, 1fr);

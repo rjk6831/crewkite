@@ -82,6 +82,8 @@ import {
   type ChatTurnRequest,
   type ChatTurnResult,
   chatFailure,
+  limitPolicy,
+  type PolicyLimit,
 } from './adapter.ts';
 import type { ChangeCommandHost } from './change-commands.ts';
 import * as changeCommands from './change-commands.ts';
@@ -262,8 +264,14 @@ type LiveTurn = {
   kinds: Map<string, ChatToolKind>;
   /** Title and input by call ID, so CrewKite can tell where an edit lands and what a command runs. */
   calls: Map<string, { title: string; input: unknown }>;
-  /** The policy the adapter launched with. It answers what that policy covers on its own. */
+  /** The policy and grants the adapter launched with. */
   policy: ChatPermissionPolicy;
+  grants: readonly ChatToolKind[];
+  /**
+   * What the adapter answers on its own now: its launch policy, narrowed by any change since. The
+   * controller answers what the thread allows beyond it.
+   */
+  applied: PolicyLimit;
   /** The scratch copy the turn works in: the thread's, or its plan slice's own. */
   scratch: string;
   /** This turn started the person's MCP servers. A policy change mid-turn never answers their calls. */
@@ -341,17 +349,21 @@ const CREW_CHALLENGE = 'Challenge the assumptions behind the last answer.';
 const MAX_FIXES = 2;
 const CREW_ROLES = { review: 'reviewer', fix: 'fixer', challenge: 'challenger' } as const;
 type CrewStep = keyof typeof CREW_ROLES;
-// Commands balanced mode runs without asking. Each reads files and changes nothing.
+// Commands Balanced and Glide run without asking. Each reads files and changes nothing. sed
+// counts only as `sed -n` with a line range to print.
 const READ_ONLY_COMMANDS = new Set(['ls', 'cat', 'head', 'tail', 'wc', 'rg', 'grep', 'find']);
+const SED_PRINT = /^(\d+|\$)(,(\d+|\$))?p$/;
+// A client can wrap the command in a shell. The script inside is read by the same rules.
+const SHELLS = new Set(['sh', 'bash', 'zsh']);
 const READ_ONLY_GIT = new Set(['status', 'diff', 'log', 'show']);
 // find can run, delete or write through these. rg runs programs with --pre, --hostname-bin and
 // --search-zip. git diff and show write a file with --output and run configured programs with
 // --ext-diff and --textconv.
 const WRITING_FLAGS =
   /^(-exec|-execdir|-ok|-okdir|-delete|-fprint0?|-fprintf|-fls|--pre|--pre-glob|--hostname-bin|-z|--search-zip|--output|--ext-diff|--textconv)(=|$)/;
-// A word balanced mode answers for is plain: no quotes, globs, variables or escapes the shell
-// would rewrite before the program sees it.
-const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
+// A piece of a word the read-only commands accept: plain characters, or a quoted part the shell
+// passes on as it stands. No globs, variables, substitutions or escapes outside quotes.
+const WORD_PIECE = /^(?:[A-Za-z0-9._/=:,+@%-]+|'[^'\n]*'|"[^"$`\\!\n]*")/;
 
 // The media type of the artifacts that hold large event output (commands/controller.ts).
 const EVENT_OUTPUT = 'application/vnd.crewkite.event+json';
@@ -599,23 +611,38 @@ export class ChatService {
       flightMode,
       ...(checks ? { checks } : {}),
     });
-    if (payload.permissionPolicy && thread.activeTurnId) {
-      const answer = () => this.answerCovered(task.id);
+    const running = [...this.live.values()].some((live) => live.taskId === task.id);
+    if ((payload.permissionPolicy || payload.flightMode) && running) {
+      const answer = () => this.applyPolicy(task.id);
       if (effects) effects.push(answer);
       else queueMicrotask(answer);
     }
     return { outcome: 'applied' };
   }
 
-  /** Answer every open ask of the running turns that the thread now covers. */
-  private answerCovered(taskId: string) {
+  /**
+   * Bring every running turn of the thread to its policy and flight mode as they are now. Plan
+   * slices and side turns run beside the thread's turn, so each one hears the change. The
+   * adapter narrows what it answers on its own, and every open ask the thread now covers is
+   * answered here. Later asks are read against the thread when they arrive.
+   */
+  private applyPolicy(taskId: string) {
     const thread = this.thread(taskId);
-    // Plan slices run side by side, so every open turn of the thread hears the new policy.
-    for (const [turnId, open] of this.live) {
-      const live = open.taskId === taskId ? this.activeLive(taskId, turnId) : undefined;
-      if (!live) continue;
+    for (const live of [...this.live.values()]) {
+      if (live.taskId !== taskId || live.finished) continue;
+      const applied = limitPolicy(
+        { policy: live.policy, grants: live.grants },
+        launchPolicy(thread, live.role),
+      );
+      if (
+        applied.policy !== live.applied.policy ||
+        applied.grants.join() !== live.applied.grants.join()
+      ) {
+        live.applied = applied;
+        this.call(() => live.handle?.setPermissionPolicy?.(applied.policy, applied.grants));
+      }
       for (const requestId of [...live.permissions.keys()]) {
-        const choice = this.covered(thread, live, requestId);
+        const choice = this.covered(thread, live, requestId, false);
         if (!choice) continue;
         live.permissions.delete(requestId);
         this.call(() => live.handle?.respondPermission(requestId, choice));
@@ -1598,6 +1625,8 @@ export class ChatService {
       kinds: new Map(),
       calls: new Map(),
       policy: 'ask',
+      grants: [],
+      applied: { policy: 'ask', grants: [] },
       scratch: this.scratchDirectory(turn.taskId),
       mcp: false,
       secrets: [],
@@ -1682,6 +1711,8 @@ export class ChatService {
     if (this.closed || live.stopRequested) return stoppedResult;
     const request = this.request(turn);
     live.policy = request.permissionPolicy;
+    live.grants = request.permissionGrants ?? [];
+    live.applied = { policy: live.policy, grants: live.grants };
     live.scratch = request.scratch.directory;
     live.mcp = (request.mcp?.servers.length ?? 0) > 0;
     live.secrets = request.mcp?.secrets ?? [];
@@ -1859,11 +1890,7 @@ export class ChatService {
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
     if (turn.handoffFrom) this.takeHandoff(task);
-    // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
-    // the thread allows.
-    const balanced = writer && thread.flightMode === 'balanced';
-    const permissionPolicy = writer && !balanced ? thread.permissionPolicy : 'ask';
-    const permissionGrants = writer && !balanced ? (thread.permissionGrants ?? []) : [];
+    const { policy: permissionPolicy, grants: permissionGrants } = launchPolicy(thread, turn.role);
     const body = carries
       ? this.packet(turn, {
           from: turn.handoffFrom ?? (asked ? (this.answeredOn(task.id) ?? family) : family),
@@ -2046,7 +2073,7 @@ export class ChatService {
     // The thread is read at ask time, so a mode or policy changed during the turn applies to this
     // ask. Adapters register an ask before they emit it, so this answer finds it.
     if (event.type === 'permission.requested') {
-      const choice = this.covered(this.thread(turn.taskId), live, event.requestId);
+      const choice = this.covered(this.thread(turn.taskId), live, event.requestId, true);
       if (choice) {
         live.permissions.delete(event.requestId);
         const respond = () =>
@@ -2061,12 +2088,18 @@ export class ChatService {
   /**
    * The allow option CrewKite picks for an open ask, or null when the person decides. Balanced
    * answers edits inside the scratch copy and read-only commands, whatever the thread allows.
-   * Otherwise the adapter already applied the policy it launched with, so only a policy changed
-   * since then answers here: allow-edits covers edits inside the scratch copy, allow-all every
-   * ask with an allow option except an edit outside the copy. Network access and asks during
-   * read-only turns always go to the person.
+   * Otherwise a fresh ask the adapter's own policy covers is the adapter's to answer, so only a
+   * thread policy that differs from it answers here. An ask still open after a change is
+   * answered by the thread's policy alone: the adapter left it to the person. allow-edits covers
+   * edits inside the scratch copy, allow-all every ask with an allow option except an edit
+   * outside the copy. Network access and asks during read-only turns always go to the person.
    */
-  private covered(thread: ChatThread, live: LiveTurn, requestId: string): string | null {
+  private covered(
+    thread: ChatThread,
+    live: LiveTurn,
+    requestId: string,
+    fresh: boolean,
+  ): string | null {
     const open = live.permissions.get(requestId);
     const allow =
       open?.options.find((option) => option.kind === 'allow-once') ??
@@ -2074,7 +2107,6 @@ export class ChatService {
     if (!open || !allow || !writesScratch(live.role)) return null;
     const balanced = thread.flightMode === 'balanced';
     const policy = thread.permissionPolicy;
-    if (!balanced && policy === live.policy) return null;
     const call = live.calls.get(open.callId ?? '');
     const kind = live.kinds.get(open.callId ?? '');
     // A call the kinds do not name may be a server's. Its policy was cut at launch and a looser
@@ -2083,12 +2115,17 @@ export class ChatService {
     const words = `${open.question}\n${call?.title ?? ''}`;
     if (/\bnetwork\b/i.test(words)) return null;
     const scratch = live.scratch;
+    // Balanced and Glide run a read-only command inside the scratch copy without asking, on every
+    // family and under every policy. Other commands follow the policy.
+    if (thread.flightMode !== 'manual' && kind === 'command')
+      if (readOnlyCommand(call?.input, scratch)) return allow.id;
     if (balanced) {
       // A delete or move is marked by the adapter from the client's own change type.
       if (kind === 'edit')
         return !open.deletes && editsInside(call?.input, scratch) ? allow.id : null;
-      return kind === 'command' && readOnlyCommand(call?.input, scratch) ? allow.id : null;
+      return null;
     }
+    if (fresh && policy === live.applied.policy) return null;
     if (kind === 'edit')
       return policy !== 'ask' && editsInside(call?.input, scratch) ? allow.id : null;
     return policy === 'allow-all' ? allow.id : null;
@@ -3932,6 +3969,16 @@ function statedFindings(text: string): number | null {
 }
 
 /**
+ * The policy a turn's adapter launches with. Balanced answers the safe asks in the controller, so
+ * its adapter sends every ask here, and a reader never sees what the thread allowed.
+ */
+function launchPolicy(thread: ChatThread, role: ChatTurn['role']): PolicyLimit {
+  return writesScratch(role) && thread.flightMode !== 'balanced'
+    ? { policy: thread.permissionPolicy, grants: thread.permissionGrants ?? [] }
+    : { policy: 'ask', grants: [] };
+}
+
+/**
  * A path inside the scratch copy by the rules the Local tools use: no `..`, nothing in `.git`, and
  * no link that leads out of the copy. The copy itself counts as inside.
  */
@@ -3981,19 +4028,61 @@ function pathParts(word: string): string[] {
  */
 function readOnlyCommand(input: unknown, scratch: string): boolean {
   if (!input || typeof input !== 'object') return false;
-  const { command, cwd } = input as Record<string, unknown>;
+  // Clients name the fields differently: command and cwd, or CommandLine and Cwd.
+  const fields = new Map(
+    Object.entries(input as Record<string, unknown>).map(([key, value]) => [
+      key.toLowerCase(),
+      value,
+    ]),
+  );
+  const command = fields.get('command') ?? fields.get('commandline');
+  const cwd = fields.get('cwd');
   if (typeof command !== 'string') return false;
   if (cwd != null && (typeof cwd !== 'string' || !inScratch(scratch, cwd))) return false;
-  const words = command.trim().split(/[ \t]+/);
-  if (!words.every((word) => PLAIN_WORD.test(word))) return false;
+  return readOnlyWords(shellWords(command), scratch, true);
+}
+
+function readOnlyWords(words: string[] | null, scratch: string, outer: boolean): boolean {
+  if (!words?.length) return false;
   const [program, ...rest] = words;
+  const name = program.split('/').at(-1) ?? '';
+  if (outer && SHELLS.has(name) && rest.length === 2 && (rest[0] === '-c' || rest[0] === '-lc'))
+    return readOnlyWords(shellWords(rest[1]), scratch, false);
+  const inside = (word: string) =>
+    pathParts(word).every((part) => !part.startsWith('~') && inScratch(scratch, part));
+  if (program === 'sed') {
+    const [flag, script, ...files] = rest;
+    return flag === '-n' && SED_PRINT.test(script ?? '') && files.length > 0 && files.every(inside);
+  }
   if (program === 'git' ? !READ_ONLY_GIT.has(rest[0] ?? '') : !READ_ONLY_COMMANDS.has(program))
     return false;
-  return rest.every(
-    (word) =>
-      !WRITING_FLAGS.test(word) &&
-      pathParts(word).every((part) => !part.startsWith('~') && inScratch(scratch, part)),
-  );
+  return rest.every((word) => !WRITING_FLAGS.test(word) && inside(word));
+}
+
+/**
+ * The words the shell hands the program, or null when the command holds anything the shell
+ * would act on: an operator, a redirect, a glob, a variable or an escape outside quotes.
+ */
+function shellWords(command: string): string[] | null {
+  const words: string[] = [];
+  let word: string | null = null;
+  let rest = command.trim();
+  while (rest) {
+    const space = /^[ \t]+/.exec(rest);
+    if (space) {
+      if (word !== null) words.push(word);
+      word = null;
+      rest = rest.slice(space[0].length);
+      continue;
+    }
+    const piece = WORD_PIECE.exec(rest)?.[0];
+    if (!piece) return null;
+    const quoted = piece.startsWith("'") || piece.startsWith('"');
+    word = (word ?? '') + (quoted ? piece.slice(1, -1) : piece);
+    rest = rest.slice(piece.length);
+  }
+  if (word !== null) words.push(word);
+  return words;
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */

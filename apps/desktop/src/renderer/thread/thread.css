@@ -1,9 +1,5 @@
 /* Thread view. Colors come from the shared tokens in style.css, so both themes work unchanged. */
 
-.workspace-body.is-thread > :is(.topbar, .statusbar) {
-  display: none;
-}
-
 .thread {
   display: flex;
   flex: 1;
@@ -696,6 +692,11 @@
   color: var(--text-muted);
   line-height: 1.5;
   white-space: pre-wrap;
+}
+/* A command line wraps at any point, so a long one never needs a sideways scroll. */
+.th-permission pre {
+  overflow-x: hidden;
+  overflow-wrap: anywhere;
 }
 /* A folded run of reads and searches. The summary reads as a sentence, the cards inside keep paths. */
 .th-run {

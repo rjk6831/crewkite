@@ -7,7 +7,7 @@ import { addedProblem, commandWords, detectChecks } from './checks.ts';
 
 // Claim: the controller reads the declared checks from the project files and nothing else. A
 // command is plain words, never a shell line. The table is the whole detection contract.
-test('detection reads package scripts, python tools, make targets and a cargo manifest', (t) => {
+test('detection reads package scripts, python tools, pytest, make targets, cargo and go', (t) => {
   const rows: {
     name: string;
     files: Record<string, string>;
@@ -58,6 +58,66 @@ test('detection reads package scripts, python tools, make targets and a cargo ma
         ['Cargo.toml:typecheck', 'cargo check'],
       ],
     },
+    {
+      name: 'pytest named as a dependency, with no tool table',
+      files: {
+        'pyproject.toml':
+          '[project]\ndependencies = []\n[dependency-groups]\ndev = ["pytest>=8"]\n',
+      },
+      found: [['pyproject.toml:test', 'python3 -m pytest']],
+    },
+    {
+      name: 'pytest in a Poetry table',
+      files: { 'pyproject.toml': '[tool.poetry.group.dev.dependencies]\npytest = "^8"\n' },
+      found: [['pyproject.toml:test', 'python3 -m pytest']],
+    },
+    {
+      name: 'a pytest plugin alone is not pytest',
+      files: { 'pyproject.toml': '[project]\ndependencies = ["pytest-cov"]\n' },
+      found: [],
+    },
+    {
+      name: 'a pytest.ini with no pyproject',
+      files: { 'pytest.ini': '[pytest]\n' },
+      found: [['pytest.ini:test', 'python3 -m pytest']],
+    },
+    {
+      name: 'a pytest.ini beside a pyproject that declares pytest gives one test check',
+      files: { 'pyproject.toml': '[tool.pytest.ini_options]\n', 'pytest.ini': '[pytest]\n' },
+      found: [['pyproject.toml:test', 'python3 -m pytest']],
+    },
+    {
+      name: 'make rules that name several targets, and no special targets or assignments',
+      files: {
+        Makefile: '.PHONY: test lint\ntypecheck := mypy\ntest lint: deps\n\techo both\n',
+      },
+      found: [
+        ['Makefile:test', 'make test'],
+        ['Makefile:lint', 'make lint'],
+      ],
+    },
+    {
+      name: 'a go module',
+      files: { 'go.mod': 'module example.com/x\n\ngo 1.23\n' },
+      found: [
+        ['go.mod:test', 'go test ./...'],
+        ['go.mod:lint', 'go vet ./...'],
+      ],
+    },
+    {
+      name: 'a mixed project lists every stack in order',
+      files: {
+        'package.json': '{"scripts":{"test":"x"}}',
+        'pyproject.toml': '[tool.ruff]\n',
+        'go.mod': 'module x\n',
+      },
+      found: [
+        ['package.json:test', 'npm run test'],
+        ['pyproject.toml:lint', 'ruff check'],
+        ['go.mod:test', 'go test ./...'],
+        ['go.mod:lint', 'go vet ./...'],
+      ],
+    },
     { name: 'an empty project', files: { 'README.md': 'nothing' }, found: [] },
   ];
   for (const row of rows) {
@@ -90,6 +150,7 @@ test('detection reads package scripts, python tools, make targets and a cargo ma
   assert.deepEqual(resolvedFor({ Makefile: 'test:\n\tgo vet\n\tgo test\n' }), [
     'make test runs go vet; go test',
   ]);
+  assert.deepEqual(resolvedFor({ Makefile: 'lint:' }), ['make lint runs no recipe']);
   // A command a person adds cannot start a shell or a wrapper, run inline code or leave the copy.
   const scratch = '/home/example/scratch';
   for (const [line, refused] of [

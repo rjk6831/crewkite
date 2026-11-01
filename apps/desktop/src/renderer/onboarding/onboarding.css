@@ -94,8 +94,9 @@
   font-weight: 600;
   letter-spacing: -0.1px;
 }
+/* The heading takes focus for screen readers when a step opens. It is not a control, so no ring. */
 .onb-panel h2:focus-visible {
-  outline-offset: 4px;
+  outline: none;
 }
 .onb-families {
   display: grid;

@@ -449,7 +449,7 @@ export function UsageGauge({
               ? reading.state === 'unavailable'
                 ? 'No reading'
                 : 'No usable report'
-              : `${remaining.unit === 'percent' ? '' : `${remaining.unit} `}${reading.state === 'reported' ? 'reported remaining' : view.dated ? 'left when observed' : 'remaining'}`}
+              : `${remaining.unit === 'percent' ? '' : `${remaining.unit} `}${reading.state === 'reported' ? 'remaining' : view.dated ? 'left when observed' : 'remaining'}`}
           </span>
         </p>
       </Face>
@@ -545,7 +545,7 @@ function UsageMeter({ reading, nowMs }: { reading: UsageReading; nowMs: number }
         {view.known && (
           <span className="usage-sr-only">
             {reading.state === 'reported'
-              ? ` reported remaining, ${view.age.label}`
+              ? ` remaining, ${view.age.label}`
               : view.dated
                 ? ` left when observed, ${view.age.label}`
                 : ` remaining, ${view.age.label}`}
@@ -593,13 +593,16 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
   const auxiliary = card.auxiliary ?? [];
   const featured = card.featured ?? null;
   const empty = card.primary.length === 0 && auxiliary.length === 0 && !featured;
-  // Two side dials and an optional center dial form the cluster. More primaries keep the grid.
-  const cluster = card.primary.length <= 2 && (card.primary.length > 0 || featured !== null);
+  // Two side dials and an optional center dial form the cluster, or three dials of one size. More
+  // primaries keep the grid.
+  const cluster =
+    (card.primary.length <= 2 || (card.primary.length === 3 && !featured)) &&
+    (card.primary.length > 0 || featured !== null);
   const all = [...card.primary, ...(featured ? [featured] : []), ...auxiliary];
   const views = all.map((reading) => ({ reading, view: describe(reading, nowMs) }));
   // A card of meters alone still needs one place for the details.
   const withFooter = views.length > 0 && (cluster || card.primary.length === 0);
-  const [left, right] = card.primary;
+  const [left, right, third] = card.primary;
   return (
     <article className="usage-gauges-card" aria-labelledby={titleId}>
       <header className="usage-gauges-card-header">
@@ -631,6 +634,7 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
           {left && <UsageGauge reading={left} nowMs={nowMs} cluster />}
           {featured && <UsageGauge reading={featured} nowMs={nowMs} size="featured" cluster />}
           {right && <UsageGauge reading={right} nowMs={nowMs} cluster />}
+          {third && <UsageGauge reading={third} nowMs={nowMs} cluster />}
         </div>
       ) : (
         card.primary.length > 0 && (

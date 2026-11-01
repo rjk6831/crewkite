@@ -1,9 +1,9 @@
 import type { ChatFamily } from '@crewkite/contracts';
 
-// The first-run welcome is three steps in one flow. This file holds the rules for which step
+// The first-run welcome is four steps in one flow. This file holds the rules for which step
 // shows, so the screen only draws what it is told and a test can read the rules directly.
 
-export const ONBOARDING_STEPS = ['provider', 'project', 'message'] as const;
+export const ONBOARDING_STEPS = ['provider', 'crew', 'project', 'message'] as const;
 export type OnboardingStep = (typeof ONBOARDING_STEPS)[number];
 
 /** `unread` until the desktop has said whether the welcome ended. */
@@ -66,9 +66,15 @@ export function onboardingView(input: OnboardingInput): OnboardingView {
   // acknowledgement can go stale, so a ready family says nothing about who is new.
   if (setup.projectCount > 0 && !engaged) return { visible: false, reason: 'existing-user' };
   // A step is only shown while what it needs still holds. A family that disconnects sends the
-  // person back to the first step, and a missing project back to the second.
+  // person back to the first step, and a missing project back to the project step. The crew step
+  // needs a family, so its automatic picks have a model to land on.
   const wanted = ONBOARDING_STEPS.indexOf(input.reached);
-  const allowed = ready.length === 0 ? 0 : setup.projectCount === 0 ? 1 : 2;
+  const allowed =
+    ready.length === 0
+      ? 0
+      : setup.projectCount === 0
+        ? ONBOARDING_STEPS.indexOf('project')
+        : ONBOARDING_STEPS.length - 1;
   const step = ONBOARDING_STEPS[Math.min(wanted, allowed)];
   return {
     visible: true,

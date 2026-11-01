@@ -29,6 +29,33 @@ export type GoogleSetupFlowResult =
 const applied = (result: CommandResult) =>
   result.outcome === 'applied' || result.outcome === 'already-applied';
 
+/** Tries per step: the first and up to two more when the step ends by timeout or stall. */
+export const GOOGLE_STEP_TRIES = 3;
+// A step the controller started on its own, such as the initialize after the terms, runs while
+// the flow reads. The flow waits for it, one read a second for up to 15 minutes.
+const RUNNING_WAITS = 900;
+// A quota read or the controller's own step can hold the Google journal when a step is sent. The
+// step is sent again a second later, for up to a minute, and that costs none of its tries.
+const BUSY_WAITS = 60;
+
+/**
+ * True when the step ended by timeout or stall, which another try can fix. A Stop, a refused
+ * sign-in, the terms and every other refusal wait for the person.
+ */
+export function retryableGoogleFailure(result: CommandResult): boolean {
+  if (result.outcome !== 'blocked') return false;
+  if (result.reason === 'acp-setup-timeout' || result.reason === 'stalled') return true;
+  if (result.reason !== 'acp-setup-failed') return false;
+  // The client ended the step early. A sign-in the person cancelled or refused ends it too, and
+  // the setup then says the sign-in is still required.
+  const data = result.data;
+  return !(data?.kind === 'google-acp-setup' && data.setup.reason === 'authentication-required');
+}
+
+const stepRunning = (state: GoogleState) =>
+  (!!state.googleAcpInstall?.operationId && state.googleAcpInstall.state !== 'unknown') ||
+  (!!state.googleAcpSetup?.operationId && state.googleAcpSetup.state !== 'unknown');
+
 export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' | null {
   const setup = state.googleAcpSetup;
   const installation = state.googleAcpInstall;
@@ -61,13 +88,21 @@ export async function runGoogleSetupFlow({
   command,
   active,
   onStage,
+  onRetry,
+  wait = () => new Promise((resolve) => setTimeout(resolve, 1_000)),
 }: {
   read: () => Promise<GoogleState>;
   command: (input: GoogleCommand) => Promise<CommandResult>;
   active: () => boolean;
   onStage: (stage: GoogleSetupStage) => void;
+  /** A step failed by timeout or stall and starts again: this is try `attempt` of `tries`. */
+  onRetry?: (stage: GoogleSetupStage, attempt: number, tries: number) => void;
+  wait?: () => Promise<void>;
 }): Promise<GoogleSetupFlowResult> {
   const attempted = new Set<GoogleSetupStage>();
+  const tries = new Map<GoogleSetupStage, number>();
+  let waits = 0;
+  let busy = 0;
   let acknowledged = false;
   for (;;) {
     const state = await read();
@@ -87,8 +122,18 @@ export async function runGoogleSetupFlow({
     }
     const stage = nextGoogleStage(state);
     if (stage === 'ready') return { kind: 'ready' };
+    // The acknowledgement and the install start the initialize in the controller. The flow
+    // follows it to its end and then takes the next step.
+    if (!stage && stepRunning(state) && waits++ < RUNNING_WAITS) {
+      await wait();
+      if (!active()) return { kind: 'stopped' };
+      continue;
+    }
     if (!stage || attempted.has(stage)) return { kind: 'blocked' };
     attempted.add(stage);
+    const attempt = (tries.get(stage) ?? 0) + 1;
+    tries.set(stage, attempt);
+    if (attempt > 1) onRetry?.(stage, attempt, GOOGLE_STEP_TRIES);
     onStage(stage);
     const setup = state.googleAcpSetup;
     let input: GoogleCommand;
@@ -137,7 +182,20 @@ export async function runGoogleSetupFlow({
     }
     const result = await command(input);
     if (!active()) return { kind: 'stopped' };
-    if (!applied(result)) return { kind: 'blocked', result };
+    if (applied(result)) continue;
+    if (result.reason === 'google-operation-active' && busy++ < BUSY_WAITS) {
+      attempted.delete(stage);
+      tries.set(stage, attempt - 1);
+      await wait();
+      if (!active()) return { kind: 'stopped' };
+      continue;
+    }
+    // The next read finds the step blocked, and the flow starts it again from there.
+    if (attempt < GOOGLE_STEP_TRIES && retryableGoogleFailure(result)) {
+      attempted.delete(stage);
+      continue;
+    }
+    return { kind: 'blocked', result };
   }
 }
 

@@ -3,19 +3,21 @@ import {
   type ChatCatalogRead,
   type ChatCrew,
   type ChatCrewRole,
+  ChatCrewRoleSchema,
   type ChatFamily,
   ChatFamilySchema,
   type ChatFlightMode,
+  ChatFlightModeSchema,
   type ChatHandoffMode,
   type ChatModelSelection,
   ChatModelSelectionSchema,
   type ChatPermissionPolicy,
   ChatPermissionPolicySchema,
   ChatSavedHandoffModeSchema,
+  type ChatThread,
   rankFamilies,
-  TaskSchema,
 } from '@crewkite/contracts';
-import { configureThread, type ThreadSource } from '../thread/commands.ts';
+import type { ThreadSettings } from '../thread/thread-state.ts';
 
 // One key holds the defaults for new threads. Storage can be full, blocked or edited by hand, so
 // every read and write tolerates failure and a bad value falls back to the built-in default.
@@ -195,31 +197,69 @@ export function preferredSelection(
   };
 }
 
+/** What a new thread holds before its first send creates it. The side panel edits these. */
+export type DraftSettings = Pick<
+  ChatThread,
+  'selection' | 'permissionPolicy' | 'autoHandoff' | 'handoffMode' | 'crew' | 'flightMode'
+>;
+
+/** The settings the controller gives a thread it has just created. */
+const created: DraftSettings = {
+  selection: null,
+  permissionPolicy: 'ask',
+  autoHandoff: false,
+  handoffMode: 'most-left',
+  crew: null,
+  flightMode: 'manual',
+};
+
+/** A new thread starts on the saved defaults for new threads. */
+export function draftSettings(store: Store | null = browserStore()): DraftSettings {
+  const { permissionPolicy, handoffMode } = readThreadDefaults(store);
+  return { ...created, permissionPolicy, handoffMode };
+}
+
 /**
- * Applies the saved permission policy and handoff mode to a thread right after its task is
- * created, in the thread's first configure. If the call fails the thread stays on Ask each time,
- * the strictest policy, and the Thread tab shows it.
+ * One side panel change on a new thread, by the rules the controller applies to a saved one: a
+ * thread with no crew is manual, and entering Glide turns automatic handoff on.
  */
-export function withThreadDefaults<Input, Result extends { outcome: string; entity?: unknown }>(
-  source: ThreadSource,
-  createTask: (input: Input) => Promise<Result>,
-): (input: Input) => Promise<Result> {
-  return async (input) => {
-    const result = await createTask(input);
-    const { permissionPolicy, handoffMode } = readThreadDefaults();
-    const patch = {
-      ...(permissionPolicy !== builtIn.permissionPolicy ? { permissionPolicy } : {}),
-      ...(handoffMode !== builtIn.handoffMode ? { handoffMode } : {}),
-    };
-    const created = TaskSchema.safeParse(result.entity);
-    if (
-      Object.keys(patch).length > 0 &&
-      created.success &&
-      (result.outcome === 'applied' || result.outcome === 'already-applied')
-    )
-      await configureThread(source, { taskId: created.data.id, ...patch }).catch(() => {});
-    return result;
+export function applyDraft(draft: DraftSettings, patch: ThreadSettings): DraftSettings {
+  const crew = patch.crew === undefined ? draft.crew : patch.crew;
+  const flightMode = crew ? (patch.flightMode ?? draft.flightMode) : 'manual';
+  const entersGlide = flightMode === 'glide' && draft.flightMode !== 'glide';
+  return {
+    selection: patch.selection ?? draft.selection,
+    permissionPolicy: patch.permissionPolicy ?? draft.permissionPolicy,
+    autoHandoff: entersGlide ? true : (patch.autoHandoff ?? draft.autoHandoff),
+    handoffMode: patch.handoffMode ?? draft.handoffMode,
+    crew,
+    flightMode,
   };
+}
+
+/**
+ * The configure calls that give a just created thread its draft settings, in order. The first
+ * message carries the model, so the selection is left out. Entering Glide turns automatic handoff
+ * on, so a second call turns it off when the person did. Empty when nothing differs.
+ */
+export function draftConfigure(draft: DraftSettings): ThreadSettings[] {
+  const first: ThreadSettings = {
+    ...(draft.permissionPolicy !== created.permissionPolicy
+      ? { permissionPolicy: draft.permissionPolicy }
+      : {}),
+    ...(draft.handoffMode !== created.handoffMode ? { handoffMode: draft.handoffMode } : {}),
+    ...(draft.autoHandoff !== created.autoHandoff && draft.flightMode !== 'glide'
+      ? { autoHandoff: draft.autoHandoff }
+      : {}),
+    ...(draft.crew ? { crew: draft.crew } : {}),
+    ...(draft.crew && draft.flightMode !== created.flightMode
+      ? { flightMode: draft.flightMode }
+      : {}),
+  };
+  const calls = Object.keys(first).length > 0 ? [first] : [];
+  if (draft.crew && draft.flightMode === 'glide' && !draft.autoHandoff)
+    calls.push({ autoHandoff: false });
+  return calls;
 }
 
 // Crew presets keep only the roles the person pinned to a model and effort. Every other role is
@@ -257,12 +297,19 @@ export const crewPresetHints: Record<CrewPresetName, string> = {
   Pair: 'A builder and a reviewer on another family.',
   'Full crew': 'Builder, reviewer, challenger and fixer, with an orchestrator that plans the work.',
 };
-export type CrewPreset = {
-  name: CrewPresetName;
-  /** Null picks the role's model and effort when a thread starts from the preset. */
-  /** allowSubagents is what the person set for the role. Missing takes the family default. */
-  members: { role: ChatCrewRole; selection: ChatModelSelection | null; allowSubagents?: boolean }[];
+/**
+ * One role of a crew a thread can start from. Null picks the role's model and effort when a
+ * thread starts. allowSubagents is what the person set for the role; missing takes the family
+ * default.
+ */
+export type CrewMemberPin = {
+  role: ChatCrewRole;
+  selection: ChatModelSelection | null;
+  allowSubagents?: boolean;
 };
+/** What crewFromPreset builds a thread's crew from: a built-in preset or a saved crew. */
+export type CrewTemplate = { name: string; members: CrewMemberPin[] };
+export type CrewPreset = CrewTemplate & { name: CrewPresetName };
 
 export function readCrewPresets(store: Store | null = browserStore()): CrewPreset[] {
   const read = (key: string): Record<string, Record<string, unknown> | undefined> | null => {
@@ -343,7 +390,7 @@ const onDefault = (entry: ChatCatalogEntry, store: Store | null): ChatModelSelec
  * unless a model is pinned for it. Null when no family is connected.
  */
 export function crewFromPreset(
-  preset: CrewPreset,
+  preset: CrewTemplate,
   catalog: ChatCatalogRead,
   threadSelection: ChatModelSelection | null,
   mode: ChatHandoffMode = 'most-left',
@@ -384,4 +431,188 @@ export function crewFromPreset(
     });
   }
   return { name: preset.name, members };
+}
+
+// Crews the person builds in Settings > Crews, saved in order. Each holds the roles it has, a pin
+// or null per role, and the flight mode a thread takes when it starts from the crew.
+const savedCrewsKey = 'crewkite-saved-crews-v1';
+// The crew new threads start with, as a CrewChoice id, and the projects that start with another.
+const defaultCrewKey = 'crewkite-default-crew-v1';
+const projectCrewsKey = 'crewkite-project-crews-v1';
+const SAVED_CREWS = 24;
+
+export type SavedCrew = CrewTemplate & { id: string; flightMode: ChatFlightMode };
+
+/** A crew a thread can start from, as the Crew tab, Settings and the welcome list them. */
+export type CrewChoice = {
+  /** preset:<name> or saved:<id>. */
+  id: string;
+  name: string;
+  hint: string;
+  template: CrewTemplate;
+  /** The flight mode the crew sets. Null keeps the thread's own. */
+  flightMode: ChatFlightMode | null;
+};
+
+export const BUILT_IN_DEFAULT_CREW = 'preset:Solo';
+
+const parse = (store: Store | null, key: string): unknown => {
+  try {
+    const raw = store?.getItem(key);
+    return raw ? JSON.parse(raw) : null;
+  } catch {
+    return null;
+  }
+};
+
+const roleOrder = (role: ChatCrewRole) => ChatCrewRoleSchema.options.indexOf(role);
+
+/** Saved crews that still read whole. An entry edited into a bad shape is left out. */
+export function readSavedCrews(store: Store | null = browserStore()): SavedCrew[] {
+  const saved = parse(store, savedCrewsKey);
+  if (!Array.isArray(saved)) return [];
+  const crews: SavedCrew[] = [];
+  for (const value of saved.slice(0, SAVED_CREWS)) {
+    const entry = value as Record<string, unknown> | null;
+    const id = entry?.id;
+    const name = typeof entry?.name === 'string' ? entry.name.trim() : '';
+    const mode = ChatFlightModeSchema.safeParse(entry?.flightMode);
+    if (typeof id !== 'string' || !/^[a-z0-9-]{1,40}$/.test(id) || !name || name.length > 60)
+      continue;
+    const members: CrewMemberPin[] = [];
+    for (const item of Array.isArray(entry?.members) ? entry.members : []) {
+      const role = ChatCrewRoleSchema.safeParse(item?.role);
+      if (!role.success || members.some((member) => member.role === role.data)) continue;
+      const selection = ChatModelSelectionSchema.safeParse(item?.selection);
+      members.push({
+        role: role.data,
+        selection: selection.success ? selection.data : null,
+        ...(typeof item?.allowSubagents === 'boolean'
+          ? { allowSubagents: item.allowSubagents }
+          : {}),
+      });
+    }
+    if (!members.some((member) => member.role === 'builder')) continue;
+    members.sort((a, b) => roleOrder(a.role) - roleOrder(b.role));
+    crews.push({ id, name, members, flightMode: mode.success ? mode.data : 'manual' });
+  }
+  return crews;
+}
+
+export function writeSavedCrews(crews: SavedCrew[], store: Store | null = browserStore()) {
+  try {
+    store?.setItem(savedCrewsKey, JSON.stringify(crews.slice(0, SAVED_CREWS)));
+  } catch {}
+  for (const listener of crewListeners) listener();
+}
+
+/** Why a name cannot be saved, or null. Names are unique across presets and saved crews. */
+export function crewNameProblem(
+  name: string,
+  saved: readonly SavedCrew[],
+  editing: string | null,
+): string | null {
+  const wanted = name.trim().toLowerCase();
+  if (!wanted) return 'Name the crew.';
+  if (wanted.length > 60) return 'Use 60 characters or fewer.';
+  const taken =
+    crewPresetNames.some((value) => value.toLowerCase() === wanted) ||
+    saved.some((crew) => crew.id !== editing && crew.name.toLowerCase() === wanted);
+  return taken ? 'Another crew has this name.' : null;
+}
+
+/** A new id for a saved crew. */
+export const savedCrewId = () =>
+  `crew-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`;
+
+const summary = (crew: SavedCrew) =>
+  `${crew.members.map(({ role }) => crewRoleNames[role]).join(', ')}. ${
+    flightModes.find(({ id }) => id === crew.flightMode)?.label ?? 'Manual'
+  }.`;
+
+/** Built-in presets first, then saved crews in the order they were made. */
+export function crewChoices(store: Store | null = browserStore()): CrewChoice[] {
+  return [
+    ...readCrewPresets(store).map((preset) => ({
+      id: `preset:${preset.name}`,
+      name: preset.name,
+      hint: crewPresetHints[preset.name],
+      template: preset,
+      flightMode: null,
+    })),
+    ...readSavedCrews(store).map((crew) => ({
+      id: `saved:${crew.id}`,
+      name: crew.name,
+      hint: summary(crew),
+      template: crew,
+      flightMode: crew.flightMode,
+    })),
+  ];
+}
+
+/** The choice whose name a thread's crew carries, if it is still listed. */
+export const choiceNamed = (choices: readonly CrewChoice[], name: string | undefined) =>
+  name === undefined ? undefined : choices.find((choice) => choice.name === name);
+
+/** The crew new threads start with. A saved crew that was deleted falls back to Solo. */
+export function readDefaultCrew(store: Store | null = browserStore()): string {
+  const id = parse(store, defaultCrewKey);
+  return typeof id === 'string' && crewChoices(store).some((choice) => choice.id === id)
+    ? id
+    : BUILT_IN_DEFAULT_CREW;
+}
+
+export function writeDefaultCrew(id: string, store: Store | null = browserStore()) {
+  try {
+    store?.setItem(defaultCrewKey, JSON.stringify(id));
+  } catch {}
+  for (const listener of crewListeners) listener();
+}
+
+/** Projects that start new threads with their own crew, keyed by project id. */
+export function readProjectCrews(store: Store | null = browserStore()): Record<string, string> {
+  const saved = parse(store, projectCrewsKey);
+  const ids = new Set(crewChoices(store).map((choice) => choice.id));
+  const crews: Record<string, string> = {};
+  if (saved && typeof saved === 'object' && !Array.isArray(saved))
+    for (const [project, id] of Object.entries(saved))
+      if (typeof id === 'string' && ids.has(id) && project.length <= 64) crews[project] = id;
+  return crews;
+}
+
+/** Null makes the project follow the default crew again. */
+export function writeProjectCrew(
+  projectId: string,
+  id: string | null,
+  store: Store | null = browserStore(),
+) {
+  const next = readProjectCrews(store);
+  if (id) next[projectId] = id;
+  else delete next[projectId];
+  try {
+    store?.setItem(projectCrewsKey, JSON.stringify(next));
+  } catch {}
+  for (const listener of crewListeners) listener();
+}
+
+/** The crew a new thread in the project starts with: the project's own, else the default. */
+export function crewForProject(
+  projectId: string | null,
+  store: Store | null = browserStore(),
+): CrewChoice {
+  const choices = crewChoices(store);
+  const id = (projectId && readProjectCrews(store)[projectId]) || readDefaultCrew(store);
+  return (
+    choices.find((choice) => choice.id === id) ??
+    choices.find((choice) => choice.id === BUILT_IN_DEFAULT_CREW) ??
+    choices[0]
+  );
+}
+
+const crewListeners = new Set<() => void>();
+
+/** Calls `listener` after saved crews or a default crew change. Returns the call that stops it. */
+export function onCrewChoices(listener: () => void): () => void {
+  crewListeners.add(listener);
+  return () => void crewListeners.delete(listener);
 }

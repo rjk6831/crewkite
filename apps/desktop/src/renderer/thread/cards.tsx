@@ -19,7 +19,7 @@ import { familyName } from '../components.tsx';
 import { formatSpan } from '../usage-gauges.tsx';
 import type { TryWithChoice } from './file-fit.ts';
 import { ModelPicker } from './model-picker.tsx';
-import { subagentBadge, subagentRows, unlistedLine } from './subagent-view.ts';
+import { spawnCardBadge, subagentRows, unlistedLine } from './subagent-view.ts';
 import { SubagentBadge } from './turn-chip.tsx';
 import {
   type PermissionBlock,
@@ -105,13 +105,21 @@ export const lineClass = (line: string) =>
         : '';
 
 /** The subagents a spawn card started, one row each with its latest action. */
-function SubagentList({ block, ended }: { block: ToolBlock; ended: boolean }) {
+function SubagentList({
+  block,
+  ended,
+  start,
+}: {
+  block: ToolBlock;
+  ended: boolean;
+  start: number;
+}) {
   if (!block.subagents) return null;
   const more = unlistedLine(block.subagents);
   return (
     <>
       <ul className="sa-list" aria-label="Subagents">
-        {subagentRows(block.subagents, ended).map((row) => (
+        {subagentRows(block.subagents, ended, start).map((row) => (
           <li key={row.key} className={`sa-row is-${row.state}`}>
             <span className="sa-row-state">
               {row.state === 'running' ? (
@@ -138,16 +146,19 @@ function SubagentList({ block, ended }: { block: ToolBlock; ended: boolean }) {
 export function ToolCard({
   block,
   ended = false,
+  subagentStart = 0,
   onOpenChanges,
 }: {
   block: ToolBlock;
   /** The turn ended, so a subagent still marked running shows as stopped. */
   ended?: boolean;
+  /** How many subagents earlier spawn cards in the turn started, so the numbers run on. */
+  subagentStart?: number;
   onOpenChanges: (path: string) => void;
 }) {
   const Icon = toolIcons[block.toolKind];
   const [override, setOverride] = useState<boolean | null>(null);
-  const badge = block.subagents ? subagentBadge([block.subagents], ended) : null;
+  const badge = block.subagents ? spawnCardBadge(block.subagents, ended, subagentStart) : null;
   const hasBody = block.output !== '' || block.summary !== null || badge !== null;
   // A spawn card stays open while its subagents run, so their latest actions are in view.
   const open =
@@ -185,7 +196,7 @@ export function ToolCard({
       )}
       {open && (
         <div className="th-tool-body">
-          <SubagentList block={block} ended={ended} />
+          <SubagentList block={block} ended={ended} start={subagentStart} />
           {block.summary && <p>{block.summary}</p>}
           {block.output && <pre>{block.output}</pre>}
           {block.truncated && <p className="th-muted">Output was cut at the provider limit.</p>}

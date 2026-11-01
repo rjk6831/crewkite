@@ -38,14 +38,13 @@ import { focusSection } from './palette/focus-section.ts';
 import { selectedOption } from './palette/select.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { RailSearch } from './rail-search.tsx';
-import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { adjacentThread, isMacPlatform, searchHint, shortcutFor } from './thread/composer-rules.ts';
 import type { HistoryFind } from './thread/history-reveal.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
-import { OpeningThread, ThreadView } from './thread/thread-view.tsx';
+import { type FirstSend, OpeningThread, ThreadView } from './thread/thread-view.tsx';
 
 // Local preferences only. Storage can be full or blocked, and the app keeps working with defaults.
 function readPreference(key: string) {
@@ -539,6 +538,8 @@ export function App() {
   );
   // The project a new thread will be created in. Null while a saved thread is open.
   const [newThread, setNewThread] = useState<string | null>(null);
+  // The message a new thread was created with. The thread opens with it before its first read.
+  const [firstSend, setFirstSend] = useState<FirstSend | null>(null);
   const [palette, setPalette] = useState(false);
   const paletteOpener = useRef<HTMLElement | null>(null);
   const searchButton = useRef<HTMLButtonElement>(null);
@@ -546,6 +547,10 @@ export function App() {
   const [about, setAbout] = useState(false);
   const task = newThread === null ? snapshot?.tasks.find(({ id }) => id === selected) : undefined;
   const selectedProjectId = task?.projectId;
+  // A thread just created opens on its first message while the workspace read catches up.
+  const fresh =
+    !task && newThread === null && firstSend?.task.id === selected ? firstSend.task : null;
+  const shown = task ?? fresh;
   useEffect(() => {
     if (selectedProjectId && !taskPages[selectedProjectId])
       void workspace.loadTasks(selectedProjectId);
@@ -582,10 +587,11 @@ export function App() {
   }
   // A history search result the open thread scrolls to. Opening a thread any other way clears it.
   const [find, setFind] = useState<HistoryFind | null>(null);
-  function openThread(id: string) {
+  function openThread(id: string, first?: FirstSend) {
     // A thread in view means the person is under way, so the welcome ends.
     if (onboarding.view.visible) onboarding.finish();
     setFind(null);
+    setFirstSend(first ?? null);
     setNewThread(null);
     setSelected(id);
     setPage('tasks');
@@ -755,20 +761,30 @@ export function App() {
           <SquarePen size={16} aria-hidden="true" />
           <span className="nav-text">New thread</span>
         </button>
-        <button
-          ref={searchButton}
-          type="button"
-          className="search-button"
-          onClick={() => setPalette(true)}
-          aria-label="Search threads and commands"
-          aria-keyshortcuts="Meta+K Control+K"
-          data-tooltip="Search"
-        >
-          <Search size={14} aria-hidden="true" />
-          <span className="nav-text">Search</span>
-          <kbd>{searchHint(isMacPlatform())}</kbd>
-        </button>
-        {threadSource && !collapsed && <RailSearch source={threadSource} onOpen={openFind} />}
+        {/* The expanded rail has one search field. Its palette button carries the shortcut hint. */}
+        {threadSource && !collapsed ? (
+          <RailSearch
+            source={threadSource}
+            onOpen={openFind}
+            onPalette={() => setPalette(true)}
+            paletteHint={searchHint(isMacPlatform())}
+            paletteButton={searchButton}
+          />
+        ) : (
+          <button
+            ref={searchButton}
+            type="button"
+            className="search-button"
+            onClick={() => setPalette(true)}
+            aria-label="Search threads and commands"
+            aria-keyshortcuts="Meta+K Control+K"
+            data-tooltip="Search"
+          >
+            <Search size={14} aria-hidden="true" />
+            <span className="nav-text">Search</span>
+            <kbd>{searchHint(isMacPlatform())}</kbd>
+          </button>
+        )}
         {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
         <div className="nav-scroll" hidden={collapsed}>
           <div className="nav-label">PROJECTS</div>
@@ -930,14 +946,6 @@ export function App() {
         </div>
       </aside>
       <div className={inThread ? 'workspace-body is-thread' : 'workspace-body'}>
-        <header className="topbar">
-          <div className="breadcrumbs">
-            <Folder size={14} />
-            <span>Workspace</span>
-            <ChevronRight size={12} />
-            <span>{page === 'settings' ? 'Settings' : 'Threads'}</span>
-          </div>
-        </header>
         {preview && (
           <div className="preview-banner">
             <Info size={14} />
@@ -1034,7 +1042,7 @@ export function App() {
         ) : newThread !== null ? (
           <NewThread
             source={threadSource}
-            createTask={withThreadDefaults(threadSource, workspace.command)}
+            createTask={workspace.command}
             projects={projects}
             projectId={newThread}
             onProject={setNewThread}
@@ -1048,20 +1056,21 @@ export function App() {
             refresh={workspace.refresh}
             blocked={connection === 'connected' ? null : 'Reconnect to the controller to send.'}
           />
-        ) : selected && !snapshot ? (
+        ) : selected && !snapshot && !fresh ? (
           <OpeningSnapshot key={selected} onRetry={() => void workspace.selectTask(selected)} />
-        ) : task ? (
+        ) : shown ? (
           <ThreadView
-            key={task.id}
+            key={shown.id}
             source={threadSource}
-            task={task}
-            projectId={task.projectId}
-            projectName={projects.find(({ id }) => id === task.projectId)?.name ?? 'Project'}
+            task={shown}
+            first={firstSend}
+            projectId={shown.projectId}
+            projectName={projects.find(({ id }) => id === shown.projectId)?.name ?? 'Project'}
             header={header}
             preview={preview}
             connection={connection}
             refresh={workspace.refresh}
-            find={find?.taskId === task.id ? find : null}
+            find={find?.taskId === shown.id ? find : null}
             onNewThread={() => startThread()}
             onOpenSettings={() => setPage('settings')}
           />
@@ -1074,15 +1083,6 @@ export function App() {
             onNewThread={() => startThread()}
           />
         )}
-        <footer className="statusbar">
-          <span>
-            Local workspace<span className="footer-separator">/</span>
-            {connectionLabel}
-          </span>
-          <span>
-            Search<kbd>{searchHint(isMacPlatform())}</kbd>
-          </span>
-        </footer>
       </div>
       {about && <About preview={preview} onClose={() => setAbout(false)} />}
       {deleting && threadSource && (

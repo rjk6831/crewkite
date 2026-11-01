@@ -17,9 +17,10 @@ import { effortLabel } from './model-picker.tsx';
 import { planlessText } from './plan-card.ts';
 import { ReplyMenu } from './reply-menu.tsx';
 import { markMatches } from './reveal-dom.ts';
+import { subagentStarts } from './subagent-view.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 import { TurnChip } from './turn-chip.tsx';
-import { briefLabel, replySource, viewBlocks } from './turn-fold.ts';
+import { blankTurn, briefLabel, replySource, type TurnIdentity, viewBlocks } from './turn-fold.ts';
 import { TurnStats } from './turn-stats.tsx';
 import { layoutRows, mountPlan, rowTop, rowWindow } from './virtual-window.ts';
 
@@ -68,6 +69,7 @@ const TurnRow = memo(function TurnRow({
   const identity = turn.identity;
   const source = turn.ended && turn.status === 'done' ? replySource(turn.blocks) : '';
   const copyable = source !== '';
+  const starts = subagentStarts(turn.blocks);
   // The plan card shows the orchestrator's plan, so its reply leaves the plan block out.
   const shownText = (text: string) =>
     identity?.role === 'orchestrator' ? planlessText(text) : text;
@@ -107,6 +109,7 @@ const TurnRow = memo(function TurnRow({
                 key={block.id}
                 block={block}
                 ended={turn.ended}
+                subagentStart={starts.get(block.id) ?? 0}
                 onOpenChanges={onOpenChanges}
               />
             );
@@ -147,6 +150,23 @@ const TurnRow = memo(function TurnRow({
     </article>
   );
 });
+
+/**
+ * The reply row a new thread shows while its first turn starts: the chip for the model the message
+ * went to and the working dots. The real turn row takes its place once the thread read lands.
+ */
+export function StartingTurn({ identity }: { identity: TurnIdentity | null }) {
+  return (
+    <article className="th-row th-assistant" aria-busy="true">
+      <TurnChip turn={{ ...blankTurn('starting'), identity }} />
+      <span className="th-working" role="status" aria-label="Starting">
+        <i />
+        <i />
+        <i />
+      </span>
+    </article>
+  );
+}
 
 function UserRow({
   item,
