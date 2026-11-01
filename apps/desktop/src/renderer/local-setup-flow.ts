@@ -235,7 +235,7 @@ export async function connectInPlace({
   }
   return {
     kind: 'blocked',
-    message: 'Taking longer than expected. Open Settings and try Refresh.',
+    message: 'Taking longer than expected. Open Settings and try Refresh model list.',
   };
 }
 
