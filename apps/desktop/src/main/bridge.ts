@@ -49,7 +49,7 @@ import {
   type SecretStorage,
 } from './local-token.ts';
 import { McpVault, supplyMcp } from './mcp-vault.ts';
-import { CommandReceipts, syncDirectory } from './receipts.ts';
+import { CommandReceipts, sendRetained, syncDirectory } from './receipts.ts';
 import { type DesktopController, desktopActor } from './runtime.ts';
 import { saveTextFile } from './save-file.ts';
 import { assertSender, openExternalLink } from './security.ts';
@@ -87,18 +87,15 @@ export async function installBridge(
     if (!window.isDestroyed() && window.webContents.getURL() === 'app://crewkite/index.html')
       window.webContents.send('crewkite:notice', parsed);
   }
-  function retain(command: Command, pending: boolean) {
-    receipts.retain(command, pending);
-    notice({ kind: 'retry', available: receipts.commands.length > 0 });
-  }
   async function send(command: Command) {
-    if (!client || (connection.kind === 'connection' && connection.state !== 'connected'))
+    const active = client;
+    if (!active || (connection.kind === 'connection' && connection.state !== 'connected'))
       throw new Error('The controller is offline. Reconnect before sending a command.');
-    const mutation = 'expectedRevision' in command;
-    if (mutation) retain(command, true);
-    const result = CommandResultSchema.parse(await client.command(command));
-    if (mutation && result.outcome !== 'outcome-unknown') retain(command, false);
-    return result;
+    const dispatch = async () => CommandResultSchema.parse(await active.command(command));
+    if (!('expectedRevision' in command)) return dispatch();
+    return sendRetained(receipts, command, dispatch, (available) =>
+      notice({ kind: 'retry', available }),
+    );
   }
   async function save(result: CommandResult, assertCurrent: () => void) {
     const parsed = ArtifactSchema.safeParse(result.entity);

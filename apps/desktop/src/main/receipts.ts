@@ -135,3 +135,25 @@ export class CommandReceipts {
     this.commands = next;
   }
 }
+
+/**
+ * Sends a change with its receipt written first, so a crash or a lost connection leaves the exact
+ * command to retry. `announce` reports whether a receipt is left once the send ends. A command in
+ * flight is not uncertain, so nothing is announced before its answer: announcing it showed the
+ * retry banner for the length of every write, which moved the whole page and blinked.
+ */
+export async function sendRetained<T extends { outcome: string }>(
+  receipts: Pick<CommandReceipts, 'commands' | 'retain'>,
+  command: Command,
+  dispatch: () => Promise<T>,
+  announce: (available: boolean) => void,
+): Promise<T> {
+  receipts.retain(command, true);
+  try {
+    const result = await dispatch();
+    if (result.outcome !== 'outcome-unknown') receipts.retain(command, false);
+    return result;
+  } finally {
+    announce(receipts.commands.length > 0);
+  }
+}
