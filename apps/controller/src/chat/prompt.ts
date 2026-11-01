@@ -33,7 +33,15 @@ export const familyName: Record<ChatFamily, string> = {
 // model: the person picked another model of the same family, which starts a new native session.
 // session: the turns since the family last ran do not fit its session, so a new one starts.
 // ask: a read-only side question to one family, which reads the thread from the packet.
-export type HandoffReason = 'manual' | 'limit' | 'steer' | 'rerun' | 'model' | 'session' | 'ask';
+export type HandoffReason =
+  | 'manual'
+  | 'limit'
+  | 'steer'
+  | 'rerun'
+  | 'model'
+  | 'session'
+  | 'ask'
+  | 'plan';
 
 export function handoffReason(reason: HandoffReason): string {
   if (reason === 'rerun') return 'the person asked for the reply again';
@@ -41,6 +49,7 @@ export function handoffReason(reason: HandoffReason): string {
   if (reason === 'model') return 'model changed in the composer';
   if (reason === 'session') return 'the thread moved past what the old session could carry';
   if (reason === 'ask') return 'the person asked a side question';
+  if (reason === 'plan') return 'the orchestrator reads the thread before it plans';
   return reason === 'limit' ? 'usage limit reached' : 'switched in the composer';
 }
 
@@ -483,6 +492,8 @@ export function handoffPacket(input: {
   earlier?: readonly EarlierFile[];
   /** True when this turn has the thread tools. The packet names them only then. */
   threadTools: boolean;
+  /** The thread's last plan and its slice results, for an orchestrator turn. */
+  plan?: string | null;
 }): string {
   const answers = input.history.flatMap((entry, index) =>
     entry.role === 'assistant' ? [index] : [],
@@ -508,18 +519,21 @@ export function handoffPacket(input: {
   const opening =
     input.reason === 'ask'
       ? `This is a side question to ${familyName[input.to]} about the thread below. Answer it from the thread and the scratch copy, and change nothing.`
-      : input.reason === 'rerun'
-        ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-        : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
-          ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
-          : input.from === input.to
-            ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-            : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+      : input.reason === 'plan'
+        ? 'You are the orchestrator of this thread. The conversation below holds the earlier plans: the plan replies, the slice briefs and what each slice answered. The last plan and its results follow it.'
+        : input.reason === 'rerun'
+          ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+          : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
+            ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+            : input.from === input.to
+              ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
+              : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
     ...(input.threadTools ? [THREAD_TOOLS_LINE] : []),
     `Conversation so far, oldest first:\n\n${transcript.join('\n\n') || 'No earlier messages.'}`,
+    input.plan ? `The last plan in this thread:\n${input.plan}` : '',
     `Files changed in the scratch copy against the base commit:\n${files}`,
     ...(input.instructions?.length
       ? [`Project instructions: ${input.instructions.join(', ')}`]
@@ -529,6 +543,30 @@ export function handoffPacket(input: {
   ]
     .filter(Boolean)
     .join('\n\n');
+}
+
+/**
+ * The thread's last plan in words for the orchestrator: its goal, where it stands, and each
+ * slice with its status and the model it ran on.
+ */
+export function planSummary(plan: {
+  goal: string;
+  phase: string;
+  slices: readonly {
+    id: number;
+    title: string;
+    status: string;
+    assignment: { family: ChatFamily; model: string } | null;
+  }[];
+}): string {
+  return [
+    `Goal: ${plan.goal}`,
+    `Plan: ${plan.phase}.`,
+    ...plan.slices.map(
+      (slice) =>
+        `Slice ${slice.id}, ${slice.title}: ${slice.status}${slice.assignment ? `, on ${familyName[slice.assignment.family]} (${slice.assignment.model})` : ''}.`,
+    ),
+  ].join('\n');
 }
 
 /** A file from an earlier message, and how this request reaches it. */

@@ -115,3 +115,7 @@ The Decision section has the orchestrator return a plan block every time, and a 
 ## Amendment, 2026-11-01: a message waits while a plan runs
 
 A message the person sent while a plan ran stopped the plan with "Plan stopped: you sent a new message." once its running turns ended. A message now waits in the thread's queue while the plan runs, as it does behind any running turn, and starts once the plan has finished or stopped. Stop and Cancel still stop the plan.
+
+## Amendment, 2026-11-01: the orchestrator reads the earlier plans
+
+An orchestrator turn started cold with the person's message alone, so a second message about the first plan got "I couldn't find an earlier plan in this thread". An orchestrator turn now carries the thread packet, as a side question does: the conversation with the earlier plan replies, slice briefs and slice answers, the changed files, and the thread's last plan in words, with its goal, its phase and each slice's status and model.

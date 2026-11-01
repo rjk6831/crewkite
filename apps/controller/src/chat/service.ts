@@ -136,6 +136,7 @@ import {
   handoffReason,
   notesDigest,
   orchestratorContext,
+  planSummary,
   presentInstructions,
   reviewContext,
   spokenText,
@@ -1794,15 +1795,18 @@ export class ChatService {
     // Anthropic and Google read no history in a new session, so a rerun on the family that
     // answered carries the conversation before the message in a packet, as a handoff does.
     const rerun = fresh && !turn.handoffFrom;
-    // An ask starts cold on any family, so the thread reaches it in the packet.
+    // An ask starts cold on any family, so the thread reaches it in the packet. So does an
+    // orchestrator turn: it plans from the earlier plans and their slice results (H10).
     const asked = turn.role === 'ask';
-    let carries = !!turn.handoffFrom || rerun || asked;
+    const planning = turn.role === 'orchestrator' && !lane;
+    let carries = !!turn.handoffFrom || rerun || asked || planning;
     const family = turn.selection.family;
     // One answer per turn. The packet, the client's MCP config and the notice all follow it.
     // Local reads the thread through functions, and its adapter drops the line when it has no reader.
     const threadTools = family === 'local' || !this.deps.threadToolsDown?.();
     const pending = turn.handoffFrom ? this.pendingHandoff(task.id) : null;
-    let reason: HandoffReason = pending?.reason ?? (asked ? 'ask' : rerun ? 'rerun' : 'manual');
+    let reason: HandoffReason =
+      pending?.reason ?? (asked ? 'ask' : planning ? 'plan' : rerun ? 'rerun' : 'manual');
     // A native session holds one model, so another model of the family starts a new session.
     const kept =
       writer && !fresh && !lane ? thread.sessions.find((value) => value.family === family) : null;
@@ -1886,6 +1890,7 @@ export class ChatService {
           files,
           threadTools,
           directory,
+          plan: planning && thread.plan ? planSummary(thread.plan) : null,
         })
       : (caught?.prompt ?? prompt);
     return {
@@ -3157,6 +3162,8 @@ export class ChatService {
       threadTools: boolean;
       /** The copy the turn works in. A read-only plan slice reads its own copy's diff. */
       directory: string;
+      /** The thread's last plan in words, for an orchestrator turn. */
+      plan?: string | null;
     },
   ): string {
     const changes = this.scratchDiff(turn.taskId, input.root, input.base, input.directory);
@@ -3176,6 +3183,7 @@ export class ChatService {
         ],
         prompt: input.prompt,
         threadTools: input.threadTools,
+        plan: input.plan ?? null,
         instructions: presentInstructions(input.directory),
         earlier: input.files.flatMap((file) =>
           file.earlier
