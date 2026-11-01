@@ -167,12 +167,14 @@ test('each interactive view draws a scripted thread in colour and without it und
     {
       name: 'large wordmark',
       view: (colors) => h(views.Wordmark, { columns: 100, colors }),
-      shows: ['◢█ █◣', '████'],
+      // The kite's panels meet along the spar and the crossbar with no gap, and the letters use
+      // half and quadrant blocks.
+      shows: ['▗▟████▙▖', '▗▟████████▙▖', '▝██████████▘', ' ▗▄███▄▖', '▐██▀▀▀', '▝▜█▄▄▟█▄▄▌'],
     },
     {
       name: 'small wordmark',
       view: (colors) => h(views.Wordmark, { columns: 50, colors }),
-      shows: ['◢◣ CrewKite'],
+      shows: ['▗▟▙▖', '▜██▛  CrewKite', ' ▜▛'],
       columns: 50,
     },
     {
@@ -354,6 +356,26 @@ test('each interactive view draws a scripted thread in colour and without it und
   );
   for (const panel of ['#40b0a8', '#e87860', '#4850a8', '#e0b860'])
     assert.ok(wordmark.includes(rgb(panel)));
+  // Every drawn cell is a half or quadrant block, so the art has twice the resolution of whole
+  // blocks, and the large mark fits the width that picks it.
+  const art = plain(wordmark).split('\n');
+  assert.ok(
+    art.every((line) => /^[ ▀▄▌▐▖▗▘▝▚▞▙▛▜▟█]*$/u.test(line)),
+    plain(wordmark),
+  );
+  const { LARGE_WORDMARK_COLUMNS } = await import('./brand.ts');
+  assert.ok(Math.max(...art.map((line) => line.length)) < LARGE_WORDMARK_COLUMNS);
+  // Each kite row is one run of cells in at most two panel colours, one each side of the spar.
+  const kiteRows = wordmark.split('\n').slice(0, 6);
+  for (const row of kiteRows) {
+    const inks = row
+      .split(`${esc}[38;2;`)
+      .slice(1)
+      .map((part) => [part.slice(0, part.indexOf('m')), part.slice(part.indexOf('m') + 1)])
+      .filter(([, text]) => text.split(esc)[0].trim() !== '')
+      .map(([colour]) => colour);
+    assert.ok(inks.length > 0 && new Set(inks).size <= 2, row);
+  }
   assert.equal(gaugeHex(100), '#21ab38');
   assert.equal(gaugeHex(85), '#70b620');
   assert.equal(gaugeHex(60), '#d9b412');

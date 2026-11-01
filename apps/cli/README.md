@@ -19,7 +19,7 @@ A recorded session is in [docs/images/cli-session.txt](../../docs/images/cli-ses
 
 ## Interactive mode
 
-The screen opens with the kite wordmark, in block letters at 72 columns and wider and in two rows below that. Under it sit the thread, the message box, the model the next message goes to and one gauge per provider.
+The screen opens with the kite wordmark, drawn in half and quadrant blocks for twice the resolution of whole blocks: the word with the four panel kite above its last letter at 74 columns and wider, and a small three row kite beside the name below that. Without colour the kite reads as one diamond. Under it sit the thread, the message box, the model the next message goes to and one gauge per provider.
 
 A new thread goes to the registered project of the checkout you started in. The CLI takes that directory from `INIT_CWD` when pnpm set it, else the current directory, and a project matches when its folder name, HEAD commit and branch are the checkout's. When none or several match, the first send opens the thread list and asks which project to use.
 
