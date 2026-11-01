@@ -139,8 +139,8 @@ const readOnlySandbox = (directory: string) => ({
 });
 // `other` spans every tool CrewKite cannot name, so no thread grant covers it. Only commands and
 // file changes ask here today; the guard holds if another request kind starts asking.
-const threadGrant = (request: ChatTurnRequest, kind: ChatToolKind) =>
-  kind !== 'other' && request.permissionGrants?.includes(kind) === true;
+const threadGrant = (request: ChatTurnRequest, kind: ChatToolKind, allowed: Set<ChatToolKind>) =>
+  kind !== 'other' && (request.permissionGrants?.includes(kind) === true || allowed.has(kind));
 
 /** Chat edits the scratch copy, and every question the client asks comes back to CrewKite. */
 function nativeChatArguments(directory: string, request: ChatTurnRequest): string[] {
@@ -244,8 +244,9 @@ const OPTIONS: ChatPermissionOption[] = [
   { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
   { id: 'deny', label: 'Deny', kind: 'deny' },
 ];
-// acceptForSession lasts as long as the client process, and that is one turn here. The controller
-// keeps the thread's grants, and serverRequest answers a granted kind on every later turn.
+// acceptForSession lasts as long as the client process, and that is one turn here, and the client
+// applies it to the one command it asked about. The controller keeps the thread's grants for
+// later turns, and the adapter applies an Allow for this thread to the rest of its own turn.
 const DECISIONS = new Map([
   ['allow-once', 'accept'],
   ['allow-thread', 'acceptForSession'],
@@ -528,6 +529,10 @@ class OpenAiChatTurn {
   private readonly output = new Map<string, number>();
   private readonly changed = new Set<string>();
   private readonly approvals = new Map<string, RpcId>();
+  /** The tool kind each open approval asks about. */
+  private readonly approvalKinds = new Map<string, ChatToolKind>();
+  /** Kinds the person allowed for the thread during this turn. */
+  private readonly allowed = new Set<ChatToolKind>();
   private readonly subagents: SubagentTracker;
   private approvalCount = 0;
   private reported = false;
@@ -578,6 +583,9 @@ class OpenAiChatTurn {
       // client still asks follows the narrower policy from here.
       setPermissionPolicy: (permissionPolicy, permissionGrants) => {
         this.request = { ...this.request, permissionPolicy, permissionGrants };
+        // A narrower policy, such as Ask each time again, takes back what was allowed here too.
+        for (const kind of this.allowed)
+          if (!permissionGrants.includes(kind)) this.allowed.delete(kind);
       },
       groups: this.group > 0 ? [this.group] : [],
       result,
@@ -1060,6 +1068,7 @@ class OpenAiChatTurn {
       .join('\n\n');
     const answerId = `approval-${++this.approvalCount}`;
     this.approvals.set(answerId, requestId);
+    this.approvalKinds.set(answerId, kind);
     this.send({
       type: 'permission.requested',
       turnId: this.request.turnId,
@@ -1106,7 +1115,7 @@ class OpenAiChatTurn {
       return this.answer(answerId, 'allow-once');
     // Thread grant: the person allowed this kind for the whole thread. Both events still go out,
     // so the thread shows what was allowed and why nobody was asked.
-    if (threadGrant(this.request, kind)) this.answer(answerId, 'allow-thread');
+    if (threadGrant(this.request, kind, this.allowed)) this.answer(answerId, 'allow-thread');
   }
 
   private answer(requestId: string, choice: string) {
@@ -1114,6 +1123,12 @@ class OpenAiChatTurn {
     const decision = DECISIONS.get(choice);
     if (target === undefined || !decision || this.outcome) return;
     this.approvals.delete(requestId);
+    const kind = this.approvalKinds.get(requestId);
+    this.approvalKinds.delete(requestId);
+    // Allow for this thread covers the same kind for the rest of the turn, under the same checks
+    // a thread grant gets. The client's own acceptForSession covers only the one command.
+    if (choice === 'allow-thread' && kind && kind !== 'other' && !this.request.readOnly)
+      this.allowed.add(kind);
     this.write({ id: target, result: { decision } });
     this.send({ type: 'permission.resolved', turnId: this.request.turnId, requestId, choice });
   }

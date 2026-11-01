@@ -139,6 +139,16 @@ const scripts = {
     ['item/started', { ...ids(), item: { id: 'change-1', type: 'fileChange', changes: [{ path: here(given.path), kind: given.movePath ? { type: 'update', move_path: here(given.movePath) } : { type: given.delete ? 'delete' : 'add' }, diff: 'x\n' }], status: 'inProgress' } }],
     { id: 0, method: 'item/fileChange/requestApproval', params: { ...ids(), itemId: 'change-1', reason: null, grantRoot: given.grantRoot ? here(given.grantRoot) : null } },
   ],
+  // Two commands in one turn. The second asks only after the first is answered.
+  'two-commands': () => [
+    ['item/started', { ...ids(), item: command }],
+    { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: null, command: 'pnpm test', cwd: here('.') } },
+  ],
+  'second-command': () => [
+    ['item/completed', { ...ids(), item: { ...command, status: 'completed', exitCode: 0, aggregatedOutput: 'ok\n' } }],
+    ['item/started', { ...ids(), item: { ...command, id: 'command-2', command: 'pnpm lint' } }],
+    { id: 1, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-2', reason: null, command: 'pnpm lint', cwd: here(given.cwd ?? '.') } },
+  ],
   approved: () => [
     ['item/commandExecution/outputDelta', { ...ids(), itemId: 'command-1', delta: 'ok\n' }],
     ['item/completed', { ...ids(), item: { ...command, status: 'completed', exitCode: 0, aggregatedOutput: 'ok\n' } }],
@@ -201,6 +211,8 @@ input.on('line', (line) => {
     return send({ id: value.id, error: { code: -32602, message: 'Invalid params: thread not loaded\nretry later' } });
   if (value.method === 'thread/resume' && given.lostThread)
     return send({ id: value.id, error: { code: -32600, message: 'no rollout found for thread' } });
+  if (value.method === undefined && scenario === 'two-commands')
+    return value.id === 0 ? play('second-command') : send({ method: 'turn/completed', params: { threadId, turn: { ...running, status: 'completed' } } });
   if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : 'approved');
   if (value.id === undefined) return;
   // A hung client never answers the interrupt.
@@ -527,6 +539,46 @@ test('a command kind the thread allows is answered without asking only inside th
     assert.deepEqual(
       run.frames().find((frame) => frame.id === 0),
       { id: 0, result: { decision: row.decision } },
+    );
+  }
+});
+
+test('Allow for this thread answers the later commands of the same turn inside the copy', async () => {
+  // The client applies acceptForSession to the one command it asked about, so the adapter
+  // answers the next command itself. One run from outside the copy still goes to the person.
+  for (const row of [
+    { cwd: '.', asked: 1, decisions: ['acceptForSession', 'acceptForSession'] },
+    { cwd: '..', asked: 2, decisions: ['acceptForSession', 'decline'] },
+  ]) {
+    const run = turn('two-commands', { detail: { cwd: row.cwd } });
+    const first = await run.when('permission.requested');
+    run.handle.respondPermission(first.requestId, 'allow-thread');
+    if (row.asked === 2) {
+      await new Promise<void>((resolve) => {
+        const check = () =>
+          run.events.filter((event) => event.type === 'permission.requested').length === 2
+            ? resolve()
+            : setTimeout(check, 10);
+        check();
+      });
+      const second = run.events.filter((event) => event.type === 'permission.requested')[1];
+      assert(second?.type === 'permission.requested');
+      assert.equal(second.question, 'Run this command?');
+      run.handle.respondPermission(second.requestId, 'deny');
+    }
+    assert.equal((await run.settled()).stopReason, 'done', row.cwd);
+    const asks = run.events.filter((event) => event.type === 'permission.requested');
+    assert.equal(asks.length, 2, row.cwd);
+    // Both asks show in the thread, and the second is resolved without the person when inside.
+    assert.deepEqual(
+      run.events.flatMap((event) => (event.type === 'permission.resolved' ? [event.choice] : [])),
+      row.asked === 1 ? ['allow-thread', 'allow-thread'] : ['allow-thread', 'deny'],
+      row.cwd,
+    );
+    assert.deepEqual(
+      run.frames().flatMap((frame) => (frame.result?.decision ? [frame.result.decision] : [])),
+      row.decisions,
+      row.cwd,
     );
   }
 });
