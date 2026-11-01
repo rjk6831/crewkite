@@ -106,3 +106,7 @@ The assignment rule in the Decision section ranked every connected family for ea
 I put the models in the crew on purpose, and a plan that spends a subscription I left out of the crew breaks that choice. The handoff switch is the one place I already said another family may take over, so it stays the only way out of the crew. The fixer takes hard slices because a crew with its own fixer model names the model I trust with the hard part.
 
 The Easy-slice paragraph under Why and the Local consequence no longer hold. Local takes easy work when I make Local a member of the crew.
+
+## Amendment, 2026-11-01: the orchestrator answers questions itself
+
+The Decision section has the orchestrator return a plan block every time, and a reply without one went back once and then stopped the chain. In a d3-rc5 run a question about the calendar became a one-slice plan to confirm the answer. The orchestrator now answers a question, or a request that changes no file, in plain sentences with no plan block, and proposes a plan only for work that changes files or splits into independent parts. A reply with no plan block is that answer: nothing runs after it and no line follows. A reply with a plan block that fails the schema still goes back once with the error, and a second failure stops the chain with one line.
