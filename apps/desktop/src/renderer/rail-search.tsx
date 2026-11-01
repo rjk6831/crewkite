@@ -1,6 +1,14 @@
 import type { ChatSearchGroup, ChatSearchHit, ChatSearchResult } from '@crewkite/contracts';
-import { MessagesSquare, X } from 'lucide-react';
-import { type KeyboardEvent, useEffect, useId, useMemo, useRef, useState } from 'react';
+import { Search, X } from 'lucide-react';
+import {
+  type KeyboardEvent,
+  type RefObject,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { searchHistory, type ThreadSource } from './thread/commands.ts';
 import {
   type HistoryFind,
@@ -10,9 +18,10 @@ import {
 } from './thread/history-reveal.ts';
 import './rail-search.css';
 
-// A search field in the rail over every thread's messages, tool cards and file paths. Results are
-// grouped by thread. Choosing one opens the thread at the matching turn. The field keeps focus and
-// the results are reached with the arrow keys, as in the command palette.
+// The one search field in the rail, over every thread's title, messages, tool cards and file paths.
+// Results show under the field, grouped by thread. Choosing one opens the thread at the matching turn. The field keeps focus and
+// the results are reached with the arrow keys, as in the command palette. A small button at the end
+// of the field opens the command palette and shows its shortcut.
 
 const DEBOUNCE_MS = 220;
 // Counts the results opened in this window. It lives here and not in the component, so a rail that
@@ -37,9 +46,15 @@ type Status =
 export function RailSearch({
   source,
   onOpen,
+  onPalette,
+  paletteHint,
+  paletteButton,
 }: {
   source: ThreadSource;
   onOpen: (find: HistoryFind) => void;
+  onPalette: () => void;
+  paletteHint: string;
+  paletteButton?: RefObject<HTMLButtonElement | null>;
 }) {
   const [text, setText] = useState('');
   const [status, setStatus] = useState<Status>({ kind: 'idle' });
@@ -140,14 +155,14 @@ export function RailSearch({
   return (
     <div className="rs">
       <div className="rs-field">
-        <MessagesSquare size={14} aria-hidden="true" />
+        <Search size={14} aria-hidden="true" />
         <input
           ref={field}
           type="text"
           role="combobox"
           className="rs-input"
-          placeholder="Search messages"
-          aria-label="Search all messages, tool cards and file paths"
+          placeholder="Search"
+          aria-label="Search thread titles, messages, tool cards and file paths"
           aria-autocomplete="list"
           aria-expanded={rows.length > 0}
           aria-controls={rows.length > 0 ? listId : undefined}
@@ -172,6 +187,17 @@ export function RailSearch({
             <X size={12} aria-hidden="true" />
           </button>
         )}
+        <button
+          ref={paletteButton}
+          type="button"
+          className="rs-palette"
+          onClick={onPalette}
+          aria-label="Open the command palette"
+          aria-keyshortcuts="Meta+K Control+K"
+          title="Command palette"
+        >
+          <kbd>{paletteHint}</kbd>
+        </button>
       </div>
       <p
         className={status.kind === 'failed' ? 'rs-note is-error' : 'rs-note'}
