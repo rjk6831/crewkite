@@ -186,6 +186,9 @@ input.on('line', (line) => {
   if (scenario === 'crash') return;
   appendFileSync(frames, line + '\n');
   const value = JSON.parse(line);
+  // An older client build refuses the narrower read-only sandbox policy.
+  if (value.method === 'turn/start' && given.refuseRestricted && value.params.sandboxPolicy?.access)
+    return send({ id: value.id, error: { code: -32602, message: 'Invalid params: unknown variant access' } });
   if (value.method === 'turn/start' && scenario === 'refuse')
     return send({ id: value.id, error: { code: -32602, message: 'Invalid params: thread not loaded\nretry later' } });
   if (value.method === 'thread/resume' && given.lostThread)
@@ -250,6 +253,7 @@ function turn(
     detail?: {
       cwd?: string;
       network?: boolean;
+      refuseRestricted?: boolean;
       path?: string;
       movePath?: string;
       grantRoot?: string;
@@ -972,6 +976,16 @@ test('a read-only turn runs in the read-only sandbox under never, and an edit tu
         : undefined,
     );
   }
+});
+
+test('a read-only turn falls back to the plain read-only sandbox when the client refuses the narrower one', async () => {
+  const run = turn('reply', { readOnly: true, detail: { refuseRestricted: true } });
+  const { stopReason } = await run.settled();
+  assert.equal(stopReason, 'done');
+  const starts = run.frames().filter((frame) => frame.method === 'turn/start');
+  assert.equal(starts.length, 2);
+  assert.ok(starts[0].params.sandboxPolicy.access);
+  assert.deepEqual(starts[1].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
 });
 
 test('a read-only turn stops when a command names a path outside the scratch copy', async () => {

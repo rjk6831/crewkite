@@ -908,32 +908,43 @@ class OpenAiChatTurn {
     // turn/start sets the effort for this turn and the ones after it. thread/start and
     // thread/resume have no effort field, so every turn names its own and a resumed thread follows
     // the composer. Default sends none and leaves the thread's level as it is.
-    this.call(
-      'turn/start',
-      {
-        threadId: this.threadId,
-        input: [...this.media.map((file) => file.input), { type: 'text', text }],
-        ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
-        ...(this.request.readOnly
-          ? { sandboxPolicy: readOnlySandbox(this.request.scratch.directory) }
-          : {}),
-      },
-      (reply) => {
-        if ('error' in reply)
-          return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
-        this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
-        // The client accepted the effort. A default turn runs at the thread's own level.
-        this.send({
-          type: 'turn.started',
-          turnId: this.request.turnId,
-          family: 'openai',
-          model: selection.model,
-          effort:
-            selection.effort === 'default' ? (this.threadEffort ?? 'default') : selection.effort,
-          role: this.request.role,
-        });
-      },
-    );
+    const start = (narrow: boolean) =>
+      this.call(
+        'turn/start',
+        {
+          threadId: this.threadId,
+          input: [...this.media.map((file) => file.input), { type: 'text', text }],
+          ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
+          ...(this.request.readOnly
+            ? {
+                sandboxPolicy: narrow
+                  ? readOnlySandbox(this.request.scratch.directory)
+                  : { type: 'readOnly', networkAccess: false },
+              }
+            : {}),
+        },
+        (reply) => onStart(reply, narrow),
+      );
+    // A client build that does not know the narrower read-only policy refuses it. The turn then
+    // starts on the plain read-only sandbox, and the path check on each command still stops a read
+    // outside the scratch copy.
+    const onStart = (reply: Reply, narrow: boolean) => {
+      if ('error' in reply && narrow && this.request.readOnly) return start(false);
+      if ('error' in reply)
+        return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
+      this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
+      // The client accepted the effort. A default turn runs at the thread's own level.
+      this.send({
+        type: 'turn.started',
+        turnId: this.request.turnId,
+        family: 'openai',
+        model: selection.model,
+        effort:
+          selection.effort === 'default' ? (this.threadEffort ?? 'default') : selection.effort,
+        role: this.request.role,
+      });
+    };
+    start(true);
   }
 
   /** Frames matter until the turn ends, and after an interrupt until the client confirms it. */
