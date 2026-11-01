@@ -25,7 +25,6 @@ import { Dialog, short, titleCase } from './components.tsx';
 import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
-import { SUGGESTED_FIRST_MESSAGE } from './onboarding/flow.ts';
 import { Onboarding } from './onboarding/onboarding.tsx';
 import { useOnboarding } from './onboarding/use-onboarding.ts';
 import {
@@ -578,10 +577,10 @@ export function App() {
     setAddedProject(project.data.id);
     startThread(project.data.id);
   }
-  // The last welcome step opens a new thread in the project with the suggested message in the box.
-  function finishWelcome(projectId: string) {
+  // The last welcome step opens a new thread in the project with its message, as edited, in the box.
+  function finishWelcome(projectId: string, message: string) {
     onboarding.finish();
-    setPrefill(SUGGESTED_FIRST_MESSAGE);
+    setPrefill(message);
     setAddedProject(projectId);
     startThread(projectId);
   }
