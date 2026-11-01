@@ -283,14 +283,29 @@ function ProjectStep({
   );
 }
 
-function MessageStep() {
+function MessageStep({
+  message,
+  onMessage,
+}: {
+  message: string;
+  onMessage: (text: string) => void;
+}) {
+  const field = useId();
   return (
     <>
       <p className="onb-lead">
-        This message goes into the composer when you open it. CrewKite does not send it, and you can
-        edit it first.
+        This message goes into the composer when you open it. CrewKite does not send it.
       </p>
-      <blockquote className="onb-message">{SUGGESTED_FIRST_MESSAGE}</blockquote>
+      <label className="onb-message-label" htmlFor={field}>
+        Your first message
+      </label>
+      <textarea
+        id={field}
+        className="onb-message"
+        rows={3}
+        value={message}
+        onChange={(event) => onMessage(event.target.value)}
+      />
     </>
   );
 }
@@ -318,12 +333,13 @@ export function Onboarding({
   onContinue: () => void;
   onBack: () => void;
   onSkip: () => void;
-  /** Finish with the first message in the composer of this project. */
-  onFinish: (projectId: string) => void;
+  /** Finish with the first message, as edited, in the composer of this project. */
+  onFinish: (projectId: string, message: string) => void;
 }) {
   const { step, ready, canContinue, skipLabel } = view;
   const heading = useRef<HTMLHeadingElement>(null);
   const [chosen, setChosen] = useState<string | null>(null);
+  const [message, setMessage] = useState(SUGGESTED_FIRST_MESSAGE);
   const project = workspace.projects.find(({ id }) => id === chosen) ?? workspace.projects[0];
   const hint = useId();
   // A step change moves focus to its heading, so a screen reader starts at the new step.
@@ -387,7 +403,7 @@ export function Onboarding({
               onProject={setChosen}
             />
           )}
-          {step === 'message' && <MessageStep />}
+          {step === 'message' && <MessageStep message={message} onMessage={setMessage} />}
         </section>
         <footer className="onb-foot">
           {step !== 'provider' && (
@@ -408,7 +424,7 @@ export function Onboarding({
               type="button"
               className="button primary"
               disabled={!project}
-              onClick={() => project && onFinish(project.id)}
+              onClick={() => project && onFinish(project.id, message)}
             >
               Open the composer
             </button>
