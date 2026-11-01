@@ -10,6 +10,7 @@ import {
   draftConfigure,
   draftSettings,
   familyModel,
+  firstAnswer,
   flightPreset,
   preferredSelection,
   readCrewPresets,
@@ -261,6 +262,29 @@ test('new thread settings follow the controller rules and configure only what ch
   assert.deepEqual(draftConfigure(applyDraft(fresh, { autoHandoff: true })), [
     { autoHandoff: true },
   ]);
+  // The starting chip names who answers the first message: the orchestrator when the crew has one
+  // and the thread runs on its own, else the builder on the model the message went to (H3).
+  const planner = { family: 'anthropic', model: 'opus', effort: 'medium' } as const;
+  const planned = {
+    name: 'Full crew',
+    members: [
+      { role: 'builder' as const, selection },
+      { role: 'orchestrator' as const, selection: planner },
+    ],
+  };
+  assert.deepEqual(firstAnswer({ crew: planned, flightMode: 'glide' }, selection), {
+    ...planner,
+    role: 'orchestrator',
+  });
+  assert.deepEqual(firstAnswer({ crew: planned, flightMode: 'manual' }, selection), {
+    ...selection,
+    role: 'assistant',
+  });
+  assert.deepEqual(firstAnswer({ crew, flightMode: 'balanced' }, selection), {
+    ...selection,
+    role: 'assistant',
+  });
+  assert.equal(firstAnswer({ crew: null, flightMode: 'manual' }, null), null);
 });
 
 // Claim: saved crews list with the presets in one set of choices, one of them is the default for
