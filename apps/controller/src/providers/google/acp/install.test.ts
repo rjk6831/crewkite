@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
   existsSync,
@@ -12,10 +12,13 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { deflateRawSync } from 'node:zlib';
+import { probeLocal } from '../../local/chat-connect.ts';
 import { importGoogleAcp } from './import.ts';
 import { googleAcpCacheDirectory, installGoogleAcp } from './install.ts';
 import { googleAcpDeveloperIdRequirement } from './profile.ts';
@@ -403,5 +406,78 @@ test('the cache folder is the per-user cache directory', () => {
   assert.equal(
     googleAcpCacheDirectory({}, '/home/someone', 'linux'),
     '/home/someone/.cache/crewkite',
+  );
+});
+
+// Claim: a Local connect that starts while the Google import checks the client still reaches the
+// runtime. The import reads and hashes the client files several times. Done in one synchronous
+// read of each file, it held the event loop for seconds, the probe's timer ran before its socket,
+// and Connect read as failed against a runtime that was up. The files here are a third of the
+// real size. The probe runs against a loopback socket that asks for a token, which takes a real
+// round trip, with a short wait so a held loop shows as a timeout.
+test('a Local connect probe gets its answer while the Google import checks the client', async (t) => {
+  if (Object.hasOwn(process.env, 'LM_API_TOKEN')) return;
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'acp-parallel-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  mkdirSync(join(home, 'imports'), { recursive: true, mode: 0o700 });
+  chmodSync(home, 0o700);
+  const staging = join(home, 'imports/.google-acp-install-Ab1234');
+  mkdirSync(staging, { mode: 0o700 });
+  const server = randomBytes(96 * 1024 * 1024);
+  const harness = randomBytes(32 * 1024 * 1024);
+  writeFileSync(join(staging, 'agy_acp_server.par'), server, { mode: 0o600 });
+  writeFileSync(join(staging, 'localharness_external'), harness, { mode: 0o600 });
+  writeFileSync(
+    join(staging, 'identity.json'),
+    JSON.stringify({
+      version: '1.4.0',
+      sha256: digest(server),
+      harnessSha256: digest(harness),
+      signerTeamId: 'EQHXZ8M8AV',
+    }),
+    { mode: 0o600 },
+  );
+  const runtime = createServer();
+  runtime.on('upgrade', (_request, socket) => {
+    socket.end('HTTP/1.1 401 Refused\r\nConnection: close\r\nContent-Length: 0\r\n\r\n');
+  });
+  await new Promise<void>((resolve) => runtime.listen(0, '127.0.0.1', resolve));
+  t.after(() => runtime.close());
+  const endpoint = `ws://127.0.0.1:${(runtime.address() as AddressInfo).port}`;
+  let last = performance.now();
+  let held = 0;
+  const ticker = setInterval(() => {
+    const now = performance.now();
+    held = Math.max(held, now - last);
+    last = now;
+  }, 5);
+  let done = false;
+  const answers: string[] = [];
+  const connects = (async () => {
+    while (!done) answers.push(await probeLocal(endpoint, 500));
+  })();
+  const imported = await importGoogleAcp(
+    { home, consent: 'explicit', installerStaging: staging },
+    {
+      verifySignature: async () => {
+        // The real check is a codesign child that the controller awaits.
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        return signed.verifySignature();
+      },
+    },
+  );
+  done = true;
+  await connects;
+  clearInterval(ticker);
+  assert.equal(imported.reason, 'imported', JSON.stringify(imported));
+  assert.ok(answers.length >= 3, `${answers.length} probes`);
+  assert.deepEqual(new Set(answers), new Set(['token-required']));
+  assert.ok(held < 250, `the event loop was held for ${Math.round(held)} ms`);
+  assert.equal(
+    readFileSync(
+      join(home, 'providers/google-acp-v1', digest(server), 'agy_acp_server.par'),
+    ).equals(server),
+    true,
   );
 });
