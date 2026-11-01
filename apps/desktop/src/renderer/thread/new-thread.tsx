@@ -13,9 +13,12 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import {
   applyDraft,
+  crewForProject,
+  crewFromPreset,
   type DraftSettings,
   draftConfigure,
   draftSettings,
+  preferredSelection,
 } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
 import type { DesktopCommand } from '../source.ts';
@@ -24,6 +27,7 @@ import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
 import { EmptyThread } from './empty-thread.tsx';
 import { FamilyMark } from './family-mark.tsx';
 import { Inspector, type InspectorTab } from './inspector.tsx';
+import { defaultSelection } from './model-picker.tsx';
 import './thread.css';
 
 const NO_PROVIDER = 'Connect a provider in Settings';
@@ -139,6 +143,28 @@ export function NewThread({
   const [draft, setDraft] = useState<DraftSettings>(() => draftSettings());
   const pending = useMemo(() => draftThread(draft), [draft]);
   const configured = useRef(false);
+  // The project's crew, else the default crew, once the catalog says which families are
+  // connected. A crew or mode the person picks in the panel stays, and so does the model picked
+  // in the composer, so this runs once per project.
+  const crewPicked = useRef(false);
+  const crewFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (!catalog || crewPicked.current || crewFor.current === projectId) return;
+    crewFor.current = projectId;
+    setDraft((current) => {
+      const choice = crewForProject(projectId);
+      const model = current.selection ?? preferredSelection(catalog) ?? defaultSelection(catalog);
+      const crew = choice && crewFromPreset(choice.template, catalog, model, current.handoffMode);
+      const base = applyDraft(current, { crew: null });
+      if (!crew) return base;
+      const builder = crew.members.find((member) => member.role === 'builder')?.selection;
+      return applyDraft(base, {
+        crew,
+        ...(builder ? { selection: builder } : {}),
+        ...(choice.flightMode ? { flightMode: choice.flightMode } : {}),
+      });
+    });
+  }, [catalog, projectId]);
   const [panel, setPanel] = useState<{ open: boolean; tab: InspectorTab }>({
     open: false,
     tab: 'crew',
@@ -289,7 +315,10 @@ export function NewThread({
           onClose={closePanel}
           changesKey={0}
           focusPath={null}
-          onConfigure={(patch) => setDraft((current) => applyDraft(current, patch))}
+          onConfigure={(patch) => {
+            if (patch.crew !== undefined || patch.flightMode) crewPicked.current = true;
+            setDraft((current) => applyDraft(current, patch));
+          }}
         />
       )}
     </div>

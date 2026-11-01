@@ -3,16 +3,24 @@ import { test } from 'node:test';
 import type { ChatCatalogRead } from '@crewkite/contracts';
 import {
   applyDraft,
+  crewChoices,
+  crewForProject,
   crewFromPreset,
+  crewNameProblem,
   draftConfigure,
   draftSettings,
   familyModel,
   flightPreset,
   preferredSelection,
   readCrewPresets,
+  readDefaultCrew,
+  readSavedCrews,
   readThreadDefaults,
   writeCrewPresets,
+  writeDefaultCrew,
   writeFamilyDefault,
+  writeProjectCrew,
+  writeSavedCrews,
   writeThreadDefaults,
 } from './preferences.ts';
 
@@ -253,4 +261,80 @@ test('new thread settings follow the controller rules and configure only what ch
   assert.deepEqual(draftConfigure(applyDraft(fresh, { autoHandoff: true })), [
     { autoHandoff: true },
   ]);
+});
+
+// Claim: saved crews list with the presets in one set of choices, one of them is the default for
+// new threads, a project can start with its own, and a deleted or broken crew falls back to Solo.
+test('saved crews join the presets, one is the default, and bad storage falls back to Solo', () => {
+  const values = new Map<string, string>();
+  const store = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => void values.set(key, value),
+  };
+  assert.deepEqual(
+    crewChoices(store).map((choice) => choice.id),
+    ['preset:Solo', 'preset:Pair', 'preset:Full crew'],
+  );
+  assert.equal(readDefaultCrew(store), 'preset:Solo');
+  const pinned = { family: 'openai', model: 'large-1', effort: 'high' } as const;
+  writeSavedCrews(
+    [
+      {
+        id: 'crew-a',
+        name: 'Review heavy',
+        // Saved out of order: the roles read back in crew order.
+        members: [
+          { role: 'challenger', selection: null },
+          { role: 'builder', selection: pinned, allowSubagents: false },
+        ],
+        flightMode: 'glide',
+      },
+    ],
+    store,
+  );
+  const [, , , saved] = crewChoices(store);
+  assert.equal(saved.id, 'saved:crew-a');
+  assert.equal(saved.flightMode, 'glide');
+  assert.equal(saved.hint, 'Builder, Challenger. Glide.');
+  assert.deepEqual(
+    saved.template.members.map((member) => member.role),
+    ['builder', 'challenger'],
+  );
+  // A saved crew builds a thread crew the same way a preset does, its pins included.
+  const catalog: ChatCatalogRead = {
+    families: [entry('openai', true, []), entry('anthropic', true, [])],
+  };
+  const crew = crewFromPreset(saved.template, catalog, null, 'most-left', NOW, store);
+  assert.equal(crew?.name, 'Review heavy');
+  assert.deepEqual(crew?.members[0], { role: 'builder', selection: pinned, allowSubagents: false });
+  assert.equal(crew?.members[1].selection.family, 'anthropic');
+
+  writeDefaultCrew('saved:crew-a', store);
+  assert.equal(readDefaultCrew(store), 'saved:crew-a');
+  assert.equal(crewForProject('prj-1', store).id, 'saved:crew-a');
+  writeProjectCrew('prj-1', 'preset:Pair', store);
+  assert.equal(crewForProject('prj-1', store).id, 'preset:Pair');
+  assert.equal(crewForProject('prj-2', store).id, 'saved:crew-a');
+  writeProjectCrew('prj-1', null, store);
+  assert.equal(crewForProject('prj-1', store).id, 'saved:crew-a');
+
+  // Names are unique across presets and saved crews, and an edit may keep its own name.
+  assert.equal(crewNameProblem(' ', [], null), 'Name the crew.');
+  assert.equal(crewNameProblem('pair', [], null), 'Another crew has this name.');
+  const list = readSavedCrews(store);
+  assert.equal(crewNameProblem('review HEAVY', list, null), 'Another crew has this name.');
+  assert.equal(crewNameProblem('Review heavy', list, 'crew-a'), null);
+
+  // A crew without a builder, or with a bad id, does not read; the default goes back to Solo.
+  values.set(
+    'crewkite-saved-crews-v1',
+    JSON.stringify([
+      { id: 'crew-b', name: 'No builder', members: [{ role: 'reviewer' }], flightMode: 'manual' },
+      { id: 'Bad id!', name: 'X', members: [{ role: 'builder' }] },
+    ]),
+  );
+  assert.deepEqual(readSavedCrews(store), []);
+  assert.equal(readDefaultCrew(store), 'preset:Solo');
+  values.set('crewkite-saved-crews-v1', '{not json');
+  assert.deepEqual(readSavedCrews(store), []);
 });
