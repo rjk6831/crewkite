@@ -1,9 +1,5 @@
 /* Thread view. Colors come from the shared tokens in style.css, so both themes work unchanged. */
 
-.workspace-body.is-thread > :is(.topbar, .statusbar) {
-  display: none;
-}
-
 .thread {
   display: flex;
   flex: 1;

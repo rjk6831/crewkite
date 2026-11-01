@@ -9,6 +9,17 @@ import type { ProviderActions } from './provider-actions.ts';
 
 type Family = 'openai' | 'anthropic' | 'google';
 
+/** Google setup states that come before discovery ends. */
+const googleSettling = new Set([
+  'uninitialized',
+  'initializing',
+  'authentication-required',
+  'authenticating',
+  'discovery-required',
+  'discovering',
+  'stopping',
+]);
+
 export function clientFor(header: WorkspaceState, family: Family, now: number) {
   const client = nativeUsageClients(header).find((value) => value.family === family);
   const reader = client?.reader ?? null;
@@ -43,6 +54,15 @@ export function ClientStatus({
   children: ReactNode;
 }) {
   const { label, profiles, reader, codingReady } = clientFor(header, family, now);
+  // While Google setup is still working, its client line would read as a failure. It shows once
+  // discovery has ended.
+  const googleState = header.googleAcpSetup?.state;
+  const settling =
+    family === 'google' &&
+    !codingReady &&
+    (!!header.googleAcpSetup?.operationId ||
+      !!header.googleAcpInstall?.operationId ||
+      (googleState !== undefined && googleSettling.has(googleState)));
   const quota =
     family === 'anthropic' && reader?.reading
       ? `Received ${new Date(reader.reading.receivedAt).toLocaleTimeString()} · age unknown`
@@ -55,7 +75,9 @@ export function ClientStatus({
     <section className="st-block" aria-label={`${label} client status`}>
       <div className="st-subhead">
         <h3>Client</h3>
-        <span>{codingReady ? 'Supported client present' : 'Supported client unavailable'}</span>
+        {!settling && (
+          <span>{codingReady ? 'Supported client present' : 'Supported client unavailable'}</span>
+        )}
       </div>
       {profiles.length > 0 && (
         // Profile codes help a bug report and mean little in daily use, so they stay folded.

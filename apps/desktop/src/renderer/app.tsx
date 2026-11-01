@@ -947,14 +947,6 @@ export function App() {
         </div>
       </aside>
       <div className={inThread ? 'workspace-body is-thread' : 'workspace-body'}>
-        <header className="topbar">
-          <div className="breadcrumbs">
-            <Folder size={14} />
-            <span>Workspace</span>
-            <ChevronRight size={12} />
-            <span>{page === 'settings' ? 'Settings' : 'Threads'}</span>
-          </div>
-        </header>
         {preview && (
           <div className="preview-banner">
             <Info size={14} />
@@ -1092,15 +1084,6 @@ export function App() {
             onNewThread={() => startThread()}
           />
         )}
-        <footer className="statusbar">
-          <span>
-            Local workspace<span className="footer-separator">/</span>
-            {connectionLabel}
-          </span>
-          <span>
-            Search<kbd>{searchHint(isMacPlatform())}</kbd>
-          </span>
-        </footer>
       </div>
       {about && <About preview={preview} onClose={() => setAbout(false)} />}
       {deleting && threadSource && (

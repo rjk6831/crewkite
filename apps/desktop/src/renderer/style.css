@@ -696,27 +696,6 @@ kbd {
   min-width: 0;
   flex: 1;
 }
-.topbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 49px;
-  padding: 0 22px;
-  flex-shrink: 0;
-  border-bottom: 1px solid var(--border);
-}
-.breadcrumbs {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-}
-.breadcrumbs {
-  font-size: 11px;
-  color: var(--text-dim);
-}
-.breadcrumbs span:last-child {
-  color: var(--text-muted);
-}
 .preview-banner,
 .error-banner {
   display: flex;
@@ -843,29 +822,6 @@ kbd {
   font-weight: 600;
   line-height: 1;
   flex-shrink: 0;
-}
-.statusbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  height: 27px;
-  flex-shrink: 0;
-  border-top: 1px solid var(--border);
-  color: var(--text-dim);
-  font-size: 9px;
-  padding: 0 15px;
-}
-.statusbar > span {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-}
-.statusbar kbd {
-  margin-left: 5px;
-}
-.footer-separator {
-  color: var(--border-strong);
-  padding: 0 3px;
 }
 .view-stack {
   display: grid;
