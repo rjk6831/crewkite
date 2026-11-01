@@ -36,7 +36,7 @@ import {
   stripTurnNotes,
   withoutThreadToolsLine,
 } from '../../chat/prompt.ts';
-import { outsidePaths } from '../../chat/read-only-command.ts';
+import { outsidePaths, scratchCommand } from '../../chat/read-only-command.ts';
 import { readableType, SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
@@ -122,6 +122,16 @@ const sandboxMode = (request: ChatTurnRequest) =>
 // scratch copy and the platform's own files, so a command cannot read a file outside the copy,
 // such as the client's memory files under the home folder (H11). The turn also stops when a
 // command names a path outside the copy, in case a client build ignores the narrower policy.
+//
+// A client build that refuses the narrower shape gets the plain read-only sandbox, which reads
+// the whole disk. That turn runs under `untrusted`, so the client asks before each command an
+// explicit rule of its own does not allow, and CrewKite allows only a command that provably
+// reads inside the copy (scratchCommand). Any other error from turn/start ends the turn.
+const WIDE_APPROVAL_POLICY = 'untrusted';
+// The refusal a client build gives for a sandbox shape it does not know: invalid params that name
+// an unknown variant or field. Any other turn/start error is the turn's own failure.
+const refusesRestricted = (error: ProviderError) =>
+  error?.code === -32602 && /\bunknown (?:variant|field)\b/i.test(error.message ?? '');
 const readOnlySandbox = (directory: string) => ({
   type: 'readOnly',
   access: { type: 'restricted', includePlatformDefaults: true, readableRoots: [directory] },
@@ -493,6 +503,8 @@ class OpenAiChatTurn {
   private mcpConfig: Record<string, unknown> | null = null;
   private threadEffort: z.output<typeof threadReply>['reasoningEffort'];
   private turnId: string | null = null;
+  /** The read-only turn runs on the plain read-only sandbox, which reads the whole disk. */
+  private wideSandbox = false;
   // A terminal error notice. The failure is built when the turn ends, so a rate-limit update
   // that lands in between still supplies the reset time.
   private terminal: ProviderError | undefined;
@@ -916,20 +928,23 @@ class OpenAiChatTurn {
           input: [...this.media.map((file) => file.input), { type: 'text', text }],
           ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
           ...(this.request.readOnly
-            ? {
-                sandboxPolicy: narrow
-                  ? readOnlySandbox(this.request.scratch.directory)
-                  : { type: 'readOnly', networkAccess: false },
-              }
+            ? narrow
+              ? { sandboxPolicy: readOnlySandbox(this.request.scratch.directory) }
+              : {
+                  sandboxPolicy: { type: 'readOnly', networkAccess: false },
+                  approvalPolicy: WIDE_APPROVAL_POLICY,
+                }
             : {}),
         },
         (reply) => onStart(reply, narrow),
       );
     // A client build that does not know the narrower read-only policy refuses it. The turn then
-    // starts on the plain read-only sandbox, and the path check on each command still stops a read
-    // outside the scratch copy.
+    // starts on the plain read-only sandbox, where each command asks first.
     const onStart = (reply: Reply, narrow: boolean) => {
-      if ('error' in reply && narrow && this.request.readOnly) return start(false);
+      if ('error' in reply && narrow && this.request.readOnly && refusesRestricted(reply.error)) {
+        this.wideSandbox = true;
+        return start(false);
+      }
       if ('error' in reply)
         return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
       this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
@@ -1060,8 +1075,17 @@ class OpenAiChatTurn {
       ...(kind === 'edit' && callId && this.deleting.has(callId) ? { deletes: true as const } : {}),
     });
     const policy = this.request.permissionPolicy;
-    // Review and advice turns read only.
-    if (this.request.readOnly) return this.answer(answerId, 'deny');
+    // Review and advice turns read only. On the wide sandbox a command runs only when it provably
+    // reads inside the scratch copy.
+    if (this.request.readOnly) {
+      const call = { command: value?.command ?? '', cwd: value?.cwd ?? null };
+      const inside =
+        this.wideSandbox &&
+        kind === 'command' &&
+        !network &&
+        scratchCommand(call, this.request.scratch.directory);
+      return this.answer(answerId, inside ? 'allow-once' : 'deny');
+    }
     // Network access reaches past the scratch copy, and no policy or grant covers a host, so the
     // person decides each one.
     if (network) return;
@@ -1207,17 +1231,20 @@ class OpenAiChatTurn {
       title = detail || 'Run a command';
       input = { command: detail, cwd: value?.cwd ?? null };
       // A read-only turn runs commands without a question, so one that reaches past the copy
-      // ends the turn here.
-      const outside = this.request.readOnly
-        ? outsidePaths(input, this.request.scratch.directory)
-        : [];
-      if (outside.length) {
+      // ends the turn here. On the wide sandbox a command the client ran under a rule of its own
+      // ends the turn too unless it provably reads inside the copy.
+      const directory = this.request.scratch.directory;
+      const outside = this.request.readOnly ? outsidePaths(input, directory) : [];
+      const unproven = this.wideSandbox && !outside.length && !scratchCommand(input, directory);
+      if (outside.length || unproven) {
         this.interrupt();
         this.fail(
           chatFailure({
             stage: 'tool',
             kind: 'internal',
-            message: `The turn stopped: a read-only command named a path outside the scratch copy (${clip(outside.join(', '), 400)}).`,
+            message: outside.length
+              ? `The turn stopped: a read-only command named a path outside the scratch copy (${clip(outside.join(', '), 400)}).`
+              : `The turn stopped: a read-only command ran that CrewKite could not confirm stays in the scratch copy (${clip(detail, 400)}).`,
             nextAction: 'Ask again. Read-only turns read only inside the scratch copy.',
           }),
         );
