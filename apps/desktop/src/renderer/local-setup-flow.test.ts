@@ -8,10 +8,13 @@ import {
   DISCOVERY_FOLLOW_MS,
   followDiscovery,
   lastSeen,
+  localNotices,
   lowMemory,
+  READING_LINE,
   selectionConfirmed,
   selectionLost,
   statusLine,
+  WAITING_LINE,
   WITHOUT_TOKEN,
   waitForLocalReadiness,
 } from './local-setup-flow.ts';
@@ -467,5 +470,60 @@ test('a background model read is followed past ten seconds and stops at its dead
   assert.equal(
     await followDiscovery({ read: async () => running, wait: async () => {}, active: () => false }),
     false,
+  );
+});
+
+test('the Local card shows only the notices that describe the current state', () => {
+  const observation = {} as LocalSetup['observation'];
+  const connected = setup({
+    operation: null,
+    connected: true,
+    connectedWithoutToken: true,
+    observation,
+    observationStale: true,
+  });
+  const read = setup({
+    operation: null,
+    connected: true,
+    connectedWithoutToken: true,
+    observation,
+  });
+  const notices = (change: Partial<Parameters<typeof localNotices>[0]>) =>
+    localNotices({
+      setup: connected,
+      message: null,
+      following: false,
+      reading: false,
+      connected: true,
+      stamp: 'Last seen just now.',
+      ...change,
+    });
+  // While a Connect follows a new connection, only the waiting line shows.
+  assert.deepEqual(notices({ message: WAITING_LINE, following: true }), {
+    message: WAITING_LINE,
+    stamp: null,
+    withoutToken: false,
+  });
+  // Once the models are read, the waiting line goes and the no-token line is the one left.
+  assert.deepEqual(notices({ setup: read, message: WAITING_LINE, following: true, stamp: null }), {
+    message: null,
+    stamp: null,
+    withoutToken: true,
+  });
+  // A follow that stopped leaves no waiting line either.
+  assert.equal(notices({ message: WAITING_LINE }).message, null);
+  // The reading line lasts as long as the read it is about.
+  assert.equal(notices({ message: READING_LINE, reading: true }).message, READING_LINE);
+  assert.equal(notices({ message: READING_LINE }).message, null);
+  // A line from an action stays.
+  assert.equal(notices({ message: 'Disconnect confirmed.' }).message, 'Disconnect confirmed.');
+  // Offline, the cached list keeps its age.
+  assert.deepEqual(
+    notices({
+      setup: { ...connected, connected: false },
+      connected: false,
+      stamp: 'Last seen 2 h ago. Not connected.',
+    }),
+    { message: null, stamp: 'Last seen 2 h ago. Not connected.', withoutToken: false },
   );
 });

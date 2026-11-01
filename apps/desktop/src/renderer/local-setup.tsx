@@ -9,11 +9,14 @@ import {
   DEFAULT_LOCAL_ENDPOINT,
   followDiscovery,
   lastSeen,
+  localNotices,
   lowMemory,
+  READING_LINE,
   REOBSERVE_MS,
   selectionConfirmed,
   selectionLost,
   statusLine,
+  WAITING_LINE,
   WITHOUT_TOKEN,
   waitForLocalReadiness,
 } from './local-setup-flow.ts';
@@ -37,7 +40,6 @@ const modelReasons = {
   'not-downloaded': 'Model is not downloaded',
 };
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
-const WAITING = 'Waiting for the connection and model metadata.';
 
 export function LocalSetup({
   snapshot,
@@ -95,9 +97,17 @@ export function LocalSetup({
   const lost = selectionLost(lastChoice, setup);
   const confirmed = confirming !== null && selectionConfirmed(setup, confirming);
   const memory = lowMemory(setup, snapshot.localHardware);
-  const status = statusLine({
+  const notices = localNotices({
     setup,
     message,
+    following: polling,
+    reading: quiet || observing.current,
+    connected: connectionReady,
+    stamp,
+  });
+  const status = statusLine({
+    setup,
+    message: notices.message,
     lost,
     confirmed,
     quiet,
@@ -145,7 +155,11 @@ export function LocalSetup({
         return 'The runtime could not be read. Reconnect and try again.';
       } finally {
         observing.current = false;
-        if (mounted.current) setQuiet(false);
+        if (mounted.current) {
+          setQuiet(false);
+          // The read that line was about has ended.
+          setMessage((current) => (current === READING_LINE ? null : current));
+        }
       }
     },
     [source, preview, refresh],
@@ -230,7 +244,7 @@ export function LocalSetup({
     pollAbort.current = control;
     setPolling(true);
     setPollTimedOut(false);
-    setMessage(WAITING);
+    setMessage(WAITING_LINE);
     void waitForLocalReadiness({
       endpoint: targetEndpoint,
       active: () =>
@@ -279,7 +293,7 @@ export function LocalSetup({
         // failed connection, in place of the waiting line.
         // A refusal said during the follow stays. Only the waiting line goes.
         if (result === 'ready' || (result === 'stopped' && actionGeneration.current === generation))
-          setMessage((current) => (current === WAITING ? null : current));
+          setMessage((current) => (current === WAITING_LINE ? null : current));
         if (result === 'timeout') {
           setPollTimedOut(true);
           setMessage('Taking longer than expected. Try Refresh model list.');
@@ -300,7 +314,7 @@ export function LocalSetup({
   // runs. Say so plainly.
   function readingInBackground() {
     if (!observing.current) return false;
-    setMessage('Local is reading its models. Try again in a moment.');
+    setMessage(READING_LINE);
     return true;
   }
   async function action(name: string, command: DesktopCommand) {
@@ -394,12 +408,12 @@ export function LocalSetup({
       <p className="notice" role="status">
         {status}
       </p>
-      {stamp && (
+      {notices.stamp && (
         <p className="notice" role="status">
-          {stamp}
+          {notices.stamp}
         </p>
       )}
-      {connectionReady && setup?.connectedWithoutToken === true && (
+      {notices.withoutToken && (
         <p className="notice" role="status">
           {WITHOUT_TOKEN}
         </p>
