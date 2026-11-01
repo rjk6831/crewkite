@@ -38,6 +38,60 @@ export const DISCOVERY_FOLLOW_MS = 30_000;
 
 export const WITHOUT_TOKEN = 'Connected without a token. The runtime has auth off on loopback.';
 
+/** The line while a Connect waits for the connection and the first model read. */
+export const WAITING_LINE = 'Waiting for the connection and model metadata.';
+/** The line when an action meets a model read the card started on its own. */
+export const READING_LINE = 'Local is reading its models. Try again in a moment.';
+
+const ready = (
+  setup:
+    | Pick<LocalSetup, 'connected' | 'observation' | 'observationStale' | 'operation'>
+    | null
+    | undefined,
+) => !!setup?.connected && !!setup.observation && !setup.observationStale && !setup.operation;
+
+/**
+ * The notices under the status line, kept to what is true now. The line from the last action
+ * goes when its condition ends: the waiting line once the connection is read or the follow
+ * stops, the reading line once that read ends. The last-seen age shows while the list is not
+ * being read again, and the no-token line once a Connect has finished.
+ */
+export function localNotices({
+  setup,
+  message,
+  following,
+  reading,
+  connected,
+  stamp,
+}: {
+  setup:
+    | Pick<
+        LocalSetup,
+        'connected' | 'observation' | 'observationStale' | 'operation' | 'connectedWithoutToken'
+      >
+    | null
+    | undefined;
+  message: string | null;
+  /** A Connect is following the connection to its first read. */
+  following: boolean;
+  /** A model read the card started on its own is running. */
+  reading: boolean;
+  /** The connection the card counts as up. */
+  connected: boolean;
+  stamp: string | null;
+}): { message: string | null; stamp: string | null; withoutToken: boolean } {
+  const done = ready(setup);
+  const settling = (following && !done) || !!setup?.operation;
+  return {
+    message:
+      (message === WAITING_LINE && (!following || done)) || (message === READING_LINE && !reading)
+        ? null
+        : message,
+    stamp: stamp && !(connected && settling) ? stamp : null,
+    withoutToken: connected && setup?.connectedWithoutToken === true && !settling,
+  };
+}
+
 /** The port the Local runtime listens on unless the person changed it. */
 export const DEFAULT_LOCAL_ENDPOINT = 'ws://127.0.0.1:1234';
 
