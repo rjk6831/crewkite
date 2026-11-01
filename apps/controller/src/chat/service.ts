@@ -349,17 +349,21 @@ const CREW_CHALLENGE = 'Challenge the assumptions behind the last answer.';
 const MAX_FIXES = 2;
 const CREW_ROLES = { review: 'reviewer', fix: 'fixer', challenge: 'challenger' } as const;
 type CrewStep = keyof typeof CREW_ROLES;
-// Commands balanced mode runs without asking. Each reads files and changes nothing.
+// Commands Balanced and Glide run without asking. Each reads files and changes nothing. sed
+// counts only as `sed -n` with a line range to print.
 const READ_ONLY_COMMANDS = new Set(['ls', 'cat', 'head', 'tail', 'wc', 'rg', 'grep', 'find']);
+const SED_PRINT = /^(\d+|\$)(,(\d+|\$))?p$/;
+// A client can wrap the command in a shell. The script inside is read by the same rules.
+const SHELLS = new Set(['sh', 'bash', 'zsh']);
 const READ_ONLY_GIT = new Set(['status', 'diff', 'log', 'show']);
 // find can run, delete or write through these. rg runs programs with --pre, --hostname-bin and
 // --search-zip. git diff and show write a file with --output and run configured programs with
 // --ext-diff and --textconv.
 const WRITING_FLAGS =
   /^(-exec|-execdir|-ok|-okdir|-delete|-fprint0?|-fprintf|-fls|--pre|--pre-glob|--hostname-bin|-z|--search-zip|--output|--ext-diff|--textconv)(=|$)/;
-// A word balanced mode answers for is plain: no quotes, globs, variables or escapes the shell
-// would rewrite before the program sees it.
-const PLAIN_WORD = /^[A-Za-z0-9._/=:,+@%-]+$/;
+// A piece of a word the read-only commands accept: plain characters, or a quoted part the shell
+// passes on as it stands. No globs, variables, substitutions or escapes outside quotes.
+const WORD_PIECE = /^(?:[A-Za-z0-9._/=:,+@%-]+|'[^'\n]*'|"[^"$`\\!\n]*")/;
 
 // The media type of the artifacts that hold large event output (commands/controller.ts).
 const EVENT_OUTPUT = 'application/vnd.crewkite.event+json';
@@ -2103,7 +2107,6 @@ export class ChatService {
     if (!open || !allow || !writesScratch(live.role)) return null;
     const balanced = thread.flightMode === 'balanced';
     const policy = thread.permissionPolicy;
-    if (!balanced && fresh && policy === live.applied.policy) return null;
     const call = live.calls.get(open.callId ?? '');
     const kind = live.kinds.get(open.callId ?? '');
     // A call the kinds do not name may be a server's. Its policy was cut at launch and a looser
@@ -2112,12 +2115,17 @@ export class ChatService {
     const words = `${open.question}\n${call?.title ?? ''}`;
     if (/\bnetwork\b/i.test(words)) return null;
     const scratch = live.scratch;
+    // Balanced and Glide run a read-only command inside the scratch copy without asking, on every
+    // family and under every policy. Other commands follow the policy.
+    if (thread.flightMode !== 'manual' && kind === 'command')
+      if (readOnlyCommand(call?.input, scratch)) return allow.id;
     if (balanced) {
       // A delete or move is marked by the adapter from the client's own change type.
       if (kind === 'edit')
         return !open.deletes && editsInside(call?.input, scratch) ? allow.id : null;
-      return kind === 'command' && readOnlyCommand(call?.input, scratch) ? allow.id : null;
+      return null;
     }
+    if (fresh && policy === live.applied.policy) return null;
     if (kind === 'edit')
       return policy !== 'ask' && editsInside(call?.input, scratch) ? allow.id : null;
     return policy === 'allow-all' ? allow.id : null;
@@ -4020,19 +4028,61 @@ function pathParts(word: string): string[] {
  */
 function readOnlyCommand(input: unknown, scratch: string): boolean {
   if (!input || typeof input !== 'object') return false;
-  const { command, cwd } = input as Record<string, unknown>;
+  // Clients name the fields differently: command and cwd, or CommandLine and Cwd.
+  const fields = new Map(
+    Object.entries(input as Record<string, unknown>).map(([key, value]) => [
+      key.toLowerCase(),
+      value,
+    ]),
+  );
+  const command = fields.get('command') ?? fields.get('commandline');
+  const cwd = fields.get('cwd');
   if (typeof command !== 'string') return false;
   if (cwd != null && (typeof cwd !== 'string' || !inScratch(scratch, cwd))) return false;
-  const words = command.trim().split(/[ \t]+/);
-  if (!words.every((word) => PLAIN_WORD.test(word))) return false;
+  return readOnlyWords(shellWords(command), scratch, true);
+}
+
+function readOnlyWords(words: string[] | null, scratch: string, outer: boolean): boolean {
+  if (!words?.length) return false;
   const [program, ...rest] = words;
+  const name = program.split('/').at(-1) ?? '';
+  if (outer && SHELLS.has(name) && rest.length === 2 && (rest[0] === '-c' || rest[0] === '-lc'))
+    return readOnlyWords(shellWords(rest[1]), scratch, false);
+  const inside = (word: string) =>
+    pathParts(word).every((part) => !part.startsWith('~') && inScratch(scratch, part));
+  if (program === 'sed') {
+    const [flag, script, ...files] = rest;
+    return flag === '-n' && SED_PRINT.test(script ?? '') && files.length > 0 && files.every(inside);
+  }
   if (program === 'git' ? !READ_ONLY_GIT.has(rest[0] ?? '') : !READ_ONLY_COMMANDS.has(program))
     return false;
-  return rest.every(
-    (word) =>
-      !WRITING_FLAGS.test(word) &&
-      pathParts(word).every((part) => !part.startsWith('~') && inScratch(scratch, part)),
-  );
+  return rest.every((word) => !WRITING_FLAGS.test(word) && inside(word));
+}
+
+/**
+ * The words the shell hands the program, or null when the command holds anything the shell
+ * would act on: an operator, a redirect, a glob, a variable or an escape outside quotes.
+ */
+function shellWords(command: string): string[] | null {
+  const words: string[] = [];
+  let word: string | null = null;
+  let rest = command.trim();
+  while (rest) {
+    const space = /^[ \t]+/.exec(rest);
+    if (space) {
+      if (word !== null) words.push(word);
+      word = null;
+      rest = rest.slice(space[0].length);
+      continue;
+    }
+    const piece = WORD_PIECE.exec(rest)?.[0];
+    if (!piece) return null;
+    const quoted = piece.startsWith("'") || piece.startsWith('"');
+    word = (word ?? '') + (quoted ? piece.slice(1, -1) : piece);
+    rest = rest.slice(piece.length);
+  }
+  if (word !== null) words.push(word);
+  return words;
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */
