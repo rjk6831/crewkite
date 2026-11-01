@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatCatalogRead, SavedCrew, SavedCrewsRead } from '@crewkite/contracts';
-import { deleteCrew, loadCrews, saveCrew, setDefaultCrew } from './crew-store.ts';
+import {
+  deleteCrew,
+  loadCrews,
+  readCrewLoad,
+  reloadCrews,
+  saveCrew,
+  setDefaultCrew,
+} from './crew-store.ts';
 import {
   applyDraft,
   clearLegacyCrews,
@@ -470,5 +477,19 @@ test('crews kept in the window move to the controller once and every change goes
     readSavedCrews().map(({ id }) => id),
     ['crew-a'],
   );
+
+  // A failed read is kept for Settings to show, and trying again reads from the same controller.
+  let fail = true;
+  const flaky = {
+    command: async (input: unknown) => {
+      if (fail) throw new Error('The controller did not answer.');
+      return (source as { command: (input: unknown) => Promise<unknown> }).command(input);
+    },
+  } as never;
+  await assert.rejects(loadCrews(flaky, store));
+  assert.deepEqual(readCrewLoad(), { state: 'failed', message: 'The controller did not answer.' });
+  fail = false;
+  await reloadCrews();
+  assert.deepEqual(readCrewLoad(), { state: 'loaded' });
   clearLegacyCrews(store);
 });
