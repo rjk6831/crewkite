@@ -5,12 +5,20 @@ import {
   type ChatFlightMode,
   SAVED_CREWS_MAX,
 } from '@crewkite/contracts';
-import { Pencil, Plus, Trash2 } from 'lucide-react';
+import { Pencil, Plus, RotateCw, Trash2 } from 'lucide-react';
 import { useEffect, useId, useState } from 'react';
 import { Dialog } from '../components.tsx';
 import { RoleInfo } from '../thread/role-info.tsx';
 import { SubagentSwitch } from '../thread/subagent-switch.tsx';
-import { deleteCrew, saveCrew, setDefaultCrew } from './crew-store.ts';
+import {
+  type CrewLoad,
+  deleteCrew,
+  onCrewLoad,
+  readCrewLoad,
+  reloadCrews,
+  saveCrew,
+  setDefaultCrew,
+} from './crew-store.ts';
 import { modelChoices, SelectionFields } from './general-card.tsx';
 import {
   type CrewChoice,
@@ -28,6 +36,7 @@ import {
   readSavedCrews,
   type SavedCrew,
   savedCrewId,
+  savedCrewsLoaded,
   writeCrewPresets,
   writeProjectCrew,
 } from './preferences.ts';
@@ -47,7 +56,15 @@ const readChoices = () => ({
   defaultId: readDefaultCrew(),
   projects: readProjectCrews(),
   saved: readSavedCrews(),
+  loaded: savedCrewsLoaded(),
 });
+
+/** Where the read of the saved crews stands. */
+function useCrewLoad(): CrewLoad {
+  const [state, setState] = useState(readCrewLoad);
+  useEffect(() => onCrewLoad(() => setState(readCrewLoad())), []);
+  return state;
+}
 
 /** The crews a thread can start from, read again whenever a saved crew or a default changes. */
 export function useCrewChoices() {
@@ -284,7 +301,8 @@ export function CrewsCard({
   catalog: ChatCatalogRead | null;
   projects: readonly { id: string; name: string }[];
 }) {
-  const { choices, defaultId, projects: projectCrews, saved } = useCrewChoices();
+  const { choices, defaultId, projects: projectCrews, saved, loaded } = useCrewChoices();
+  const load = useCrewLoad();
   const [presets, setPresets] = useState<CrewPreset[]>(() => readCrewPresets());
   const [editing, setEditing] = useState<SavedCrew | 'new' | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
@@ -386,7 +404,25 @@ export function CrewsCard({
             </small>
           </span>
           <div className="st-controls st-saved-crews">
-            {saved.length === 0 ? (
+            {!loaded && load.state === 'failed' ? (
+              <div className="st-crews-failed" role="alert">
+                <p className="st-note">Saved crews could not be read. {load.message}</p>
+                <button
+                  type="button"
+                  className="button secondary"
+                  onClick={() => void reloadCrews().catch(() => {})}
+                >
+                  <RotateCw size={13} aria-hidden="true" />
+                  Try again
+                </button>
+              </div>
+            ) : !loaded ? (
+              <p className="st-hint">
+                {load.state === 'loading'
+                  ? 'Loading saved crews.'
+                  : 'Saved crews load when the controller connects.'}
+              </p>
+            ) : saved.length === 0 ? (
               <p className="st-hint">None yet.</p>
             ) : (
               <ul className="st-saved-list">
@@ -428,7 +464,7 @@ export function CrewsCard({
             <button
               type="button"
               className="button secondary"
-              disabled={saved.length >= SAVED_CREWS_MAX}
+              disabled={!loaded || saved.length >= SAVED_CREWS_MAX}
               onClick={() => setEditing('new')}
             >
               <Plus size={14} aria-hidden="true" />
