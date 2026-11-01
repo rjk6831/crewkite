@@ -555,6 +555,12 @@ export const LocalHardwareStatusSchema = z
 export type LocalHardwareStatus = z.infer<typeof LocalHardwareStatusSchema>;
 /** Tokens a Local reply leaves for the chat template's own markers. */
 export const LOCAL_REPLY_MARGIN = 256;
+/** Share of the context the Local project outline may take. */
+export const LOCAL_OUTLINE_SHARE = 0.18;
+/** Tokens the Local rolling summary takes at most. */
+export const LOCAL_SUMMARY_TOKENS = 300;
+/** Bytes counted as one token when no tokenizer is at hand. Text and code run 3 to 5, so 3 never undercounts. */
+export const BYTES_PER_TOKEN_ESTIMATE = 3;
 /** The smallest reply budget a Local turn starts with: 2,048 or 30 percent of the context. */
 export const localReplyFloor = (contextLength: number) =>
   Math.max(2048, Math.ceil(contextLength * 0.3));

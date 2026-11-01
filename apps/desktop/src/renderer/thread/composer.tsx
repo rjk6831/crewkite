@@ -52,6 +52,7 @@ import { canSend, isMacPlatform, shortcutFor } from './composer-rules.ts';
 import { deliveryNote, deliveryOf } from './file-fit.ts';
 import { InstructionChip } from './instruction-chip.tsx';
 import { defaultSelection, ModelPicker } from './model-picker.tsx';
+import { type NextMessageInput, nextMessage } from './next-message.ts';
 import { NotesChip } from './project-notes.tsx';
 import {
   ASK_NEEDS_TEXT,
@@ -106,7 +107,7 @@ export function Composer({
   taskId,
   thread,
   running,
-  context,
+  meter = null,
   currentFamily,
   blocked,
   notice,
@@ -128,7 +129,14 @@ export function Composer({
   taskId: string | null;
   thread: ChatThread | null;
   running: boolean;
-  context: { used: number; capacity: number | null } | null;
+  /**
+   * What the meter counts for the next message: the stored turns, and the window a turn on a
+   * family and model last reported. Null on a new thread.
+   */
+  meter?: {
+    history: NextMessageInput['history'];
+    windowFor: (family: ChatFamily, model: string) => number | null;
+  } | null;
   currentFamily: ChatFamily | null;
   blocked: string | null;
   notice: string | null;
@@ -316,6 +324,20 @@ export function Composer({
       ? lastSeen(saved.observedAt, Date.now(), !!saved.connected)
       : null;
   const adding = files.some((file) => file.busy);
+  // The meter is about the next message for the selected model, so it moves with the model, the
+  // draft and the attachments. Local reads its window from the loaded instance.
+  const estimate =
+    meter && selection
+      ? nextMessage({
+          family: selection.family,
+          capacity:
+            (selection.family === 'local' ? saved?.contextTokens : null) ??
+            meter.windowFor(selection.family, selection.model),
+          history: meter.history,
+          draft: text,
+          fileBytes: files.reduce((sum, file) => sum + file.bytes, 0),
+        })
+      : null;
   const canAttach = !!source.attachFiles && !blocked;
   async function submit(event?: FormEvent) {
     event?.preventDefault();
@@ -720,13 +742,32 @@ export function Composer({
             </button>
           )}
           <div className="th-bar-end">
-            {context?.capacity && (
+            {estimate && (
               <ContextGauge
-                usedTokens={context.used}
-                capacityTokens={context.capacity}
+                usedTokens={estimate.tokens}
+                capacityTokens={estimate.capacity}
                 measurement="current"
                 updating={running}
                 size={22}
+                label="Next message"
+                tone={estimate.tone}
+                folding={estimate.folds}
+                detail={{
+                  status: `For ${selection?.model ?? 'the selected model'}`,
+                  rows: [
+                    [
+                      'This message',
+                      `about ${estimate.tokens.toLocaleString()} of ${estimate.capacity.toLocaleString()} tokens`,
+                    ],
+                    ['Thread history stored', `${estimate.storedTokens.toLocaleString()} tokens`],
+                  ],
+                  lines: [
+                    estimate.olderTurns,
+                    ...(estimate.folds
+                      ? ['Older turns will be summarized before this message.']
+                      : []),
+                  ],
+                }}
               />
             )}
             {running && (

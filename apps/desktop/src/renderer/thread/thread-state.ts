@@ -522,10 +522,33 @@ export function activeTurnId(state: ThreadState): string | null {
   return null;
 }
 
-export function latestContext(items: readonly ThreadItem[]): TurnView['context'] {
+/**
+ * The newest window a turn on this family and model reported, or null. Only the capacity is
+ * read: a turn's usage is its own peak, and the composer meter estimates the next message.
+ */
+export function reportedWindow(
+  items: readonly ThreadItem[],
+  family: ChatFamily,
+  model: string,
+): number | null {
   for (const item of items.toReversed())
-    if (item.kind === 'turn' && item.turn.context) return item.turn.context;
+    if (
+      item.kind === 'turn' &&
+      item.turn.identity?.family === family &&
+      item.turn.identity.model === model &&
+      item.turn.context?.capacity
+    )
+      return item.turn.context.capacity;
   return null;
+}
+
+/** The thread's stored user and assistant messages as the meter counts them, oldest first. */
+export function storedHistory(state: Pick<ThreadState, 'messages'>) {
+  return state.messages.flatMap((message) =>
+    message.author.kind === 'system'
+      ? []
+      : [{ role: message.author.kind, text: message.text } as const],
+  );
 }
 
 // The family that answered last, counted the way the controller counts it: the assistant turn with

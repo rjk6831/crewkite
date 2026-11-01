@@ -1,4 +1,11 @@
-import { LOCAL_REPLY_MARGIN, localBudget, localReplyFloor } from '@crewkite/contracts';
+import {
+  BYTES_PER_TOKEN_ESTIMATE,
+  LOCAL_OUTLINE_SHARE,
+  LOCAL_REPLY_MARGIN,
+  LOCAL_SUMMARY_TOKENS,
+  localBudget,
+  localReplyFloor,
+} from '@crewkite/contracts';
 
 // The sizes a Local prompt may use, derived from the one reply rule in contracts. The chat turn,
 // the file proposal and the orchestrator's fit check all read their room from here.
@@ -31,12 +38,11 @@ export function localProposalBudget(contextLength: number) {
   return localBudget(contextLength, localPromptRoom(contextLength), true);
 }
 
-// Text and code run three to five bytes a token. Three never undercounts.
-const BYTES_PER_TOKEN = 3;
+const BYTES_PER_TOKEN = BYTES_PER_TOKEN_ESTIMATE;
 // The project outline takes up to 18 percent of the context and the rolling summary about 300
 // tokens, both before any file, so a slice cannot count on that part of the room.
-const OUTLINE_SHARE = 0.18;
-const SUMMARY_TOKENS = 300;
+const OUTLINE_SHARE = LOCAL_OUTLINE_SHARE;
+const SUMMARY_TOKENS = LOCAL_SUMMARY_TOKENS;
 
 /**
  * Whether a slice naming these files can run on Local: no image among them, and the files fit in
