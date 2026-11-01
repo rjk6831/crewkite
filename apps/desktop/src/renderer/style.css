@@ -71,11 +71,12 @@
   box-sizing: border-box;
 }
 /* The shell scrolls its own panes. A document scrollbar beside them would scroll the whole
-   window, so the page itself never scrolls. */
+   window, so the page itself never scrolls. Hidden still lets scrollIntoView move the page, which
+   leaves the top of the shell cut off, so the page clips. */
 html,
 body {
   height: 100%;
-  overflow: hidden;
+  overflow: clip;
 }
 body {
   margin: 0;
@@ -305,7 +306,7 @@ th:not(:first-child) {
 .app-shell {
   display: flex;
   height: 100dvh;
-  overflow: hidden;
+  overflow: clip;
 }
 .navigation {
   width: 222px;
