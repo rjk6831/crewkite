@@ -6,6 +6,7 @@ import {
   GOOGLE_CONNECT_LIMIT_MS,
   GOOGLE_READ_TRIES,
   googleConnectButton,
+  googleConnectError,
   googleSetupProgress,
   nextGoogleStage,
   pollGoogleSetupStatus,
@@ -884,4 +885,20 @@ test('a Connect press shows its first step and keeps the button in place', () =>
   assert.deepEqual(button(true, false), { label: 'Starting…', disabled: true });
   assert.deepEqual(button(true, true), { label: 'Connecting…', disabled: true });
   assert.deepEqual(button(true, true, true), { label: 'Connect Google', disabled: true });
+});
+
+test('the unconfirmed outcome line shows only after a step ended in an unknown state', () => {
+  const unconfirmed = 'The setup outcome could not be confirmed. Review status before retrying.';
+  const plain = 'Connect stopped. Press Connect to try again.';
+  // A fresh launch with no attempt, an unreadable state and a blocked step say nothing unknown.
+  assert.equal(googleConnectError({ googleAcpInstall: null, googleAcpSetup: null }), plain);
+  assert.equal(googleConnectError(null), plain);
+  assert.equal(
+    googleConnectError({ googleAcpInstall: null, googleAcpSetup: setup(2, 'blocked') }),
+    plain,
+  );
+  assert.equal(
+    googleConnectError({ googleAcpInstall: null, googleAcpSetup: setup(2, 'unknown') }),
+    unconfirmed,
+  );
 });

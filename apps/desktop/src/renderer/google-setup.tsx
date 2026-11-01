@@ -16,6 +16,7 @@ import {
   type GoogleSetupProgress,
   type GoogleSetupStage,
   googleConnectButton,
+  googleConnectError,
   googleSetupProgress,
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
@@ -280,8 +281,9 @@ export function GoogleSetup({
         );
       }
     } catch {
+      const state = await workspace.refresh().catch(() => null);
       if (mounted.current && generation.current === currentGeneration) {
-        setMessage('The setup outcome could not be confirmed. Review status before retrying.');
+        setMessage(googleConnectError(state));
       }
     } finally {
       if (mounted.current && generation.current === currentGeneration) {
