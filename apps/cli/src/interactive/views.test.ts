@@ -18,6 +18,7 @@ process.env.FORCE_COLOR = '3';
 const { renderToString } = await import('ink');
 const views = await import('./views.ts');
 const { gaugeHex, palette } = await import('./theme.ts');
+const { modelList } = await import('./pickers.ts');
 
 const esc = String.fromCharCode(27);
 const plain = (text: string) => stripVTControlCharacters(text).replace(/[ \t]+$/gm, '');
@@ -222,6 +223,37 @@ test('each interactive view draws a scripted thread in colour and without it und
         /reviewer\s+L fixture-local/,
         'Flight mode: Balanced',
       ],
+    },
+    {
+      name: 'model list grouped by family with effort',
+      view: (colors) => {
+        const current = { family: 'anthropic', model: 'model-a', effort: 'high' } as const;
+        return h(views.ModelListView, {
+          groups: modelList(catalog, current, ''),
+          selected: 1,
+          current,
+          filter: '',
+          colors,
+        });
+      },
+      shows: [
+        'A Anthropic',
+        /model-a\s+Scripted model A\s+low \[high\]\s+current/,
+        '› model-b',
+        'Left, Right effort',
+      ],
+    },
+    {
+      name: 'model list with a filter that matches nothing',
+      view: (colors) =>
+        h(views.ModelListView, {
+          groups: modelList(catalog, null, 'none'),
+          selected: 0,
+          current: null,
+          filter: 'none',
+          colors,
+        }),
+      shows: ['Models  matching none', 'No connected model matches.'],
     },
     {
       name: 'plan card in Balanced',

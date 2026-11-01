@@ -5,6 +5,7 @@ import type {
   ChatFailure,
   ChatFamily,
   ChatFlightMode,
+  ChatModelSelection,
   ChatPlanState,
   ChatThread,
   CliSettings,
@@ -34,6 +35,7 @@ import { type Art, pickWordmark, spinnerFrames } from './brand.ts';
 import type { Composer } from './composer-state.ts';
 import { defaultKeys, keyLabel, keysFor } from './keys.ts';
 import { Markdown } from './markdown.ts';
+import type { ModelGroup } from './pickers.ts';
 import { familyMarks, familyNames, gaugeBar, gaugeHex, type Palette, safeText } from './theme.ts';
 
 // Every view of the interactive CLI as a pure function of its data. The app holds the state and
@@ -619,6 +621,84 @@ export function CrewView({ thread, colors }: { thread: ChatThread; colors: Palet
       Text,
       { color: colors.muted },
       '1 Solo  2 Pair  3 Full crew  F flight mode  P policy  H handoff mode  A automatic handoff',
+    ),
+  );
+}
+
+/**
+ * The list `/model` opens: every connected family's models under the family's name, the row the
+ * cursor is on drawn inverse with a pointer, its effort levels with the picked one in brackets.
+ */
+export function ModelListView({
+  groups,
+  selected,
+  current,
+  filter,
+  colors,
+}: {
+  groups: readonly ModelGroup[];
+  selected: number;
+  current: ChatModelSelection | null;
+  filter: string;
+  colors: Palette;
+}) {
+  const rows: ReactNode[] = [];
+  let at = 0;
+  for (const group of groups) {
+    rows.push(
+      h(
+        Text,
+        { key: `family-${group.family}` },
+        FamilyMark({ family: group.family, colors }),
+        h(Text, { bold: true }, ` ${familyNames[group.family]}`),
+      ),
+    );
+    for (const row of group.rows) {
+      const on = at === selected;
+      const isCurrent = current?.family === row.family && current.model === row.model;
+      rows.push(
+        h(
+          Text,
+          { key: `${row.family}:${row.model}` },
+          h(Text, { inverse: on }, `${on ? '›' : ' '} ${safeText(row.model)}`),
+          row.label && row.label !== row.model
+            ? h(Text, { color: colors.muted }, `  ${safeText(row.label)}`)
+            : null,
+          row.efforts.length > 0
+            ? h(
+                Text,
+                { color: on ? colors.text : colors.muted },
+                `  ${row.efforts.map((effort) => (effort === row.effort ? `[${effort}]` : effort)).join(' ')}`,
+              )
+            : null,
+          isCurrent ? h(Text, { color: colors.green }, '  current') : null,
+        ),
+      );
+      at++;
+    }
+  }
+  return h(
+    Box,
+    { flexDirection: 'column' },
+    h(
+      Text,
+      { bold: true },
+      'Models',
+      filter ? h(Text, { color: colors.muted }, `  matching ${safeText(filter)}`) : null,
+    ),
+    ...(rows.length > 0
+      ? rows
+      : [
+          h(
+            Text,
+            { key: 'none', color: colors.muted },
+            filter ? 'No connected model matches.' : 'Connect a provider to pick a model.',
+          ),
+        ]),
+    h(
+      Text,
+      { color: colors.muted },
+      'Up, Down move  Left, Right effort  Enter choose  Type to filter  Esc close',
     ),
   );
 }
