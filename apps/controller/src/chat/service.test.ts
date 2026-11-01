@@ -66,6 +66,7 @@ import { detectType } from './files.ts';
 import { McpRegistry } from './mcp-servers.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
+import { AskingTurnError, answer } from './thread-tools/broker.ts';
 
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
 
@@ -499,7 +500,7 @@ test('a message sent during a turn waits and starts when the turn ends', {
       end: 'answer',
       asked: [first, ...later],
     },
-    { name: 'stop clears', send: later, remove: null, end: 'stop', asked: [first] },
+    { name: 'stop pauses', send: later, remove: null, end: 'stop', asked: [first] },
     {
       name: 'dequeue removes',
       send: later,
@@ -568,7 +569,15 @@ test('a message sent during a turn waits and starts when the turn ends', {
     const removed = waiting.thread.queued.find((message) => message.text === row.remove);
     if (removed) store.transaction(() => service.configure({ taskId, dequeue: removed.id }));
 
-    const idle = settles(thread);
+    // A stopped turn leaves its queue paused, so the thread frees with messages still waiting.
+    const idle =
+      row.end === 'stop'
+        ? next(
+            thread,
+            (event) =>
+              event.type === 'chat.thread' && (event.payload as ChatThread).activeTurnId === null,
+          )
+        : settles(thread);
     const effects: (() => void)[] = [];
     const ended = store.transaction(() =>
       row.end === 'stop'
@@ -578,7 +587,7 @@ test('a message sent during a turn waits and starts when the turn ends', {
             effects,
           ),
     );
-    // Stop hands the cleared messages back, so the composer can offer the text again.
+    // Stop names the messages still waiting. Nothing goes back to the composer.
     if (row.end === 'stop')
       assert.deepEqual(
         ended.data?.kind === 'chat-queue' ? ended.data.messages.map((m) => m.text) : null,
@@ -592,6 +601,12 @@ test('a message sent during a turn waits and starts when the turn ends', {
     assert.deepEqual(
       users(after).map((message) => message.text),
       row.asked,
+      row.name,
+    );
+    // The paused queue keeps every message, in order, and starts none of them by itself.
+    assert.deepEqual(
+      [after.thread.queued.map((message) => message.text), after.thread.queuePaused],
+      row.end === 'stop' ? [row.send.slice(0, 8), true] : [[], undefined],
       row.name,
     );
     // A queued message joins the conversation under the ID it had while it waited.
@@ -630,7 +645,8 @@ test('a message sent during a turn waits and starts when the turn ends', {
 
     // A side question carries the thread packet. With no thread tools, the packet does not name
     // them, and the turn carries the same answer for the client's config.
-    const asking = settles(thread);
+    // A new message starts at once beside a paused queue.
+    const asking = turnReaches(thread, 'done');
     const effects2: (() => void)[] = [];
     store.transaction(() =>
       service.ask(
@@ -644,6 +660,29 @@ test('a message sent during a turn waits and starts when the turn ends', {
     assert.match(side?.prompt ?? '', /^This is a side question to OpenAI/, row.name);
     assert.doesNotMatch(side?.prompt ?? '', /Thread tools are available/, row.name);
     assert.equal(side?.threadTools, false, row.name);
+    if (row.end !== 'stop') continue;
+    assert.equal(thread.read().thread.queued.length, Math.min(row.send.length, 8), row.name);
+
+    // Send now on a paused message starts that one. The rest stay paused, and the queue clears
+    // its pause once it empties.
+    const chosen = thread.read().thread.queued[1];
+    const sentNow = turnReaches(thread, 'done');
+    const now = act(store, (work) => service.steer({ taskId, messageId: chosen.id }, work));
+    assert.equal(now.outcome, 'applied', row.name);
+    await sentNow;
+    const resumed = thread.read();
+    assert.equal(users(resumed).at(-1)?.id, chosen.id, row.name);
+    assert.deepEqual(
+      resumed.thread.queued.map((message) => message.id),
+      waiting.thread.queued.filter((message) => message.id !== chosen.id).map((m) => m.id),
+      row.name,
+    );
+    assert.equal(resumed.thread.queuePaused, true, row.name);
+    store.transaction(() => {
+      for (const message of resumed.thread.queued)
+        service.configure({ taskId, dequeue: message.id });
+    });
+    assert.equal(thread.read().thread.queuePaused, undefined, row.name);
   }
 
   // One running turn per family: a second thread's message on the same family waits in its own
@@ -1007,6 +1046,16 @@ test('a usage limit writes a system line, and auto handoff runs the same message
     ],
   );
   assert.equal(thread.turns[1].userMessageId, thread.turns[0].userMessageId);
+  // Each turn carries CrewKite's reading of its family's tightest window, so the adapter can
+  // tell a client's early usage warning from a low allowance.
+  assert.deepEqual(
+    (['openai', 'google'] as const).map(
+      (family) =>
+        (on.adapters.get(family)?.requests as unknown as ChatTurnRequest[] | undefined)?.[0]
+          ?.allowanceLeft,
+    ),
+    [99, 80],
+  );
   assert.deepEqual(on.settled, [
     ['openai', on.taskId],
     ['google', on.taskId],
@@ -1176,9 +1225,11 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   assert.match(google[4].prompt, /^Person:\nThink harder\.$/m);
   const changed = off.read();
   assert.equal(changed.turns.at(-1)?.handoffFrom, 'google');
+  // The listed model shows its picker label (the fixture labels google-model as google), and an
+  // ID the catalog does not list shows as itself.
   assert.equal(
     changed.messages.at(-2)?.text,
-    'Continued on Google (google-model-2) from Google (google-model). Reason: model changed in the composer.',
+    'Continued on Google (google-model-2) from Google (google). Reason: model changed in the composer.',
   );
 
   // The cap decision clears the saved session before the turn runs. When that turn fails, the
@@ -2278,13 +2329,16 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           return;
         }
         const lines = read.messages.map((message) => message.text);
+        // The card carries the assignment reason, so the thread writes no line that repeats it.
         assert.ok(
-          lines.includes(
-            'Slice 1 (medium) assigned to OpenAI: the crew builder, ranked 2 of 3 by Most allowance left.',
+          !lines.some(
+            (line) =>
+              /^Slice \d+ \(\w+\) assigned to /.test(line) &&
+              !line.endsWith('picked on the plan card.'),
           ),
           row.name,
         );
-        // An override keeps the controller's line and adds the person's pick after it.
+        // An override adds the person's pick as a line.
         if ('picked' in row) assert.ok(lines.includes(row.picked), row.name);
         const builtOn = 'builtOn' in row ? row.builtOn : 'openai';
         assert.equal(card?.slices[0].assignment?.family, builtOn, row.name);
@@ -3554,6 +3608,24 @@ test('the thread reader returns bounded, redacted reads of its own thread only',
     assert.ok(Buffer.byteLength(live.text) <= 8 * 1024);
     assert.equal(live.role, 'assistant');
   }
+  // The turn that asks reads the thread without itself: thread_turns and thread_live leave it
+  // out, and thread_turn on its id says so, through the broker too.
+  const asking = thread.read().thread.activeTurnId as string;
+  const own = thread.service.threadReads(thread.taskId, undefined, asking);
+  assert.deepEqual(
+    reads.turns({ limit: 50 }).turns.map((turn) => turn.id),
+    [first.id, asking],
+  );
+  assert.deepEqual(
+    own.turns({ limit: 50 }).turns.map((turn) => turn.id),
+    [first.id],
+  );
+  assert.equal(own.live().state, 'none');
+  assert.throws(() => own.turn({ id: asking }), AskingTurnError);
+  assert.equal(own.turn({ id: first.id }).id, first.id);
+  assert.deepEqual(await answer(own, 'thread_turn', { id: asking }), {
+    error: 'That id is the turn asking, which has no reply yet. Read an earlier turn.',
+  });
   // Rows: what the redaction catches before any text leaves.
   for (const [raw, shown] of [
     [`key ${secret} here`, 'key [redacted] here'],

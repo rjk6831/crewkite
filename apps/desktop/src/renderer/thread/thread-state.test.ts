@@ -47,6 +47,7 @@ import {
 import {
   type Block,
   blankTurn,
+  briefLabel,
   replySource,
   runLabel,
   type ToolBlock,
@@ -633,6 +634,14 @@ test('finished reads and searches in a row fold into one line, and anything to a
     options: [{ id: 'once', label: 'Allow once', kind: 'allow-once' }],
     choice: 'once',
   };
+  const ask = (request: string, call: string, choice: string | null = null): Block => ({
+    ...asked,
+    id: `permission:${request}`,
+    requestId: request,
+    callId: call,
+    question: 'Run this command?',
+    choice,
+  });
   // A run shows as its label and any other block as its id.
   const cases: { name: string; blocks: Block[]; ended?: boolean; want: string[] }[] = [
     {
@@ -665,6 +674,29 @@ test('finished reads and searches in a row fold into one line, and anything to a
       name: 'a read that asked first stands alone',
       blocks: [tool('r1', 'read'), tool('r2', 'read'), tool('r3', 'read'), asked],
       want: ['Read 2 files', 'tool:r3', 'permission:p1'],
+    },
+    {
+      // One state per request: the command waits in its request card alone.
+      name: 'a call waiting on its request shows only the request',
+      blocks: [tool('c1', 'command', { status: 'running' }), ask('p2', 'c1')],
+      ended: false,
+      want: ['permission:p2'],
+    },
+    {
+      name: 'a request the turn ended before an answer shows once, without a stopped card',
+      blocks: [tool('c1', 'command', { status: 'stopped' }), ask('p2', 'c1'), ask('p3', 'c2')],
+      want: ['permission:p2', 'permission:p3'],
+    },
+    {
+      name: 'a request asked again for the same call shows the newest one',
+      blocks: [tool('c1', 'command', { status: 'running' }), ask('p2', 'c1'), ask('p3', 'c1')],
+      ended: false,
+      want: ['permission:p3'],
+    },
+    {
+      name: 'an answered request keeps the card of the call it allowed',
+      blocks: [tool('c1', 'command'), ask('p2', 'c1', 'once')],
+      want: ['tool:c1', 'permission:p2'],
     },
     {
       name: 'a thought that ended with no text draws nothing and keeps the run',
@@ -872,6 +904,44 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
   };
   const state = reduceThread(initialThreadState(task), { type: 'loaded', read: sliced });
   assert.equal(turnOf(threadItems(state)).identity?.slice, 2);
+  // The brief the slice ran on folds under its chip and leaves no user bubble.
+  const brief = 'Slice 2 of 4 in plan p1: Read the totals';
+  const briefed: ChatThreadRead = {
+    ...sliced,
+    messages: [
+      {
+        id: id('msg', 10),
+        taskId: task,
+        at: stamp,
+        cursor: '10',
+        author: { kind: 'user' },
+        text: brief,
+        attachments: [],
+        files: [],
+      },
+      ...sliced.messages,
+    ],
+  };
+  const folded = threadItems(
+    reduceThread(initialThreadState(task), { type: 'loaded', read: briefed }),
+  );
+  assert.deepEqual(
+    folded.map((item) => item.kind),
+    ['turn'],
+  );
+  assert.equal(turnOf(folded).brief, brief);
+  assert.equal(briefLabel(turnOf(folded).identity), 'Slice 2 brief');
+  // A message that started no slice turn stays a bubble.
+  const plainItems = threadItems(
+    reduceThread(initialThreadState(task), {
+      type: 'loaded',
+      read: { ...briefed, turns: plain.turns },
+    }),
+  );
+  assert.deepEqual(
+    plainItems.map((item) => item.kind),
+    ['user', 'turn'],
+  );
 });
 
 test('events that a thread read or a stored turn read already covers apply once', () => {

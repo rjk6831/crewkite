@@ -178,7 +178,9 @@ export type ControllerOptions = {
   localInputHelper?: LocalInputHelper;
   localInput?: Parameters<typeof startLocalSecretInput>[2];
   /** True when the runtime at the endpoint answers without a token. Tests pass their own. */
-  localProbe?: (endpoint: string) => Promise<boolean | 'token-required' | 'unavailable' | 'open'>;
+  localProbe?: (
+    endpoint: string,
+  ) => Promise<boolean | 'token-required' | 'timeout' | 'unavailable' | 'open'>;
   localDiscovery?: Omit<Parameters<typeof startLocalDiscovery>[2], 'lifecycle'>;
   localWriter?: Omit<Parameters<typeof startLocalReplacement>[2], 'lifecycle' | 'onSubmitted'>;
   prepareVerification?: typeof prepareToolchain;
@@ -498,7 +500,7 @@ export class Controller {
     return runtime.broker.mint({
       taskId: request.taskId,
       turnId: request.turnId,
-      reader: this.chat().threadReads(request.taskId, request.scratch.directory),
+      reader: this.chat().threadReads(request.taskId, request.scratch.directory, request.turnId),
     });
   }
 
@@ -813,6 +815,10 @@ export class Controller {
       if (models.length && !model && selection.family === 'local') return null;
       if (model && selection.effort !== 'default' && !model.efforts.includes(selection.effort))
         return null;
+      // A thread saved with Default on a model that lists levels runs at the preselected level,
+      // so the chip shows the level the turn asks for.
+      if (model && selection.effort === 'default' && !model.efforts.includes('default'))
+        return { ...selection, effort: model.defaultEffort };
       return selection;
     }
     for (const entry of families) {
@@ -932,7 +938,8 @@ export class Controller {
         return { ...connection, connectedWithoutToken: secret === null };
       },
       // Local runs the same five reads as functions in this process. No socket or token.
-      threadReader: (request) => this.chat().threadReads(request.taskId, request.scratch.directory),
+      threadReader: (request) =>
+        this.chat().threadReads(request.taskId, request.scratch.directory, request.turnId),
     });
     return new Map<ChatFamily, ChatAdapter>([
       ['openai', openai],

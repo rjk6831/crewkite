@@ -376,9 +376,16 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     if (turn.failure && !isStop(turn.failure)) failed.add(turn.id);
   for (const record of Object.values(state.turns))
     if (record.view.failure) failed.add(record.view.id);
+  // A plan slice turn's message is the brief the controller wrote. It folds under the turn's chip.
+  const briefs = new Map<string, string>();
+  for (const turn of Object.values(state.turnMeta))
+    if (turn.slice !== undefined) briefs.set(turn.userMessageId, turn.id);
+  const briefOf = new Map<string, string>();
   for (const message of state.messages) {
     const order = BigInt(message.cursor) * STEP;
-    if (message.author.kind === 'user')
+    const sliceTurn = message.author.kind === 'user' ? briefs.get(message.id) : undefined;
+    if (sliceTurn) briefOf.set(sliceTurn, message.text);
+    else if (message.author.kind === 'user')
       rows.push({
         order,
         item: {
@@ -446,6 +453,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     // their summary count stands in for the rolling summary cards.
     const stats = base.stats ?? meta?.stats ?? null;
     const outputLimit = base.outputLimit ?? meta?.outputLimit ?? null;
+    const brief = briefOf.get(id);
     const turn: TurnView = {
       ...base,
       identity,
@@ -455,6 +463,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
       ended,
       stats,
       outputLimit,
+      ...(brief ? { brief } : {}),
     };
     const asked = meta && byId.get(meta.userMessageId);
     const firstCursor = record?.events[0]?.cursor ?? null;
@@ -468,7 +477,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
             : reply
               ? BigInt(reply.cursor) * STEP
               : LAST;
-    if (blocks.length > 0 || !ended || status === 'stopped')
+    if (blocks.length > 0 || !ended || status === 'stopped' || brief)
       rows.push({ order, item: { kind: 'turn', key: `turn:${id}`, turn } });
     if (failure)
       rows.push({
@@ -489,6 +498,12 @@ export function threadItems(state: ThreadState): ThreadItem[] {
       pending: true,
     });
   return items;
+}
+
+/** The line a queue paused by Stop shows, and `thread stop` prints, or null for an empty one. */
+export function pausedQueueLine(count: number): string | null {
+  if (count <= 0) return null;
+  return `Stopped. ${count} queued ${count === 1 ? 'message is' : 'messages are'} waiting.`;
 }
 
 export function activeTurnId(state: ThreadState): string | null {

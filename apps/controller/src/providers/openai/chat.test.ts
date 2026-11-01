@@ -1,11 +1,12 @@
 // Native frames this adapter assumes, one JSON object per line. A live run on the pinned client
 // should confirm each of them.
 //
-// Launch: `-c approval_policy="on-request"` under every policy. The client's config loader refuses
-// "untrusted" and the app-server exits before it answers initialize. The thread's own policy goes
+// Launch: `-c approval_policy="on-request"` under every policy of a turn that edits. The client's
+// config loader refuses "untrusted" and the app-server exits before it answers initialize. The thread's own policy goes
 // in approvalPolicy below: "untrusted" for the ask and allow-edits policies, "on-request" for
 // allow-all. Under untrusted the client asks before every file change and every command outside
-// its own read-only list.
+// its own read-only list. A read-only turn launches and opens its thread with "never" and the
+// "read-only" sandbox, so its commands run in the sandbox and nothing asks.
 //
 // Client to server, ids counted from 1 per process:
 //   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.1.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
@@ -15,7 +16,7 @@
 //   {"id":4,"method":"config/read","params":{"includeLayers":false,"cwd":SCRATCH}}, only with the
 //     thread tools; the reply's config.mcp_servers names each configured server, and the ids after
 //     it move up by one
-//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","ephemeral":false}},
+//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request"|"never","approvalsReviewer":"user","sandbox":"workspace-write"|"read-only","serviceTier":"default","ephemeral":false}},
 //     with the thread tools also "config":{"mcp_servers.NAME.enabled":false for each other server,
 //     "mcp_servers.crewkite":{"command","args","enabled":true,"default_tools_approval_mode":"approve"}}
 //   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings and config without ephemeral,"excludeTurns":true}}
@@ -164,6 +165,12 @@ const scripts = {
     done('failed', given.error ?? limit),
   ],
   reply: () => [['item/completed', { ...ids(), item: message('message-1', 'Hello.') }], done()],
+  'usage-warning': () => [
+    ['warning', { message: 'You have used 80% of your usage limit.' }],
+    ['warning', { message: 'A setting in config.toml is deprecated.' }],
+    ['item/completed', { ...ids(), item: message('message-1', 'Hello.') }],
+    done(),
+  ],
 };
 const play = (name) => {
   for (const frame of scripts[name]()) send(Array.isArray(frame) ? { method: frame[0], params: frame[1] } : frame);
@@ -253,6 +260,7 @@ function turn(
     prompt?: string;
     threadTools?: OpenAiChatDeps['threadTools'];
     readOnly?: boolean;
+    allowanceLeft?: number | null;
     files?: File[];
     /** Runs on the empty scratch copy before the turn starts. */
     prepare?: (scratch: string) => void;
@@ -309,6 +317,7 @@ function turn(
     now: () => Date.parse('2026-10-23T12:00:00.000Z'),
     files: options.files ?? [],
     readOnly: options.readOnly,
+    ...(options.allowanceLeft !== undefined ? { allowanceLeft: options.allowanceLeft } : {}),
   };
   const handle = adapter.startTurn(request, (event) => {
     events.push(event);
@@ -887,6 +896,60 @@ test('the next turn resumes the thread with its own approval policy and effort a
   }
   const tokens = minted.map((args) => args[args.indexOf('--token') + 1]);
   assert.equal(new Set(tokens).size, rows.length);
+});
+
+test("a client usage warning shows in the thread only when CrewKite's reading is low or missing", async () => {
+  // Any other client warning stays in the trace whatever the allowance.
+  for (const [left, shown] of [
+    [60, false],
+    [20, true],
+    [null, true],
+  ] as const) {
+    const run = turn('usage-warning', { allowanceLeft: left });
+    assert.equal((await run.settled()).stopReason, 'done');
+    assert.deepEqual(
+      run.events.flatMap((event) =>
+        event.type === 'provider.notice' ? [[event.message, event.trace === true]] : [],
+      ),
+      [
+        ['You have used 80% of your usage limit.', !shown],
+        ['A setting in config.toml is deprecated.', true],
+      ],
+      String(left),
+    );
+  }
+});
+
+test('a read-only turn runs in the read-only sandbox under never, and an edit turn keeps its policy', async () => {
+  // Under untrusted the client asked about pwd, ls -la and rg --files, and a read-only turn could
+  // only deny each one. Under never the commands run inside the read-only sandbox, which refuses
+  // writes and network on its own.
+  const rows = [
+    { options: { readOnly: true }, approval: 'never', launch: 'never', sandbox: 'read-only' },
+    {
+      options: { readOnly: true, permissionPolicy: 'allow-all' as const },
+      approval: 'never',
+      launch: 'never',
+      sandbox: 'read-only',
+    },
+    { options: {}, approval: 'untrusted', launch: 'on-request', sandbox: 'workspace-write' },
+    {
+      options: { permissionPolicy: 'allow-all' as const },
+      approval: 'on-request',
+      launch: 'on-request',
+      sandbox: 'workspace-write',
+    },
+  ];
+  for (const row of rows) {
+    const run = turn('reply', row.options);
+    const { stopReason } = await run.settled();
+    assert.equal(stopReason, 'done', row.approval);
+    const started = run.frames().find((frame) => frame.method === 'thread/start');
+    assert.equal(started?.params.approvalPolicy, row.approval);
+    assert.equal(started?.params.sandbox, row.sandbox);
+    assert(run.args().includes(`approval_policy="${row.launch}"`));
+    assert(run.args().includes(`sandbox_mode="${row.sandbox}"`));
+  }
 });
 
 test('a client that fails before its turn runs leaves its error output and last frames in the failure', async () => {

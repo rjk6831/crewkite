@@ -49,6 +49,7 @@ import {
   scrubSecrets,
   type Task,
   TaskSchema,
+  tightestAllowance,
   writesScratch,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
@@ -484,7 +485,8 @@ export class ChatService {
           }
         : queued;
     }
-    if (free && !thread.queued.length)
+    // A paused queue holds its messages for Send now, so a new message starts on its own.
+    if (free && (!thread.queued.length || thread.queuePaused))
       return this.begin(task, thread, this.plans.route(thread, message), effects);
     if (free) {
       // The oldest queued message goes first. One that cannot start any more, say on a family
@@ -542,10 +544,11 @@ export class ChatService {
     }
     // The turn result marks the row stopped once the provider has let go.
     live.stopRequested = true;
-    // Stop ends the wait too. The cleared messages go back so the composer can offer the text.
+    // The queue stays and pauses: nothing in it starts by itself, and each message waits for
+    // Send now or Remove. The result names the messages still waiting.
     const task = this.task(payload.taskId);
     const thread = this.thread(payload.taskId);
-    if (task && thread.queued.length) this.putThread(task, { ...thread, queued: [] });
+    if (task && thread.queued.length) this.putThread(task, { ...thread, queuePaused: true });
     effects.push(() => this.call(() => live.handle?.stop()));
     return { outcome: 'applied', data: { kind: 'chat-queue', messages: thread.queued } };
   }
@@ -582,8 +585,10 @@ export class ChatService {
     // it off afterwards, and then glide stops on a limit like the other modes.
     const entersGlide = flightMode === 'glide' && thread.flightMode !== 'glide';
     this.putThread(task, {
-      ...thread,
-      queued: thread.queued.filter((message) => message.id !== payload.dequeue),
+      ...withQueue(
+        thread,
+        thread.queued.filter((message) => message.id !== payload.dequeue),
+      ),
       selection,
       permissionPolicy: payload.permissionPolicy ?? thread.permissionPolicy,
       // Choosing ask again takes back everything the thread allowed.
@@ -813,8 +818,10 @@ export class ChatService {
     if (!task) return blocked('task-not-found');
     const thread = this.thread(task.id);
     const live = thread.activeTurnId ? this.activeLive(task.id, thread.activeTurnId) : undefined;
-    if (!live) return blocked('nothing-running', 'Nothing is running. Send the message.');
     const message = thread.queued.find((entry) => entry.id === payload.messageId);
+    if (!live && thread.queuePaused && message && !thread.activeTurnId)
+      return this.sendPausedNow(task, message, effects);
+    if (!live) return blocked('nothing-running', 'Nothing is running. Send the message.');
     if (!message)
       return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
     // Stop keeps the queue here. Once the provider lets go the queue starts its first message.
@@ -826,6 +833,25 @@ export class ChatService {
     });
     effects.push(() => this.call(() => live.handle?.stop()));
     return { outcome: 'applied' };
+  }
+
+  /**
+   * Send now on a paused queue starts that one message at once. The rest of the queue stays
+   * paused behind it.
+   */
+  private sendPausedNow(task: Task, message: ChatQueuedMessage, effects: Effects): CommandResult {
+    const { thread, left } = this.checkedThread(task);
+    if (left.length || this.checksBusy(task.id) || this.plans.holds(thread))
+      return blocked('thread-busy', 'Wait for the thread to be free, then choose Send now.');
+    const route = this.plans.route(thread, message);
+    const waiting = this.waitsOnFamily(task, thread, route);
+    if (waiting)
+      return blocked(
+        'family-busy',
+        `${familyName[waiting]} is answering in another thread. Choose Send now when that reply ends.`,
+      );
+    const rest = thread.queued.filter((entry) => entry.id !== message.id);
+    return this.begin(task, withQueue(thread, rest), route, effects, message.id);
   }
 
   pushBranch(payload: Payload<'PushChatBranch'>): Promise<CommandResult> {
@@ -1102,8 +1128,11 @@ export class ChatService {
     return { outcome: 'applied' };
   }
 
-  /** The read-only thread tools for one thread, as the MCP server and the Local functions call them. */
-  threadReads(taskId: string, scratch?: string): ThreadReads {
+  /**
+   * The read-only thread tools for one thread, as the MCP server and the Local functions call
+   * them. `asking` is the turn that reads, which the reads leave out.
+   */
+  threadReads(taskId: string, scratch?: string, asking?: string): ThreadReads {
     return createThreadReader(
       {
         store: this.deps.store,
@@ -1113,6 +1142,7 @@ export class ChatService {
         now: () => Date.parse(this.deps.now()),
       },
       taskId,
+      asking,
     );
   }
 
@@ -1867,6 +1897,7 @@ export class ChatService {
       permissionGrants,
       readOnly: !writer,
       subagents: turnAllowsSubagents(thread.crew, turn.role, turn.selection.family),
+      allowanceLeft: this.allowanceLeft(task.id, turn.selection),
       // Decided with the thread tools above: the person's servers a turn starts follow this turn's
       // family and this policy, and never exceed it.
       mcp: this.deps.mcp?.compose({
@@ -1880,6 +1911,18 @@ export class ChatService {
       environment: this.deps.resolveEnvironment(turn.selection.family),
       now: () => Date.parse(this.deps.now()),
     };
+  }
+
+  /** CrewKite's reading of the tightest window the turn's family and model run on, or null. */
+  private allowanceLeft(taskId: string, selection: ChatModelSelection): number | null {
+    try {
+      const entry = this.deps
+        .catalog(taskId)
+        .families.find((value) => value.family === selection.family);
+      return entry ? tightestAllowance(entry, selection.model).percent : null;
+    } catch {
+      return null;
+    }
   }
 
   private ensureScratch(task: Task, root: string): ChatThread {
@@ -2106,7 +2149,9 @@ export class ChatService {
     // A family freed here may let a waiting plan slice start in any thread.
     if (turn && !this.closed) this.plans.wake();
     // A handoff above opens the rerun first. The queue waits for that turn to settle. The family
-    // is free now, so a thread that waited on it may start too.
+    // is free now, so a thread that waited on it may start too. Send now starts its message even
+    // when the queue is paused.
+    if (turn && !this.closed && live.steered) this.continueQueue(turn.taskId, true);
     if (turn && !this.closed) this.wakeQueues();
   }
 
@@ -2776,7 +2821,7 @@ export class ChatService {
     if (!first) return { outcome: 'applied' };
     return this.begin(
       task,
-      { ...thread, queued: rest },
+      withQueue(thread, rest),
       this.plans.route(thread, first),
       effects,
       first.id,
@@ -2792,9 +2837,10 @@ export class ChatService {
    * came after the failure too, so the queue moves when that family frees. A leftover process
    * holds the queue until a later check finds it gone. A turn that startup recovery failed
    * does not hold it: the reply died with the controller, not on a limit or a sign-in, so the
-   * messages queued before the restart start once the thread is free.
+   * messages queued before the restart start once the thread is free. A queue Stop paused starts
+   * nothing until the person picks Send now on a message.
    */
-  private continueQueue(taskId: string) {
+  private continueQueue(taskId: string, sendNow = false) {
     const effects: Effects = [];
     try {
       this.deps.store.transaction(() => {
@@ -2803,6 +2849,7 @@ export class ChatService {
         if (
           !task ||
           !thread.queued.length ||
+          (thread.queuePaused && !sendNow) ||
           thread.activeTurnId ||
           thread.ownershipUnknown ||
           this.checksBusy(taskId) ||
@@ -2880,10 +2927,17 @@ export class ChatService {
       handoffFrom = selection.family;
       this.setHandoff(task.id, { from: selection.family, reason: 'model' });
       const name = familyName[selection.family];
+      // The picker's labels, the names with their versions, name the models. An ID the catalog
+      // does not list, such as one typed in, shows as itself.
+      const models = this.deps
+        .catalog(task.id)
+        .families.find((entry) => entry.family === selection.family)?.models;
+      const label = (model: string) =>
+        models?.find((entry) => entry.model === model)?.label ?? model;
       this.appendEntry(task, {
         kind: 'chat-system',
         author: { kind: 'system', turnId: null },
-        text: `Continued on ${name} (${selection.model}) from ${name} (${before}). Reason: ${handoffReason('model')}.`,
+        text: `Continued on ${name} (${label(selection.model)}) from ${name} (${label(before)}). Reason: ${handoffReason('model')}.`,
       });
     }
     const turn = ChatTurnSchema.parse({
@@ -3943,6 +3997,12 @@ function readOnlyCommand(input: unknown, scratch: string): boolean {
 }
 
 /** Turns written before stop reasons were stored fall back to the failure kind. */
+/** The thread with this queue. A paused queue that empties has nothing left to hold. */
+function withQueue(thread: ChatThread, queued: ChatQueuedMessage[]): ChatThread {
+  const { queuePaused, ...rest } = thread;
+  return queued.length && queuePaused ? { ...rest, queued, queuePaused } : { ...rest, queued };
+}
+
 function endedOnLimit(turn: ChatTurn): boolean {
   return turn.stopReason
     ? turn.stopReason === 'limit'

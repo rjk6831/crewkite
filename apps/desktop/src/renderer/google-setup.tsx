@@ -1,4 +1,5 @@
 import {
+  type CommandResult,
   GOOGLE_TERMS_CHECKBOX,
   GOOGLE_TERMS_SUMMARY,
   GOOGLE_TERMS_VERSION,
@@ -108,6 +109,15 @@ const profileText: Record<string, string> = {
   'authentication-required': 'Google sign-in has not finished.',
   'qualification-pending': 'Setup is complete. The route still needs qualification.',
 };
+
+/** True when a command result is the install's own outcome, which the install line shows. */
+function installOutcome(result: CommandResult | undefined) {
+  return (
+    result?.data?.kind === 'google-acp-install' &&
+    !!result.reason &&
+    result.data.install.reason === result.reason
+  );
+}
 
 const stageLabels: Record<GoogleSetupStage, string> = {
   clear: 'Clearing the stuck setup step',
@@ -233,6 +243,9 @@ export function GoogleSetup({
       if (!mounted.current || generation.current !== currentGeneration) return;
       if (result.kind === 'ready') {
         setMessage('Google coding setup is ready. Quota reporting remains a separate status.');
+      } else if (result.kind === 'blocked' && installOutcome(result.result)) {
+        // The install line under the progress shows the install outcome once.
+        setMessage(null);
       } else if (result.kind === 'blocked') {
         const reason = result.result?.reason;
         // A refused clear names the process that still runs in its next step.
@@ -296,10 +309,15 @@ export function GoogleSetup({
             })
           : null;
       if (!mounted.current) return;
+      // A stopped install shows its sentence in the install line below.
       setMessage(
-        result
-          ? result.reason || result.next || 'Cancellation requested for the active operation.'
-          : 'No exact Google setup operation is active.',
+        !result
+          ? 'No exact Google setup operation is active.'
+          : installOutcome(result)
+            ? null
+            : (refusalText[result.reason ?? ''] ??
+              result.next ??
+              'Cancellation requested for the active operation.'),
       );
     } catch {
       if (mounted.current) {
@@ -437,9 +455,7 @@ export function GoogleSetup({
         <p role="status">Taking longer than expected. Review status before retrying.</p>
       )}
       {installation?.reason && (
-        <p className="muted small">
-          {refusalText[installation.reason] ?? `${installation.reason}.`} {installation.next}
-        </p>
+        <p className="muted small">{refusalText[installation.reason] ?? installation.next}</p>
       )}
       {installed && !codingReady && !working && profileReason && (
         <p className="muted small">{profileReason}</p>

@@ -1,17 +1,21 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   constants,
+  copyFileSync,
   createReadStream,
   createWriteStream,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
+  renameSync,
   rmSync,
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { open } from 'node:fs/promises';
-import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { isAbsolute, join } from 'node:path';
 import { Transform } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
 import { createInflateRaw } from 'node:zlib';
@@ -43,7 +47,12 @@ export type AcpInstallResult = (
   | AcpImportResult
   | {
       imported: false;
-      reason: 'download-unavailable' | 'archive-refused' | 'cancelled' | 'install-unavailable';
+      reason:
+        | 'download-unavailable'
+        | 'archive-refused'
+        | 'cancelled'
+        | 'stalled'
+        | 'install-unavailable';
       client: null;
     }
 ) & { cleanupReason?: 'temporary-cleanup-failed' };
@@ -57,7 +66,115 @@ export type AcpInstallDependencies = {
   fetch?: typeof fetch;
   release?: Release;
   import?: AcpImportDependencies;
+  /**
+   * A private per-user folder outside every CrewKite home that keeps the verified archive, named by
+   * its sha256, so a new home skips the download. Absent keeps no copy.
+   */
+  cache?: string;
+  /** How long the download or the unpack may go without progress before the install stops. */
+  stallMs?: number;
 };
+
+/** The download or unpack stops when no bytes arrive for this long. */
+export const ACP_INSTALL_STALL_MS = 90_000;
+// Larger reads and inflate output keep the unpack of the 383 MB client to a few hundred writes.
+const CHUNK = 1024 * 1024;
+
+/**
+ * The per-user cache folder for the verified Google client archive: the user's cache directory,
+ * outside the CrewKite home, so every package home shares one verified copy.
+ */
+export function googleAcpCacheDirectory(
+  environment: NodeJS.ProcessEnv = process.env,
+  home = homedir(),
+  platform: NodeJS.Platform = process.platform,
+): string {
+  const xdg = environment.XDG_CACHE_HOME;
+  if (platform === 'darwin') return join(home, 'Library/Caches/CrewKite');
+  return join(xdg && isAbsolute(xdg) ? xdg : join(home, '.cache'), 'crewkite');
+}
+
+const cachedName = (expected: Release) => `google-acp-${expected.sha256}.zip`;
+
+/** Creates the cache folder private to this user, or refuses when it is shared or linked. */
+function privateCache(cache: string) {
+  mkdirSync(join(cache, '..'), { recursive: true, mode: 0o700 });
+  try {
+    mkdirSync(cache, { mode: 0o700 });
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+  }
+  validateAcpDirectory(cache);
+}
+
+/**
+ * Copies the cached archive into the install folder through the same size and sha256 check as a
+ * download. A copy that fails the check is removed. False when there is no usable copy.
+ */
+async function fromCache(
+  cache: string,
+  expected: Release,
+  archive: string,
+  signal: AbortSignal,
+  counted: (bytes: number) => void,
+): Promise<boolean> {
+  const path = join(cache, cachedName(expected));
+  try {
+    validateAcpDirectory(cache);
+    if (!existsSync(path)) return false;
+  } catch {
+    return false;
+  }
+  try {
+    const file = await open(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const state = await file.stat();
+      if (
+        !state.isFile() ||
+        state.nlink !== 1 ||
+        state.uid !== process.getuid?.() ||
+        (state.mode & 0o077) !== 0 ||
+        state.size !== expected.bytes
+      )
+        throw Error('archive-refused');
+      await pipeline(
+        createReadStream(path, { fd: file.fd, autoClose: false, highWaterMark: CHUNK }),
+        verifier(expected, counted),
+        createWriteStream(archive, { flags: 'wx', mode: 0o600 }),
+        { signal },
+      );
+    } finally {
+      await file.close();
+    }
+    return true;
+  } catch (error) {
+    if (signal.aborted) throw error;
+    rmSync(archive, { force: true });
+    try {
+      unlinkSync(path);
+    } catch {}
+    return false;
+  }
+}
+
+/** Keeps a verified archive for the next home. Older releases are removed. Best effort. */
+function toCache(cache: string, expected: Release, archive: string) {
+  try {
+    privateCache(cache);
+    const name = cachedName(expected);
+    for (const entry of readdirSync(cache))
+      if (entry !== name && /^google-acp-[0-9a-f]{64}\.zip(\.partial-[0-9a-f]{12})?$/.test(entry))
+        rmSync(join(cache, entry), { force: true });
+    if (existsSync(join(cache, name))) return;
+    const partial = join(cache, `${name}.partial-${randomBytes(6).toString('hex')}`);
+    try {
+      copyFileSync(archive, partial, constants.COPYFILE_EXCL | constants.COPYFILE_FICLONE);
+      renameSync(partial, join(cache, name));
+    } finally {
+      rmSync(partial, { force: true });
+    }
+  } catch {}
+}
 
 function verifier(expected: { bytes: number; sha256: string }, counted?: (bytes: number) => void) {
   let length = 0;
@@ -171,10 +288,15 @@ async function extract(
           autoClose: false,
           start: entry.start,
           end: entry.start + entry.file.compressed - 1,
+          highWaterMark: CHUNK,
         }),
-        createInflateRaw(),
+        createInflateRaw({ chunkSize: CHUNK }),
         verifier(entry.file, (bytes) => counted(before + bytes)),
-        createWriteStream(join(target, entry.file.name), { flags: 'wx', mode: 0o600 }),
+        createWriteStream(join(target, entry.file.name), {
+          flags: 'wx',
+          mode: 0o600,
+          highWaterMark: CHUNK,
+        }),
         { signal },
       );
       written += entry.file.bytes;
@@ -198,15 +320,28 @@ export async function installGoogleAcp(
     reason: Exclude<AcpInstallResult['reason'], AcpImportResult['reason']>,
   ): AcpInstallResult => ({ imported: false, reason, client: null });
   const expected = dependencies.release ?? release;
-  const signal = AbortSignal.any([
-    AbortSignal.timeout(180000),
-    ...(options.signal ? [options.signal] : []),
-  ]);
+  // The download and the unpack stop only when no bytes arrive for the stall time. A slow
+  // connection or a slow disk keeps going while it makes progress. Stop from the person cancels.
+  const stall = new AbortController();
+  const stallMs = dependencies.stallMs ?? ACP_INSTALL_STALL_MS;
+  let watchdog: ReturnType<typeof setTimeout> | undefined;
+  const watch = () => {
+    clearTimeout(watchdog);
+    watchdog = setTimeout(() => stall.abort(), stallMs);
+  };
+  const signal = AbortSignal.any([stall.signal, ...(options.signal ? [options.signal] : [])]);
+  const stopped = () => (options.signal?.aborted ? 'cancelled' : 'stalled');
   let temporary: string | undefined;
   let failure: 'download-unavailable' | 'archive-refused' | 'install-unavailable' =
     'install-unavailable';
   // A report is for display. A listener that throws never stops the install.
+  let reported = -1;
   const report = (step: AcpInstallProgress['step'], bytes: number, totalBytes: number) => {
+    if (step !== 'verify') watch();
+    // One report per tenth of a percent is enough for the bar. The first and last always go.
+    const tick = Math.floor((bytes * 1000) / totalBytes) + (step === 'download' ? 0 : 2000);
+    if (tick === reported && bytes !== 0 && bytes !== totalBytes) return;
+    reported = tick;
     try {
       options.onProgress?.({ step, bytes, totalBytes });
     } catch {}
@@ -235,39 +370,52 @@ export async function installGoogleAcp(
       validateAcpDirectory(imports, options.home);
       temporary = mkdtempSync(join(imports, '.google-acp-install-'));
       const archive = join(temporary, 'release.zip');
-      failure = 'download-unavailable';
-      const response = await (dependencies.fetch ?? fetch)(expected.url, {
-        signal,
-        redirect: 'error',
-        credentials: 'omit',
-        cache: 'no-store',
-        headers: { 'Accept-Encoding': 'identity' },
-      });
-      const encoding = response.headers.get('content-encoding');
-      if (
-        (encoding !== null && encoding !== 'identity') ||
-        !response.ok ||
-        response.status !== 200 ||
-        !response.body ||
-        (response.headers.has('content-length') &&
-          response.headers.get('content-length') !== String(expected.bytes))
-      ) {
-        await response.body?.cancel();
-        return refused('download-unavailable');
+      watch();
+      report('download', 0, expected.bytes);
+      const cached =
+        !!dependencies.cache &&
+        (await fromCache(dependencies.cache, expected, archive, signal, (bytes) =>
+          report('download', bytes, expected.bytes),
+        ));
+      if (!cached) {
+        failure = 'download-unavailable';
+        const response = await (dependencies.fetch ?? fetch)(expected.url, {
+          signal,
+          redirect: 'error',
+          credentials: 'omit',
+          cache: 'no-store',
+          headers: { 'Accept-Encoding': 'identity' },
+        });
+        const encoding = response.headers.get('content-encoding');
+        if (
+          (encoding !== null && encoding !== 'identity') ||
+          !response.ok ||
+          response.status !== 200 ||
+          !response.body ||
+          (response.headers.has('content-length') &&
+            response.headers.get('content-length') !== String(expected.bytes))
+        ) {
+          await response.body?.cancel();
+          return refused('download-unavailable');
+        }
+        failure = 'archive-refused';
+        report('download', 0, expected.bytes);
+        await pipeline(
+          response.body,
+          verifier(expected, (bytes) => report('download', bytes, expected.bytes)),
+          createWriteStream(archive, { flags: 'wx', mode: 0o600 }),
+          { signal },
+        );
+        // Only an archive that passed the size and sha256 check is kept.
+        if (dependencies.cache) toCache(dependencies.cache, expected, archive);
       }
       failure = 'archive-refused';
-      report('download', 0, expected.bytes);
-      await pipeline(
-        response.body,
-        verifier(expected, (bytes) => report('download', bytes, expected.bytes)),
-        createWriteStream(archive, { flags: 'wx', mode: 0o600 }),
-        { signal },
-      );
       report('extract', 0, inflated);
       await extract(archive, temporary, expected, signal, (bytes) =>
         report('extract', bytes, inflated),
       );
       signal.throwIfAborted();
+      clearTimeout(watchdog);
       failure = 'install-unavailable';
       unlinkSync(archive);
       writeFileSync(
@@ -314,10 +462,12 @@ export async function installGoogleAcp(
       return imported.imported || imported.reason === 'ownership'
         ? imported
         : signal.aborted
-          ? refused('cancelled')
+          ? refused(stopped())
           : imported;
     } catch {
-      return refused(signal.aborted ? 'cancelled' : failure);
+      return refused(signal.aborted ? stopped() : failure);
+    } finally {
+      clearTimeout(watchdog);
     }
   };
   const result = await run();

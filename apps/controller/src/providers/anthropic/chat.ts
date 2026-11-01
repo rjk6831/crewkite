@@ -30,6 +30,7 @@ import {
   type ChatTurnRequest,
   type ChatTurnResult,
   chatFailure,
+  usageWarningShows,
 } from '../../chat/adapter.ts';
 import { ChatClientRefused } from '../../chat/clients.ts';
 import { scratchPath } from '../../chat/local-tools.ts';
@@ -1231,8 +1232,15 @@ function startTurn(
     }
     if (info.isUsingOverage === true || info.overageInUse === true)
       notice('overage', 'This turn is using paid extra usage on the Anthropic account.', 'warning');
+    // The client warns well before the allowance is low. Its warning shows in the thread only
+    // when CrewKite's own reading is low or missing; otherwise it waits in the turn trace.
     if (info.status === 'allowed_warning')
-      notice('limit-warning', 'The Anthropic account is close to its usage limit.', 'warning');
+      notice(
+        'limit-warning',
+        'The Anthropic account is close to its usage limit.',
+        'warning',
+        !usageWarningShows(request),
+      );
     if (info.status !== 'rejected') return;
     notice('limit-reached', 'The Anthropic account reached its usage limit.', 'warning');
     decide(

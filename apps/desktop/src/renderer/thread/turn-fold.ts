@@ -107,7 +107,21 @@ export type TurnView = {
   /** Set when the reply stopped at its output limit. */
   outputLimit: ChatOutputLimit | null;
   failure: ChatFailure | null;
+  /** The brief a plan slice turn ran on. It shows folded under the chip. */
+  brief?: string;
 };
+
+/** The folded label of a slice turn's brief, such as `Slice 1 brief`. */
+export function briefLabel(identity: TurnIdentity | null): string {
+  const slice = identity?.slice === undefined ? 'Slice' : `Slice ${identity.slice}`;
+  const kind =
+    identity?.role === 'reviewer'
+      ? 'review brief'
+      : identity?.role === 'fixer'
+        ? 'fix brief'
+        : 'brief';
+  return `${slice} ${kind}`;
+}
 
 /** The badge a role shows on its reply. The builder's own reply has none. */
 export const roleLabels: Record<ChatRole, string | null> = {
@@ -200,6 +214,25 @@ const blank = (block: Block, ended: boolean) =>
   (block.kind === 'text' && block.text === '') ||
   (block.kind === 'thinking' && block.text.trim() === '' && (block.done || ended));
 
+/**
+ * The blocks a request already shows, so each request reads as one state. A call that waits on an
+ * unanswered request, or that never got an answer before the turn ended, shows through its request
+ * card alone: its tool card would add a second running or stopped line for the same command. A
+ * request the client asked again for the same call gives way to the newer one while unanswered.
+ */
+function shownByRequest(blocks: readonly Block[]): Set<string> {
+  const hidden = new Set<string>();
+  const latest = new Map<string, string>();
+  for (const block of blocks)
+    if (block.kind === 'permission' && block.callId) latest.set(block.callId, block.id);
+  for (const block of blocks) {
+    if (block.kind !== 'permission' || !block.callId || block.choice !== null) continue;
+    if (latest.get(block.callId) !== block.id) hidden.add(block.id);
+    else hidden.add(`tool:${block.callId}`);
+  }
+  return hidden;
+}
+
 /** The blocks of a turn as the thread lays them out. Only the view changes; the turn stays as is. */
 export function viewBlocks(blocks: readonly Block[], ended: boolean): (Block | ToolRun)[] {
   const asked = new Set(
@@ -207,6 +240,7 @@ export function viewBlocks(blocks: readonly Block[], ended: boolean): (Block | T
       block.kind === 'permission' && block.callId ? [`tool:${block.callId}`] : [],
     ),
   );
+  const hidden = shownByRequest(blocks);
   const laid: (Block | ToolRun)[] = [];
   let run: ToolBlock[] = [];
   const close = () => {
@@ -215,7 +249,7 @@ export function viewBlocks(blocks: readonly Block[], ended: boolean): (Block | T
     run = [];
   };
   for (const block of blocks) {
-    if (blank(block, ended)) continue;
+    if (blank(block, ended) || hidden.has(block.id)) continue;
     if (block.kind === 'tool' && routine(block, asked)) {
       run.push(block);
       continue;

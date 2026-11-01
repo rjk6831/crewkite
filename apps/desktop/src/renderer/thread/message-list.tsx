@@ -19,7 +19,7 @@ import { ReplyMenu } from './reply-menu.tsx';
 import { markMatches } from './reveal-dom.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 import { TurnChip } from './turn-chip.tsx';
-import { replySource, viewBlocks } from './turn-fold.ts';
+import { briefLabel, replySource, viewBlocks } from './turn-fold.ts';
 import { TurnStats } from './turn-stats.tsx';
 import { layoutRows, mountPlan, rowTop, rowWindow } from './virtual-window.ts';
 
@@ -78,6 +78,12 @@ const TurnRow = memo(function TurnRow({
       data-turn-id={turn.id}
     >
       <TurnChip turn={turn} />
+      {turn.brief && (
+        <details className="th-trace th-brief">
+          <summary>{briefLabel(identity)}</summary>
+          <div className="th-brief-body">{turn.brief}</div>
+        </details>
+      )}
       {viewBlocks(turn.blocks, turn.ended).map((block): ReactNode => {
         // A client note is not part of the reply. It waits in the trace below.
         if (block.kind === 'notice' && block.trace) return null;

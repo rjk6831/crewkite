@@ -574,9 +574,14 @@ export const ChatThreadSchema = z.strictObject({
   handoffMode: ChatSavedHandoffModeSchema.default('most-left'),
   /**
    * Messages sent while a turn was running, oldest first. Each starts its own turn, in order,
-   * once the thread is free. Stopping the running turn clears them.
+   * once the thread is free, unless the queue is paused.
    */
   queued: z.array(ChatQueuedMessageSchema).max(8).default([]),
+  /**
+   * Stop ended the running turn and kept the queue. A paused queue starts nothing by itself: each
+   * message waits for Send now or Remove. It clears when the queue empties.
+   */
+  queuePaused: z.boolean().optional(),
   /** The crew the thread runs and how far it runs on its own. A thread with no crew is manual. */
   crew: ChatCrewSchema.nullable().default(null),
   flightMode: ChatFlightModeSchema.default('manual'),
@@ -1157,6 +1162,13 @@ export function windowAppliesTo(
  * The tightest window that limits a model: lowest known percent, with its reset time. A window
  * named for another model of the family does not count. Without a model every window counts.
  */
+/**
+ * At or below this share left in a family's tightest window, CrewKite counts the family as low.
+ * A client's own early usage warning shows in the thread only then, or when CrewKite has no
+ * reading; otherwise it goes to the turn trace.
+ */
+export const LOW_ALLOWANCE_PERCENT = 20;
+
 export function tightestAllowance(
   entry: Pick<ChatCatalogEntry, 'remaining'>,
   model: string | null = null,

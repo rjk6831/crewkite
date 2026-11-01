@@ -15,9 +15,13 @@ import { createElement as h, type ReactNode } from 'react';
 import { modelGroups } from '../../../desktop/src/renderer/thread/model-groups.ts';
 import { outputLimitLine } from '../../../desktop/src/renderer/thread/output-limit.ts';
 import { planCard } from '../../../desktop/src/renderer/thread/plan-card.ts';
-import type { ThreadItem } from '../../../desktop/src/renderer/thread/thread-state.ts';
+import {
+  pausedQueueLine,
+  type ThreadItem,
+} from '../../../desktop/src/renderer/thread/thread-state.ts';
 import {
   type Block,
+  briefLabel,
   roleLabels,
   runLabel,
   type ToolBlock,
@@ -317,6 +321,7 @@ function TurnHeader({
     identity ? FamilyMark({ family: identity.family, colors }) : h(Text, null, '◆'),
     h(Text, { color: colors.muted }, identity ? safeText(identity.model) : 'Starting'),
     role ? h(Text, { color: colors.accent }, `[${role}]`) : null,
+    turn.brief ? h(Text, { color: colors.muted }, briefLabel(identity)) : null,
     turn.ended
       ? turn.status === 'stopped'
         ? h(Text, { color: colors.muted }, 'Stopped')
@@ -476,12 +481,21 @@ export function UserMessage({
   );
 }
 
+/** An effort after a model name. Default names no level, so it shows nothing. */
+export const effortSuffix = (effort: string) => (effort === 'default' ? '' : ` ${effort}`);
+
 export function QueuedList({ thread, colors }: { thread: ChatThread; colors: Palette }) {
   if (thread.queued.length === 0) return null;
   return h(
     Box,
     { flexDirection: 'column' },
-    h(Text, { color: colors.muted }, `Queued (${thread.queued.length})`),
+    h(
+      Text,
+      { color: colors.muted },
+      thread.queuePaused
+        ? (pausedQueueLine(thread.queued.length) ?? '')
+        : `Queued (${thread.queued.length})`,
+    ),
     ...thread.queued.map((message, index) =>
       h(
         Text,
@@ -584,7 +598,7 @@ export function CrewView({ thread, colors }: { thread: ChatThread; colors: Palet
         { key: member.role },
         `  ${member.role.padEnd(13)}`,
         FamilyMark({ family: member.selection.family, colors }),
-        ` ${safeText(member.selection.model)} ${member.selection.effort}`,
+        ` ${safeText(member.selection.model)}${effortSuffix(member.selection.effort)}`,
       ),
     ),
     h(Text, null, `Flight mode: ${flightLabels[thread.flightMode]}`),
@@ -771,7 +785,7 @@ export function SettingsView({
     theme: settings.theme,
     animation: settings.animation,
     selection: settings.selection
-      ? `${familyNames[settings.selection.family]} ${settings.selection.model} ${settings.selection.effort}`
+      ? `${familyNames[settings.selection.family]} ${settings.selection.model}${effortSuffix(settings.selection.effort)}`
       : 'most allowance left',
     permissionPolicy: policyLabels[settings.permissionPolicy],
     handoffMode: handoffLabels[settings.handoffMode],
