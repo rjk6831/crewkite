@@ -53,6 +53,39 @@ export function parsePlan(reply: string): { plan: ChatPlan } | { error: string }
   return { error: `The plan does not match the schema. ${issues.join('; ')}` };
 }
 
+// A provider the person rules out in the message, such as "Do not assign anything to Local AI".
+// The negation and the name sit in one clause, at most 40 characters apart.
+const RULED_OUT =
+  /\b(?:do not|don't|dont|never|no|not|without|avoid|exclude|except|skip)\b[^.;\n]{0,40}?\b(openai|gpt|anthropic|google|gemini|local(?: ai| models?)?|lm studio)\b/gi;
+const LISTED =
+  /^\s*(?:,|or|and|nor)\s*(?:to\s+|the\s+)?(openai|gpt|anthropic|google|gemini|local(?: ai| models?)?|lm studio)\b/i;
+const RULED_OUT_FAMILY: Record<string, ChatFamily> = {
+  openai: 'openai',
+  gpt: 'openai',
+  anthropic: 'anthropic',
+  google: 'google',
+  gemini: 'google',
+  'lm studio': 'local',
+};
+
+/** The families the person's message rules out for this plan, in the order it names them. */
+export function ruledOut(message: string): ChatFamily[] {
+  const found = new Set<ChatFamily>();
+  const add = (name: string) => found.add(RULED_OUT_FAMILY[name.toLowerCase()] ?? 'local');
+  for (const match of message.matchAll(RULED_OUT)) {
+    add(match[1] ?? '');
+    // A list after the first name, as in "Google or OpenAI", rules out each name in it.
+    let rest = message.slice((match.index ?? 0) + match[0].length);
+    for (;;) {
+      const more = LISTED.exec(rest);
+      if (!more) break;
+      add(more[1] ?? '');
+      rest = rest.slice(more[0].length);
+    }
+  }
+  return [...found];
+}
+
 /** What the controller knows about one named file of a slice, read from the scratch copy. */
 export type PlanFile = { bytes: number; image: boolean };
 
@@ -70,6 +103,8 @@ export type PlanInputs = {
    * may move it to the family the thread's mode ranks first.
    */
   autoHandoff: boolean;
+  /** Families the person's message ruled out. No slice runs on one, crew member or not. */
+  excluded: readonly ChatFamily[];
   /** The loaded Local model's context length, or null when Local has none to offer. */
   localContext: number | null;
   /**
@@ -169,6 +204,7 @@ function assignSlice(
   const blockedBy = (selection: ChatModelSelection): string | null => {
     const entry = inputs.families.find((value) => value.family === selection.family);
     const name = familyName[selection.family];
+    if (inputs.excluded.includes(selection.family)) return `your message rules out ${name}`;
     if (!entry?.connected) return `${name} is not connected`;
     if (!ranked.includes(entry)) return `${name} has no allowance left`;
     if (selection.family !== 'local') return null;
@@ -221,10 +257,10 @@ function assignSlice(
       candidates: [],
       missing: `Slice ${slice.id} (${slice.difficulty}) has no model in the crew to run on: ${out}. Continue on another provider is off.`,
     };
-  const others = rank(
-    inputs.families,
-    crew.map((member) => member.family),
-  ).filter((entry) => (entry.family !== 'local' || localFits) && modelOf(entry) !== null);
+  const others = rank(inputs.families, [
+    ...crew.map((member) => member.family),
+    ...inputs.excluded,
+  ]).filter((entry) => (entry.family !== 'local' || localFits) && modelOf(entry) !== null);
   const top = others[0];
   if (!top)
     return {

@@ -253,6 +253,8 @@ test('the orchestrator brief names the slices as the parallel workers and keeps 
     /every slice runs on the crew builder, and a hard slice runs on the crew fixer/,
   );
   assert.match(brief, /No provider outside the crew takes a slice/);
+  // A provider the person rules out takes no slice (H15).
+  assert.match(brief, /A provider the person rules out in the message/);
   assert.match(
     brief,
     /Continue on another provider is on, the handoff rule may still move a slice/,
