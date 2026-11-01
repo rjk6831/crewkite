@@ -119,6 +119,15 @@ function installOutcome(result: CommandResult | undefined) {
   );
 }
 
+// What a retry line names: "Retrying sign-in (2 of 3)".
+const retryLabels: Record<GoogleSetupStage, string> = {
+  clear: 'the clear',
+  install: 'the download',
+  initialize: 'initialization',
+  authenticate: 'sign-in',
+  discover: 'discovery',
+};
+
 const stageLabels: Record<GoogleSetupStage, string> = {
   clear: 'Clearing the stuck setup step',
   install: 'Installing and verifying the official client',
@@ -144,6 +153,7 @@ export function GoogleSetup({
   );
   const reader = snapshot.usageReaders.find((value) => value.family === 'google');
   const [requested, setRequested] = useState<GoogleSetupStage | null>(null);
+  const [retry, setRetry] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [pollTimedOut, setPollTimedOut] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
@@ -239,6 +249,10 @@ export function GoogleSetup({
         onStage: (stage) => {
           if (mounted.current && generation.current === currentGeneration) setRequested(stage);
         },
+        onRetry: (stage, attempt, tries) => {
+          if (mounted.current && generation.current === currentGeneration)
+            setRetry(`Retrying ${retryLabels[stage]} (${attempt} of ${tries})`);
+        },
       });
       if (!mounted.current || generation.current !== currentGeneration) return;
       if (result.kind === 'ready') {
@@ -271,6 +285,7 @@ export function GoogleSetup({
         pollAbort.current?.abort();
         pollAbort.current = null;
         setRequested(null);
+        setRetry(null);
         // The poll gives up after 15 minutes, and a browser sign-in can take longer. Once the
         // flow ends, the slow-setup line no longer describes anything.
         setPollTimedOut(false);
@@ -282,6 +297,7 @@ export function GoogleSetup({
     if (!connected || cancelBusy) return;
     stopPolling();
     setRequested(null);
+    setRetry(null);
     setPollTimedOut(false);
     setCancelBusy(true);
     try {
@@ -450,6 +466,7 @@ export function GoogleSetup({
       ) : active ? (
         <p role="status">Google setup is running…</p>
       ) : null}
+      {retry && <p className="muted small">{retry}</p>}
       {ready && <p role="status">Google coding setup is ready.</p>}
       {pollTimedOut && !ready && (
         <p role="status">Taking longer than expected. Review status before retrying.</p>
