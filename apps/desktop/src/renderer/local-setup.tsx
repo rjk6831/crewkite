@@ -1,5 +1,9 @@
 import type { LocalTokenStatus } from '@crewkite/client';
-import { LocalEndpointSchema, type WorkspaceState } from '@crewkite/contracts';
+import {
+  LocalEndpointSchema,
+  type LocalSetup as LocalSetupState,
+  type WorkspaceState,
+} from '@crewkite/contracts';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
 import { Fact } from './components.tsx';
 import { ExternalLink } from './external-link.tsx';
@@ -11,7 +15,6 @@ import {
   lastSeen,
   localNotices,
   lowMemory,
-  READING_LINE,
   REOBSERVE_MS,
   selectionConfirmed,
   selectionLost,
@@ -90,7 +93,9 @@ export function LocalSetup({
   const stamp = stale ? lastSeen(setup?.observedAt, now, connectionReady) : null;
   const [lastChoice, setLastChoice] = useState<string | null>(null);
   const [confirming, setConfirming] = useState<number | null>(null);
-  const observing = useRef(false);
+  // The model read the card runs, so an action can wait for it to end.
+  const observing = useRef<Promise<void> | null>(null);
+  const connecting = useRef(false);
   useEffect(() => {
     if (currentChoice) setLastChoice(currentChoice.identity.displayName);
   }, [currentChoice]);
@@ -101,7 +106,6 @@ export function LocalSetup({
     setup,
     message,
     following: polling,
-    reading: quiet || observing.current,
     connected: connectionReady,
     stamp,
   });
@@ -131,8 +135,10 @@ export function LocalSetup({
   const { source, preview, refresh } = workspace;
   const reobserve = useCallback(
     async (background = false): Promise<string | null> => {
-      if (!source || preview || observing.current) return null;
-      observing.current = true;
+      if (!source || preview || observing.current || (background && connecting.current))
+        return null;
+      const ended = Promise.withResolvers<void>();
+      observing.current = ended.promise;
       // A read the card starts on its own posts no line. Only a change in what is loaded does.
       if (background) setQuiet(true);
       try {
@@ -154,12 +160,9 @@ export function LocalSetup({
       } catch {
         return 'The runtime could not be read. Reconnect and try again.';
       } finally {
-        observing.current = false;
-        if (mounted.current) {
-          setQuiet(false);
-          // The read that line was about has ended.
-          setMessage((current) => (current === READING_LINE ? null : current));
-        }
+        observing.current = null;
+        ended.resolve();
+        if (mounted.current) setQuiet(false);
       }
     },
     [source, preview, refresh],
@@ -310,21 +313,28 @@ export function LocalSetup({
         }
       });
   }
-  // The controls stay on during a background read, and the controller refuses a change while it
-  // runs. Say so plainly.
-  function readingInBackground() {
-    if (!observing.current) return false;
-    setMessage(READING_LINE);
-    return true;
+  // The controls stay on during a model read the card runs, and the controller refuses a change
+  // while it runs. An action pressed then waits for the read to end and goes with the setup that
+  // read left. Null when there was no read to wait for.
+  async function afterRead(): Promise<LocalSetupState | null | undefined> {
+    const running = observing.current;
+    if (!running) return null;
+    await running;
+    return (await refresh()).localSetup;
   }
   async function action(name: string, command: DesktopCommand) {
     if (!connected || workspace.retryAvailable || requested) return;
-    if (readingInBackground()) return;
     setRequested(name);
     setMessage(null);
     setConfirming(null);
     try {
-      const result = await workspace.command(command);
+      const fresh = await afterRead();
+      if (!mounted.current) return;
+      const result = await workspace.command(
+        fresh && 'expectedRevision' in command
+          ? { ...command, expectedRevision: fresh.revision }
+          : command,
+      );
       if (!mounted.current) return;
       const done = applied(result.outcome);
       const said =
@@ -357,20 +367,25 @@ export function LocalSetup({
   async function connectLocal() {
     if (!setup || !parsedEndpoint.success || !connected || workspace.retryAvailable || requested)
       return;
-    if (readingInBackground()) return;
     stopPolling();
     const generation = actionGeneration.current;
+    const active = () => mounted.current && actionGeneration.current === generation;
     setRequested('Local connection');
     // Every Connect starts from a clean card: no line from an earlier attempt stays on it.
     setMessage(null);
     setConfirming(null);
     setPollTimedOut(false);
+    connecting.current = true;
     try {
+      const fresh = await afterRead();
+      if (!active()) return;
       const result = await connectLocalFlow({
-        setup,
+        setup: fresh ?? setup,
         endpoint: parsedEndpoint.data,
         command: workspace.command,
-        active: () => mounted.current && actionGeneration.current === generation,
+        // A read started elsewhere, such as the model picker, holds the runtime for a moment.
+        wait: () => new Promise((resolve) => window.setTimeout(resolve, 1000)),
+        active,
       });
       if (result.kind === 'stopped') return;
       if (result.kind === 'blocked') {
@@ -387,6 +402,7 @@ export function LocalSetup({
           'Local connection could not be confirmed. Reconnect and use exact retry if available.',
         );
     } finally {
+      connecting.current = false;
       if (mounted.current && actionGeneration.current === generation) setRequested(null);
     }
   }
@@ -477,7 +493,7 @@ export function LocalSetup({
             void connectLocal();
           }}
         >
-          Connect
+          {requested === 'Local connection' || polling ? 'Connecting…' : 'Connect'}
         </button>
         <button
           className="button secondary"

@@ -10,7 +10,6 @@ import {
   lastSeen,
   localNotices,
   lowMemory,
-  READING_LINE,
   selectionConfirmed,
   selectionLost,
   statusLine,
@@ -493,7 +492,6 @@ test('the Local card shows only the notices that describe the current state', ()
       setup: connected,
       message: null,
       following: false,
-      reading: false,
       connected: true,
       stamp: 'Last seen just now.',
       ...change,
@@ -512,9 +510,6 @@ test('the Local card shows only the notices that describe the current state', ()
   });
   // A follow that stopped leaves no waiting line either.
   assert.equal(notices({ message: WAITING_LINE }).message, null);
-  // The reading line lasts as long as the read it is about.
-  assert.equal(notices({ message: READING_LINE, reading: true }).message, READING_LINE);
-  assert.equal(notices({ message: READING_LINE }).message, null);
   // A line from an action stays.
   assert.equal(notices({ message: 'Disconnect confirmed.' }).message, 'Disconnect confirmed.');
   // Offline, the cached list keeps its age.
@@ -526,4 +521,45 @@ test('the Local card shows only the notices that describe the current state', ()
     }),
     { message: null, stamp: 'Last seen 2 h ago. Not connected.', withoutToken: false },
   );
+});
+
+test('Local connect waits out a model read the controller is running and then connects', async () => {
+  const sent: string[] = [];
+  let busy = 2;
+  let waits = 0;
+  const result = await connectLocalFlow({
+    setup: setup({ operation: null, revision: 3 }),
+    endpoint: 'ws://127.0.0.1:1234',
+    active: () => true,
+    wait: async () => {
+      waits++;
+    },
+    command: async (input) => {
+      sent.push(`${input.command} ${'expectedRevision' in input ? input.expectedRevision : ''}`);
+      if (busy > 0) {
+        busy--;
+        return { outcome: 'blocked', reason: 'local-operation-active' };
+      }
+      // The read that ended moved the revision on.
+      return 'expectedRevision' in input && input.expectedRevision !== 5
+        ? { outcome: 'stale-revision', revision: 5 }
+        : { outcome: 'applied', revision: 6 };
+    },
+  });
+  assert.deepEqual(result, { kind: 'started' });
+  assert.equal(waits, 2);
+  assert.deepEqual(sent, [
+    'BeginLocalConnectionInput 3',
+    'BeginLocalConnectionInput 3',
+    'BeginLocalConnectionInput 3',
+    'BeginLocalConnectionInput 5',
+  ]);
+  // Without a wait the refusal ends the connect, as before.
+  const refused = await connectLocalFlow({
+    setup: setup({ operation: null }),
+    endpoint: 'ws://127.0.0.1:1234',
+    active: () => true,
+    command: async () => ({ outcome: 'blocked', reason: 'local-operation-active' }),
+  });
+  assert.equal(refused.kind, 'blocked');
 });
