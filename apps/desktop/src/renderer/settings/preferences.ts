@@ -12,10 +12,10 @@ import {
   type ChatPermissionPolicy,
   ChatPermissionPolicySchema,
   ChatSavedHandoffModeSchema,
+  type ChatThread,
   rankFamilies,
-  TaskSchema,
 } from '@crewkite/contracts';
-import { configureThread, type ThreadSource } from '../thread/commands.ts';
+import type { ThreadSettings } from '../thread/thread-state.ts';
 
 // One key holds the defaults for new threads. Storage can be full, blocked or edited by hand, so
 // every read and write tolerates failure and a bad value falls back to the built-in default.
@@ -195,31 +195,69 @@ export function preferredSelection(
   };
 }
 
+/** What a new thread holds before its first send creates it. The side panel edits these. */
+export type DraftSettings = Pick<
+  ChatThread,
+  'selection' | 'permissionPolicy' | 'autoHandoff' | 'handoffMode' | 'crew' | 'flightMode'
+>;
+
+/** The settings the controller gives a thread it has just created. */
+const created: DraftSettings = {
+  selection: null,
+  permissionPolicy: 'ask',
+  autoHandoff: false,
+  handoffMode: 'most-left',
+  crew: null,
+  flightMode: 'manual',
+};
+
+/** A new thread starts on the saved defaults for new threads. */
+export function draftSettings(store: Store | null = browserStore()): DraftSettings {
+  const { permissionPolicy, handoffMode } = readThreadDefaults(store);
+  return { ...created, permissionPolicy, handoffMode };
+}
+
 /**
- * Applies the saved permission policy and handoff mode to a thread right after its task is
- * created, in the thread's first configure. If the call fails the thread stays on Ask each time,
- * the strictest policy, and the Thread tab shows it.
+ * One side panel change on a new thread, by the rules the controller applies to a saved one: a
+ * thread with no crew is manual, and entering Glide turns automatic handoff on.
  */
-export function withThreadDefaults<Input, Result extends { outcome: string; entity?: unknown }>(
-  source: ThreadSource,
-  createTask: (input: Input) => Promise<Result>,
-): (input: Input) => Promise<Result> {
-  return async (input) => {
-    const result = await createTask(input);
-    const { permissionPolicy, handoffMode } = readThreadDefaults();
-    const patch = {
-      ...(permissionPolicy !== builtIn.permissionPolicy ? { permissionPolicy } : {}),
-      ...(handoffMode !== builtIn.handoffMode ? { handoffMode } : {}),
-    };
-    const created = TaskSchema.safeParse(result.entity);
-    if (
-      Object.keys(patch).length > 0 &&
-      created.success &&
-      (result.outcome === 'applied' || result.outcome === 'already-applied')
-    )
-      await configureThread(source, { taskId: created.data.id, ...patch }).catch(() => {});
-    return result;
+export function applyDraft(draft: DraftSettings, patch: ThreadSettings): DraftSettings {
+  const crew = patch.crew === undefined ? draft.crew : patch.crew;
+  const flightMode = crew ? (patch.flightMode ?? draft.flightMode) : 'manual';
+  const entersGlide = flightMode === 'glide' && draft.flightMode !== 'glide';
+  return {
+    selection: patch.selection ?? draft.selection,
+    permissionPolicy: patch.permissionPolicy ?? draft.permissionPolicy,
+    autoHandoff: entersGlide ? true : (patch.autoHandoff ?? draft.autoHandoff),
+    handoffMode: patch.handoffMode ?? draft.handoffMode,
+    crew,
+    flightMode,
   };
+}
+
+/**
+ * The configure calls that give a just created thread its draft settings, in order. The first
+ * message carries the model, so the selection is left out. Entering Glide turns automatic handoff
+ * on, so a second call turns it off when the person did. Empty when nothing differs.
+ */
+export function draftConfigure(draft: DraftSettings): ThreadSettings[] {
+  const first: ThreadSettings = {
+    ...(draft.permissionPolicy !== created.permissionPolicy
+      ? { permissionPolicy: draft.permissionPolicy }
+      : {}),
+    ...(draft.handoffMode !== created.handoffMode ? { handoffMode: draft.handoffMode } : {}),
+    ...(draft.autoHandoff !== created.autoHandoff && draft.flightMode !== 'glide'
+      ? { autoHandoff: draft.autoHandoff }
+      : {}),
+    ...(draft.crew ? { crew: draft.crew } : {}),
+    ...(draft.crew && draft.flightMode !== created.flightMode
+      ? { flightMode: draft.flightMode }
+      : {}),
+  };
+  const calls = Object.keys(first).length > 0 ? [first] : [];
+  if (draft.crew && draft.flightMode === 'glide' && !draft.autoHandoff)
+    calls.push({ autoHandoff: false });
+  return calls;
 }
 
 // Crew presets keep only the roles the person pinned to a model and effort. Every other role is

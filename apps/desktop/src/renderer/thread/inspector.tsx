@@ -69,6 +69,8 @@ const tabs: { id: InspectorTab; label: string }[] = [
   { id: 'crew', label: 'Crew' },
   { id: 'thread', label: 'Thread' },
 ];
+/** The tabs a new thread has before its first send. The others need a thread record. */
+export const draftTabs: readonly InspectorTab[] = ['crew', 'thread'];
 const roleNames: Record<ChatRole, string> = {
   assistant: 'Assistant',
   reviewer: 'Reviewer',
@@ -393,6 +395,7 @@ function ThreadTab({
   turns,
   messages,
   loaded,
+  draft,
   onConfigure,
 }: {
   taskId: string;
@@ -400,6 +403,8 @@ function ThreadTab({
   turns: readonly ChatTurn[];
   messages: readonly ChatMessage[];
   loaded: boolean;
+  /** A new thread before its first send. It has no record, sessions or turns yet. */
+  draft: boolean;
   onConfigure: (patch: ThreadSettings) => void;
 }) {
   const accepted = thread?.lastAcceptance;
@@ -408,40 +413,44 @@ function ThreadTab({
   const mode = handoffModes.find(({ id }) => id === thread?.handoffMode) ?? handoffModes[0];
   return (
     <div className="th-facts">
-      <dl>
-        <dt>Task</dt>
-        <dd>
-          <code>{taskId}</code>
-        </dd>
-        <dt>Base</dt>
-        <dd>{thread?.base ? <code>{thread.base}</code> : 'None yet'}</dd>
-        <dt>Scratch copy</dt>
-        <dd>{thread?.scratchReady ? 'Ready' : 'Created on the first edit'}</dd>
-        <dt>Accepted</dt>
-        <dd>
-          {accepted
-            ? `${accepted.branch} · ${accepted.fileCount} ${accepted.fileCount === 1 ? 'file' : 'files'}`
-            : 'Not yet'}
-        </dd>
-        <dt>Sessions</dt>
-        <dd>
-          {thread && thread.sessions.length > 0 ? (
-            <ul>
-              {thread.sessions.map((session) => (
-                <li key={session.family}>
-                  <span className="th-session">
-                    <FamilyMark family={session.family} />
-                    {familyName(session.family)} · {session.model}
-                  </span>
-                  <code title={session.sessionId}>{session.sessionId.slice(0, 12)}</code>
-                </li>
-              ))}
-            </ul>
-          ) : (
-            'None yet'
-          )}
-        </dd>
-      </dl>
+      {draft ? (
+        <p className="th-muted">These settings apply when your first message creates the thread.</p>
+      ) : (
+        <dl>
+          <dt>Task</dt>
+          <dd>
+            <code>{taskId}</code>
+          </dd>
+          <dt>Base</dt>
+          <dd>{thread?.base ? <code>{thread.base}</code> : 'None yet'}</dd>
+          <dt>Scratch copy</dt>
+          <dd>{thread?.scratchReady ? 'Ready' : 'Created on the first edit'}</dd>
+          <dt>Accepted</dt>
+          <dd>
+            {accepted
+              ? `${accepted.branch} · ${accepted.fileCount} ${accepted.fileCount === 1 ? 'file' : 'files'}`
+              : 'Not yet'}
+          </dd>
+          <dt>Sessions</dt>
+          <dd>
+            {thread && thread.sessions.length > 0 ? (
+              <ul>
+                {thread.sessions.map((session) => (
+                  <li key={session.family}>
+                    <span className="th-session">
+                      <FamilyMark family={session.family} />
+                      {familyName(session.family)} · {session.model}
+                    </span>
+                    <code title={session.sessionId}>{session.sessionId.slice(0, 12)}</code>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              'None yet'
+            )}
+          </dd>
+        </dl>
+      )}
       <label>
         Permissions
         <select
@@ -458,7 +467,9 @@ function ThreadTab({
           ))}
         </select>
       </label>
-      <McpThreadMenu taskId={taskId} permissionPolicy={thread?.permissionPolicy ?? 'ask'} />
+      {!draft && (
+        <McpThreadMenu taskId={taskId} permissionPolicy={thread?.permissionPolicy ?? 'ask'} />
+      )}
       <div className="th-handoff">
         <AutoHandoff thread={thread} onConfigure={onConfigure} />
         {/* The limit offer and the picker rank by the mode too, so it stays open with the box off. */}
@@ -480,35 +491,37 @@ function ThreadTab({
           </select>
         </label>
       </div>
-      <section className="th-turns" aria-labelledby="th-turns-head">
-        <h3 id="th-turns-head">Turns</h3>
-        {!loaded ? (
-          <p className="th-muted">Not available yet.</p>
-        ) : groups.length === 0 ? (
-          <p className="th-muted">None yet.</p>
-        ) : (
-          <ol>
-            {groups.map((group) => (
-              <li key={group.messageId}>
-                <p className="th-turn-ask" title={group.text ?? undefined}>
-                  {group.text ? asked(group.text) : 'An earlier message'}
-                </p>
-                <ol className="th-turn-list">
-                  {group.turns.map((turn) => (
-                    <TurnRow
-                      key={turn.id}
-                      turn={turn}
-                      reply={
-                        turn.assistantMessageId ? replies.get(turn.assistantMessageId) : undefined
-                      }
-                    />
-                  ))}
-                </ol>
-              </li>
-            ))}
-          </ol>
-        )}
-      </section>
+      {!draft && (
+        <section className="th-turns" aria-labelledby="th-turns-head">
+          <h3 id="th-turns-head">Turns</h3>
+          {!loaded ? (
+            <p className="th-muted">Not available yet.</p>
+          ) : groups.length === 0 ? (
+            <p className="th-muted">None yet.</p>
+          ) : (
+            <ol>
+              {groups.map((group) => (
+                <li key={group.messageId}>
+                  <p className="th-turn-ask" title={group.text ?? undefined}>
+                    {group.text ? asked(group.text) : 'An earlier message'}
+                  </p>
+                  <ol className="th-turn-list">
+                    {group.turns.map((turn) => (
+                      <TurnRow
+                        key={turn.id}
+                        turn={turn}
+                        reply={
+                          turn.assistantMessageId ? replies.get(turn.assistantMessageId) : undefined
+                        }
+                      />
+                    ))}
+                  </ol>
+                </li>
+              ))}
+            </ol>
+          )}
+        </section>
+      )}
     </div>
   );
 }
@@ -535,11 +548,14 @@ function chainLine(chain: ChatCrewChain | null): string {
 function CrewTab({
   source,
   thread,
+  draft,
   onConfigure,
   onDone,
 }: {
   source: ThreadSource;
   thread: ChatThread | null;
+  /** A new thread before its first send. Its checks are read once the thread exists. */
+  draft: boolean;
   onConfigure: (patch: ThreadSettings) => void;
   /** Closes the panel. */
   onDone: () => void;
@@ -732,14 +748,18 @@ function CrewTab({
           : 'Balanced and Glide run with a crew. Picking one here starts the Solo crew, the builder alone, and Pair or Full crew above add the other roles.'}
       </p>
       <AutoHandoff thread={thread} onConfigure={onConfigure} />
-      <ChecksSettings
-        thread={thread}
-        onEdit={(checks) =>
-          thread
-            ? configureThread(source, { taskId: thread.taskId, checks }).then(() => {})
-            : Promise.resolve()
-        }
-      />
+      {draft ? (
+        <p className="th-muted">Project checks are read after the first message.</p>
+      ) : (
+        <ChecksSettings
+          thread={thread}
+          onEdit={(checks) =>
+            thread
+              ? configureThread(source, { taskId: thread.taskId, checks }).then(() => {})
+              : Promise.resolve()
+          }
+        />
+      )}
       {note && (
         <p className="th-note" role="status">
           {note}
@@ -770,6 +790,7 @@ export function Inspector({
   changesKey,
   focusPath,
   onConfigure,
+  draft = false,
 }: {
   source: ThreadSource;
   taskId: string;
@@ -786,6 +807,11 @@ export function Inspector({
   changesKey: number;
   focusPath: string | null;
   onConfigure: (patch: ThreadSettings) => void;
+  /**
+   * A new thread before its first send. Only Crew and Thread show, and their changes wait in the
+   * new thread until the send creates it.
+   */
+  draft?: boolean;
 }) {
   const panel = useRef<HTMLElement>(null);
   const size = useInspectorWidth(panel);
@@ -793,6 +819,7 @@ export function Inspector({
   const extensionTabs = slotsOf(extensionRead, 'inspector-tab');
   // An extension tab whose extension turned off falls back to Changes once the read is in.
   const missingTab =
+    !draft &&
     tab.startsWith('ext:') &&
     extensionRead !== null &&
     !extensionTabs.some((slot) => extensionTabId(slot) === tab);
@@ -826,10 +853,13 @@ export function Inspector({
       />
       <div className="th-inspector-head">
         <div role="tablist" aria-label="Inspector sections">
-          {[
-            ...tabs,
-            ...extensionTabs.map((slot) => ({ id: extensionTabId(slot), label: slot.title })),
-          ].map((item) => (
+          {(draft
+            ? tabs.filter(({ id }) => draftTabs.includes(id))
+            : [
+                ...tabs,
+                ...extensionTabs.map((slot) => ({ id: extensionTabId(slot), label: slot.title })),
+              ]
+          ).map((item) => (
             <button
               key={item.id}
               type="button"
@@ -873,7 +903,13 @@ export function Inspector({
           />
         )}
         {tab === 'crew' && (
-          <CrewTab source={source} thread={thread} onConfigure={onConfigure} onDone={onClose} />
+          <CrewTab
+            source={source}
+            thread={thread}
+            draft={draft}
+            onConfigure={onConfigure}
+            onDone={onClose}
+          />
         )}
         {tab === 'thread' && (
           <ThreadTab
@@ -882,14 +918,16 @@ export function Inspector({
             turns={turns}
             messages={messages}
             loaded={loaded}
+            draft={draft}
             onConfigure={onConfigure}
           />
         )}
-        {extensionTabs
-          .filter((slot) => tab === extensionTabId(slot))
-          .map((slot) => (
-            <ExtensionInspectorTab key={tab} source={source} taskId={taskId} slot={slot} />
-          ))}
+        {!draft &&
+          extensionTabs
+            .filter((slot) => tab === extensionTabId(slot))
+            .map((slot) => (
+              <ExtensionInspectorTab key={tab} source={source} taskId={taskId} slot={slot} />
+            ))}
       </div>
     </aside>
   );

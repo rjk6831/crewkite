@@ -38,7 +38,6 @@ import { focusSection } from './palette/focus-section.ts';
 import { selectedOption } from './palette/select.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { RailSearch } from './rail-search.tsx';
-import { withThreadDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
 import { adjacentThread, isMacPlatform, searchHint, shortcutFor } from './thread/composer-rules.ts';
@@ -1034,7 +1033,7 @@ export function App() {
         ) : newThread !== null ? (
           <NewThread
             source={threadSource}
-            createTask={withThreadDefaults(threadSource, workspace.command)}
+            createTask={workspace.command}
             projects={projects}
             projectId={newThread}
             onProject={setNewThread}
