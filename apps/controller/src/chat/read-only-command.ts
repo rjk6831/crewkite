@@ -184,3 +184,102 @@ function shellWords(command: string): string[] | null {
   if (word !== null) words.push(word);
   return words;
 }
+
+// Programs a read-only turn on the wide sandbox may run, each one reading only the paths it is
+// given. Anything else, a script in the copy included, could read past it.
+const SCRATCH_PROGRAMS = new Set([
+  ...READ_ONLY_COMMANDS,
+  'sed',
+  'git',
+  'pwd',
+  'echo',
+  'printf',
+  'true',
+  'false',
+  'nl',
+  'uniq',
+  'cut',
+  'tr',
+  'diff',
+  'stat',
+  'file',
+  'tree',
+  'du',
+]);
+// The client runs each command through its own shell wrapper, such as `/bin/zsh -lc "..."`. The
+// wrapper is taken off once; a shell inside it could run anything.
+const WRAPPER = /^\s*(?:\/[\w./-]*\/)?(?:sh|bash|zsh)\s+-l?c\s+([\s\S]+)$/;
+// Anything that can move the command out of the folder it was given, or run a second program
+// the words do not show: a variable or substitution, a home or parent path, a change of folder,
+// a nested shell or a program that runs its arguments.
+const MOVES = /[$`]|~|\.\./;
+const RUNNERS = new Set([
+  'cd',
+  'pushd',
+  'popd',
+  'eval',
+  'env',
+  'exec',
+  'source',
+  'command',
+  'builtin',
+  'sh',
+  'bash',
+  'zsh',
+  'dash',
+  'ksh',
+  'fish',
+  'xargs',
+]);
+
+/** The script inside the client's shell wrapper, unquoted, or the command when it has none. */
+function unwrapped(command: string): string {
+  const inner = WRAPPER.exec(command)?.[1]?.trim();
+  if (inner === undefined) return command;
+  if (/^'[^']*'$/.test(inner)) return inner.slice(1, -1);
+  if (/^"(?:[^"\\]|\\.)*"$/.test(inner)) return inner.slice(1, -1).replace(/\\(["\\])/g, '$1');
+  return inner;
+}
+
+/**
+ * True only for a command that provably reads inside the scratch copy, for a read-only turn on a
+ * sandbox that can read the whole disk. The command runs in a folder inside the copy, names no
+ * variable, home or parent path and changes no folder, runs no nested shell or argument runner,
+ * and every absolute path and every word it names resolves inside the copy.
+ */
+export function scratchCommand(input: unknown, scratch: string): boolean {
+  const call = commandOf(input);
+  if (!call || call.cwd === null || !inScratch(scratch, call.cwd)) return false;
+  const script = unwrapped(call.command);
+  if (!script.trim() || MOVES.test(script)) return false;
+  const folder = folderOf(scratch, call.cwd);
+  const words = script
+    .split(/[\s;&|()<>]+/)
+    .map((word) => word.replace(/["']/g, ''))
+    .filter(Boolean);
+  if (words.some((word) => RUNNERS.has(word.split('/').at(-1) ?? ''))) return false;
+  // `2>&1` joins two outputs and starts no command, so only an `&` after no redirect splits.
+  for (const segment of script.split(/(?<![<>])[;&|]+|[()\n]+/)) {
+    const [program, ...rest] = segment
+      .trim()
+      .split(/\s+/)
+      .map((word) => word.replace(/["']/g, ''));
+    if (!program) continue;
+    if (!SCRATCH_PROGRAMS.has(program)) return false;
+    if (program === 'git' && !READ_ONLY_GIT.has(rest[0] ?? '')) return false;
+    // sed runs programs through its e command, so it counts only as `sed -n` with a line range.
+    if (program === 'sed' && !(rest[0] === '-n' && SED_PRINT.test(rest[1] ?? ''))) return false;
+    if (rest.some((word) => WRITING_FLAGS.test(word) || FOLLOWS[program]?.test(word))) return false;
+  }
+  // An absolute path anywhere in a word, such as `--file=/etc/hosts` or `-f/etc/hosts`. Output
+  // sent to /dev/null reads nothing.
+  const absolute = [...script.matchAll(/(?:^|[^\w.-])(\/[^\s'";&|()<>]*)/g)].map(
+    (match) => match[1],
+  );
+  return (
+    absolute.every((path) => path === '/dev/null' || inScratch(scratch, path)) &&
+    words.every(
+      (word) => /^\d*&\d*$/.test(word) || word === '/dev/null' || wordInside(word, scratch, folder),
+    )
+  );
+}

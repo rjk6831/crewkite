@@ -171,6 +171,14 @@ const scripts = {
   'outside-read': () => [
     ['item/started', { ...ids(), item: { ...command, command: "/bin/zsh -lc \"sed -n '46,51p' /Users/raykraft/.codex/memories/MEMORY.md\"", cwd: given.cwd } }],
   ],
+  // A command on the plain read-only sandbox: the client asks first, or with a rule of its own
+  // runs it without asking.
+  'wide-ask': () => [
+    { id: 0, method: 'item/commandExecution/requestApproval', params: { ...ids(), itemId: 'command-1', reason: null, command: given.command, cwd: here('') } },
+  ],
+  'wide-run': () => [
+    ['item/started', { ...ids(), item: { ...command, command: given.command, cwd: here('') } }],
+  ],
   'usage-warning': () => [
     ['warning', { message: 'You have used 80% of your usage limit.' }],
     ['warning', { message: 'A setting in config.toml is deprecated.' }],
@@ -254,6 +262,8 @@ function turn(
       cwd?: string;
       network?: boolean;
       refuseRestricted?: boolean;
+      /** The command line in a wide-ask or wide-run scenario. */
+      command?: string;
       path?: string;
       movePath?: string;
       grantRoot?: string;
@@ -986,6 +996,56 @@ test('a read-only turn falls back to the plain read-only sandbox when the client
   assert.equal(starts.length, 2);
   assert.ok(starts[0].params.sandboxPolicy.access);
   assert.deepEqual(starts[1].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+  // The plain sandbox reads the whole disk, so the client asks before each command.
+  assert.equal(starts[0].params.approvalPolicy, undefined);
+  assert.equal(starts[1].params.approvalPolicy, 'untrusted');
+});
+
+test('a read-only turn keeps the first turn/start error when it is not a refused sandbox shape', async () => {
+  const run = turn('refuse', { readOnly: true });
+  const { stopReason, failure } = await run.settled();
+  assert.equal(stopReason, 'error');
+  assert.equal(failure?.providerMessage, 'Invalid params: thread not loaded\nretry later');
+  assert.equal(run.frames().filter((frame) => frame.method === 'turn/start').length, 1);
+});
+
+test('on the plain read-only sandbox only a command that provably stays in the copy runs', async () => {
+  const rows = [
+    { command: '/bin/zsh -lc "rg --files"', decision: 'accept' },
+    { command: '/bin/zsh -lc "sed -n \'1,40p\' src/main.ts"', decision: 'accept' },
+    { command: '/bin/zsh -lc "cd && cat .ssh/id_rsa"', decision: 'decline' },
+    { command: 'bash -lc "cd \\"$HOME\\" && rg token .codex"', decision: 'decline' },
+    { command: 'cat $HOME', decision: 'decline' },
+    { command: '/bin/zsh -lc "cat ~/.ssh/id_rsa"', decision: 'decline' },
+    { command: '/bin/zsh -lc "cat ../../.codex/auth.json"', decision: 'decline' },
+    { command: '/bin/zsh -lc "cat /etc/passwd"', decision: 'decline' },
+    { command: '/bin/zsh -lc "pushd src"', decision: 'decline' },
+    { command: '/bin/zsh -lc "cat `ls`"', decision: 'decline' },
+    { command: '/bin/zsh -lc "sh -c \'cat x\'"', decision: 'decline' },
+    { command: '/bin/zsh -lc "zsh -c \'cat x\'"', decision: 'decline' },
+    { command: '/bin/zsh -lc "eval cat x"', decision: 'decline' },
+    { command: '/bin/zsh -lc "env cat x"', decision: 'decline' },
+    { command: '/bin/zsh -lc "ls | xargs bash"', decision: 'decline' },
+    { command: '/bin/zsh -lc "./run.sh"', decision: 'decline' },
+  ];
+  for (const row of rows) {
+    const run = turn('wide-ask', {
+      readOnly: true,
+      detail: { refuseRestricted: true, command: row.command },
+    });
+    await run.settled();
+    const answer = run.frames().find((frame) => frame.id === 0 && frame.result);
+    assert.equal(answer?.result.decision, row.decision, row.command);
+  }
+  // A command the client ran under a rule of its own ends the turn unless it stays in the copy.
+  const run = turn('wide-run', {
+    readOnly: true,
+    detail: { refuseRestricted: true, command: '/bin/zsh -lc "cd && cat .ssh/id_rsa"' },
+  });
+  const { stopReason, failure } = await run.settled();
+  assert.equal(stopReason, 'error');
+  assert.match(failure?.message ?? '', /could not confirm stays in the scratch copy/);
+  assert.ok(run.frames().some((frame) => frame.method === 'turn/interrupt'));
 });
 
 test('a read-only turn stops when a command names a path outside the scratch copy', async () => {
