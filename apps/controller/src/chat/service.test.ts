@@ -2720,6 +2720,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
         /^Files changed in the scratch copy against the base commit:\nNo files changed yet\.$/m,
         row.name,
       );
+      assert.ok(lines.includes('Slice 1 finished. No files changed.'), row.name);
     }
     if ('unplugged' in row) {
       assert.equal(read.turns.find((turn) => turn.slice === 1)?.state, 'stopped', row.name);
