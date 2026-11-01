@@ -113,3 +113,8 @@
   padding: 0;
   list-style: none;
 }
+.th-checks-empty {
+  display: grid;
+  justify-items: start;
+  gap: 8px;
+}

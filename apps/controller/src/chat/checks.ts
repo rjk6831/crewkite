@@ -127,9 +127,32 @@ function packageScripts(directory: string): Record<string, unknown> | null {
 const clipText = (text: string, characters: number) =>
   text.length > characters ? `${text.slice(0, characters - 1).toWellFormed()}…` : text;
 
+// "pytest" as a quoted requirement, such as "pytest>=8", or as a Poetry key, such as pytest = "^8".
+const PYTEST_DEPENDENCY = /["']pytest(?:[\s<>=~!;[\]"',]|$)|^\s*pytest\s*=/m;
+
 /**
- * The checks a project declares: package.json scripts, pyproject.toml tool tables, Makefile
- * targets and a Cargo.toml. Reads files only; nothing is run and nothing is installed. The
+ * The targets a Makefile defines, with the recipe lines of each joined by "; ". A rule line can
+ * name several targets, such as "test lint: deps". Special targets such as .PHONY and variable
+ * assignments are not targets.
+ */
+function makeTargets(make: string): Map<string, string> {
+  const targets = new Map<string, string>();
+  const rule = /^([A-Za-z0-9_][^:=#\n]*?)\s*::?(?!=)[^\n]*(?:\n|$)((?:\t[^\n]*(?:\n|$))*)/gm;
+  for (const match of make.matchAll(rule)) {
+    const recipe = match[2]
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .join('; ');
+    for (const name of match[1].split(/\s+/))
+      if (name && !targets.has(name)) targets.set(name, recipe);
+  }
+  return targets;
+}
+
+/**
+ * The checks a project declares: package.json scripts, pyproject.toml tool tables and pytest,
+ * a pytest.ini, Makefile targets, a Cargo.toml and a go.mod. Reads files only; nothing is run and nothing is installed. The
  * resolved text names what the command runs, including the pre and post scripts npm and yarn
  * run around a script.
  */
@@ -170,30 +193,38 @@ export function detectChecks(directory: string): DetectedCheck[] {
     }
   }
 
+  // pytest runs from a [tool.pytest] table, a pytest.ini or a project that names pytest as a
+  // dependency, in a PEP 621 list or a Poetry table. One test check covers them.
   const python = read(directory, 'pyproject.toml');
+  const pytestIni = read(directory, 'pytest.ini');
   if (python !== null) {
-    if (/^\[tool\.pytest/m.test(python)) add('pyproject.toml', 'test', 'python3 -m pytest');
+    if (/^\[tool\.pytest/m.test(python) || PYTEST_DEPENDENCY.test(python))
+      add('pyproject.toml', 'test', 'python3 -m pytest');
+    else if (pytestIni !== null) add('pytest.ini', 'test', 'python3 -m pytest');
     if (/^\[tool\.ruff/m.test(python)) add('pyproject.toml', 'lint', 'ruff check');
     if (/^\[tool\.mypy/m.test(python)) add('pyproject.toml', 'typecheck', 'mypy .');
-  }
+  } else if (pytestIni !== null) add('pytest.ini', 'test', 'python3 -m pytest');
 
   const make = read(directory, 'Makefile');
-  if (make !== null)
+  if (make !== null) {
+    const targets = makeTargets(make);
     for (const [kind] of KINDS) {
-      const target = new RegExp(`^${kind}\\s*:[^\\n]*\\n((?:\\t[^\\n]*\\n?)*)`, 'm').exec(make);
-      if (!target) continue;
-      const recipe = target[1]
-        .split('\n')
-        .map((line) => line.trim())
-        .filter(Boolean)
-        .join('; ');
+      const recipe = targets.get(kind);
+      if (recipe === undefined) continue;
       add('Makefile', kind, `make ${kind}`, `make ${kind} runs ${recipe || 'no recipe'}`);
     }
+  }
 
   if (read(directory, 'Cargo.toml') !== null) {
     add('Cargo.toml', 'test', 'cargo test');
     add('Cargo.toml', 'lint', 'cargo clippy');
     add('Cargo.toml', 'typecheck', 'cargo check');
+  }
+
+  // go vet type checks every package as it lints, so a Go module gets no separate type check.
+  if (read(directory, 'go.mod') !== null) {
+    add('go.mod', 'test', 'go test ./...');
+    add('go.mod', 'lint', 'go vet ./...');
   }
   return found;
 }
