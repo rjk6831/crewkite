@@ -380,6 +380,8 @@ function ThreadBody({
   );
   const newestId = useMemo(() => newestTurnId(state), [state]);
   const current = thread?.selection ?? null;
+  const crewBuilder =
+    thread?.crew?.members.find((member) => member.role === 'builder')?.selection ?? null;
   // The line is shown here unless the controller wrote the same line into the thread.
   const limitLine = (limit: Parameters<typeof outputLimitLine>[0]) => {
     const line = outputLimitLine(limit);
@@ -402,10 +404,23 @@ function ThreadBody({
     if (item.kind !== 'turn' && item.kind !== 'failure') return null;
     const turnId = item.kind === 'turn' ? item.turn.id : item.turnId;
     const note = item.kind === 'turn' ? state.historyNotes[turnId] : undefined;
-    // The controller reruns only the newest turn, so an older failure offers nothing to run.
+    // The controller reruns only the newest turn, so an older failure offers nothing to run. A
+    // failed plan slice is the exception: Retry runs that slice again from the plan, on the crew
+    // builder unless another model is picked.
     const newest = turnId === newestId;
-    const retryable = newest && (item.kind === 'failure' || item.turn.status === 'stopped');
-    const regenerate = item.kind === 'turn' && turnId === replyId;
+    const sliceId = state.turnMeta[turnId]?.slice;
+    const slice = sliceId === undefined ? undefined : plan?.slices.find((s) => s.id === sliceId);
+    const sliceRetry =
+      !!slice &&
+      slice.turnId === turnId &&
+      plan?.phase !== 'running' &&
+      (slice.status === 'failed' || slice.status === 'not-run');
+    const retryable =
+      sliceRetry ||
+      (newest &&
+        sliceId === undefined &&
+        (item.kind === 'failure' || item.turn.status === 'stopped'));
+    const regenerate = item.kind === 'turn' && turnId === replyId && sliceId === undefined;
     const rejected =
       newest && item.kind === 'failure' && item.failure.kind === 'attachment-rejected';
     const limit = item.kind === 'turn' && newest && item.turn.ended ? item.turn.outputLimit : null;
@@ -426,7 +441,7 @@ function ThreadBody({
           <RerunControl
             label={regenerate ? 'Regenerate' : 'Retry'}
             catalog={catalog}
-            current={current}
+            current={sliceRetry ? (crewBuilder ?? current) : current}
             onRun={(selection) => rerun(turnId, regenerate ? 'regenerate' : 'retry', selection)}
           />
         )}
