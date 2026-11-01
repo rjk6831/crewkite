@@ -15,9 +15,11 @@ import {
   GOOGLE_PROGRESS_STEPS,
   type GoogleSetupProgress,
   type GoogleSetupStage,
+  googleConnectButton,
   googleSetupProgress,
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
+  startingGoogleStage,
 } from './google-setup-flow.ts';
 import type { Workspace } from './source.ts';
 import './google-setup.css';
@@ -238,6 +240,8 @@ export function GoogleSetup({
     if (!connected || working || installUnknown || !termsAccepted) return;
     stopPolling();
     const currentGeneration = generation.current;
+    // The press shows its first step at once. The first status read can take a few seconds.
+    setRequested(startingGoogleStage({ googleAcpInstall: installation, googleAcpSetup: setup }));
     setMessage(null);
     setPollTimedOut(false);
     setPollUnreadable(false);
@@ -344,6 +348,12 @@ export function GoogleSetup({
   // One button. Connect runs every step to the end, sign-in included, and Try again resumes at
   // the step that failed, clearing a stuck step first when its process has ended.
   const primaryLabel = needsRepair ? 'Try again' : 'Connect Google';
+  const primary = googleConnectButton({
+    working,
+    running: active || installing,
+    cancelling: cancelBusy,
+    label: primaryLabel,
+  });
   const profileReason =
     profile && !profile.available && 'reason' in profile
       ? profile.reason === 'acp-capability-missing'
@@ -437,19 +447,20 @@ export function GoogleSetup({
         <Fact label="Quota available" value={quotaAvailable} />
       </div>
       <div className="gs-actions">
-        {!ready && !working && !installUnknown && (
+        {/* The button stays where it is while Connect runs, so Cancel never takes its place. */}
+        {!ready && !installUnknown && (
           <button
             className="button primary"
             type="button"
-            disabled={!connected || !termsAccepted}
+            disabled={!connected || !termsAccepted || primary.disabled}
             onClick={() => void connectGoogle()}
           >
-            {primaryLabel}
+            {primary.label}
           </button>
         )}
         {working && (active || installing) && (
           <button
-            className="button secondary"
+            className="button secondary gs-cancel"
             type="button"
             disabled={!connected || cancelBusy}
             onClick={() => void cancelCurrent()}

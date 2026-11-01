@@ -5,10 +5,12 @@ import {
   classifyGoogleFailure,
   GOOGLE_CONNECT_LIMIT_MS,
   GOOGLE_READ_TRIES,
+  googleConnectButton,
   googleSetupProgress,
   nextGoogleStage,
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
+  startingGoogleStage,
 } from './google-setup-flow.ts';
 
 type GoogleState = Pick<WorkspaceState, 'googleAcpInstall' | 'googleAcpSetup'>;
@@ -863,4 +865,23 @@ test('the status poll tries a failed read again and gives up after three in a ro
   });
   assert.equal(always, 'unreadable');
   assert.equal(failures, GOOGLE_READ_TRIES);
+});
+
+test('a Connect press shows its first step and keeps the button in place', () => {
+  // Nothing installed: the download is step 1 of 5 from the press on.
+  const fresh = { googleAcpInstall: null, googleAcpSetup: null };
+  assert.equal(startingGoogleStage(fresh), 'install');
+  assert.equal(googleSetupProgress(fresh, startingGoogleStage(fresh))?.step, 'download');
+  // An installed client starts at initialize.
+  const installed = {
+    googleAcpInstall: null,
+    googleAcpSetup: setup(1, 'uninitialized', { client }),
+  };
+  assert.equal(startingGoogleStage(installed), 'initialize');
+  const button = (working: boolean, running: boolean, cancelling = false) =>
+    googleConnectButton({ working, running, cancelling, label: 'Connect Google' });
+  assert.deepEqual(button(false, false), { label: 'Connect Google', disabled: false });
+  assert.deepEqual(button(true, false), { label: 'Starting…', disabled: true });
+  assert.deepEqual(button(true, true), { label: 'Connecting…', disabled: true });
+  assert.deepEqual(button(true, true, true), { label: 'Connect Google', disabled: true });
 });
