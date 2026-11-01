@@ -16,6 +16,7 @@ import { importAttachment, sendMessage, type ThreadSource } from './commands.ts'
 import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
 import { EmptyThread } from './empty-thread.tsx';
 import { FamilyMark } from './family-mark.tsx';
+import type { FirstSend } from './thread-view.tsx';
 import './thread.css';
 
 const NO_PROVIDER = 'Connect a provider in Settings';
@@ -95,7 +96,8 @@ export function NewThread({
   projects: readonly Project[];
   projectId: string;
   onProject: (id: string) => void;
-  onCreated: (taskId: string) => void;
+  /** The thread exists and its first message went. The message opens with it. */
+  onCreated: (taskId: string, first: FirstSend) => void;
   onAddProject: (() => void) | null;
   /** Opens Settings. The first-run card focuses a family's card before calling it. */
   onOpenSettings?: () => void;
@@ -145,7 +147,7 @@ export function NewThread({
         throw new Error(result.next ?? result.reason ?? 'The thread could not be created.');
       created.current = saved.data;
     }
-    const taskId = created.current.id;
+    const { id: taskId, title } = created.current;
     const stored: ChatAttachment[] = [];
     for (const item of files)
       stored.push(item.file ?? (await importAttachment(source, taskId, item.path ?? '')));
@@ -155,7 +157,13 @@ export function NewThread({
       files: stored,
       ...(selection ? { selection } : {}),
     });
-    onCreated(taskId);
+    onCreated(taskId, {
+      task: { id: taskId, title, projectId: project.id },
+      text,
+      files: stored,
+      selection,
+      at: new Date().toISOString(),
+    });
   }
 
   return (

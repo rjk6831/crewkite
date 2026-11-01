@@ -1,6 +1,19 @@
-import type { ChatCatalogRead, ChatModelSelection, WorkspaceState } from '@crewkite/contracts';
+import type {
+  ChatAttachment,
+  ChatCatalogRead,
+  ChatModelSelection,
+  WorkspaceState,
+} from '@crewkite/contracts';
 import { GitBranch, PanelRight } from 'lucide-react';
-import { type ReactNode, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import {
+  type ReactNode,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react';
 import { familyName } from '../components.tsx';
 import { ExtensionThreadActions } from '../extension-slots.tsx';
 import { provide } from '../palette/actions.ts';
@@ -27,7 +40,7 @@ import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
 import type { HistoryFind } from './history-reveal.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
-import { MessageList, modelLine } from './message-list.tsx';
+import { MessageList, modelLine, StartingTurn } from './message-list.tsx';
 import { catalogLabels, ModelLabels } from './model-labels.ts';
 import { outputLimitLine } from './output-limit.ts';
 import { planRow } from './plan-card.ts';
@@ -56,6 +69,18 @@ import { useThread } from './use-thread.ts';
 import './thread.css';
 
 export type ThreadTask = { id: string; title: string };
+
+/**
+ * The message that created a thread, kept by New thread so the thread opens with it in view and a
+ * starting reply chip under it while the first read is on its way.
+ */
+export type FirstSend = {
+  task: ThreadTask & { projectId: string };
+  text: string;
+  files: ChatAttachment[];
+  selection: ChatModelSelection | null;
+  at: string;
+};
 
 // Grey lines where the conversation will be while the thread opens. A read that is only slow
 // never shows a failure; use-thread reports one after ten seconds of retries.
@@ -101,11 +126,14 @@ function ThreadBody({
   connection,
   refresh,
   find,
+  first,
   onNewThread,
   onOpenSettings,
 }: {
   source: ThreadSource;
   task: ThreadTask;
+  /** The message this thread was just created with, shown at once in place of the skeleton. */
+  first?: FirstSend | null;
   projectName: string;
   header: WorkspaceState | null;
   preview: boolean;
@@ -145,6 +173,31 @@ function ThreadBody({
   const composer = useRef<ComposerHandle>(null);
   const toggle = useRef<HTMLButtonElement>(null);
   const thread = state.thread;
+  // The first message shows as a pending bubble before the first paint, so a new thread never
+  // opens on the skeleton. The stored message replaces it when the read lands.
+  const firstSend = first?.task.id === task.id ? first : null;
+  // biome-ignore lint/correctness/useExhaustiveDependencies: runs once for the thread it opened
+  useLayoutEffect(() => {
+    if (!firstSend) return;
+    dispatch({
+      type: 'sending',
+      pending: {
+        localId: 'first-send',
+        text: firstSend.text,
+        files: firstSend.files,
+        at: firstSend.at,
+      },
+    });
+  }, []);
+  // Until a reply row of its own shows, the first turn reads as starting on the model it went to.
+  const starting =
+    firstSend &&
+    !items.some((item) => item.kind === 'turn' || item.kind === 'failure') &&
+    (!state.loaded || activeTurn !== null) ? (
+      <StartingTurn
+        identity={firstSend.selection ? { ...firstSend.selection, role: 'assistant' } : null}
+      />
+    ) : null;
   const changesKey = useMemo(() => changeCount(items), [items]);
   const turns = useMemo(() => Object.values(state.turnMeta), [state.turnMeta]);
   const offer = useMemo(() => limitOffer(state), [state]);
@@ -465,8 +518,9 @@ function ThreadBody({
             items={items}
             empty={empty}
             footer={
-              ((planned && !planInline) || checked || offer) && (
+              (starting || (planned && !planInline) || checked || offer) && (
                 <>
+                  {starting}
                   {!planInline && planned}
                   {checked}
                   {offer && (

@@ -19,7 +19,7 @@ import { ReplyMenu } from './reply-menu.tsx';
 import { markMatches } from './reveal-dom.ts';
 import type { ThreadItem, TurnView } from './thread-state.ts';
 import { TurnChip } from './turn-chip.tsx';
-import { briefLabel, replySource, viewBlocks } from './turn-fold.ts';
+import { blankTurn, briefLabel, replySource, type TurnIdentity, viewBlocks } from './turn-fold.ts';
 import { TurnStats } from './turn-stats.tsx';
 import { layoutRows, mountPlan, rowTop, rowWindow } from './virtual-window.ts';
 
@@ -147,6 +147,23 @@ const TurnRow = memo(function TurnRow({
     </article>
   );
 });
+
+/**
+ * The reply row a new thread shows while its first turn starts: the chip for the model the message
+ * went to and the working dots. The real turn row takes its place once the thread read lands.
+ */
+export function StartingTurn({ identity }: { identity: TurnIdentity | null }) {
+  return (
+    <article className="th-row th-assistant" aria-busy="true">
+      <TurnChip turn={{ ...blankTurn('starting'), identity }} />
+      <span className="th-working" role="status" aria-label="Starting">
+        <i />
+        <i />
+        <i />
+      </span>
+    </article>
+  );
+}
 
 function UserRow({
   item,
