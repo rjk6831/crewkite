@@ -2978,6 +2978,100 @@ test('a policy change acts on the running turn, and balanced answers only safe a
   }
 });
 
+// The person changes the flight mode or the policy while a turn waits on an ask. Each row sends
+// the changes one at a time, as the composer does. The open ask is answered when the new policy
+// covers it, and the adapter hears the narrower policy for the asks still to come.
+test('a flight mode or policy change answers the open ask the new setting covers', {
+  timeout: 30000,
+}, async (t) => {
+  const crew: ChatCrew = {
+    name: 'Pair',
+    members: [
+      { role: 'builder', selection },
+      { role: 'reviewer', selection },
+    ],
+  };
+  type Setting = {
+    flightMode?: 'manual' | 'balanced' | 'glide';
+    permissionPolicy?: 'ask' | 'allow-edits' | 'allow-all';
+  };
+  const cases: {
+    name: string;
+    start: Setting;
+    change: Setting[];
+    answered: boolean;
+    narrowed: string[];
+  }[] = [
+    {
+      name: 'manual to glide',
+      start: { flightMode: 'manual', permissionPolicy: 'ask' },
+      change: [{ flightMode: 'glide' }, { permissionPolicy: 'allow-all' }],
+      answered: true,
+      narrowed: [],
+    },
+    {
+      name: 'glide to manual',
+      start: { flightMode: 'glide', permissionPolicy: 'allow-edits' },
+      change: [{ flightMode: 'manual' }, { permissionPolicy: 'ask' }],
+      answered: false,
+      narrowed: ['ask'],
+    },
+    {
+      name: 'balanced to glide',
+      start: { flightMode: 'balanced', permissionPolicy: 'allow-all' },
+      change: [{ flightMode: 'glide' }],
+      answered: true,
+      narrowed: [],
+    },
+  ];
+  for (const row of cases) {
+    const inner = editingAdapter(['command'], { command: 'npm i' });
+    const narrowed: string[] = [];
+    const adapter: ChatAdapter = {
+      family: 'openai',
+      startTurn: (request, emit) => ({
+        ...inner.startTurn(request, emit),
+        setPermissionPolicy: (policy) => narrowed.push(policy),
+      }),
+    };
+    const thread = standalone(t, { adapters: new Map([['openai', adapter]]) });
+    const { store, service, taskId } = thread;
+    store.transaction(() => service.configure({ taskId, crew, ...row.start }));
+    const parked = turnReaches(thread, 'waiting-permission');
+    const idle = settles(thread);
+    thread.send('Go.');
+    const turn = await parked;
+    for (const change of row.change) {
+      const effects: (() => void)[] = [];
+      store.transaction(() => service.configure({ taskId, ...change }, effects));
+      for (const effect of effects) effect();
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+    const open = thread.read().turns[0].state === 'waiting-permission';
+    assert.equal(open, !row.answered, row.name);
+    assert.deepEqual(narrowed, row.narrowed, row.name);
+    if (open) {
+      const effects: (() => void)[] = [];
+      store.transaction(() =>
+        service.resolvePermission(
+          { taskId, turnId: turn.id, requestId: 'edit-1', choice: 'deny' },
+          effects,
+        ),
+      );
+      for (const effect of effects) effect();
+    }
+    await idle;
+    const resolved = agentEvents(thread).find((event) => event.type === 'permission.resolved');
+    assert.equal(
+      resolved?.type === 'permission.resolved' && resolved.choice,
+      row.answered ? 'allow-once' : 'deny',
+      row.name,
+    );
+    // Stop whatever the crew chain started after the builder.
+    await service.close();
+  }
+});
+
 test('send now stops the running turn and starts the queued message with its packet', {
   timeout: 30000,
 }, async (t) => {

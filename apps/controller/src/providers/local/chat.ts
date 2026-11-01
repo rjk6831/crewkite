@@ -719,6 +719,8 @@ function startLocalTurn(
   const groups: number[] = [];
   const pending = new Map<string, (choice: string | null) => void>();
   const grants = new Set<'edit' | 'command'>();
+  // The thread's policy can narrow during the turn, and later calls follow it.
+  let limit = { policy: request.permissionPolicy, grants: request.permissionGrants ?? [] };
   const changed = new Set<string>();
   const rounds: LLMPredictionStats[] = [];
   // Reasoning and reply tokens of each finished round, from the streamed fragments.
@@ -916,13 +918,13 @@ function startLocalTurn(
     // allow-all also runs commands without asking. Allow-edits still asks before a command.
     const gate =
       tool.name === 'run'
-        ? request.permissionPolicy === 'allow-all'
+        ? limit.policy === 'allow-all'
           ? null
           : 'command'
-        : tool.kind === 'edit' && request.permissionPolicy === 'ask'
+        : tool.kind === 'edit' && limit.policy === 'ask'
           ? 'edit'
           : null;
-    const granted = gate !== null && request.permissionGrants?.includes(gate) === true;
+    const granted = gate !== null && limit.grants.includes(gate);
     if (gate && !grants.has(gate)) {
       const choice = await ask(callId, tool, granted);
       if (ending) {
@@ -1381,6 +1383,9 @@ function startLocalTurn(
   return {
     respondPermission: (requestId, choice) => pending.get(requestId)?.(choice),
     stop: () => stop('stopped'),
+    setPermissionPolicy: (policy, permissionGrants) => {
+      limit = { policy, grants: permissionGrants };
+    },
     get groups() {
       return groups;
     },

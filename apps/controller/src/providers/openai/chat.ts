@@ -463,7 +463,8 @@ const isLimit = (error: ProviderError) => {
 
 class OpenAiChatTurn {
   readonly handle: ChatTurnHandle;
-  private readonly request: ChatTurnRequest;
+  // Replaced when the thread's policy narrows during the turn, so later asks follow it.
+  private request: ChatTurnRequest;
   private readonly emit: (event: AgentEvent) => void;
   private readonly reportUsage: UsageReporter;
   private readonly roots: string[];
@@ -550,6 +551,11 @@ class OpenAiChatTurn {
     this.handle = {
       respondPermission: (requestId, choice) => this.answer(requestId, choice),
       stop: () => this.stop(),
+      // The approval policy went to the client at thread start and holds for the turn. What the
+      // client still asks follows the narrower policy from here.
+      setPermissionPolicy: (permissionPolicy, permissionGrants) => {
+        this.request = { ...this.request, permissionPolicy, permissionGrants };
+      },
       groups: this.group > 0 ? [this.group] : [],
       result,
     };

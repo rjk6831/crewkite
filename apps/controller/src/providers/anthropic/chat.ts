@@ -20,6 +20,7 @@ import {
   type AnthropicUsageReadingSchema,
   type ChatFailure,
   type ChatPermissionOption,
+  type ChatPermissionPolicy,
   ChatSetEffortSchema,
   type ChatToolKind,
 } from '@crewkite/contracts';
@@ -488,6 +489,10 @@ function userMessage(text: string, files: readonly TurnFile[], staging: string) 
   };
 }
 
+/** The client's own mode: under ask every edit comes back as a question. */
+const permissionMode = (policy: ChatPermissionPolicy) =>
+  policy === 'ask' ? 'default' : 'acceptEdits';
+
 function chatArguments(
   request: ChatTurnRequest,
   resume: string | null,
@@ -526,7 +531,7 @@ function chatArguments(
     '--settings',
     '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
     '--permission-mode',
-    request.permissionPolicy === 'ask' ? 'default' : 'acceptEdits',
+    permissionMode(request.permissionPolicy),
     // Review and advice turns read only. The thread tools only read, on every turn.
     ...(allowed.length ? ['--allowedTools', allowed.join(',')] : []),
     // The crew role turned subagents off, so the tools that start one are not offered.
@@ -772,6 +777,12 @@ function startTurn(
   const messages = new Map<string, { ordinal: number; items: Item[] }>();
   const tools = new Map<string, { path: string | null; done: boolean }>();
   const asks = new Map<string, Ask>();
+  // The thread's policy can narrow during the turn. Later asks follow it, and the client's own
+  // permission mode follows it too, so an edit asks again once the thread asks before edits.
+  let policy = request.permissionPolicy;
+  let grants = request.permissionGrants ?? [];
+  let mode = permissionMode(policy);
+  let modeRequests = 0;
   const allowed = new Set<string>();
   const denied = new Set<string>();
   const changed = new Set<string>();
@@ -1158,8 +1169,7 @@ function startTurn(
     // covers it. An allow for this thread given in this turn names the one tool.
     const granted =
       (kind !== 'edit' || inside) &&
-      (allowed.has(toolName) ||
-        (kind !== 'other' && request.permissionGrants?.includes(kind) === true));
+      (allowed.has(toolName) || (kind !== 'other' && grants.includes(kind)));
     // A tool of the person's own MCP server follows the policy the controller cut to the thread's
     // ceiling. Allow-all and the kind grants say nothing about it, and a tool of any server this
     // turn did not attach asks.
@@ -1174,7 +1184,7 @@ function startTurn(
           : allowed.has(toolName)
             ? 'allow-thread'
             : null
-        : request.permissionPolicy === 'allow-all' && (kind !== 'edit' || inside)
+        : policy === 'allow-all' && (kind !== 'edit' || inside)
           ? 'allow-once'
           : granted
             ? 'allow-thread'
@@ -1407,6 +1417,9 @@ function startTurn(
         return onControl(value);
       case 'control_cancel_request':
         return onCancel(value);
+      // The client's answer to a permission mode change. Nothing waits on it.
+      case 'control_response':
+        return;
       case 'rate_limit_event':
       case 'rate_limit':
         return onRateLimit(type, value);
@@ -1583,6 +1596,18 @@ function startTurn(
         chatFailure({ stage: 'stream', kind: 'stopped', message: 'The turn was stopped.' }),
       );
       terminate();
+    },
+    setPermissionPolicy(next, nextGrants) {
+      policy = next;
+      grants = nextGrants;
+      const wanted = permissionMode(next);
+      if (wanted === mode || settled || terminating) return;
+      mode = wanted;
+      write({
+        type: 'control_request',
+        request_id: `crewkite-mode-${++modeRequests}`,
+        request: { subtype: 'set_permission_mode', mode },
+      });
     },
     groups: group > 0 ? [group] : [],
     result: outcomePromise,

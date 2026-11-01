@@ -495,6 +495,53 @@ test('an edit outside the scratch copy asks under a thread grant or allow-all, a
   }
 });
 
+test('a policy narrowed during the turn sets the client mode and leaves later asks to the person', async (t) => {
+  const ask = {
+    subtype: 'can_use_tool',
+    tool_name: 'Bash',
+    input: { command: 'npm test' },
+    tool_use_id: 'toolu_1',
+  };
+  const turn = run(
+    [
+      'read',
+      { out: init() },
+      // The mode change reaches the client before its next ask.
+      'read',
+      { out: { type: 'control_response', response: { subtype: 'success', request_id: 'x' } } },
+      { out: { type: 'control_request', request_id: 'req-1', request: ask } },
+      'read',
+      { out: done() },
+      'drain',
+    ],
+    null,
+    ['command'],
+    'allow-all',
+  );
+  t.after(turn.cleanup);
+  await turn.next('turn.started');
+  assert.equal(
+    turn.launched.argv[turn.launched.argv.indexOf('--permission-mode') + 1],
+    'acceptEdits',
+  );
+  turn.handle.setPermissionPolicy?.('ask', []);
+  const asked = await turn.next('permission.requested');
+  assert.deepEqual(JSON.parse(turn.launched.input[1] ?? ''), {
+    type: 'control_request',
+    request_id: 'crewkite-mode-1',
+    request: { subtype: 'set_permission_mode', mode: 'default' },
+  });
+  // Allow-all and the command grant would have answered this ask at launch.
+  assert.equal(turn.events.at(-1)?.type, 'permission.requested');
+  turn.handle.respondPermission(asked.requestId, 'deny');
+  assert.equal((await turn.handle.result).stopReason, 'done');
+  // The client's answer to the mode change is no notice.
+  assert.equal(
+    turn.events.some((event) => event.type === 'provider.notice'),
+    false,
+  );
+});
+
 test('stop ends a running turn as stopped and leaves no process behind', async (t) => {
   const turn = run(['read', { out: init() }, 'hold']);
   t.after(turn.cleanup);

@@ -103,6 +103,12 @@ export type ChatTurnHandle = Readonly<{
   respondPermission(requestId: string, choice: string): void;
   /** Interrupt the turn through the native protocol, then terminate the owned process. */
   stop(): void;
+  /**
+   * The thread's policy changed during the turn. The adapter answers later asks on its own by
+   * `limitPolicy` of its launch policy and this one, so a change can only narrow what it answers.
+   * The controller answers what a wider policy adds.
+   */
+  setPermissionPolicy?(policy: ChatPermissionPolicy, grants: readonly ChatToolKind[]): void;
   /** Process groups the controller must prove absent before the turn is quiescent. */
   readonly groups: readonly number[];
   readonly result: Promise<ChatTurnResult>;
@@ -115,6 +121,25 @@ export interface ChatAdapter {
    * finished, whether it succeeded, was stopped or failed. Never throw after returning.
    */
   startTurn(request: ChatTurnRequest, emit: (event: AgentEvent) => void): ChatTurnHandle;
+}
+
+const POLICY_RANK: Record<ChatPermissionPolicy, number> = {
+  ask: 0,
+  'allow-edits': 1,
+  'allow-all': 2,
+};
+
+export type PolicyLimit = Readonly<{
+  policy: ChatPermissionPolicy;
+  grants: readonly ChatToolKind[];
+}>;
+
+/** The narrower of two policies, with the grants both share. */
+export function limitPolicy(launch: PolicyLimit, next: PolicyLimit): PolicyLimit {
+  return {
+    policy: POLICY_RANK[next.policy] < POLICY_RANK[launch.policy] ? next.policy : launch.policy,
+    grants: launch.grants.filter((kind) => next.grants.includes(kind)),
+  };
 }
 
 /** Build the failure the person sees. Every adapter uses this so copy stays consistent. */

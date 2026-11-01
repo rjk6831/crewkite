@@ -82,6 +82,8 @@ import {
   type ChatTurnRequest,
   type ChatTurnResult,
   chatFailure,
+  limitPolicy,
+  type PolicyLimit,
 } from './adapter.ts';
 import type { ChangeCommandHost } from './change-commands.ts';
 import * as changeCommands from './change-commands.ts';
@@ -262,8 +264,14 @@ type LiveTurn = {
   kinds: Map<string, ChatToolKind>;
   /** Title and input by call ID, so CrewKite can tell where an edit lands and what a command runs. */
   calls: Map<string, { title: string; input: unknown }>;
-  /** The policy the adapter launched with. It answers what that policy covers on its own. */
+  /** The policy and grants the adapter launched with. */
   policy: ChatPermissionPolicy;
+  grants: readonly ChatToolKind[];
+  /**
+   * What the adapter answers on its own now: its launch policy, narrowed by any change since. The
+   * controller answers what the thread allows beyond it.
+   */
+  applied: PolicyLimit;
   /** The scratch copy the turn works in: the thread's, or its plan slice's own. */
   scratch: string;
   /** This turn started the person's MCP servers. A policy change mid-turn never answers their calls. */
@@ -599,23 +607,38 @@ export class ChatService {
       flightMode,
       ...(checks ? { checks } : {}),
     });
-    if (payload.permissionPolicy && thread.activeTurnId) {
-      const answer = () => this.answerCovered(task.id);
+    const running = [...this.live.values()].some((live) => live.taskId === task.id);
+    if ((payload.permissionPolicy || payload.flightMode) && running) {
+      const answer = () => this.applyPolicy(task.id);
       if (effects) effects.push(answer);
       else queueMicrotask(answer);
     }
     return { outcome: 'applied' };
   }
 
-  /** Answer every open ask of the running turns that the thread now covers. */
-  private answerCovered(taskId: string) {
+  /**
+   * Bring every running turn of the thread to its policy and flight mode as they are now. Plan
+   * slices and side turns run beside the thread's turn, so each one hears the change. The
+   * adapter narrows what it answers on its own, and every open ask the thread now covers is
+   * answered here. Later asks are read against the thread when they arrive.
+   */
+  private applyPolicy(taskId: string) {
     const thread = this.thread(taskId);
-    // Plan slices run side by side, so every open turn of the thread hears the new policy.
-    for (const [turnId, open] of this.live) {
-      const live = open.taskId === taskId ? this.activeLive(taskId, turnId) : undefined;
-      if (!live) continue;
+    for (const live of [...this.live.values()]) {
+      if (live.taskId !== taskId || live.finished) continue;
+      const applied = limitPolicy(
+        { policy: live.policy, grants: live.grants },
+        launchPolicy(thread, live.role),
+      );
+      if (
+        applied.policy !== live.applied.policy ||
+        applied.grants.join() !== live.applied.grants.join()
+      ) {
+        live.applied = applied;
+        this.call(() => live.handle?.setPermissionPolicy?.(applied.policy, applied.grants));
+      }
       for (const requestId of [...live.permissions.keys()]) {
-        const choice = this.covered(thread, live, requestId);
+        const choice = this.covered(thread, live, requestId, false);
         if (!choice) continue;
         live.permissions.delete(requestId);
         this.call(() => live.handle?.respondPermission(requestId, choice));
@@ -1598,6 +1621,8 @@ export class ChatService {
       kinds: new Map(),
       calls: new Map(),
       policy: 'ask',
+      grants: [],
+      applied: { policy: 'ask', grants: [] },
       scratch: this.scratchDirectory(turn.taskId),
       mcp: false,
       secrets: [],
@@ -1682,6 +1707,8 @@ export class ChatService {
     if (this.closed || live.stopRequested) return stoppedResult;
     const request = this.request(turn);
     live.policy = request.permissionPolicy;
+    live.grants = request.permissionGrants ?? [];
+    live.applied = { policy: live.policy, grants: live.grants };
     live.scratch = request.scratch.directory;
     live.mcp = (request.mcp?.servers.length ?? 0) > 0;
     live.secrets = request.mcp?.secrets ?? [];
@@ -1859,11 +1886,7 @@ export class ChatService {
     const work = join(this.deps.home, 'chat', task.id, 'turns', turn.id);
     mkdirSync(work, { recursive: true, mode: 0o700 });
     if (turn.handoffFrom) this.takeHandoff(task);
-    // Balanced mode answers the safe asks itself, so the adapter sends every ask here whatever
-    // the thread allows.
-    const balanced = writer && thread.flightMode === 'balanced';
-    const permissionPolicy = writer && !balanced ? thread.permissionPolicy : 'ask';
-    const permissionGrants = writer && !balanced ? (thread.permissionGrants ?? []) : [];
+    const { policy: permissionPolicy, grants: permissionGrants } = launchPolicy(thread, turn.role);
     const body = carries
       ? this.packet(turn, {
           from: turn.handoffFrom ?? (asked ? (this.answeredOn(task.id) ?? family) : family),
@@ -2046,7 +2069,7 @@ export class ChatService {
     // The thread is read at ask time, so a mode or policy changed during the turn applies to this
     // ask. Adapters register an ask before they emit it, so this answer finds it.
     if (event.type === 'permission.requested') {
-      const choice = this.covered(this.thread(turn.taskId), live, event.requestId);
+      const choice = this.covered(this.thread(turn.taskId), live, event.requestId, true);
       if (choice) {
         live.permissions.delete(event.requestId);
         const respond = () =>
@@ -2061,12 +2084,18 @@ export class ChatService {
   /**
    * The allow option CrewKite picks for an open ask, or null when the person decides. Balanced
    * answers edits inside the scratch copy and read-only commands, whatever the thread allows.
-   * Otherwise the adapter already applied the policy it launched with, so only a policy changed
-   * since then answers here: allow-edits covers edits inside the scratch copy, allow-all every
-   * ask with an allow option except an edit outside the copy. Network access and asks during
-   * read-only turns always go to the person.
+   * Otherwise a fresh ask the adapter's own policy covers is the adapter's to answer, so only a
+   * thread policy that differs from it answers here. An ask still open after a change is
+   * answered by the thread's policy alone: the adapter left it to the person. allow-edits covers
+   * edits inside the scratch copy, allow-all every ask with an allow option except an edit
+   * outside the copy. Network access and asks during read-only turns always go to the person.
    */
-  private covered(thread: ChatThread, live: LiveTurn, requestId: string): string | null {
+  private covered(
+    thread: ChatThread,
+    live: LiveTurn,
+    requestId: string,
+    fresh: boolean,
+  ): string | null {
     const open = live.permissions.get(requestId);
     const allow =
       open?.options.find((option) => option.kind === 'allow-once') ??
@@ -2074,7 +2103,7 @@ export class ChatService {
     if (!open || !allow || !writesScratch(live.role)) return null;
     const balanced = thread.flightMode === 'balanced';
     const policy = thread.permissionPolicy;
-    if (!balanced && policy === live.policy) return null;
+    if (!balanced && fresh && policy === live.applied.policy) return null;
     const call = live.calls.get(open.callId ?? '');
     const kind = live.kinds.get(open.callId ?? '');
     // A call the kinds do not name may be a server's. Its policy was cut at launch and a looser
@@ -3929,6 +3958,16 @@ function statedFindings(text: string): number | null {
     if (match) found = Number(match[1]);
   }
   return found;
+}
+
+/**
+ * The policy a turn's adapter launches with. Balanced answers the safe asks in the controller, so
+ * its adapter sends every ask here, and a reader never sees what the thread allowed.
+ */
+function launchPolicy(thread: ChatThread, role: ChatTurn['role']): PolicyLimit {
+  return writesScratch(role) && thread.flightMode !== 'balanced'
+    ? { policy: thread.permissionPolicy, grants: thread.permissionGrants ?? [] }
+    : { policy: 'ask', grants: [] };
 }
 
 /**
