@@ -263,9 +263,10 @@ function entry(
     defaultModel: connected ? (defaultModel ?? null) : null,
     remaining: windows,
     readAt: readAt(input, family),
-    // The quota reader runs without Connect, as the Google reader does, so the rail can show
-    // allowance for a family the composer cannot use yet. A percent from before a reset says
-    // nothing about the account now, so it does not count.
+    // A family whose quota was read before Connect shows its allowance on the rail while the
+    // composer cannot use it yet. The Google reader waits for Connect, and the rail draws no
+    // Google bars before it. A percent from before a reset says nothing about the account now,
+    // so it does not count.
     needsConnect: !connected && windows.some((window) => window.percent !== null),
     lastTurnStats: lastTurnStats(input, family),
     accepts: null,

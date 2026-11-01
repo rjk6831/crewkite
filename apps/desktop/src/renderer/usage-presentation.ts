@@ -511,11 +511,12 @@ export function railFamilies(
     );
     const tightest = tightestAllowance(entry, model);
     // A provider that is not connected and has read nothing keeps its row with Connect, so the
-    // rail shows one gauge per provider. It has no bar to draw yet.
+    // rail shows one gauge per provider. It has no bar to draw yet. Google reads its quota only
+    // once it is connected, so until then its row is Connect alone, whatever an older read left.
     const unread =
       entry.family !== 'local' &&
       !entry.connected &&
-      !entry.remaining.some((window) => window.percent !== null);
+      (entry.family === 'google' || !entry.remaining.some((window) => window.percent !== null));
     const bars: RailBar[] =
       unlimited || setUp || unread
         ? []

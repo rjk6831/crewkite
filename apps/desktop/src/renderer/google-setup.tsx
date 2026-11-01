@@ -362,11 +362,14 @@ export function GoogleSetup({
     : installation?.state === 'idle'
       ? 'Not installed'
       : 'Unknown';
-  const quotaAvailable = reader?.lastObservedAt
-    ? 'Reported'
-    : reader?.available
-      ? 'Reader ready, not read'
-      : 'Unknown';
+  // The quota read waits for Connect.
+  const quotaAvailable = !ready
+    ? 'Read after Connect'
+    : reader?.lastObservedAt
+      ? 'Reported'
+      : reader?.available
+        ? 'Reader ready, not read'
+        : 'Unknown';
 
   return (
     <section className="card view-stack" aria-labelledby="google-setup-title">

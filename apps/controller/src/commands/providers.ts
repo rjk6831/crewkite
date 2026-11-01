@@ -570,6 +570,15 @@ export class ProviderCommands {
     } finally {
       runtime.resolve(CommandResultSchema.parse(result));
     }
+    // The quota read waits for Connect. The step that makes the setup ready starts the first one,
+    // once this step's runtime has let go of the Google journal. A harness that drives each step
+    // leaves registration off and reads when it chooses, as it does for the launch steps.
+    if (
+      this.options.registerGoogleAcp &&
+      result.outcome === 'applied' &&
+      this.store.googleAcpSetup().state === 'ready'
+    )
+      void runtime.promise.then(() => this.refreshGoogleUsage('connect')).catch(() => {});
   }
 
   /**

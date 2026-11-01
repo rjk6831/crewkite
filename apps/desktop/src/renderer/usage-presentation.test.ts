@@ -365,7 +365,7 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     },
     {
       claim: 'a family with one window gets one bar, and an unconnected reader asks for Connect',
-      entry: entry('google', [window('pool-daily', 'pool-daily', 99, 600)], {
+      entry: entry('openai', [window('pool-daily', 'pool-daily', 99, 600)], {
         connected: false,
         needsConnect: true,
         models: [],
@@ -373,6 +373,17 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
         readAt: at(-125),
       }),
       expect: { bars: ['99% left'], needsConnect: true, read: 'read 2 h ago' },
+    },
+    {
+      claim: 'Google before Connect shows Connect and no bars, even with an older read',
+      entry: entry('google', [window('pool-daily', 'pool-daily', 99, 600)], {
+        connected: false,
+        needsConnect: true,
+        models: [],
+        defaultModel: null,
+        readAt: at(-125),
+      }),
+      expect: { bars: [], needsConnect: true },
     },
     {
       claim: 'Local has no bars, reads No limits and carries the hardware line',
