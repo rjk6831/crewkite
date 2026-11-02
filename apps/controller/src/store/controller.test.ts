@@ -8604,6 +8604,8 @@ test('google quota authority survives retries and restart while sharing one oper
       groups: number[];
     };
   };
+  // The OpenAI card's sign-in connects the device. Quota reads run only after it.
+  openController.store.transaction(() => openController.store.markConnectedOnce('openai'));
   const manualRead = metadata.command('ObserveUsage', { family: 'openai' }, 0);
   const firstRead = await openController.execute(manualRead, 'local-owner');
   assert.equal(firstRead.outcome, 'applied');
