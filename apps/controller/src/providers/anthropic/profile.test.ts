@@ -34,7 +34,7 @@ test('the writer profiles keep their exact pinned builds while chat takes a vers
   assert.equal(repository.family === 'openai' && repository.clientVersion, '0.163.0');
   assert.equal(anthropic.family === 'anthropic' && anthropic.clientVersion, '2.1.302');
   assert.equal(CLIENT_VERSIONS.openai.tested, '0.163.0');
-  assert.equal(CLIENT_VERSIONS.anthropic.tested, '2.1.302');
+  assert.equal(CLIENT_VERSIONS.anthropic.tested, '2.1.316');
   // With no HOME, the chat path refuses before it searches and says why in words. A computer
   // the preview does not run on gets the platform line; the others get the home line.
   const allowed = platformGate('openai').allowed;

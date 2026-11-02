@@ -1,4 +1,4 @@
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
   closeSync,
@@ -489,6 +489,38 @@ export class Store {
     this.db
       .prepare('INSERT INTO receipts(command_key,request_hash,principal,result) VALUES (?,?,?,?)')
       .run(key, hash, principal, canonicalJson(CommandResultSchema.parse(result)));
+  }
+
+  /**
+   * Whether the person connected this provider on this device at least once. Reads that run on
+   * their own, such as the quota read at launch, wait for it, so a provider nobody connected never
+   * starts a client. The mark is a row in receipts and is never removed.
+   */
+  hasConnectedOnce(provider: Route['family']): boolean {
+    return !!this.db
+      .prepare('SELECT 1 FROM receipts WHERE command_key=?')
+      .get(`connected-once:${provider}`);
+  }
+
+  /** Sign-out or Disconnect ends it, so the next launch asks again. */
+  forgetConnectedOnce(provider: Route['family']) {
+    if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
+    this.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`connected-once:${provider}`);
+  }
+
+  markConnectedOnce(provider: Route['family']) {
+    if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
+    const key = `connected-once:${provider}`;
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO receipts(command_key,request_hash,principal,result) VALUES (?,?,?,?)',
+      )
+      .run(
+        key,
+        createHash('sha256').update(key).digest('hex'),
+        'local-owner',
+        canonicalJson({ outcome: 'applied' }),
+      );
   }
 
   append(event: Omit<Event, 'cursor'>): Event {

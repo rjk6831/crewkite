@@ -40,11 +40,57 @@ export type ThreadDefaults = {
 };
 type Store = Pick<Storage, 'getItem' | 'setItem'>;
 
-export const permissionPolicies: { id: ChatPermissionPolicy; label: string }[] = [
-  { id: 'ask', label: 'Ask each time' },
-  { id: 'allow-edits', label: 'Allow edits' },
-  { id: 'allow-all', label: 'Allow all' },
+export const permissionPolicies: { id: ChatPermissionPolicy; label: string; title: string }[] = [
+  {
+    id: 'ask',
+    label: 'Ask each time',
+    title: 'Every edit and every command asks first. Allow for this thread covers that kind later.',
+  },
+  {
+    id: 'allow-edits',
+    label: 'Allow edits',
+    title: 'Edits inside the scratch copy run without asking. Commands still ask.',
+  },
+  {
+    id: 'allow-all',
+    label: 'Allow all',
+    title: 'Commands and edits inside the scratch copy run without asking. Edits outside it ask.',
+  },
 ];
+
+export type InfoText = { name: string; text: string };
+
+/** The fuller text behind the info mark beside each flight mode control. */
+export const flightModeInfo: Record<ChatFlightMode, InfoText> = {
+  manual: {
+    name: 'Manual',
+    text: 'Nothing runs after your message except the builder. A plan waits for you to run each slice. The Permissions policy decides what asks.',
+  },
+  balanced: {
+    name: 'Balanced',
+    text: 'The reviewer, up to two fixes and the challenger run after each builder turn. A plan waits for Run plan. Read-only commands and edits inside the scratch copy run without asking. Everything else asks, whatever the policy says.',
+  },
+  glide: {
+    name: 'Glide',
+    text: 'The chain runs to the end and a plan starts at once. Only what the Permissions policy does not cover asks. Automatic handoff turns on.',
+  },
+};
+
+/** The fuller text behind the info mark beside each Permissions control. */
+export const permissionInfo: Record<ChatPermissionPolicy, InfoText> = {
+  ask: {
+    name: 'Ask each time',
+    text: 'The client asks before every edit and every command, and you answer each one. Allow for this thread covers that kind of action in later turns. Choosing this again clears those grants.',
+  },
+  'allow-edits': {
+    name: 'Allow edits',
+    text: 'An edit whose files all lie inside the scratch copy runs without asking. Commands, network access and edits outside the copy ask.',
+  },
+  'allow-all': {
+    name: 'Allow all',
+    text: 'Every command and every edit inside the scratch copy runs without asking. An edit outside the copy asks. Network access asks under OpenAI. Reviewer, advisor and challenger turns ignore this setting.',
+  },
+};
 
 export const handoffModes: { id: ChatHandoffMode; label: string; title: string }[] = [
   {

@@ -5,6 +5,7 @@ import {
   classifyGoogleFailure,
   GOOGLE_CONNECT_LIMIT_MS,
   GOOGLE_READ_TRIES,
+  googleClientStatus,
   googleConnectButton,
   googleConnectError,
   googleSetupProgress,
@@ -263,7 +264,7 @@ test('Google setup clears an unknown step once and retries a blocked one', async
   );
 });
 
-test('Google connect progress names the step and counts the download', () => {
+test('Google connect progress follows the real work: download, unpack, then each file checked', () => {
   const operationId = 'cmd_01M69BW1J2CTWNBH0QKA4P08Y5';
   const installing = (progress: NonNullable<GoogleState['googleAcpInstall']>['progress']) => ({
     googleAcpInstall: {
@@ -300,11 +301,45 @@ test('Google connect progress names the step and counts the download', () => {
     )?.detail,
     'Unpacking the client: 4%, 17.1 MB of 383 MB.',
   );
-  const verify = googleSetupProgress(
-    installing({ step: 'verify', bytes: 401_226_992, totalBytes: 401_226_992 }),
+  // Checks report the files copied and hashed. The bar moves with them and with the elapsed time,
+  // and stays under the end of the step while the signature checks run.
+  const first = googleSetupProgress(
+    installing({ step: 'verify', bytes: 0, totalBytes: 2 }),
     'install',
+    0,
   );
-  assert.equal(verify?.detail, 'Checking the Google signatures on the client.');
+  const second = googleSetupProgress(
+    installing({ step: 'verify', bytes: 1, totalBytes: 2 }),
+    'install',
+    12_000,
+  );
+  const signatures = googleSetupProgress(
+    installing({ step: 'verify', bytes: 2, totalBytes: 2 }),
+    'install',
+    90_000,
+  );
+  assert.equal(first?.step, 'verify');
+  assert.equal(first?.detail, 'Checking file 1 of 2. 0 s elapsed.');
+  assert.equal(second?.detail, 'Checking file 2 of 2. 12 s elapsed.');
+  assert.equal(
+    signatures?.detail,
+    'Checking the Google signatures on both files. 1 min 30 s elapsed.',
+  );
+  assert.ok(first && second && signatures);
+  assert.ok(first.percent < second.percent && second.percent < signatures.percent);
+  assert.ok(signatures.percent < 65);
+  assert.equal(
+    googleClientStatus(installing({ step: 'extract', bytes: 1, totalBytes: 2 })),
+    'Installing',
+  );
+  assert.equal(
+    googleClientStatus(installing({ step: 'verify', bytes: 1, totalBytes: 2 })),
+    'Checking',
+  );
+  assert.equal(
+    googleClientStatus({ googleAcpInstall: null, googleAcpSetup: setup(0, 'uninitialized') }),
+    'Not installed',
+  );
   // After the install the controller's own setup state names the step.
   const signIn = googleSetupProgress(
     { googleAcpInstall: null, googleAcpSetup: setup(3, 'authenticating', { client, operationId }) },

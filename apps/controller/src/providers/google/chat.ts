@@ -25,6 +25,7 @@ import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { withGitCeiling } from '../../host/git-ceiling.ts';
 import type { Schedule } from '../../host/worker.ts';
+import { capabilityNames, recordClient } from '../client-record.ts';
 import {
   type AcpConnection,
   AcpError,
@@ -124,8 +125,10 @@ const permissionRequest = z.object({
 const flag = z.boolean().optional().catch(undefined);
 const initialized = z.object({
   protocolVersion: z.number().optional().catch(undefined),
+  // Kept whole on the client's record, so Settings can list what this build declares.
+  configOptions: z.array(z.unknown()).max(64).optional().catch(undefined),
   agentCapabilities: z
-    .object({
+    .looseObject({
       loadSession: flag,
       promptCapabilities: z
         .object({ image: flag, audio: flag, embeddedContext: flag })
@@ -1154,6 +1157,7 @@ export function googleChatAdapter(deps: {
             ? (options.find((option) => option.kind === 'allow-thread') ?? allow)
             : undefined;
         const automatic = refuses ? reject : (granted ?? permitted);
+        const by = refuses ? 'read-only' : granted ? 'thread-grant' : 'policy';
         const requestId = `${turnId}:permission:${++permissionCount}`;
         const detail = permissionDetail(call.rawInput, call.paths, scratch);
         if (!automatic)
@@ -1178,11 +1182,22 @@ export function googleChatAdapter(deps: {
           detail,
           options,
           ...(call.deletes ? { deletes: true as const } : {}),
+          kind: call.kind,
+          // A grant covers the scratch copy only, so the card says why this one asks.
+          ...(!automatic && call.outside && limit.grants.includes(call.kind)
+            ? { reason: 'Asked because it touches paths outside the scratch copy.' }
+            : {}),
         });
         if (automatic) {
           if (refuses) call.denied = true;
           reply(live, id, { outcome: { outcome: 'selected', optionId: automatic.id } });
-          send({ type: 'permission.resolved', turnId, requestId, choice: automatic.id });
+          send({
+            type: 'permission.resolved',
+            turnId,
+            requestId,
+            choice: automatic.id,
+            answeredBy: by,
+          });
         }
       }
 
@@ -1248,6 +1263,15 @@ export function googleChatAdapter(deps: {
                 message: 'The Google client speaks a protocol version this app does not.',
               }),
             );
+          recordClient('google', {
+            capabilities: capabilityNames(handshake.agentCapabilities),
+            kept: {
+              initialize: {
+                agentCapabilities: handshake.agentCapabilities ?? null,
+                configOptions: handshake.configOptions ?? [],
+              },
+            },
+          });
           const declared = handshake.agentCapabilities?.promptCapabilities;
           const capabilities: GooglePromptCapabilities = {
             image: declared?.image === true,
@@ -1349,6 +1373,7 @@ export function googleChatAdapter(deps: {
           };
           const setup = launch?.configuration;
           if (setup) {
+            recordClient('google', { kept: { models: [...setup.model.supported].slice(0, 64) } });
             await setModel(request.selection.model, setup.model.optionId);
             const effort = request.selection.effort;
             if (setup.thoughtLevel && effort !== 'default') {

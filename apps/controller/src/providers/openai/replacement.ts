@@ -19,6 +19,7 @@ import {
   type OpenAiUsageHook,
 } from './discovery.ts';
 import { type NativeLaunch, type NativeTranscript, startNativeTask } from './native-discovery.ts';
+import { READ_ONLY_SANDBOX, turnInterruptParams } from './protocol.ts';
 
 const MAX_CONTENT = 65_536;
 // The client repeats submitted text when its user item starts and completes, and JSON escaping
@@ -446,7 +447,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
         cwd: this.plan.directory,
         approvalPolicy: 'on-request',
         approvalsReviewer: 'user',
-        sandboxPolicy: { type: 'readOnly', networkAccess: false },
+        sandboxPolicy: READ_ONLY_SANDBOX,
         input: [{ type: 'text', text: this.codec.text }],
         outputSchema: this.codec.outputSchema,
       },
@@ -804,7 +805,7 @@ export class StructuredTranscript<T extends Record<string, unknown>> {
     return encode({
       id: 12,
       method: 'turn/interrupt',
-      params: { threadId: this.threadId, turnId: this.turnId },
+      params: turnInterruptParams(this.threadId, this.turnId),
     });
   }
   finish() {

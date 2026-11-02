@@ -1,6 +1,7 @@
 import type { DesktopCommand } from '@crewkite/client';
 import type { CommandResult, LocalSetup } from '@crewkite/contracts';
 import { formatSize } from './format-size.ts';
+import { localResultLine } from './source.ts';
 
 /** Why the saved setup is where it is. The card and the rail say the same sentence. */
 export const setupReasons: Record<NonNullable<LocalSetup['reason']>, string> = {
@@ -238,7 +239,7 @@ export async function connectInPlace({
     if (!applied(started))
       return {
         kind: 'blocked',
-        message: started.next ?? started.reason ?? 'Local did not connect.',
+        message: localResultLine(started, 'Local did not connect.'),
       };
   }
   let discovered = false;
@@ -278,7 +279,7 @@ export async function connectInPlace({
       if (!applied(read))
         return {
           kind: 'blocked',
-          message: read.next ?? read.reason ?? 'The models were not read.',
+          message: localResultLine(read, 'The models were not read.'),
         };
     }
   }
@@ -470,4 +471,22 @@ export async function observeOpenConnection(
       payload: { consent: 'explicit' },
     }),
   );
+}
+
+/** How often a launch reconnect tries again while the runtime is not running. */
+export const LAUNCH_RETRY_MS = 5_000;
+
+/**
+ * Whether a launch reconnects Local now. Only a device that connected Local once reconnects, with
+ * the saved endpoint. With the runtime's auth on, only a remembered token reconnects, so no token
+ * window opens at launch. With auth off the endpoint alone is enough.
+ */
+export function launchReconnect(
+  setup: LocalSetup | null | undefined,
+  connectedOnce: boolean,
+  tokenRemembered: boolean,
+): boolean {
+  if (!connectedOnce || !setup?.endpoint || setup.connected) return false;
+  if (setup.operation || setup.generation !== 'idle') return false;
+  return setup.authMode === 'none' || tokenRemembered;
 }

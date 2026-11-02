@@ -3,8 +3,9 @@ import type { Workspace } from '../source.ts';
 
 type Family = 'openai' | 'anthropic' | 'google';
 const applied = (outcome: string) => outcome === 'applied' || outcome === 'already-applied';
+// The controller's reason codes are for the trace. The card shows the next step in plain words.
 const refusal = (result: { outcome: string; reason?: string; next?: string }) =>
-  [result.reason ?? result.outcome, result.next].filter(Boolean).join('. ');
+  result.next ?? 'That did not go through. Try again.';
 
 /**
  * The quota and sign-in commands the provider cards send, with the status line each one leaves

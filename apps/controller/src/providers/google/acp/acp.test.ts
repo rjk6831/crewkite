@@ -525,6 +525,7 @@ test('the acp writer binds an imported client and observed configuration before 
         );
         let clock = 0;
         let closes = 0;
+        let spawned = 0;
         const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
         let capture = true;
         const ready = Promise.withResolvers<void>();
@@ -568,20 +569,28 @@ test('the acp writer binds an imported client and observed configuration before 
                   assert(
                     args.includes(`=${googleAcpDeveloperIdRequirement(row.client.signerTeamId)}`),
                   );
-                  // A held child ignores TERM and leaves only on the kill.
-                  const child = held
-                    ? spawnCheckChild(
-                        process.execPath,
-                        [
-                          '-e',
-                          "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 10000); process.stdout.write('ready\\n');",
-                        ],
-                        options,
-                      )
-                    : spawnCheckChild(row.client.executable, [], options);
-                  if (child.pid) row.groups.push(child.pid);
+                  // A held child ignores TERM and leaves only on the kill. Both files are
+                  // checked at once, so only the first check is held; the second one ends
+                  // refused at once and its reason comes after the first file's.
+                  const holding = held && spawned++ === 0;
+                  const child =
+                    held && !holding
+                      ? spawnCheckChild(process.execPath, ['-e', 'process.exit(1)'], options)
+                      : holding
+                        ? spawnCheckChild(
+                            process.execPath,
+                            [
+                              '-e',
+                              "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 10000); process.stdout.write('ready\\n');",
+                            ],
+                            options,
+                          )
+                        : spawnCheckChild(row.client.executable, [], options);
+                  // The quick second check has left before the cutoff, so the row kills only
+                  // the groups that can still be present.
+                  if (child.pid && (holding || !held)) row.groups.push(child.pid);
                   exits.push(new Promise((resolve) => child.once('close', resolve)));
-                  if (held) {
+                  if (holding) {
                     child.stdout.once('data', () => ready.resolve());
                     child.once('exit', () => onExit?.());
                     child.once('error', ready.reject);
@@ -593,7 +602,7 @@ test('the acp writer binds an imported client and observed configuration before 
                     });
                   }
                   // Each file has its own window. The bundle row spends the second one.
-                  else
+                  else if (!held)
                     child.once('close', () => {
                       // A first check after the unpack can take seconds. Five each used to
                       // spend the one shared window.
@@ -2330,7 +2339,7 @@ setInterval(() => {}, 1000);
   output.destroy();
 });
 
-test('a controller that registers the Google client sets it up at launch and leaves the sign-in to the person', async () => {
+test('a registered Google client starts only after the person connects it, then sets up at each launch and leaves the sign-in to the person', async () => {
   const f = fixture('complete');
   const started: string[] = [];
   const clock = createTestClock();
@@ -2367,8 +2376,8 @@ test('a controller that registers the Google client sets it up at launch and lea
     assert.deepEqual(started, []);
     assert.deepEqual(steps(controller), []);
 
-    // Acknowledging Google's terms runs the launch steps at once. A fresh client initializes on
-    // its own and stops before the browser sign-in, which is the person's choice.
+    // Acknowledging Google's terms connects nothing. Connect is the person's initialize, which
+    // stops before the browser sign-in. From then on the launch steps run on their own.
     const acknowledged = await controller.execute(
       CommandSchema.parse({
         protocol: 1,
@@ -2381,6 +2390,21 @@ test('a controller that registers the Google client sets it up at launch and lea
       'local-owner',
     );
     assert.equal(acknowledged.outcome, 'applied');
+    await controller.googleAcpPreparation;
+    assert.deepEqual(started, []);
+    assert.equal(controller.store.googleAcpSetup().state, 'uninitialized');
+    const connect = await controller.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: id('cmd'),
+        actor: { id: 'terminal', kind: 'cli' },
+        command: 'InitializeGoogleAcp',
+        expectedRevision: controller.store.googleAcpSetup().revision,
+        payload: { profileId: 'google-acp-v1', consent: 'explicit' },
+      }),
+      'local-owner',
+    );
+    assert.notEqual(connect.outcome, 'denied');
     await controller.googleAcpPreparation;
     setup = controller.store.googleAcpSetup();
     assert.equal(setup.state, 'authentication-required');
@@ -2470,6 +2494,7 @@ test('an initialize with no sign-in method retries initialize and a cancelled si
       f.dispose();
     });
     await command('AcknowledgeGoogleTerms', { textVersion: GOOGLE_TERMS_VERSION });
+    await command('InitializeGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' });
     await controller.googleAcpPreparation;
     return { command, setup: () => controller.store.googleAcpSetup() };
   };

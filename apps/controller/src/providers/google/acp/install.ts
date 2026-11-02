@@ -56,7 +56,10 @@ export type AcpInstallResult = (
       client: null;
     }
 ) & { cleanupReason?: 'temporary-cleanup-failed' };
-/** How far the running install is. Download and extract count bytes; verify counts none. */
+/**
+ * How far the running install is. Download and extract count bytes. Verify counts the two client
+ * files copied and hashed, out of two, and holds at two while both signature checks run.
+ */
 export type AcpInstallProgress = {
   step: 'download' | 'extract' | 'verify';
   bytes: number;
@@ -354,7 +357,7 @@ export async function installGoogleAcp(
       validateAcpDirectory(options.home);
       if (existsSync(join(options.home, 'providers/google-acp-v1/pin.json'))) {
         try {
-          const client = await readGoogleAcpPinAsync(options.home);
+          const client = await readGoogleAcpPinAsync(options.home, true);
           return client.version === '1.4.0' &&
             client.signerTeamId === 'EQHXZ8M8AV' &&
             client.sha256 === expected.files[0]?.sha256 &&
@@ -429,13 +432,14 @@ export async function installGoogleAcp(
         { flag: 'wx', mode: 0o600 },
       );
       signal.throwIfAborted();
-      report('verify', inflated, inflated);
+      report('verify', 0, expected.files.length);
       const lifecycle = dependencies.import?.lifecycle;
       const verify = dependencies.import?.verifySignature;
       const imported = await importGoogleAcp(
         { home: options.home, consent: 'explicit', installerStaging: temporary },
         {
           ...dependencies.import,
+          onCheck: (done) => report('verify', done, expected.files.length),
           ...(verify
             ? {
                 verifySignature: async (input: Parameters<typeof verify>[0]) => {

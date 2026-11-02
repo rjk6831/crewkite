@@ -215,7 +215,9 @@ test('a usage read maps each reported limit and ignores what it does not show', 
   for (const [version, accepted] of [
     ['2.1.302', true],
     ['2.1.340', true],
-    ['2.1.0', true],
+    // The first build with --permission-prompts and --restricted.
+    ['2.1.259', true],
+    ['2.1.258', false],
     ['2.0.99', false],
     ['3.0.0', false],
     ['unknown', false],
@@ -745,14 +747,14 @@ test('an Anthropic quota read runs on any build in range and refuses one outside
   assert.equal(ready?.clientVersion, '2.1.340');
   assert.equal(
     ready?.client?.message,
-    'Claude Code 2.1.340 found. Tested with 2.1.302; newer builds usually work.',
+    'Claude Code 2.1.340 found. Checked with 2.1.316 on 3 Nov 2026; a newer build runs while its flags and replies match what CrewKite sends.',
   );
   assert.equal((await newer.controller.execute(newer.command(), 'local-owner')).outcome, 'applied');
   assert.equal(newer.calls(), 1);
   assert.deepEqual(newer.status()?.reading?.windows, reported);
 
   const line =
-    'Claude Code 1.9.0 is older than the minimum 2.1.0. Update it with claude update, then press Check again.';
+    'Claude Code 1.9.0 is older than the minimum 2.1.259. Update it with claude update, then press Check again.';
   const older = refreshFixture(t, 'success', () => ({ status: found('1.9.0') }));
   const refused = older.status();
   assert.equal(refused?.available, false);

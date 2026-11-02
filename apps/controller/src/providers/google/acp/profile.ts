@@ -9,7 +9,7 @@ import {
   readSync,
   type Stats,
 } from 'node:fs';
-import { lstat, open } from 'node:fs/promises';
+import { lstat, open, unlink } from 'node:fs/promises';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join, parse, resolve } from 'node:path';
 import {
@@ -20,6 +20,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
+import { DIGEST_PIECE_BYTES, fileDigest, fileDigestSync } from '../../file-digest.ts';
 
 const identifier = z
   .string()
@@ -151,7 +152,7 @@ function parseAcpClientIdentity(client: AcpClientIdentity): AcpClientIdentity {
 
 const harnessPath = (executable: string) => join(dirname(executable), 'localharness_external');
 
-/** Spawn keeps the default full hash. Only profile resolution reuses a matching digest. */
+/** With reuse true, a file whose identity matches the last full hash is not read again. */
 export function validateAcpClientIdentity(
   client: AcpClientIdentity,
   reuse = false,
@@ -170,10 +171,11 @@ export function validateAcpClientIdentity(
 /** The same full check, read in pieces that let other work run between them. */
 export async function validateAcpClientIdentityAsync(
   client: AcpClientIdentity,
+  reuse = false,
 ): Promise<AcpClientIdentity> {
   const parsed = parseAcpClientIdentity(client);
   if (
-    (await hashAcpPrivateFileAsync(parsed.executable, AcpServerMaximumBytes, true)) !==
+    (await hashAcpPrivateFileAsync(parsed.executable, AcpServerMaximumBytes, true, reuse)) !==
     parsed.sha256
   )
     throw new Error('Managed executable changed.');
@@ -182,6 +184,7 @@ export async function validateAcpClientIdentityAsync(
       harnessPath(parsed.executable),
       AcpHarnessMaximumBytes,
       true,
+      reuse,
     )) !== parsed.harnessSha256
   )
     throw new Error('Managed harness changed.');
@@ -287,7 +290,7 @@ function checkPrivateFileHeld(before: Stats, after: Stats, trailing: number, cur
  * it, held the event loop for seconds, and every socket in the controller waited. Reads of large
  * files go in pieces of this size, which take a few milliseconds each.
  */
-export const ACP_READ_PIECE_BYTES = 8 * 1024 * 1024;
+export const ACP_READ_PIECE_BYTES = DIGEST_PIECE_BYTES;
 
 export function readAcpPrivateFile(path: string, maximum: number, executable = false): Buffer {
   validateAcpDirectory(dirname(path));
@@ -311,90 +314,14 @@ export function readAcpPrivateFile(path: string, maximum: number, executable = f
   }
 }
 
-/** The sha256 of a private file, read with the same checks as `readAcpPrivateFile`. */
-function digestAcpPrivateFile(path: string, maximum: number, executable: boolean): string {
+// Profile resolution runs for every ACP notification and snapshot, and every ACP launch checks the
+// bundle again. The shared digest cache answers a matching file identity without reading the
+// files. The private file checks run on every call, cache or not, since they are cheap and a
+// caller can ask with a different size limit. The digest itself reads with no-follow and checks
+// that the file kept its identity from open to close.
+function checkedAcpPrivateFile(path: string, maximum: number, executable: boolean) {
   validateAcpDirectory(dirname(path));
-  const descriptor = openSync(path, privateFlags);
-  try {
-    const before = fstatSync(descriptor);
-    checkPrivateFile(before, maximum, executable);
-    const hash = createHash('sha256');
-    const piece = Buffer.allocUnsafe(Math.min(before.size, ACP_READ_PIECE_BYTES));
-    let offset = 0;
-    while (offset < before.size) {
-      const count = readSync(
-        descriptor,
-        piece,
-        0,
-        Math.min(piece.length, before.size - offset),
-        null,
-      );
-      if (count === 0) throw new Error('Private file changed while reading.');
-      hash.update(piece.subarray(0, count));
-      offset += count;
-    }
-    const after = fstatSync(descriptor);
-    const trailing = readSync(descriptor, Buffer.alloc(1), 0, 1, null);
-    checkPrivateFileHeld(before, after, trailing, lstatSync(path));
-    return hash.digest('hex');
-  } finally {
-    closeSync(descriptor);
-  }
-}
-
-/** The same digest, one awaited piece at a time, so sockets and timers run between pieces. */
-async function digestAcpPrivateFileAsync(
-  path: string,
-  maximum: number,
-  executable: boolean,
-): Promise<string> {
-  validateAcpDirectory(dirname(path));
-  const file = await open(path, privateFlags);
-  try {
-    const before = await file.stat();
-    checkPrivateFile(before, maximum, executable);
-    const hash = createHash('sha256');
-    const piece = Buffer.allocUnsafe(Math.min(before.size, ACP_READ_PIECE_BYTES));
-    let offset = 0;
-    while (offset < before.size) {
-      const { bytesRead } = await file.read(
-        piece,
-        0,
-        Math.min(piece.length, before.size - offset),
-        null,
-      );
-      if (bytesRead === 0) throw new Error('Private file changed while reading.');
-      hash.update(piece.subarray(0, bytesRead));
-      offset += bytesRead;
-    }
-    const after = await file.stat();
-    const { bytesRead: trailing } = await file.read(Buffer.alloc(1), 0, 1, null);
-    checkPrivateFileHeld(before, after, trailing, await lstat(path));
-    return hash.digest('hex');
-  } finally {
-    await file.close();
-  }
-}
-
-// Profile resolution runs for every ACP notification and snapshot, and the
-// managed bundle is about 400 MB. Hashing it each time stalls the event loop.
-// A write, chmod, link or replacement changes the inode or ctime, so matching
-// metadata reuses the last full digest.
-// shortcut: a filesystem with coarse timestamps could hide a same-size rewrite
-// inside one tick. Upgrade: skip reuse while ctime is within two seconds of the hash.
-const digests = new Map<string, { key: string; sha256: string }>();
-function digestKey(path: string, maximum: number, executable: boolean) {
-  const state = lstatSync(path, { bigint: true });
-  return [
-    maximum,
-    executable,
-    state.dev,
-    state.ino,
-    state.size,
-    state.mtimeNs,
-    state.ctimeNs,
-    state.mode,
-  ].join(':');
+  checkPrivateFile(lstatSync(path), maximum, executable);
 }
 
 export function hashAcpPrivateFile(
@@ -403,26 +330,89 @@ export function hashAcpPrivateFile(
   executable = false,
   reuse = false,
 ): string {
-  validateAcpDirectory(dirname(path));
-  const key = digestKey(path, maximum, executable);
-  const known = digests.get(path);
-  if (reuse && known?.key === key) return known.sha256;
-  const sha256 = digestAcpPrivateFile(path, maximum, executable);
-  if (digestKey(path, maximum, executable) === key) digests.set(path, { key, sha256 });
-  return sha256;
+  checkedAcpPrivateFile(path, maximum, executable);
+  return fileDigestSync(path, { reuse });
 }
 
-/** A full hash that never reuses a digest. It leaves one behind for profile resolution. */
+/**
+ * The same digest for callers that can wait. A file above 16 MB is hashed in a worker thread.
+ * With reuse true, a file whose identity matches the last full hash is not read again.
+ */
 export async function hashAcpPrivateFileAsync(
   path: string,
   maximum: number,
   executable = false,
+  reuse = false,
 ): Promise<string> {
-  validateAcpDirectory(dirname(path));
-  const key = digestKey(path, maximum, executable);
-  const sha256 = await digestAcpPrivateFileAsync(path, maximum, executable);
-  if (digestKey(path, maximum, executable) === key) digests.set(path, { key, sha256 });
-  return sha256;
+  checkedAcpPrivateFile(path, maximum, executable);
+  return fileDigest(path, { reuse });
+}
+
+export type AcpHash = { update(chunk: Uint8Array): unknown; digest(encoding: 'hex'): string };
+
+/**
+ * Copies a staged file into the managed folder in pieces, hashing the bytes it writes, so one read
+ * gives both the source digest and the copy. A source that is not the expected file, changes while
+ * it is read, or hashes to another digest leaves no copy behind.
+ */
+export async function copyAcpPrivateFile(
+  source: string,
+  path: string,
+  expected: { maximum: number; mode: number; sha256: string },
+  create: () => AcpHash = () => createHash('sha256'),
+): Promise<void> {
+  validateAcpDirectory(dirname(source));
+  const input = await open(source, privateFlags);
+  try {
+    const before = await input.stat();
+    checkPrivateFile(before, expected.maximum, false);
+    const output = await open(
+      path,
+      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    );
+    let complete = false;
+    try {
+      const hash = create();
+      const piece = Buffer.allocUnsafe(Math.min(before.size, ACP_READ_PIECE_BYTES));
+      let offset = 0;
+      while (offset < before.size) {
+        const { bytesRead } = await input.read(
+          piece,
+          0,
+          Math.min(piece.length, before.size - offset),
+          null,
+        );
+        if (bytesRead === 0) throw new Error('Private file changed while reading.');
+        hash.update(piece.subarray(0, bytesRead));
+        let written = 0;
+        while (written < bytesRead)
+          written += (await output.write(piece, written, bytesRead - written)).bytesWritten;
+        offset += bytesRead;
+      }
+      const after = await input.stat();
+      const { bytesRead: trailing } = await input.read(Buffer.alloc(1), 0, 1, null);
+      checkPrivateFileHeld(before, after, trailing, await lstat(source));
+      if (hash.digest('hex') !== expected.sha256) throw new Error('Invalid private file.');
+      await output.chmod(expected.mode);
+      await output.sync();
+      complete = true;
+    } finally {
+      await output.close();
+      if (!complete) await unlink(path).catch(() => {});
+    }
+  } finally {
+    await input.close();
+  }
+  const directory = await open(
+    dirname(path),
+    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
+  );
+  try {
+    await directory.sync();
+  } finally {
+    await directory.close();
+  }
 }
 
 /** The pinned identity, checked against its receipts and layout. The files are not hashed yet. */
@@ -457,8 +447,11 @@ export function readGoogleAcpPin(home: string, reuse = false): AcpClientIdentity
 }
 
 /** The full check of `readGoogleAcpPin`, for callers that can wait for it. */
-export async function readGoogleAcpPinAsync(home: string): Promise<AcpClientIdentity> {
-  return validateAcpClientIdentityAsync(readGoogleAcpPinRecord(home));
+export async function readGoogleAcpPinAsync(
+  home: string,
+  reuse = false,
+): Promise<AcpClientIdentity> {
+  return validateAcpClientIdentityAsync(readGoogleAcpPinRecord(home), reuse);
 }
 
 export type AcpProfileResolution = {

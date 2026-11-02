@@ -9,10 +9,13 @@ import { Fact } from './components.tsx';
 import { ExternalLink } from './external-link.tsx';
 import { formatSize } from './format-size.ts';
 import {
+  connectInPlace,
   connectLocalFlow,
   DEFAULT_LOCAL_ENDPOINT,
   followDiscovery,
+  LAUNCH_RETRY_MS,
   lastSeen,
+  launchReconnect,
   localNotices,
   lowMemory,
   REOBSERVE_MS,
@@ -24,7 +27,7 @@ import {
   waitForLocalReadiness,
 } from './local-setup-flow.ts';
 import { useClock } from './settings/use-catalog.ts';
-import type { DesktopCommand, Workspace } from './source.ts';
+import { type DesktopCommand, localResultLine, type Workspace } from './source.ts';
 
 export const localModelStates = {
   'installed-unloaded': 'Installed and unloaded',
@@ -80,7 +83,7 @@ export function LocalSetup({
   const owned = Boolean(
     (setup?.operation && !backgroundRead) || (setup && setup.generation !== 'idle'),
   );
-  const blocked = !connected || busy || workspace.retryAvailable || !setup || owned;
+  const blocked = !connected || busy || !setup || owned;
   const models = setup?.observation?.models;
   const selectedChoice = models?.find((model) => model.selectionId === choiceId);
   const currentChoice = models?.find(
@@ -150,7 +153,7 @@ export function LocalSetup({
           payload: { consent: 'explicit' },
         });
         if (!applied(result.outcome))
-          return result.next ?? result.reason ?? 'The runtime could not be read.';
+          return localResultLine(result, 'The runtime could not be read.');
         await followDiscovery({
           read: async () => (await refresh()).localSetup,
           wait: () => new Promise((resolve) => window.setTimeout(resolve, 500)),
@@ -274,7 +277,7 @@ export function LocalSetup({
         if (control.signal.aborted || !mounted.current || actionGeneration.current !== generation)
           return false;
         if (applied(result.outcome)) return true;
-        setMessage(result.next ?? result.reason ?? 'Model metadata could not be read.');
+        setMessage(localResultLine(result, 'Model metadata could not be read.'));
         return false;
       },
       reconnect: async (current) => {
@@ -286,7 +289,7 @@ export function LocalSetup({
         if (control.signal.aborted || !mounted.current || actionGeneration.current !== generation)
           return false;
         if (applied(result.outcome)) return true;
-        setMessage(result.next ?? result.reason ?? 'Local connection was not confirmed.');
+        setMessage(localResultLine(result, 'Local connection was not confirmed.'));
         return false;
       },
     })
@@ -323,7 +326,7 @@ export function LocalSetup({
     return (await refresh()).localSetup;
   }
   async function action(name: string, command: DesktopCommand) {
-    if (!connected || workspace.retryAvailable || requested) return;
+    if (!connected || requested) return;
     setRequested(name);
     setMessage(null);
     setConfirming(null);
@@ -346,7 +349,7 @@ export function LocalSetup({
             : command.command === 'CancelLocalConnectionInput'
               ? 'Connection input closed. Local is not connected.'
               : `${name} confirmed.`;
-      setMessage(done ? said : (result.next ?? result.reason ?? `${name} was not confirmed.`));
+      setMessage(done ? said : localResultLine(result, `${name} was not confirmed.`));
       if (done && command.command === 'SelectLocalModel') {
         // The command only saved the choice. It counts once a read made after it still holds the
         // instance.
@@ -358,15 +361,13 @@ export function LocalSetup({
         setConfirming(null);
       }
     } catch {
-      if (mounted.current)
-        setMessage(`${name} could not be confirmed. Reconnect and use exact retry if available.`);
+      if (mounted.current) setMessage(`${name} could not be confirmed. Reconnect, then try again.`);
     } finally {
       if (mounted.current) setRequested(null);
     }
   }
   async function connectLocal() {
-    if (!setup || !parsedEndpoint.success || !connected || workspace.retryAvailable || requested)
-      return;
+    if (!setup || !parsedEndpoint.success || !connected || requested) return;
     stopPolling();
     const generation = actionGeneration.current;
     const active = () => mounted.current && actionGeneration.current === generation;
@@ -389,18 +390,14 @@ export function LocalSetup({
       });
       if (result.kind === 'stopped') return;
       if (result.kind === 'blocked') {
-        setMessage(
-          result.result.next ?? result.result.reason ?? 'Local connection was not confirmed.',
-        );
+        setMessage(localResultLine(result.result, 'Local connection was not confirmed.'));
         return;
       }
       setEndpointEdited(false);
       startPolling(parsedEndpoint.data);
     } catch {
       if (mounted.current && actionGeneration.current === generation)
-        setMessage(
-          'Local connection could not be confirmed. Reconnect and use exact retry if available.',
-        );
+        setMessage('Local connection could not be confirmed. Reconnect, then press Connect again.');
     } finally {
       connecting.current = false;
       if (mounted.current && actionGeneration.current === generation) setRequested(null);
@@ -433,34 +430,6 @@ export function LocalSetup({
         <p className="notice" role="status">
           {WITHOUT_TOKEN}
         </p>
-      )}
-      {workspace.retryAvailable && (
-        <div className="button-row">
-          <p className="muted small">
-            The last command is uncertain. Resolve it before changing Local setup.
-          </p>
-          <button
-            className="button secondary"
-            type="button"
-            disabled={!connected || busy}
-            onClick={() => {
-              void workspace
-                .retryCommand()
-                .then((result) =>
-                  setMessage(
-                    result
-                      ? (result.next ?? result.reason ?? result.outcome)
-                      : 'No exact command is pending.',
-                  ),
-                )
-                .catch(() =>
-                  setMessage('Exact retry could not be confirmed. Reconnect and retry.'),
-                );
-            }}
-          >
-            Retry exact command
-          </button>
-        </div>
       )}
       <label>
         Local endpoint
@@ -498,7 +467,7 @@ export function LocalSetup({
         <button
           className="button secondary"
           type="button"
-          disabled={!connected || busy || workspace.retryAvailable || !setup?.endpoint}
+          disabled={!connected || busy || !setup?.endpoint}
           onClick={() => {
             stopPolling();
             if (setup)
@@ -525,7 +494,7 @@ export function LocalSetup({
             <button
               className="button secondary"
               type="button"
-              disabled={!connected || busy || workspace.retryAvailable}
+              disabled={!connected || busy}
               onClick={() => void keepToken(!remembered.remembered)}
             >
               {remembered.remembered ? 'Forget' : 'Remember the token on this device'}
@@ -547,7 +516,7 @@ export function LocalSetup({
             <button
               className="button secondary"
               type="button"
-              disabled={!connected || busy || workspace.retryAvailable}
+              disabled={!connected || busy}
               onClick={() => {
                 stopPolling();
                 if (setup.operation?.kind === 'input')
@@ -702,7 +671,7 @@ export function LocalSetup({
       <button
         className="button secondary"
         type="button"
-        disabled={!connected || busy || polling || !connectionReady || workspace.retryAvailable}
+        disabled={!connected || busy || polling || !connectionReady}
         onClick={() => {
           if (pollTimedOut && setup?.endpoint) startPolling(setup.endpoint);
           else void reobserve().then((problem) => mounted.current && setMessage(problem));
@@ -712,4 +681,64 @@ export function LocalSetup({
       </button>
     </section>
   );
+}
+
+/**
+ * Reconnects Local at launch on a device that connected it once, with no click. While the runtime
+ * is not running the card says so and this tries again every few seconds until it answers.
+ */
+export function useLocalReconnect(workspace: Workspace) {
+  const { source, header, preview, refresh } = workspace;
+  const once = header?.providerConnections?.connectedOnce.includes('local') ?? false;
+  const setup = header?.localSetup;
+  const live = workspace.connection === 'connected' && !preview;
+  const [remembered, setRemembered] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const running = useRef(false);
+  const mounted = useRef(true);
+  const timer = useRef(0);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      window.clearTimeout(timer.current);
+    },
+    [],
+  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the kept token belongs to the endpoint and mode
+  useEffect(() => {
+    if (!live || !once || !source?.localTokenStatus) return;
+    let active = true;
+    void source
+      .localTokenStatus()
+      .then((status) => active && setRemembered(status.remembered))
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [live, once, source, setup?.endpoint, setup?.authMode]);
+  const due = live && launchReconnect(setup, once, remembered);
+  // The attempt outlives this effect on purpose. Its own connect command starts an operation,
+  // which turns `due` off for a moment; cancelling there would drop the attempt and never set
+  // the next try. A try that ends without a connection always schedules the next one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `attempt` schedules the next try
+  useEffect(() => {
+    if (!due || !setup || running.current) return;
+    running.current = true;
+    void connectInPlace({
+      setup,
+      command: (input) => workspace.command(input),
+      read: async () => (await refresh()).localSetup,
+      wait: () => new Promise((resolve) => window.setTimeout(resolve, 500)),
+      active: () => mounted.current,
+    })
+      .catch(() => null)
+      .then((result) => {
+        running.current = false;
+        if (mounted.current && result?.kind !== 'connected')
+          timer.current = window.setTimeout(
+            () => setAttempt((value) => value + 1),
+            LAUNCH_RETRY_MS,
+          );
+      });
+  }, [due, attempt]);
 }

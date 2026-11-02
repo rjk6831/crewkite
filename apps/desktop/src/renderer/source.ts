@@ -29,6 +29,52 @@ declare global {
   }
 }
 
+const LOCAL_COMMANDS: ReadonlySet<string> = new Set([
+  'ConfigureLocal',
+  'BeginLocalConnectionInput',
+  'CancelLocalConnectionInput',
+  'DisconnectLocal',
+  'RefreshLocalModels',
+  'SelectLocalModel',
+]);
+
+/** The Local card's line when a command's answer never came back. A second press is safe. */
+export const LOCAL_UNANSWERED = 'Local did not answer in time. Press Connect again.';
+
+// What the controller says about a Local command it refused, in the card's words.
+const localRefusals: Record<string, string> = {
+  'local-not-configured': 'Configure a loopback endpoint first.',
+  'local-connection-required': 'Press Connect. CrewKite checks whether the runtime wants a token.',
+  'local-operation-active': 'A Local connect or model read is running. Wait for it to end.',
+  'local-operation-unknown': 'A Local connect did not report how it ended. Reconnect first.',
+  'local-input-unavailable': 'The native Local connection input is unavailable.',
+  'local-selection-stale': 'The selected model changed. Refresh and choose again.',
+  'generation-active': 'A Local generation is active. Stop its task before changing this.',
+  'generation-unknown': 'Local generation ownership is unknown. Connection changes stay blocked.',
+  'stale-revision': 'The Local setup changed. Press Connect again.',
+};
+
+/**
+ * The line a Local card shows for a command that did not apply. A lost or late answer reads as
+ * one sentence with one action. A refusal gets its sentence, or the controller's own, or the
+ * card's fallback. A bare reason code is never shown.
+ */
+export function localResultLine(
+  result: { reason?: string | null; next?: string | null },
+  fallback: string,
+): string {
+  const reason = result.reason ?? '';
+  if (reason === 'response-timeout' || reason === 'connection-lost') return LOCAL_UNANSWERED;
+  return localRefusals[reason] ?? result.next ?? fallback;
+}
+
+/** The provider card's note after a quota read that ended with no reading. */
+export function usageReadLine(reason: string): string {
+  return reason === 'no-observations'
+    ? 'The last read returned no quota. Press Refresh to read again.'
+    : 'The last read did not finish. Press Refresh to read again.';
+}
+
 export function useWorkspace() {
   const preview = new URLSearchParams(window.location.search).get('preview') === '1';
   const source = useMemo(() => (preview ? createPreviewSource() : window.crewkite), [preview]);
@@ -387,7 +433,7 @@ export function useWorkspace() {
         const result = value === null ? null : CommandResultSchema.parse(value);
         if (!result) return value;
         if (reportError && result.outcome !== 'applied' && result.outcome !== 'already-applied') {
-          setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+          setError(result.next ?? 'That did not go through. Try again.');
         }
         try {
           await refresh();
@@ -466,8 +512,11 @@ export function useWorkspace() {
         input.command === 'StopGoogleAcpSetup'
       )
         return metadataCommand(input);
+      // The Local card says what happened to its own commands, so they raise no page error.
       const reportError =
-        input.command !== 'GetTaskConversationState' && input.command !== 'GetTaskConversation';
+        input.command !== 'GetTaskConversationState' &&
+        input.command !== 'GetTaskConversation' &&
+        !LOCAL_COMMANDS.has(input.command);
       return perform(async () => {
         if (!source) throw new Error('The desktop bridge is unavailable.');
         return source.command(input);

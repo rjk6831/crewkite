@@ -38,7 +38,7 @@ const stepNames: Record<OnboardingStep, string> = {
 };
 
 const familyNotes: Record<ChatFamily, string> = {
-  openai: 'The OpenAI client, signed in on this computer.',
+  openai: 'The OpenAI client, signed in once inside CrewKite.',
   anthropic: 'The Anthropic client, signed in with your own account.',
   google: 'Google’s own agent, signed in with your Google account. It needs your acknowledgement.',
   local: 'A model server on this computer, reached over loopback.',

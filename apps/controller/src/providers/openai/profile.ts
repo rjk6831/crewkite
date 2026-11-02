@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { type ClientVersionStatus, NativeProfileSchema } from '@crewkite/contracts';
@@ -10,7 +10,8 @@ import {
   findClient,
   openAiNativeSibling,
 } from '../client-versions.ts';
-import { nativeDiscoveryEnvironment } from './native-discovery.ts';
+import { fileDigestSync } from '../file-digest.ts';
+import { crewKiteCodexHome, nativeDiscoveryEnvironment } from './native-discovery.ts';
 
 const descriptor = {
   id: 'openai-file-v1',
@@ -56,8 +57,6 @@ export function resolveNativeProfile(environment = process.env): NativeProfileRe
     return unavailableNativeProfile('unsupported-platform');
   if (!environment.HOME || environment.HOME !== userInfo().homedir)
     return unavailableNativeProfile('native-home-unavailable');
-  if (environment.CODEX_HOME !== undefined)
-    return unavailableNativeProfile('configuration-location-unsupported');
   let found = false;
   for (const directory of [
     ...new Set([
@@ -80,14 +79,18 @@ export function resolveNativeProfile(environment = process.env): NativeProfileRe
         const stat = lstatSync(executable);
         if (!stat.isFile() || stat.size > 256 * 1024 * 1024) continue;
         found = true;
-        if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== clientHash)
-          continue;
+        if (fileDigestSync(executable) !== clientHash) continue;
         return {
           facts: NativeProfileSchema.parse({ ...descriptor, available: true, reason: 'available' }),
           client: { executable, sha256: clientHash, version: descriptor.clientVersion },
           environment: nativeDiscoveryEnvironment(environment),
           locationHash: createHash('sha256')
-            .update(JSON.stringify({ home: environment.HOME, configurationHome: null }))
+            .update(
+              JSON.stringify({
+                home: environment.HOME,
+                configurationHome: crewKiteCodexHome(environment),
+              }),
+            )
             .digest('hex'),
         };
       }
@@ -173,15 +176,9 @@ export function resolveOpenAiChatClient(
     cachedOnly?: boolean;
   } = {},
 ): ChatClientResolution {
-  const gate =
-    clientHostGate('openai', environment) ??
-    (environment.CODEX_HOME !== undefined
-      ? {
-          reason: 'configuration-location-unsupported',
-          detail:
-            'Codex reads CODEX_HOME, which CrewKite does not support yet. Unset it, then restart CrewKite.',
-        }
-      : null);
+  // A CODEX_HOME the person set is left alone. Every Codex process CrewKite starts runs in
+  // CrewKite's own home with its own sign-in.
+  const gate = clientHostGate('openai', environment);
   if (gate)
     return {
       status: clientVersionStatus('openai', { state: 'unavailable', detail: gate.detail }),
@@ -199,7 +196,12 @@ export function resolveOpenAiChatClient(
     client: found.client,
     environment: nativeDiscoveryEnvironment(environment),
     locationHash: createHash('sha256')
-      .update(JSON.stringify({ home: environment.HOME, configurationHome: null }))
+      .update(
+        JSON.stringify({
+          home: environment.HOME,
+          configurationHome: crewKiteCodexHome(environment),
+        }),
+      )
       .digest('hex'),
   };
   const facts = { ...descriptor, clientVersion: found.client.version };

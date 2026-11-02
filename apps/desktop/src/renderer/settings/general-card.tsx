@@ -5,8 +5,10 @@ import { familyName } from '../components.tsx';
 import { runExport } from '../diagnostics.tsx';
 import { effortLevels, shownEffort } from '../thread/model-groups.ts';
 import { EffortSelect } from '../thread/model-picker.tsx';
+import { InfoMark } from '../thread/role-info.tsx';
 import {
   handoffModes,
+  permissionInfo,
   permissionPolicies,
   readThreadDefaults,
   type ThreadDefaults,
@@ -186,9 +188,12 @@ export function GeneralCard({
         </div>
         <div className="st-row">
           <label className="st-field" htmlFor="settings-permissions">
-            <span className="st-name">Permissions</span>
+            <span className="role-name st-name">
+              Permissions <InfoMark {...permissionInfo[saved.permissionPolicy]} />
+            </span>
             <small className="st-hint">
-              Each thread can change it under Thread in the inspector.
+              {permissionPolicies.find(({ id }) => id === saved.permissionPolicy)?.title} Each
+              thread can change it under Thread in the inspector.
             </small>
           </label>
           <div className="st-controls">

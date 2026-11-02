@@ -15,6 +15,7 @@ import {
   GOOGLE_PROGRESS_STEPS,
   type GoogleSetupProgress,
   type GoogleSetupStage,
+  googleClientStatus,
   googleConnectButton,
   googleConnectError,
   googleSetupProgress,
@@ -30,7 +31,13 @@ import './google-setup.css';
 const POLL_ATTEMPTS = GOOGLE_CONNECT_LIMIT_MS / 1_000;
 
 /** The whole connect as one bar, the current step named, and every step listed under it. */
-function GoogleProgress({ progress }: { progress: GoogleSetupProgress }) {
+function GoogleProgress({
+  progress,
+  retry,
+}: {
+  progress: GoogleSetupProgress;
+  retry: string | null;
+}) {
   const index = GOOGLE_PROGRESS_STEPS.findIndex(({ id }) => id === progress.step);
   const position = `Step ${index + 1} of ${GOOGLE_PROGRESS_STEPS.length}`;
   const label = GOOGLE_PROGRESS_STEPS[index]?.label ?? '';
@@ -51,6 +58,7 @@ function GoogleProgress({ progress }: { progress: GoogleSetupProgress }) {
         <div className="gs-progress-fill" style={{ width: `${progress.percent}%` }} />
       </div>
       <p className="muted small">{progress.detail}</p>
+      {retry && <p className="muted small">{retry}</p>}
       <ol className="gs-progress-steps" aria-label="Connect steps">
         {GOOGLE_PROGRESS_STEPS.map((step, at) => (
           <li
@@ -105,8 +113,24 @@ const refusalText: Record<string, string> = {
   'authentication-required': 'The Google sign-in did not finish. Press Try again to sign in.',
   'google-status-unreadable':
     'Setup status could not be read three times in a row, so Connect paused. Press it again to continue.',
+  'google-install-limit':
+    'Unpacking and checking the client ran for more than 4 minutes. Press Try again.',
+  'google-download-slow':
+    'The download is slow and has not finished in the time its size allows. Press Try again.',
   'google-connect-limit':
     'Connect did not finish within 20 minutes. Press Try again to continue from this step.',
+};
+
+// Why a step starts again, for the line "Try 2 of 3".
+const retryReasonText: Record<string, string> = {
+  stalled: 'the download stopped making progress',
+  'download-unavailable': 'the download could not start',
+  'archive-refused': 'the download did not match the reviewed release',
+  'invalid-import': 'the unpacked files did not pass their checks',
+  'signature-timeout': 'a signature check did not finish in time',
+  'signature-refused': 'a signature check failed',
+  'response-timeout': 'the controller did not answer in time',
+  'connection-lost': 'the connection to the controller dropped',
 };
 
 // Why the coding setup is not ready, from the Google profile, in plain words.
@@ -160,6 +184,10 @@ export function GoogleSetup({
   const [pollUnreadable, setPollUnreadable] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [termsChecked, setTermsChecked] = useState(false);
+  const [retry, setRetry] = useState<string | null>(null);
+  // When the install reached its current step, and a tick each second so the elapsed time runs.
+  const stepSince = useRef<{ key: string; at: number } | null>(null);
+  const [, setTick] = useState(0);
   const pollAbort = useRef<AbortController | null>(null);
   const generation = useRef(0);
   const mounted = useRef(true);
@@ -175,6 +203,15 @@ export function GoogleSetup({
   const working = !!requested || active || installing || cancelBusy;
   const termsAcknowledged = googleTermsCurrent(setup?.googleTerms);
   const termsAccepted = termsAcknowledged || termsChecked;
+
+  const installStep = installing
+    ? `${installation?.operationId}:${installation?.progress?.step}`
+    : null;
+  useEffect(() => {
+    if (!installStep) return;
+    const timer = window.setInterval(() => setTick((value) => value + 1), 1_000);
+    return () => window.clearInterval(timer);
+  }, [installStep]);
 
   useEffect(() => {
     mounted.current = true;
@@ -244,6 +281,7 @@ export function GoogleSetup({
     // The press shows its first step at once. The first status read can take a few seconds.
     setRequested(startingGoogleStage({ googleAcpInstall: installation, googleAcpSetup: setup }));
     setMessage(null);
+    setRetry(null);
     setPollTimedOut(false);
     setPollUnreadable(false);
     startPolling(currentGeneration, true);
@@ -255,6 +293,11 @@ export function GoogleSetup({
         // A transient failure runs its step again with no word here. The bar shows the step.
         onStage: (stage) => {
           if (mounted.current && generation.current === currentGeneration) setRequested(stage);
+        },
+        onRetry: (_stage, attempt, tries, reason) => {
+          if (!mounted.current || generation.current !== currentGeneration) return;
+          const why = reason ? retryReasonText[reason] : undefined;
+          setRetry(`Try ${attempt} of ${tries}${why ? `: ${why}` : ''}.`);
         },
       });
       if (!mounted.current || generation.current !== currentGeneration) return;
@@ -290,6 +333,7 @@ export function GoogleSetup({
         pollAbort.current?.abort();
         pollAbort.current = null;
         setRequested(null);
+        setRetry(null);
         // The poll gives up after 15 minutes, and a browser sign-in can take longer. Once the
         // flow ends, the slow-setup line no longer describes anything.
         setPollTimedOut(false);
@@ -371,15 +415,18 @@ export function GoogleSetup({
         ? 'Sign-in required'
         : 'Unknown';
   const codingReady = ready && profile?.available === true;
+  if (installStep && stepSince.current?.key !== installStep)
+    stepSince.current = { key: installStep, at: Date.now() };
+  if (!installStep) stepSince.current = null;
   const progress = googleSetupProgress(
     { googleAcpInstall: installation, googleAcpSetup: setup },
     requested,
+    stepSince.current ? Date.now() - stepSince.current.at : 0,
   );
-  const officialClient = installed
-    ? 'Installed'
-    : installation?.state === 'idle'
-      ? 'Not installed'
-      : 'Unknown';
+  const officialClient = googleClientStatus({
+    googleAcpInstall: installation,
+    googleAcpSetup: setup,
+  });
   // The quota read waits for Connect.
   const quotaAvailable = !ready
     ? 'Read after Connect'
@@ -472,7 +519,7 @@ export function GoogleSetup({
         )}
       </div>
       {progress ? (
-        <GoogleProgress progress={progress} />
+        <GoogleProgress progress={progress} retry={retry} />
       ) : requested ? (
         <p role="status">{stageLabels[requested]}…</p>
       ) : active ? (

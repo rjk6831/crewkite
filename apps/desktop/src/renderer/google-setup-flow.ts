@@ -38,6 +38,18 @@ export const GOOGLE_STEP_TRIES = 3;
 export const GOOGLE_READ_TRIES = 3;
 /** One Connect runs for at most this long, whatever it waits on. */
 export const GOOGLE_CONNECT_LIMIT_MS = 20 * 60_000;
+/** Unpacking and checking the client takes seconds. A try still at it after this long is stuck. */
+export const GOOGLE_INSTALL_LIMIT_MS = 4 * 60_000;
+// A download slower than this is called slow, not stuck. The controller stops one that makes no
+// progress at all.
+const SLOWEST_DOWNLOAD_BYTES_PER_SECOND = 100_000;
+/** How long the download may run, sized to the bytes it has to move. */
+export function googleDownloadLimitMs(totalBytes: number): number {
+  return Math.max(
+    GOOGLE_INSTALL_LIMIT_MS,
+    Math.ceil(totalBytes / SLOWEST_DOWNLOAD_BYTES_PER_SECOND) * 1_000,
+  );
+}
 
 /**
  * Reasons another try of the same step can clear with nothing done by the person: a stall or a
@@ -211,8 +223,11 @@ export async function runGoogleSetupFlow({
   command: (input: GoogleCommand) => Promise<CommandResult>;
   active: () => boolean;
   onStage: (stage: GoogleSetupStage) => void;
-  /** A step failed by a transient failure and starts again: this is try `attempt` of `tries`. */
-  onRetry?: (stage: GoogleSetupStage, attempt: number, tries: number) => void;
+  /**
+   * A step failed by a transient failure and starts again: this is try `attempt` of `tries`, and
+   * `reason` is why the last one ended.
+   */
+  onRetry?: (stage: GoogleSetupStage, attempt: number, tries: number, reason?: string) => void;
   wait?: () => Promise<void>;
   now?: () => number;
 }): Promise<GoogleSetupFlowResult> {
@@ -229,6 +244,25 @@ export async function runGoogleSetupFlow({
   const pause = async () => {
     await wait();
     return active();
+  };
+  // The install phase the follow loop is watching, and when it began.
+  let phase: { key: string; since: number; totalBytes: number } | null = null;
+  const installLimit = (state: GoogleState): GoogleSetupFlowResult | null => {
+    const install = state.googleAcpInstall;
+    if (!install?.operationId || install.state !== 'installing') {
+      phase = null;
+      return null;
+    }
+    const unpacking = !!install.progress && install.progress.step !== 'download';
+    const key = `${install.operationId}:${unpacking ? 'unpack' : 'download'}`;
+    if (phase?.key !== key)
+      phase = { key, since: now(), totalBytes: install.progress?.totalBytes ?? 0 };
+    const spent = now() - phase.since;
+    if (unpacking && spent >= GOOGLE_INSTALL_LIMIT_MS)
+      return { kind: 'blocked', result: { outcome: 'blocked', reason: 'google-install-limit' } };
+    if (!unpacking && spent >= googleDownloadLimitMs(phase.totalBytes))
+      return { kind: 'blocked', result: { outcome: 'blocked', reason: 'google-download-slow' } };
+    return null;
   };
   let failedReads = 0;
   for (;;) {
@@ -250,6 +284,10 @@ export async function runGoogleSetupFlow({
       continue;
     }
     if (!active()) return { kind: 'stopped' };
+    // The follow loop reads the state while an install runs, so the install limits are checked
+    // on every pass, not only between steps.
+    const over = installLimit(state);
+    if (over) return over;
     // The person ticked the box in this click. The controller stores it and refuses every
     // connection step until it holds the current text version.
     if (!acknowledged && !googleTermsCurrent(state.googleAcpSetup?.googleTerms)) {
@@ -286,7 +324,13 @@ export async function runGoogleSetupFlow({
             : last.result;
         return { kind: 'blocked', result };
       }
-      onRetry?.(stage, attempt, GOOGLE_STEP_TRIES);
+      onRetry?.(
+        stage,
+        attempt,
+        GOOGLE_STEP_TRIES,
+        (stage === 'install' ? state.googleAcpInstall?.reason : state.googleAcpSetup?.reason) ??
+          last.result.reason,
+      );
     }
     tries.set(stage, attempt);
     onStage(stage);
@@ -379,7 +423,7 @@ export async function pollGoogleSetupStatus({
 export type GoogleProgressStep = 'download' | 'verify' | 'initialize' | 'authenticate' | 'discover';
 export const GOOGLE_PROGRESS_STEPS: readonly { id: GoogleProgressStep; label: string }[] = [
   { id: 'download', label: 'Download the official client' },
-  { id: 'verify', label: 'Unpack and verify it' },
+  { id: 'verify', label: 'Unpack and verify' },
   { id: 'initialize', label: 'Initialize' },
   { id: 'authenticate', label: 'Sign in with Google' },
   { id: 'discover', label: 'Discover models' },
@@ -406,14 +450,42 @@ export type GoogleSetupProgress = {
   detail: string;
 };
 
+/** Seconds under a minute, then minutes and seconds. */
+export function formatElapsed(milliseconds: number): string {
+  const seconds = Math.max(0, Math.floor(milliseconds / 1_000));
+  return seconds < 60 ? `${seconds} s` : `${Math.floor(seconds / 60)} min ${seconds % 60} s`;
+}
+
+/**
+ * The word beside "Official client". Unknown is the controller's own unknown state. A running
+ * install reads Installing, and Checking once it verifies the files.
+ */
+export function googleClientStatus(state: GoogleState): string {
+  const install = state.googleAcpInstall;
+  if (install?.state === 'unknown') return 'Unknown';
+  if (install?.state === 'installing' || install?.state === 'stopping')
+    return install.progress?.step === 'verify' ? 'Checking' : 'Installing';
+  if (install?.state === 'installed' || state.googleAcpSetup?.client) return 'Installed';
+  return install?.state === 'blocked' ? 'Install failed' : 'Not installed';
+}
+
+// The bar inside step 2: the unpack, the copy and hash of each file, then the signature checks.
+// The checks report no bytes, so the bar creeps toward its end with the time they take and never
+// reaches it.
+const UNPACK_SHARE = 0.5;
+const COPY_SHARE = 0.25;
+const CREEP_MS = 15_000;
+
 /**
  * Where a running connect stands: the step the controller reports first, then the step this card
- * asked for. The install reports bytes while it downloads and unpacks; the later steps report
- * only that they run. Null when nothing runs.
+ * asked for. The install reports bytes while it downloads and unpacks, then the files checked;
+ * the later steps report only that they run. `elapsedMs` is the time in the current install step.
+ * Null when nothing runs.
  */
 export function googleSetupProgress(
   state: GoogleState,
   requested: GoogleSetupStage | null,
+  elapsedMs = 0,
 ): GoogleSetupProgress | null {
   const install = state.googleAcpInstall;
   const setup = state.googleAcpSetup;
@@ -424,16 +496,27 @@ export function googleSetupProgress(
     const progress = install.progress;
     step = !progress || progress.step === 'download' ? 'download' : 'verify';
     if (progress && progress.step !== 'verify') {
-      fraction = Math.min(1, progress.bytes / progress.totalBytes);
+      const share = Math.min(1, progress.bytes / progress.totalBytes);
+      fraction = progress.step === 'download' ? Math.min(0.99, share) : share * UNPACK_SHARE;
       const amount = `${formatSize(progress.bytes)} of ${formatSize(progress.totalBytes)}`;
       detail =
         progress.step === 'download'
-          ? `Downloading the official client: ${Math.floor(fraction * 100)}%, ${amount}.`
-          : `Unpacking the client: ${Math.floor(fraction * 100)}%, ${amount}.`;
-    } else
-      detail = progress
-        ? 'Checking the Google signatures on the client.'
-        : 'Starting the download of the official client.';
+          ? `Downloading the official client: ${Math.floor(share * 100)}%, ${amount}.`
+          : `Unpacking the client: ${Math.floor(share * 100)}%, ${amount}.`;
+    } else if (progress) {
+      const total = progress.totalBytes;
+      const done = progress.bytes;
+      const elapsed = formatElapsed(elapsedMs);
+      const creep = elapsedMs / (elapsedMs + CREEP_MS);
+      if (done < total) {
+        fraction = UNPACK_SHARE + (done / total) * COPY_SHARE + creep * 0.05;
+        detail = `Checking file ${done + 1} of ${total}. ${elapsed} elapsed.`;
+      } else {
+        fraction = UNPACK_SHARE + COPY_SHARE + creep * 0.2;
+        detail = `Checking the Google signatures on both files. ${elapsed} elapsed.`;
+      }
+      fraction = Math.min(0.97, fraction);
+    } else detail = 'Starting the download of the official client.';
   } else if (setup?.operationId && setup.state !== 'unknown') {
     step = setupSteps[setup.state];
   }
@@ -443,7 +526,7 @@ export function googleSetupProgress(
   if (!detail)
     detail = {
       download: 'Starting the download of the official client.',
-      verify: 'Checking the Google signatures on the client.',
+      verify: 'Unpacking and checking the client.',
       initialize: 'Starting the client and reading what it offers. No prompt is sent.',
       authenticate: 'Finish the Google sign-in in your browser.',
       discover: 'Reading the models and modes your account offers. No prompt is sent.',

@@ -209,7 +209,7 @@ test('a permission request parks the turn until the person answers through the c
   );
 });
 
-test('stop ends the turn as stopped and keeps the text already streamed', {
+test('stop ends the turn as stopped, keeps the text already streamed and says the person stopped it', {
   timeout: 30000,
 }, async (t) => {
   const { controller, run, send, read } = await chat(t, [
@@ -232,9 +232,14 @@ test('stop ends the turn as stopped and keeps the text already streamed', {
   const turn = await stopped;
 
   assert.equal(turn.failure, null);
+  assert.equal(turn.stopCause, 'person');
   const thread = await read();
-  assert.equal(thread.messages.at(-1)?.text, 'Partial answer');
-  assert.equal(thread.messages.at(-1)?.id, turn.assistantMessageId);
+  assert.equal(thread.messages.at(-2)?.text, 'Partial answer');
+  assert.equal(thread.messages.at(-2)?.id, turn.assistantMessageId);
+  assert.deepEqual(
+    [thread.messages.at(-1)?.author, thread.messages.at(-1)?.text],
+    [{ kind: 'system', turnId }, 'Stopped: you pressed Stop.'],
+  );
   assert.equal(thread.thread.activeTurnId, null);
   assert.equal((await run('StopChatTurn', { turnId }, 0)).reason, 'no-active-turn');
 });
@@ -699,8 +704,8 @@ test('a message sent during a turn waits and starts when the turn ends', {
     family: 'openai',
     turns: [
       [{ kind: 'wait' }],
-      [{ kind: 'text', itemId: 'reply', chunks: ['Second.'] }],
       [{ kind: 'text', itemId: 'reply', chunks: ['Answered.'] }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Second.'] }],
     ],
   });
   const other = createScriptedChatAdapter({
@@ -719,11 +724,13 @@ test('a message sent during a turn waits and starts when the turn ends', {
       ],
     ],
   });
+  const usage: [ChatFamily, string][] = [];
   const one = standalone(t, {
     adapters: new Map<ChatFamily, ChatAdapter>([
       ['openai', shared],
       ['google', other],
     ]),
+    onTurnSettled: (family, taskId) => usage.push([family, taskId]),
   });
   const [second, third] = ['1', '2'].map((digit) => ({
     ...(one.store.get<Task>('task', one.taskId) as Task),
@@ -762,25 +769,9 @@ test('a message sent during a turn waits and starts when the turn ends', {
   assert.equal(sendTo(third.id, 'On Google.', google).next, undefined);
   await elsewhere;
   assert.equal(other.requests.length, 1);
-  // An ask on a busy family waits like a message, behind the thread that waited first. It was
-  // sent after the limit stopped this thread, so that stop does not hold it.
-  one.clock.advance(1000);
-  const asked = act(one.store, (effects) =>
-    one.service.ask(
-      { taskId: third.id, family: 'openai', model: 'fixture-model', question: 'Why?' },
-      effects,
-    ),
-  );
-  assert.equal(
-    asked.next,
-    'OpenAI is answering in another thread. This message starts when that reply ends.',
-  );
-  assert.deepEqual(
-    one.service
-      .readThread({ taskId: third.id, limit: 100 })
-      .thread.queued.map((message) => [message.role, message.text]),
-    [['ask', 'Why?']],
-  );
+  // A side question reads only and runs in a fresh session of its own, so it starts at once on a
+  // family busy in another thread, and it never joins the queue. Its usage is read when it ends,
+  // like any turn's.
   const answered = next(
     one,
     (event) =>
@@ -789,6 +780,16 @@ test('a message sent during a turn waits and starts when the turn ends', {
       (event.payload as ChatTurn).role === 'ask' &&
       (event.payload as ChatTurn).state === 'done',
   );
+  const asked = act(one.store, (effects) =>
+    one.service.ask(
+      { taskId: third.id, family: 'openai', model: 'fixture-model', question: 'Why?' },
+      effects,
+    ),
+  );
+  assert.deepEqual([asked.outcome, asked.next], ['applied', undefined]);
+  assert.deepEqual(one.service.readThread({ taskId: third.id, limit: 100 }).thread.queued, []);
+  await answered;
+  assert.deepEqual(usage.at(-1), ['openai', third.id]);
   const freed = next(
     one,
     (event) =>
@@ -800,13 +801,12 @@ test('a message sent during a turn waits and starts when the turn ends', {
     one.service.stopTurn({ taskId: one.taskId, turnId: held.id }, effects),
   );
   await freed;
-  await answered;
   assert.deepEqual(
     shared.requests.map((request) => [request.role, request.prompt.split('\n').at(-1)]),
     [
       ['assistant', 'First thread.'],
-      ['assistant', 'Second thread.'],
       ['ask', 'Why?'],
+      ['assistant', 'Second thread.'],
     ],
   );
 });
@@ -1414,9 +1414,13 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
 
 // The scripted adapter has no allow-thread option and no tool event, so this one plays what a real
 // adapter emits for a tool call: tool.started, then permission.requested for the same call. Turn N
-// asks about `asks[N]`: a tool kind, null for a request with no tool call, or nothing once the
-// list runs out. It keeps every request it receives.
-function editingAdapter(asks: readonly (ChatToolKind | null)[], input?: unknown) {
+// asks about `asks[N]`: a tool kind, null for a request with no tool call, `{ first }` for a call
+// whose ask names its kind and comes before its tool starts, or nothing once the list runs out.
+// It keeps every request it receives.
+function editingAdapter(
+  asks: readonly (ChatToolKind | null | { first: ChatToolKind })[],
+  input?: unknown,
+) {
   const requests: ChatTurnRequest[] = [];
   const adapter: ChatAdapter = {
     family: 'openai',
@@ -1439,7 +1443,7 @@ function editingAdapter(asks: readonly (ChatToolKind | null)[], input?: unknown)
           const choice = new Promise<string>((resolve) => {
             answer = resolve;
           });
-          if (ask)
+          if (typeof ask === 'string')
             emit({
               type: 'tool.started',
               turnId,
@@ -1453,6 +1457,7 @@ function editingAdapter(asks: readonly (ChatToolKind | null)[], input?: unknown)
             turnId,
             requestId: 'edit-1',
             callId: ask ? 'call-1' : null,
+            ...(ask && typeof ask === 'object' ? { kind: ask.first } : {}),
             question: 'Go ahead?',
             detail: null,
             ...((input as { deletes?: boolean } | undefined)?.deletes ? { deletes: true } : {}),
@@ -1481,12 +1486,13 @@ function editingAdapter(asks: readonly (ChatToolKind | null)[], input?: unknown)
 }
 
 // The edit grant is kept. An ask with no tool call and an ask during a review stay with their turn.
+// An ask that names its kind before its tool starts is kept by that kind.
 test('allow for this thread records the tool kind for later assistant turns and nothing else', {
   timeout: 30000,
 }, async (t) => {
   const { controller, adapter, task, run, send, read } = await open(
     t,
-    editingAdapter(['edit', null, 'command']),
+    editingAdapter(['edit', null, 'command', { first: 'command' }]),
   );
   const allow = async (sent: () => Promise<CommandResult>) => {
     const parked = turnReaches(controller, 'waiting-permission');
@@ -1502,13 +1508,21 @@ test('allow for this thread records the tool kind for later assistant turns and 
   const review = { text: 'Review it.', role: 'reviewer', selection };
   await allow(() => run('SendChatMessage', review, task.revision));
   assert.deepEqual((await read()).thread.permissionGrants, ['edit']);
+  await allow(() => send('Now the totals.'));
+  assert.deepEqual((await read()).thread.permissionGrants, ['edit', 'command']);
+  // The person's answer comes back from the adapter without a source, and the thread names them.
+  assert.ok(
+    agentEvents(controller).every(
+      (event) => event.type !== 'permission.resolved' || event.answeredBy === 'person',
+    ),
+  );
 
   const last = turnReaches(controller, 'done');
-  await send('Now the totals.');
+  await send('Then the docs.');
   await last;
   assert.deepEqual(
     adapter.requests.map((request) => request.permissionGrants),
-    [[], ['edit'], [], ['edit']],
+    [[], ['edit'], [], ['edit'], ['edit', 'command']],
   );
 });
 
@@ -2022,21 +2036,22 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       builds: [reply('Built part 1.'), reply('Built part 2.')],
       reviews: [reply('Clean.\nFindings: 0'), reply('Clean.\nFindings: 0')],
       autoHandoff: undefined,
-      // An Ask sent while the orchestrator reads stops neither the plan nor a chain. It runs last.
+      // An Ask sent while the orchestrator reads stops neither the plan nor a chain. It runs at
+      // once beside the orchestrator.
       ask: 'Why two parts?',
       turns: [
         ['orchestrator', 'openai'],
+        ['ask', 'google'],
         ['assistant', 'openai'],
         ['reviewer', 'anthropic'],
         ['assistant', 'openai'],
         ['reviewer', 'anthropic'],
         ['challenger', 'google'],
-        ['ask', 'google'],
       ],
       line: 'Crew finished: 2 slices, 2 reviews, 0 fixes.',
       // Each slice reviews in its own lane. The thread's chain holds the challenge alone.
       chain: { step: 'finished', reviewRounds: 0, fixes: 0, reason: null },
-      builderAt: 3,
+      builderAt: 4,
       card: ['finished', 'done', 'done'],
     },
     {
@@ -2338,8 +2353,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
         row.turns,
         row.name,
       );
-      // The Ask's question and answer follow the closing line.
-      assert.equal(read.messages.at('ask' in row ? -3 : -1)?.text, row.line, row.name);
+      assert.equal(read.messages.at(-1)?.text, row.line, row.name);
       if (row.chain === null) assert.equal(read.thread.crewChain, null, row.name);
       else {
         const { builderTurnId, ...chain } = read.thread.crewChain ?? {};
@@ -2756,9 +2770,12 @@ test('plan slices run side by side in their own copies, merge in plan order and 
     if ('stop' in row || 'unplugged' in row) await settles(thread);
     const read = thread.read();
     const lines = read.messages.map((message) => message.text);
-    // The message queued during the plan starts after the closing line.
+    // The message queued during the plan starts after the closing line. Each slice turn the stop
+    // ended says so on a line of its own once it settles.
     const queuedLines = ['One more thing.', 'Queued answer.'];
-    assert.equal(lines.filter((line) => !queuedLines.includes(line)).at(-1), row.line, row.name);
+    const own = (line: string) => !queuedLines.includes(line) && !line.startsWith('Stopped: ');
+    assert.equal(lines.filter(own).at(-1), row.line, row.name);
+    if ('stop' in row) assert.ok(lines.includes('Stopped: the plan was cancelled.'), row.name);
     const card = read.thread.plan;
     assert.deepEqual(
       card ? [card.phase, ...card.slices.map((value) => value.status)] : null,
@@ -3411,6 +3428,207 @@ function act(store: Store, work: (effects: (() => void)[]) => CommandResult): Co
   for (const effect of effects) effect();
   return result;
 }
+
+/** The turn's state once a chat.turn event names it in that state. */
+function turnState(
+  controller: Pick<Controller, 'store'>,
+  turnId: string,
+  state: ChatTurn['state'],
+) {
+  return next(
+    controller,
+    (event) =>
+      event.type === 'chat.turn' &&
+      (event.payload as ChatTurn).id === turnId &&
+      (event.payload as ChatTurn).state === state,
+  );
+}
+
+/** The first agent event of a turn in this role, once the adapter has the turn. */
+function launched(controller: Pick<Controller, 'store'>, role: ChatTurn['role']) {
+  return next(
+    controller,
+    (event) =>
+      event.type === 'agent.event' &&
+      event.payload.type === 'turn.started' &&
+      event.payload.role === role,
+  ).then((event) => (event.payload as AgentEvent).turnId);
+}
+
+test('a side question runs beside a builder that waits on an approval and leaves it the thread turn', {
+  timeout: 30000,
+}, async (t) => {
+  const scripted = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [
+      [
+        { kind: 'permission', requestId: 'p1', question: 'Run the tests?', toolKind: 'command' },
+        { kind: 'text', itemId: 'r', chunks: ['Built.'] },
+      ],
+      [{ kind: 'wait' }],
+    ],
+  });
+  const thread = standalone(t, { adapters: new Map([['openai', scripted]]) });
+  const { store, service, taskId } = thread;
+  const ask = (question: string) =>
+    act(store, (effects) =>
+      service.ask({ taskId, family: 'openai', model: selection.model, question }, effects),
+    );
+  const parked = turnReaches(thread, 'waiting-permission');
+  thread.send('Fix the rounding.');
+  const builder = await parked;
+  // The question goes to the family that waits on the approval, in this thread, and starts now.
+  const asking = launched(thread, 'ask');
+  assert.equal(ask('Which file rounds?').outcome, 'applied');
+  const side = await asking;
+  const during = thread.read();
+  assert.deepEqual(
+    [during.thread.activeTurnId, during.thread.queued, during.turns.map((turn) => turn.state)],
+    [builder.id, [], ['waiting-permission', 'running']],
+  );
+  assert.deepEqual(
+    scripted.requests.map((request) => request.role),
+    ['assistant', 'ask'],
+  );
+  // One side question at a time per thread.
+  assert.equal(ask('And the totals?').reason, 'ask-running');
+  // The approval is still the builder's to answer, and the builder ends while the question runs.
+  const built = turnState(thread, builder.id, 'done');
+  const answer = act(store, (effects) =>
+    service.resolvePermission(
+      { taskId, turnId: builder.id, requestId: 'p1', choice: 'allow-once' },
+      effects,
+    ),
+  );
+  assert.equal(answer.outcome, 'applied');
+  await built;
+  const after = thread.read();
+  assert.equal(after.thread.activeTurnId, null);
+  assert.equal(after.turns.find((turn) => turn.id === side)?.state, 'running');
+  const stopped = turnState(thread, side, 'stopped');
+  act(store, (effects) => service.stopTurn({ taskId, turnId: side }, effects));
+  await stopped;
+});
+
+test('stop ends only the turn it names, the builder or the side question beside it', {
+  timeout: 30000,
+}, async (t) => {
+  const scripted = createScriptedChatAdapter({ family: 'openai', turns: [[{ kind: 'wait' }]] });
+  const thread = standalone(t, { adapters: new Map([['openai', scripted]]) });
+  const { store, service, taskId } = thread;
+  const ask = () => {
+    const started = launched(thread, 'ask');
+    const question = {
+      taskId,
+      family: 'openai' as const,
+      model: selection.model,
+      question: 'Why?',
+    };
+    assert.equal(act(store, (effects) => service.ask(question, effects)).outcome, 'applied');
+    return started;
+  };
+  const stop = (turnId: string) => {
+    const stopped = turnState(thread, turnId, 'stopped');
+    assert.equal(
+      act(store, (effects) => service.stopTurn({ taskId, turnId }, effects)).outcome,
+      'applied',
+    );
+    return stopped;
+  };
+  const states = () => Object.fromEntries(thread.read().turns.map((turn) => [turn.id, turn.state]));
+  // A free thread runs the question at once, and a message sent then starts beside it.
+  const first = await ask();
+  assert.equal(thread.read().thread.activeTurnId, null);
+  const building = launched(thread, 'assistant');
+  assert.equal(thread.send('Fix the rounding.').outcome, 'applied');
+  const builder = await building;
+  assert.deepEqual(thread.read().thread.queued, []);
+  await stop(first);
+  assert.equal(states()[builder], 'running');
+  assert.equal(thread.read().thread.activeTurnId, builder);
+  const second = await ask();
+  await stop(builder);
+  assert.equal(states()[second], 'running');
+  assert.equal(thread.read().thread.activeTurnId, null);
+  await stop(second);
+});
+
+test('every stop writes its cause into the thread', { timeout: 30000 }, async (t) => {
+  const interrupted: ChatAdapter = {
+    family: 'openai',
+    startTurn: () => ({
+      respondPermission() {},
+      stop() {},
+      groups: [],
+      result: Promise.resolve({
+        stopReason: 'stopped',
+        failure: chatFailure({
+          stage: 'stream',
+          kind: 'stopped',
+          message: 'The client interrupted the turn (too many denials).',
+        }),
+        assistantText: '',
+        session: null,
+        usage: null,
+        changedPaths: [],
+      }),
+    }),
+  };
+  const waits = () =>
+    createScriptedChatAdapter({
+      family: 'openai',
+      turns: [[{ kind: 'wait' }], [{ kind: 'text', itemId: 'r', chunks: ['Next.'] }]],
+    });
+  const rows = [
+    {
+      name: 'the client stopped it',
+      adapter: interrupted,
+      end: async () => {},
+      cause: 'client',
+      line: 'Stopped: The client interrupted the turn (too many denials).',
+    },
+    {
+      name: 'send now',
+      adapter: waits(),
+      // The next message runs to its end before the thread is read.
+      end: async (thread: ReturnType<typeof standalone>) => {
+        thread.send('Then the totals.');
+        const queued = thread.read().thread.queued[0];
+        const answered = turnReaches(thread, 'done');
+        act(thread.store, (effects) =>
+          thread.service.steer({ taskId: thread.taskId, messageId: queued.id }, effects),
+        );
+        await answered;
+      },
+      cause: 'send-now',
+      line: 'Stopped: Send now started the next message.',
+    },
+    {
+      name: 'a restart',
+      adapter: waits(),
+      end: async (thread: ReturnType<typeof standalone>) => {
+        await thread.service.close();
+      },
+      cause: 'restart',
+      line: 'Stopped: CrewKite restarted.',
+    },
+  ];
+  for (const row of rows) {
+    const thread = standalone(t, { adapters: new Map([['openai', row.adapter]]) });
+    const stopped = turnReaches(thread, 'stopped');
+    const running = launched(thread, 'assistant');
+    thread.send('Fix the rounding.');
+    await running;
+    await row.end(thread);
+    const turn = await stopped;
+    const lines = thread
+      .read()
+      .messages.flatMap((message) =>
+        message.author.kind === 'system' && message.author.turnId === turn.id ? [message.text] : [],
+      );
+    assert.deepEqual([turn.stopCause, lines], [row.cause, [row.line]], row.name);
+  }
+});
 
 test('a file is stored once by its hash, and its path reaches every turn that runs its message', {
   timeout: 30000,

@@ -8,6 +8,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
+import { recordClient } from '../client-record.ts';
 import { localProposalBudget } from './budget.ts';
 
 export const LocalEndpointSchema = z
@@ -96,6 +97,11 @@ export function resolveLocalConnection(
     )
   )
     return unavailable('model-setup-unavailable');
+  // The runtime's own version and build, as it reported them when Settings last read it.
+  recordClient('local', {
+    version: observation.runtime.version,
+    kept: { runtime: { version: observation.runtime.version, build: observation.runtime.build } },
+  });
   // The selected instance decides. Other residents and the size of its context do not.
   const choice = observation.models.find((model) => model.selectionId === selectionId);
   if (choice?.state !== 'loaded-eligible' || !choice.instanceReference || !choice.contextLength)

@@ -105,8 +105,11 @@ export type PlanHost = {
   familyBusy: (family: ChatFamily) => boolean;
   /** Ask the running turn to stop. Its settle finishes the rest. */
   stopActive: (taskId: string, effects: Effects) => void;
-  /** Ask one open turn of the thread to stop, after the caller's transaction commits. */
-  stopTurn: (taskId: string, turnId: string) => void;
+  /**
+   * Ask one open turn of the thread to stop, after the caller's transaction commits. `why` is the
+   * plan's reason, which the turn's stop line repeats.
+   */
+  stopTurn: (taskId: string, turnId: string, why: string) => void;
   /** Whether no process of an earlier turn may still write to the scratch copy. */
   free: (task: Task) => boolean;
   /** The task IDs of threads whose plan runs. */
@@ -238,7 +241,7 @@ export class PlanRunner {
     if (thread.plan?.phase !== 'running') return;
     for (const slice of thread.plan.slices)
       if (slice.lane && !slice.lane.pending && slice.turnId && this.open(slice.turnId))
-        this.host.stopTurn(task.id, slice.turnId);
+        this.host.stopTurn(task.id, slice.turnId, cause);
     if (this.closing.get(task.id) === 'checks') this.host.stopCombinedChecks(task.id);
     this.closing.delete(task.id);
     // A slice whose chain finished and only waited for its turn to merge keeps its work: it

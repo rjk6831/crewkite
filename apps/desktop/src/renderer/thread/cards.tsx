@@ -23,6 +23,8 @@ import { projectRelative } from './scratch-paths.ts';
 import { spawnCardBadge, subagentRows, unlistedLine } from './subagent-view.ts';
 import { SubagentBadge } from './turn-chip.tsx';
 import {
+  answerNote,
+  automatic,
   type PermissionBlock,
   runLabel,
   type ThinkingBlock,
@@ -183,6 +185,7 @@ export function ToolCard({
         </span>
         {hasBody && <ChevronRight size={14} className="th-chevron" aria-hidden="true" />}
       </button>
+      {block.note && <p className="th-muted">{block.note}</p>}
       {block.diff?.patch && <MiniDiff patch={block.diff.patch} />}
       {block.diff && (
         <div className="th-tool-foot">
@@ -252,6 +255,8 @@ export function PermissionCard({
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const chosen = block.options.find((option) => option.id === block.choice);
+  // Nobody asked the person, so the ask shows as one line until its tool card takes it.
+  if (automatic(block)) return <p className="th-muted">{answerNote(block)}</p>;
   async function choose(choice: string) {
     setBusy(choice);
     setError(null);
@@ -273,6 +278,7 @@ export function PermissionCard({
         <p>{block.question}</p>
       </div>
       {block.detail && <pre>{block.detail}</pre>}
+      {block.reason && <p className="th-muted">{block.reason}</p>}
       {block.choice !== null ? (
         <p className="th-resolved">
           <Check size={13} aria-hidden="true" />

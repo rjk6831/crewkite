@@ -41,6 +41,10 @@ import {
 // Workspace and task reads: snapshots, retained conversation state, model catalogs and paths.
 export class ProjectCommands {
   workspaceState(this: Controller) {
+    return this.withProfiles(() => this.readWorkspaceState());
+  }
+
+  readWorkspaceState(this: Controller) {
     return WorkspaceStateSchema.parse({
       kind: 'workspace-state',
       version: 1,
@@ -64,10 +68,15 @@ export class ProjectCommands {
         .map((observation) =>
           deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
         ),
+      providerConnections: this.providerConnections(),
     });
   }
 
   snapshot(this: Controller, scope?: SnapshotScope): Snapshot {
+    return this.withProfiles(() => this.readSnapshot(scope));
+  }
+
+  readSnapshot(this: Controller, scope?: SnapshotScope): Snapshot {
     const selection = SnapshotScopeSchema.parse(scope ?? {});
     const scoped = 'taskId' in selection || 'approvalId' in selection;
     const requestedTask =

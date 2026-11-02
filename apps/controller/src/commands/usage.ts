@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
@@ -9,9 +9,11 @@ import {
   CommandResultSchema,
   CommandSchema,
   canonicalJson,
+  FamilySchema,
   NativeProfileSchema,
   type Observation,
   ObservationSchema,
+  type ProviderConnections,
   type Route,
   RouteSchema,
   type Task,
@@ -32,6 +34,7 @@ import {
   resolveGoogleUsageClient,
 } from '../providers/google/profile.ts';
 import { OpenAiDiscovery } from '../providers/openai/discovery.ts';
+import { startOpenAiAccountStep } from '../providers/openai/login.ts';
 import { startNativeSession } from '../providers/openai/native-discovery.ts';
 import {
   type NativeProfileResolution,
@@ -52,6 +55,10 @@ const preparedUsage = new WeakMap<
   Controller,
   { key: string; openai?: ReturnType<UsageCommands['openAiUsageInputs']> }
 >();
+
+// Controllers with an OpenAI retry chain waiting. A connect during the chain reads once and leaves
+// the retries to the chain.
+const retrying = new WeakSet<Controller>();
 
 // Usage readers and the provider usage observations that admission reads.
 export class UsageCommands {
@@ -180,41 +187,204 @@ export class UsageCommands {
     return Promise.allSettled([
       this.refreshGoogleUsage(trigger),
       this.refreshOpenAiUsageWithRetry(trigger),
-      // The Anthropic gauge reads once at start. Turns and the card's Refresh read it after that.
-      trigger === 'start' ? this.anthropicUsage().refreshWhenDue(this.id('cmd')) : undefined,
+      // The Anthropic gauge reads once at start, from the client's own sign-in, once the person
+      // connected Anthropic on this device. Turns and the card's Refresh read it after that.
+      trigger === 'start' && this.store.hasConnectedOnce('anthropic')
+        ? this.checkAnthropicAtLaunch().then(() =>
+            this.anthropicUsage().refreshWhenDue(this.id('cmd')),
+          )
+        : undefined,
     ]).then(() => {});
   }
 
   /**
-   * The read at start or connect runs while the chat catalog read starts its own client, and on
-   * some launches the client answers the first read out of step. One more read a few seconds later
-   * settles it, so the rail does not open on "unknown" until the person presses Refresh.
+   * A read at start or connect runs while the rest of launch competes for the same seconds: the
+   * chat catalog read, the first workspace reads and the other quota reads. A read that ends with
+   * no reading, for any reason, runs again 5 s later and once more 30 s after that, so the rail
+   * does not open on "unknown" until the person presses Refresh. The interval read keeps its own
+   * cooldown. One retry chain runs at a time.
    */
   async refreshOpenAiUsageWithRetry(
     this: Controller,
     trigger: 'start' | 'connect' | 'interval',
   ): Promise<void> {
     await this.refreshOpenAiUsage(trigger);
-    if (trigger === 'interval' || this.closed) return;
-    let state: ReturnType<Controller['openAiUsageState']>;
-    try {
-      state = this.openAiUsageState();
-    } catch {
-      return;
-    }
-    if (
-      state?.state !== 'quiescent' ||
-      (state.reason !== 'protocol' && state.reason !== 'read-failed')
-    )
-      return;
+    if (trigger === 'interval' || retrying.has(this)) return;
     const schedule =
       this.options.schedule ??
       ((run: () => void, ms: number) => {
         const timer = setTimeout(run, ms);
         return () => clearTimeout(timer);
       });
-    await new Promise<void>((resolve) => schedule(resolve, 5000));
-    if (!this.closed) await this.refreshOpenAiUsage(trigger);
+    retrying.add(this);
+    try {
+      for (const delay of [5000, 30000]) {
+        if (this.closed) return;
+        let state: ReturnType<Controller['openAiUsageState']>;
+        try {
+          state = this.openAiUsageState();
+        } catch {
+          return;
+        }
+        // A read that is unknown, still running or never started has nothing to retry.
+        if (state?.state !== 'quiescent' || state.reason === 'observed') return;
+        await new Promise<void>((resolve) => schedule(resolve, delay));
+        await this.openAiModelReadSettled();
+        if (!this.closed) await this.refreshOpenAiUsage('retry');
+      }
+    } finally {
+      retrying.delete(this);
+    }
+  }
+
+  /** What the provider cards need to know about connecting on this device. */
+  providerConnections(this: Controller): ProviderConnections {
+    const signIn = this.openAiSignIn;
+    return {
+      connectedOnce: FamilySchema.options.filter((family) => this.store.hasConnectedOnce(family)),
+      openAiSignIn: {
+        state: signIn?.state ?? 'idle',
+        url: signIn?.state === 'waiting' ? signIn.url : null,
+      },
+    };
+  }
+
+  private openAiAccountChanged(this: Controller) {
+    try {
+      const status = this.openAiUsageReader();
+      this.store.transaction(() => this.event('usage.reader-updated', null, 0, status));
+    } catch {}
+  }
+
+  /**
+   * Starts the sign-in of CrewKite's own OpenAI client home and answers at once. The browser page shows
+   * in the workspace state when the client names it, and the card opens it. A sign-in that ends
+   * well connects OpenAI on this device. A second press while one waits changes nothing.
+   */
+  signInOpenAi(
+    this: Controller,
+    command: Extract<Command, { command: 'SignInOpenAi' }>,
+  ): CommandResult {
+    if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    if (this.closed) return { outcome: 'blocked', reason: 'controller-closing' };
+    if (this.openAiSignIn?.state === 'waiting') return { outcome: 'already-applied' };
+    let profile: NativeProfileResolution | undefined;
+    try {
+      profile = this.options.openAiUsageClient?.();
+    } catch {}
+    if (!profile?.facts.available || !profile.client || !profile.environment)
+      return {
+        outcome: 'blocked',
+        reason: 'openai-client-unavailable',
+        next: 'Install the OpenAI client, then press Connect again.',
+      };
+    let directory: string;
+    try {
+      directory = mkdtempSync(join(this.home, 'openai-sign-in-'));
+    } catch {
+      return { outcome: 'blocked', reason: 'openai-sign-in-storage-failed' };
+    }
+    const completion = Promise.withResolvers<void>();
+    const runtime: NonNullable<Controller['openAiSignIn']> = {
+      key: command.key,
+      state: 'waiting',
+      url: null,
+      stopped: false,
+      done: completion.promise,
+    };
+    this.openAiSignIn = runtime;
+    void (async () => {
+      let success = false;
+      try {
+        const handle = startOpenAiAccountStep(
+          {
+            ...(profile.client as NonNullable<NativeProfileResolution['client']>),
+            directory,
+            repositoryRoot: this.home,
+            environment: profile.environment as NodeJS.ProcessEnv,
+          },
+          'sign-in',
+          {
+            schedule: this.options.schedule,
+            spawn: this.options.openAiUsageSpawn,
+            onUrl: (url) => {
+              if (this.openAiSignIn !== runtime) return;
+              runtime.url = url;
+              this.openAiAccountChanged();
+            },
+          },
+        );
+        runtime.handle = handle;
+        if (runtime.stopped) handle.stop();
+        const outcome = await handle.result;
+        success = !runtime.stopped && outcome.metadata?.success === true;
+      } catch {
+      } finally {
+        try {
+          rmSync(directory, { recursive: true, force: true });
+        } catch {}
+        if (this.openAiSignIn === runtime) {
+          if (success || runtime.stopped) this.openAiSignIn = undefined;
+          else {
+            runtime.state = 'failed';
+            runtime.url = null;
+          }
+        }
+        if (success) this.connectedNow('openai');
+        this.openAiAccountChanged();
+        completion.resolve();
+      }
+    })();
+    return { outcome: 'applied' };
+  }
+
+  /**
+   * Signs CrewKite's own OpenAI client home out and ends a sign-in that still waits. OpenAI stops
+   * reconnecting at launch at once. The client removes its own sign-in in the background.
+   */
+  signOutOpenAi(
+    this: Controller,
+    command: Extract<Command, { command: 'SignOutOpenAi' }>,
+  ): CommandResult {
+    if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    const waiting = this.openAiSignIn;
+    if (waiting?.state === 'waiting') {
+      waiting.stopped = true;
+      waiting.handle?.stop();
+    }
+    this.openAiSignIn = undefined;
+    this.store.transaction(() => this.store.forgetConnectedOnce('openai'));
+    let profile: NativeProfileResolution | undefined;
+    try {
+      profile = this.options.openAiUsageClient?.();
+    } catch {}
+    if (profile?.facts.available && profile.client && profile.environment) {
+      const directory = mkdtempSync(join(this.home, 'openai-sign-out-'));
+      void (async () => {
+        try {
+          await (waiting?.done ?? Promise.resolve());
+          const handle = startOpenAiAccountStep(
+            {
+              ...(profile.client as NonNullable<NativeProfileResolution['client']>),
+              directory,
+              repositoryRoot: this.home,
+              environment: profile.environment as NodeJS.ProcessEnv,
+            },
+            'sign-out',
+            { schedule: this.options.schedule, spawn: this.options.openAiUsageSpawn },
+          );
+          await handle.result;
+        } catch {
+        } finally {
+          try {
+            rmSync(directory, { recursive: true, force: true });
+          } catch {}
+          this.openAiAccountChanged();
+        }
+      })();
+    }
+    this.openAiAccountChanged();
+    return { outcome: 'applied' };
   }
 
   openAiUsageState(this: Controller) {
@@ -246,11 +416,13 @@ export class UsageCommands {
 
   refreshOpenAiUsage(
     this: Controller,
-    trigger: 'start' | 'connect' | 'interval' | 'manual',
+    trigger: 'start' | 'connect' | 'interval' | 'retry' | 'manual',
     commandId?: string,
   ): Promise<void> | undefined {
     try {
       if (this.closed || !this.options.openAiUsageClient) return;
+      // Only the person's own read connects OpenAI. Until then nothing starts the client on its own.
+      if (trigger !== 'manual' && !this.store.hasConnectedOnce('openai')) return;
       if (this.openAiUsageRead) return this.openAiUsageRead.done;
       const profile = this.options.openAiUsageClient();
       if (
@@ -270,11 +442,16 @@ export class UsageCommands {
       });
       const attemptedAt = this.now();
       const previous = this.openAiUsageState();
+      // A retry, or a connect after a read that published nothing, skips the cooldown. The cooldown
+      // spaces out reads that worked, and an unread gauge is what the person sees otherwise.
+      const unread = previous?.reason !== 'observed';
       if (
         previous &&
         (previous.state !== 'quiescent' ||
-          Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) <
-            (trigger === 'interval' ? 270000 : 60000))
+          (trigger !== 'retry' &&
+            !(trigger === 'connect' && unread) &&
+            Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) <
+              (trigger === 'interval' ? 270000 : 60000)))
       )
         return;
       if (
@@ -382,9 +559,12 @@ export class UsageCommands {
           )
             throw Error('usage-read-revoked');
         };
+        // The read's private client home holds its config copy and logs. Nothing reads it after
+        // the read settles, and one was left behind for every read.
+        let directory: string | undefined;
         try {
           current();
-          const directory = mkdtempSync(join(this.home, 'openai-usage-'));
+          directory = mkdtempSync(join(this.home, 'openai-usage-'));
           const onUsage = this.providerUsageAdapter(readerRoute.id, (value, prior) => {
             current();
             const bytes = Buffer.byteLength(canonicalJson({ value, prior: [...prior.values()] }));
@@ -410,8 +590,10 @@ export class UsageCommands {
               quiescent: () => {},
             },
           };
-          const deadline = performance.now() + options.timeoutMs;
-          const wallDeadline = Date.parse(this.now()) + options.timeoutMs;
+          // The session runs two launches, the features preflight and the app-server, each with its
+          // own window. Publication has to land inside both.
+          const deadline = performance.now() + 2 * options.timeoutMs;
+          const wallDeadline = Date.parse(this.now()) + 2 * options.timeoutMs;
           invoked = true;
           const handle = startNativeSession(
             {
@@ -481,6 +663,9 @@ export class UsageCommands {
             );
           } catch {}
         } finally {
+          try {
+            if (directory) rmSync(directory, { recursive: true, force: true });
+          } catch {}
           if (this.openAiUsageRead === runtime) this.openAiUsageRead = undefined;
           completion.resolve();
         }
@@ -501,7 +686,7 @@ export class UsageCommands {
     trigger: 'start' | 'connect' | 'interval',
   ): Promise<CommandResult> | undefined {
     try {
-      if (this.closed || this.acpStart) return;
+      if (this.closed || this.acpStart || !this.store.hasConnectedOnce('google')) return;
       if (!googleTermsAcknowledged(this.store) || !this.googleConnected()) return;
       if (this.usageRead) return this.usageRead.promise;
       const reader = this.store.googleUsageReader();
@@ -662,6 +847,14 @@ export class UsageCommands {
         })
       )
         return { outcome: 'blocked', reason: 'openai-task-active' };
+      // Only the OpenAI card's sign-in connects OpenAI. A quota read before it would start the
+      // client in a home with no account and leave the card claiming an expired sign-in.
+      if (!this.store.hasConnectedOnce('openai'))
+        return {
+          outcome: 'blocked',
+          reason: 'openai-not-connected',
+          next: 'Connect OpenAI in Settings > OpenAI before reading OpenAI usage.',
+        };
       effects.push(() => void this.launchOpenAiUsage(command.key));
       return { outcome: 'outcome-unknown', reason: 'openai-usage-read-pending' };
     }

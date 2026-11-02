@@ -3,13 +3,14 @@ import { test } from 'node:test';
 import { type Command, CommandSchema } from '@crewkite/contracts';
 import { sendRetained } from './receipts.ts';
 
+// A change that keeps its receipt for exact retry.
 const command: Command = CommandSchema.parse({
   protocol: 1,
   key: `cmd_${'0'.repeat(25)}1`,
   actor: { id: 'desktop', kind: 'desktop' },
   expectedRevision: 3,
-  command: 'RefreshLocalModels',
-  payload: { consent: 'explicit' },
+  command: 'RegisterProject',
+  payload: { path: '/synthetic/project' },
 });
 
 // The receipt list without the disk, so a test sees what is held at each step.
@@ -64,4 +65,23 @@ test('an unknown outcome or a lost answer keeps the receipt and announces the re
   );
   assert.deepEqual(receipts.commands, [command]);
   assert.deepEqual(announced, [true, true]);
+});
+
+test('a Local connect with a lost answer leaves no receipt and raises no retry', async () => {
+  const receipts = memoryReceipts();
+  const announced: boolean[] = [];
+  const connect = CommandSchema.parse({
+    ...command,
+    command: 'BeginLocalConnectionInput',
+    payload: { consent: 'explicit' },
+  });
+  const result = await sendRetained(
+    receipts,
+    connect,
+    async () => ({ outcome: 'outcome-unknown', reason: 'response-timeout' }),
+    (available) => announced.push(available),
+  );
+  assert.equal(result.outcome, 'outcome-unknown');
+  assert.deepEqual(receipts.commands, []);
+  assert.deepEqual(announced, []);
 });

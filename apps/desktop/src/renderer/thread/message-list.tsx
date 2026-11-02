@@ -135,7 +135,7 @@ const TurnRow = memo(function TurnRow({
         }
       })}
       <TurnTrace blocks={turn.blocks} />
-      {turn.status === 'stopped' && <p className="th-stopped">Stopped.</p>}
+      {turn.status === 'stopped' && <p className="th-stopped">{turn.stopNote ?? 'Stopped.'}</p>}
       <TurnStats turn={turn} />
       {copyable && (
         <div className="th-turn-foot">

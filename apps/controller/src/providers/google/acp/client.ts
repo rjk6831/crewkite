@@ -673,7 +673,9 @@ export function startAcpProcess<T>(
     throw new AcpError('deadline');
   if (process.platform === 'win32' || !isAbsolute(options.directory))
     throw new AcpError('identity');
-  const executable = validateAcpClientIdentity(options.client).executable;
+  // The profile hashed this bundle when it resolved. A file whose identity changed since then is
+  // hashed again here, so a replaced bundle never runs under the old digest.
+  const executable = validateAcpClientIdentity(options.client, true).executable;
   validateAcpDirectory(options.directory);
   try {
     mkdirSync(join(options.directory, 'tmp'), { mode: 0o700 });

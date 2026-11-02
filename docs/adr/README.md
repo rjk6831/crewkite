@@ -44,6 +44,10 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0045](0045-the-orchestrator-proposes-and-the-controller-assigns.md) | The orchestrator proposes and the controller assigns | Proposed |
 | [0046](0046-the-persons-servers-join-a-thread-only-by-the-controllers-config.md) | The person's servers join a thread only by the controller's config | Proposed |
 | [0047](0047-extensions-attach-through-one-versioned-seam.md) | Extensions attach through one versioned seam and receive no authority by default | Proposed |
+| [0048](0048-restricted-reads-through-a-named-permission-profile.md) | Restricted reads through a named permission profile, proven by the reply | Proposed |
+| [0049](0049-provider-setup-sends-again-without-receipt-replay.md) | Provider setup sends again without receipt replay | Proposed |
+| [0050](0050-a-side-question-runs-beside-the-active-turn.md) | A side question runs beside the active turn | Proposed |
+| [0051](0051-own-openai-client-home-and-explicit-connect.md) | The OpenAI client runs in a home of its own, and every provider connects explicitly | Proposed |
 
 ## Writing a new record
 

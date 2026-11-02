@@ -1,5 +1,4 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
@@ -8,13 +7,13 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
-  readFileSync,
   realpathSync,
 } from 'node:fs';
 import { userInfo } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import { type AuthMetadata, metadataCommand, projectAuthStatus } from './discovery.ts';
 
 type Reason =
@@ -204,8 +203,7 @@ export function startNativeAuthStatus(
     try {
       const file = fstatSync(fd);
       if (!file.isFile() || file.size > 512 * 1024 * 1024) throw new Error();
-      if (createHash('sha256').update(readFileSync(fd)).digest('hex') !== launch.sha256)
-        throw new Error();
+      if (fileDigestSync(executable) !== launch.sha256) throw new Error();
     } finally {
       closeSync(fd);
     }

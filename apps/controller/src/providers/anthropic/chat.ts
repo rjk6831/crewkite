@@ -43,7 +43,10 @@ import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { recordClient } from '../client-record.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
+import { knownFlags, RESULT_SUBTYPES, withKnownFlags } from './protocol.ts';
 
 // One chat turn on the official claude client: `--print` with stream-json in both directions,
 // so the user message goes in on stdin, permission asks come back as control requests, and the
@@ -133,6 +136,8 @@ const init = z.object({
   session_id: sessionId,
   model: z.string().min(1).max(200).optional(),
   effort: ChatSetEffortSchema.nullish().catch(undefined),
+  // The names the client lists for feature detection. A list that changed shape drops out.
+  capabilities: z.array(z.string().max(80)).max(64).optional().catch(undefined),
 });
 const streamEvent = z.object({
   event: z.object({
@@ -184,6 +189,10 @@ const control = z.object({
     input: z.record(z.string(), z.unknown()).optional(),
     tool_use_id: id.optional(),
     toolUseId: id.optional(),
+    // What a request CrewKite does not serve says for itself, if it says anything.
+    message: z.string().optional().catch(undefined),
+    description: z.string().optional().catch(undefined),
+    prompt: z.string().optional().catch(undefined),
   }),
 });
 const cancel = z.object({ request_id: id });
@@ -204,6 +213,8 @@ const result = z.object({
     z.record(z.string(), z.object({ contextWindow: loose(z.number().int().positive()) }).catch({})),
   ),
 });
+// The frame parsers, for the protocol check to replay recorded frames through.
+export const frameSchemas = { frame, init, control, result };
 
 // Copied from replacement.ts: the last Unix second that still prints as a four-digit year.
 const epochSeconds = z.number().int().nonnegative().max(253_402_300_799);
@@ -292,19 +303,15 @@ const options: ChatPermissionOption[] = [
 ];
 
 // Copied from startReplacement in replacement.ts. The profile verified this build when it
-// resolved, and hashing again right before spawn keeps a binary replaced since then from
-// running under the old identity.
+// resolved. The digest cache answers for the same file identity without a read, and a binary
+// replaced since then has a new identity, so it is hashed again and refused.
 export function verifiedExecutable(path: string, sha256: string) {
   if (!isAbsolute(path) || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('identity');
   const executable = realpathSync(path);
   const fd = openSync(executable, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const file = fstatSync(fd);
-    if (
-      !file.isFile() ||
-      file.size > 512 * 1024 * 1024 ||
-      createHash('sha256').update(readFileSync(fd)).digest('hex') !== sha256
-    )
+    if (!file.isFile() || file.size > 512 * 1024 * 1024 || fileDigestSync(executable) !== sha256)
       throw new Error('identity');
   } finally {
     closeSync(fd);
@@ -493,13 +500,15 @@ function userMessage(text: string, files: readonly TurnFile[], staging: string) 
 const permissionMode = (policy: ChatPermissionPolicy) =>
   policy === 'ask' ? 'default' : 'acceptEdits';
 
-function chatArguments(
+export function chatArguments(
   request: ChatTurnRequest,
   resume: string | null,
   folders: string[],
   tools: ThreadToolsServer | null,
   /** The config as inline JSON, or the path of the file that holds it when it carries secrets. */
   config: (server: Record<string, unknown>) => string,
+  /** The flags the build lists, when its help has been read. Optional flags it lacks are dropped. */
+  known: ReadonlySet<string> | null = null,
 ) {
   const { effort, model } = request.selection;
   // The thread tools are the one MCP server a turn gets. Strict mode keeps the person's own
@@ -511,44 +520,47 @@ function chatArguments(
   const server = tools && {
     [tools.name]: { type: 'stdio', command: tools.command, args: tools.args },
   };
-  return [
-    '--print',
-    '--output-format',
-    'stream-json',
-    '--input-format',
-    'stream-json',
-    '--verbose',
-    '--include-partial-messages',
-    '--permission-prompt-tool',
-    'stdio',
-    // Settings files carry allow rules that answer before CrewKite is asked, in the scratch
-    // copy's own file and in the person's user file. No source loads; hooks stay off too. The
-    // usage read runs the same way and signs in fine, so sign-in does not depend on settings.
-    // Empty commit and pr attribution keep a trailer or a generated-with line out of any commit
-    // or pull request text the model writes.
-    '--setting-sources',
-    '',
-    '--settings',
-    '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
-    '--permission-mode',
-    permissionMode(request.permissionPolicy),
-    // Review and advice turns read only. The thread tools only read, on every turn.
-    ...(allowed.length ? ['--allowedTools', allowed.join(',')] : []),
-    // The crew role turned subagents off, so the tools that start one are not offered.
-    ...(request.subagents === false ? ['--disallowedTools', [...SUBAGENT_TOOLS].join(',')] : []),
-    // The config option takes several values, so the flag after it closes the list. Strict mode
-    // goes on every turn: with no thread tools the config is empty and no other server loads.
-    '--mcp-config',
-    config({ ...(server ?? {}), ...anthropicMcpEntries(request.mcp) }),
-    '--strict-mcp-config',
-    '--model',
-    model,
-    // The client documents low, medium, high, xhigh and max. It has no minimal level.
-    ...(effort === 'default' || effort === 'minimal' ? [] : ['--effort', effort]),
-    ...(resume ? ['--resume', resume] : []),
-    // The option takes several folders, so it goes last where no later flag can be read as one.
-    ...(folders.length ? ['--add-dir', ...folders] : []),
-  ];
+  return withKnownFlags(
+    [
+      '--print',
+      '--output-format',
+      'stream-json',
+      '--input-format',
+      'stream-json',
+      '--verbose',
+      '--include-partial-messages',
+      '--permission-prompt-tool',
+      'stdio',
+      // Settings files carry allow rules that answer before CrewKite is asked, in the scratch
+      // copy's own file and in the person's user file. No source loads; hooks stay off too. The
+      // usage read runs the same way and signs in fine, so sign-in does not depend on settings.
+      // Empty commit and pr attribution keep a trailer or a generated-with line out of any commit
+      // or pull request text the model writes.
+      '--setting-sources',
+      '',
+      '--settings',
+      '{"disableAllHooks":true,"attribution":{"commit":"","pr":"","sessionUrl":false}}',
+      '--permission-mode',
+      permissionMode(request.permissionPolicy),
+      // Review and advice turns read only. The thread tools only read, on every turn.
+      ...(allowed.length ? ['--allowedTools', allowed.join(',')] : []),
+      // The crew role turned subagents off, so the tools that start one are not offered.
+      ...(request.subagents === false ? ['--disallowedTools', [...SUBAGENT_TOOLS].join(',')] : []),
+      // The config option takes several values, so the flag after it closes the list. Strict mode
+      // goes on every turn: with no thread tools the config is empty and no other server loads.
+      '--mcp-config',
+      config({ ...(server ?? {}), ...anthropicMcpEntries(request.mcp) }),
+      '--strict-mcp-config',
+      '--model',
+      model,
+      // The client documents low, medium, high, xhigh and max. It has no minimal level.
+      ...(effort === 'default' || effort === 'minimal' ? [] : ['--effort', effort]),
+      ...(resume ? ['--resume', resume] : []),
+      // The option takes several folders, so it goes last where no later flag can be read as one.
+      ...(folders.length ? ['--add-dir', ...folders] : []),
+    ],
+    known,
+  );
 }
 
 export function anthropicChatAdapter(deps: {
@@ -683,8 +695,11 @@ function startTurn(
     );
   }
   let executable: string;
+  let build = '';
+  let droppedFlags: string[] = [];
   try {
     const client = deps.launch(request);
+    build = client.sha256;
     executable = verifiedExecutable(client.executable, client.sha256);
   } catch (error) {
     return refuse(
@@ -700,7 +715,7 @@ function startTurn(
   }
   let child: ChildProcessWithoutNullStreams;
   try {
-    const args = chatArguments(
+    const planned = chatArguments(
       request,
       prior,
       message.folders,
@@ -729,8 +744,10 @@ function startTurn(
         }
         return mcpFile;
       },
+      knownFlags(build),
     );
-    child = (deps.spawn ?? (spawn as Spawn))(executable, args, {
+    droppedFlags = planned.dropped;
+    child = (deps.spawn ?? (spawn as Spawn))(executable, planned.argv, {
       cwd: scratch,
       env: environment,
       detached: true,
@@ -947,7 +964,13 @@ function startTurn(
         model: typeof input.model === 'string' ? input.model : null,
       });
   };
-  const answer = (requestId: string, ask: Ask, choice: string) => {
+  /** `by` names an answer the adapter gave on its own. CrewKite's own answers leave it out. */
+  const answer = (
+    requestId: string,
+    ask: Ask,
+    choice: string,
+    by?: Extract<AgentEvent, { type: 'permission.resolved' }>['answeredBy'],
+  ) => {
     const allow = choice === 'allow-once' || choice === 'allow-thread';
     if (choice === 'allow-thread') allowed.add(ask.toolName);
     if (!allow && ask.callId) denied.add(ask.callId);
@@ -961,7 +984,13 @@ function startTurn(
           : { behavior: 'deny', message: 'The user declined this action.' },
       },
     });
-    send({ type: 'permission.resolved', turnId, requestId, choice: allow ? choice : 'deny' });
+    send({
+      type: 'permission.resolved',
+      turnId,
+      requestId,
+      choice: allow ? choice : 'deny',
+      ...(by ? { answeredBy: by } : {}),
+    });
   };
 
   const onInit = (value: unknown) => {
@@ -969,6 +998,8 @@ function startTurn(
     if (!parsed.success) return unreadable('system/init');
     session = parsed.data.session_id;
     if (parsed.data.model) model = parsed.data.model;
+    if (parsed.data.capabilities?.length && build)
+      recordClient('anthropic', { build, capabilities: parsed.data.capabilities });
     if (started) return;
     started = true;
     // The badge names the level the turn runs at. The client's own report wins, since it covers
@@ -987,6 +1018,13 @@ function startTurn(
           : (parsed.data.effort ?? 'default'),
       role: request.role,
     });
+    if (droppedFlags.length)
+      notice(
+        'flags',
+        `This build of the client does not list ${droppedFlags.join(', ')}, so the turn ran without ${droppedFlags.length === 1 ? 'it' : 'them'}.`,
+        'info',
+        true,
+      );
     if (request.selection.effort === 'minimal')
       notice(
         'effort',
@@ -1148,7 +1186,20 @@ function startTurn(
         type: 'control_response',
         response: { subtype: 'error', request_id: requestId, error: 'Unsupported request.' },
       });
-      return unknown(`control_request/${label(ask.subtype)}`);
+      unknown(`control_request/${label(ask.subtype)}`);
+      // A request CrewKite cannot answer is a release it has not read. The turn stops in the
+      // client's words, so nothing looks finished that was never served.
+      decide(
+        'error',
+        chatFailure({
+          stage: 'stream',
+          kind: 'protocol',
+          method: `control_request/${label(ask.subtype)}`,
+          message: `The client sent a request CrewKite does not know (control_request/${label(ask.subtype)}). The turn stopped. Check for a CrewKite update.`,
+          providerMessage: clip(ask.message ?? ask.description ?? ask.prompt ?? '', 4096) || null,
+        }),
+      );
+      return terminate();
     }
     const toolName = ask.tool_name ?? ask.toolName ?? 'tool';
     const input = ask.input ?? {};
@@ -1176,19 +1227,19 @@ function startTurn(
     const mcp = mcpToolAnswer(request.mcp, toolName);
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
     // Edits land only in the scratch copy, so allow-all sends an edit outside it to the person.
-    const automatic = request.readOnly
-      ? 'deny'
+    const [automatic, by] = request.readOnly
+      ? (['deny', 'read-only'] as const)
       : mcp !== null
         ? mcp === 'allow'
-          ? 'allow-once'
+          ? (['allow-once', 'policy'] as const)
           : allowed.has(toolName)
-            ? 'allow-thread'
-            : null
+            ? (['allow-thread', 'thread-grant'] as const)
+            : [null, undefined]
         : policy === 'allow-all' && (kind !== 'edit' || inside)
-          ? 'allow-once'
+          ? (['allow-once', 'policy'] as const)
           : granted
-            ? 'allow-thread'
-            : null;
+            ? (['allow-thread', 'thread-grant'] as const)
+            : [null, undefined];
     // The ask is open before the event goes out, so an answer given from inside the
     // controller's event handler still finds it.
     if (!automatic) asks.set(requestId, entry);
@@ -1201,8 +1252,13 @@ function startTurn(
       // The input came from JSON.parse, so it serializes again without throwing.
       detail: clip(JSON.stringify(input, null, 2), 16_384),
       options,
+      kind,
+      // An edit grant covers the scratch copy only, so the card says why this one asks.
+      ...(!automatic && kind === 'edit' && !inside && grants.includes('edit')
+        ? { reason: 'Asked because the file is outside the scratch copy.' }
+        : {}),
     });
-    if (automatic) answer(requestId, entry, automatic);
+    if (automatic) answer(requestId, entry, automatic, by);
   };
   const onCancel = (value: unknown) => {
     const parsed = cancel.safeParse(value);
@@ -1349,8 +1405,11 @@ function startTurn(
             chatFailure({
               ...base,
               kind: 'protocol',
-              message:
-                data.subtype === 'error_max_turns'
+              // A subtype the client documents has its own line. A new one is a release CrewKite
+              // has not read, and the turn ends in the client's own words.
+              message: !RESULT_SUBTYPES.has(data.subtype ?? '')
+                ? `The client ended the turn with a result CrewKite does not know (${base.method}). Check for a CrewKite update.`
+                : data.subtype === 'error_max_turns'
                   ? 'The client reached its turn limit before it finished.'
                   : 'The client reported an error and ended the turn.',
             }),

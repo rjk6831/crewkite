@@ -398,6 +398,9 @@ The reconnect line says about a minute, which is the existing retry schedule of 
 - The task lane rows extend the ceiling claim to the clients that work in a scratch copy for a run. The Google writer test and the OpenAI repository writer test read the environment each launched process received and expect the folder above the scratch copy. A last row in `host/git-ceiling.test.ts` starts the buffered node check process of an evaluated copy and reads the value it sees.
 - The recovery marker test in `chat/restart-failure.test.ts` checks that only the two failures startup recovery writes read back as caused by a restart. The same text with client output in the detail, a provider message or a protocol method, at another stage, or with another kind, and a live process failure, all read back as ordinary failures. A row in the restart queue table repeats the restart text with client output in the detail and keeps the queue held.
 
+- The digest test in `providers/file-digest.test.ts` hashes a file once, answers the same identity from the cache, and hashes again after its mtime and then its size change, with the right digest each time.
+- The socket test in `server/index.test.ts` serves a real controller while a Google install holds at its download, then sends ConfigureLocal, BeginLocalConnectionInput and RefreshLocalModels between ten workspace reads over one connection with the desktop's 5 second deadline. No answer is an unknown outcome, and each client file is read once. A second row makes each fresh hash take 300 ms of real time, the cost of a cold client on the Mac, and expects the same.
+
 ## Changes pages, hunks and review comments
 
 These claims run against real git and real SQLite on temporary folders, through the controller and the scripted chat adapter, with no provider client and no network.

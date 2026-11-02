@@ -21,12 +21,14 @@ import {
   type ChatModelSelection,
   type ChatOutputLimit,
   ChatOutputLimitSchema,
+  type ChatPermissionAnswer,
   type ChatPermissionOption,
   type ChatPermissionPolicy,
   type ChatQueuedMessage,
   type ChatSearchResult,
   type ChatSession,
   ChatSessionSchema,
+  type ChatStopCause,
   type ChatThread,
   type ChatThreadRead,
   ChatThreadReadSchema,
@@ -241,7 +243,24 @@ type Ending = {
   effort?: ChatModelSelection['effort'];
   /** The reply used its whole output budget. */
   outputLimit?: ChatOutputLimit;
+  /** Why a stopped turn stopped, with the line the thread shows for it. */
+  stop?: Stop;
 };
+/** Why a turn stopped, and the line the thread writes for it. The first cause asked for wins. */
+type Stop = { cause: ChatStopCause; line: string };
+const STOPS = {
+  person: { cause: 'person', line: 'Stopped: you pressed Stop.' },
+  steer: { cause: 'send-now', line: 'Stopped: Send now started the next message.' },
+  restart: { cause: 'restart', line: 'Stopped: CrewKite restarted.' },
+} as const satisfies Record<string, Stop>;
+/** A plan stopped for its own reason. Its own line names the reason too. */
+const planStop = (why: string): Stop => ({
+  cause: 'plan',
+  line:
+    why === 'you cancelled it'
+      ? 'Stopped: the plan was cancelled.'
+      : `Stopped: the plan stopped because ${why}.`,
+});
 type FileDiff = ReturnType<typeof scratchChanges>[number];
 type Message = Pick<ChatQueuedMessage, 'text' | 'role' | 'selection' | 'attachments' | 'files'>;
 type LiveTurn = {
@@ -249,6 +268,8 @@ type LiveTurn = {
   role: ChatTurn['role'];
   handle: ChatTurnHandle | null;
   stopRequested: boolean;
+  /** Why CrewKite asked the turn to stop. Null for a turn the client stopped on its own. */
+  stop: Stop | null;
   finished: boolean;
   /** Streamed text by item, kept so a stop or crash keeps what the person already saw. */
   items: Map<string, string>;
@@ -262,8 +283,13 @@ type LiveTurn = {
       deletes: boolean;
     }
   >;
-  /** Tool kind by call ID. A thread grant covers a kind, and only the tool event names it. */
+  /**
+   * Tool kind by call ID. A thread grant covers a kind. The tool event names it, and so does an
+   * ask from an adapter that knows it, since a client may ask before the tool starts.
+   */
   kinds: Map<string, ChatToolKind>;
+  /** Who answered an ask, kept until the adapter reports the answer, so the thread can say so. */
+  answered: Map<string, ChatPermissionAnswer>;
   /** Title and input by call ID, so CrewKite can tell where an edit lands and what a command runs. */
   calls: Map<string, { title: string; input: unknown }>;
   /** The policy and grants the adapter launched with. */
@@ -399,8 +425,8 @@ export class ChatService {
   private readonly live = new Map<string, LiveTurn>();
   /** The hash of the notes each open turn started with, for the session the turn leaves. */
   private readonly notesSent = new Map<string, string>();
-  /** Plan slice turns stopped before their launch ran. Each starts as stopped. */
-  private readonly stoppedEarly = new Set<string>();
+  /** Plan slice turns stopped before their launch ran. Each starts as stopped, for this reason. */
+  private readonly stoppedEarly = new Map<string, Stop>();
   /** Orchestrator plans: proposal, assignment and the slice chain (ADR 0045). */
   private readonly plans: PlanRunner;
   /** Project checks the crew chain runs after a fix and after the last slice. */
@@ -515,6 +541,7 @@ export class ChatService {
     if (!open || !option)
       return blocked('permission-not-pending', 'Refresh the thread and answer the open request.');
     live.permissions.delete(payload.requestId);
+    live.answered.set(payload.requestId, 'person');
     // Allow for this thread covers the kind of tool the request was about, in later assistant
     // turns. A request with no known kind, or one filed under other, could be anything, so the
     // answer stays with this turn. So does one given to a reviewer or advisor, which never edits.
@@ -541,12 +568,14 @@ export class ChatService {
       return { outcome: 'applied', data: { kind: 'chat-queue', messages: [] } };
     }
     // The turn result marks the row stopped once the provider has let go.
-    live.stopRequested = true;
+    this.requestStop(live, STOPS.person);
     // The queue stays and pauses: nothing in it starts by itself, and each message waits for
-    // Send now or Remove. The result names the messages still waiting.
+    // Send now or Remove. The result names the messages still waiting. A side question runs
+    // beside the queue and never held it, so stopping one leaves the queue as it is.
     const task = this.task(payload.taskId);
     const thread = this.thread(payload.taskId);
-    if (task && thread.queued.length) this.putThread(task, { ...thread, queuePaused: true });
+    if (task && thread.queued.length && !this.beside(payload.turnId))
+      this.putThread(task, { ...thread, queuePaused: true });
     effects.push(() => this.call(() => live.handle?.stop()));
     return { outcome: 'applied', data: { kind: 'chat-queue', messages: thread.queued } };
   }
@@ -628,10 +657,11 @@ export class ChatService {
         this.call(() => live.handle?.setPermissionPolicy?.(applied.policy, applied.grants));
       }
       for (const requestId of [...live.permissions.keys()]) {
-        const choice = this.covered(thread, live, requestId, false);
-        if (!choice) continue;
+        const covered = this.covered(thread, live, requestId, false);
+        if (!covered) continue;
         live.permissions.delete(requestId);
-        this.call(() => live.handle?.respondPermission(requestId, choice));
+        live.answered.set(requestId, covered.by);
+        this.call(() => live.handle?.respondPermission(requestId, covered.choice));
       }
     }
   }
@@ -838,7 +868,7 @@ export class ChatService {
     if (!message)
       return blocked('message-not-queued', 'It is no longer queued. If it started, Stop ends it.');
     // Stop keeps the queue here. Once the provider lets go the queue starts its first message.
-    live.stopRequested = true;
+    this.requestStop(live, STOPS.steer);
     live.steered = true;
     this.putThread(task, {
       ...thread,
@@ -1166,9 +1196,12 @@ export class ChatService {
   }
 
   /**
-   * A read-only question to one family. It goes the way a message does, so it waits behind a
-   * running turn and behind a turn on that family in another thread. The reply posts as a turn
-   * with the ask role, and the thread keeps its own pick.
+   * A read-only question to one family. It starts at once beside whatever the thread runs, in a
+   * fresh session of its own, and never waits in the queue (ADR 0050). The thread's active turn
+   * stays the builder's, so Stop, Send now, a handoff and the plan never see the question. It
+   * reads only and holds no session the thread resumes, so the one turn per family rule that
+   * keeps threads from competing does not hold it back. One side question runs per thread at a
+   * time. The reply posts as a turn with the ask role, and the thread keeps its own pick.
    */
   ask(payload: Payload<'AskChatFamily'>, effects: Effects): CommandResult {
     const task = this.task(payload.taskId);
@@ -1185,15 +1218,17 @@ export class ChatService {
       effort,
     });
     if (!selection) return blocked('selection-unavailable', 'Pick a model the provider lists.');
-    return this.sendMessage(
-      {
-        taskId: task.id,
-        text: payload.question,
-        selection,
-        role: 'ask',
-        attachments: [],
-        files: [],
-      },
+    const open = this.deps.store.db
+      .prepare(
+        "SELECT 1 FROM chat_turns WHERE task_id=? AND json_extract(body,'$.role')='ask' AND json_extract(body,'$.slice') IS NULL AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') LIMIT 1",
+      )
+      .get(task.id);
+    if (open)
+      return blocked('ask-running', 'Wait for the side question to finish, or stop it, then ask.');
+    return this.begin(
+      task,
+      this.thread(task.id),
+      { text: payload.question, selection, role: 'ask', attachments: [], files: [] },
       effects,
     );
   }
@@ -1296,12 +1331,12 @@ export class ChatService {
             "SELECT 1 FROM chat_turns WHERE json_extract(body,'$.selection.family')=? AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') LIMIT 1",
           )
           .get(family),
-      stopTurn: (taskId, turnId) => {
+      stopTurn: (taskId, turnId, why) => {
         const live = this.activeLive(taskId, turnId);
         // A turn opened in the same transaction has no live turn yet. Its launch reads this.
-        if (!live && !this.live.has(turnId)) this.stoppedEarly.add(turnId);
+        if (!live && !this.live.has(turnId)) this.stoppedEarly.set(turnId, planStop(why));
         if (!live) return;
-        live.stopRequested = true;
+        this.requestStop(live, planStop(why));
         queueMicrotask(() => this.call(() => live.handle?.stop()));
       },
       planThreads: () =>
@@ -1318,7 +1353,7 @@ export class ChatService {
         const id = this.thread(taskId).activeTurnId;
         const live = id ? this.activeLive(taskId, id) : undefined;
         if (!live) return;
-        live.stopRequested = true;
+        this.requestStop(live, planStop('you cancelled it'));
         effects.push(() => this.call(() => live.handle?.stop()));
       },
       free: (task) => !this.checkedThread(task).left.length,
@@ -1598,7 +1633,7 @@ export class ChatService {
     this.checks.close();
     const running = [...this.live.values()];
     for (const live of running) {
-      live.stopRequested = true;
+      this.requestStop(live, STOPS.restart);
       this.call(() => live.handle?.stop());
     }
     if (!running.length) return;
@@ -1611,10 +1646,12 @@ export class ChatService {
       role: turn.role,
       handle: null,
       stopRequested: false,
+      stop: null,
       finished: false,
       items: new Map(),
       permissions: new Map(),
       kinds: new Map(),
+      answered: new Map(),
       calls: new Map(),
       policy: 'ask',
       grants: [],
@@ -1630,7 +1667,9 @@ export class ChatService {
       gone: new Set(),
       done: Promise.resolve(),
     };
-    if (this.stoppedEarly.delete(turn.id)) live.stopRequested = true;
+    const early = this.stoppedEarly.get(turn.id);
+    this.stoppedEarly.delete(turn.id);
+    if (early) this.requestStop(live, early);
     this.live.set(turn.id, live);
     live.done = this.run(turn, live);
   }
@@ -1916,6 +1955,7 @@ export class ChatService {
       // The finish keeps a session only for a writer outside a plan slice. Every other turn's
       // session is never resumed.
       resumable: writer && !lane,
+      title: task.title.slice(0, 80),
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
       permissionPolicy,
@@ -2049,6 +2089,17 @@ export class ChatService {
       live.kinds.set(event.callId, event.kind);
       live.calls.set(event.callId, { title: event.title, input: event.input });
     }
+    // The tool event names the kind when it comes first. When the ask comes first, the kind the
+    // adapter put on the ask keeps a grant from depending on the order the client sends them.
+    if (event.type === 'permission.requested' && event.kind && event.callId)
+      if (!live.kinds.has(event.callId)) live.kinds.set(event.callId, event.kind);
+    // An adapter knows when it answered on its own. An answer CrewKite sent for the person or for
+    // the thread comes back without the field, and the thread still shows who gave it.
+    if (event.type === 'permission.resolved') {
+      const by = event.answeredBy ?? live.answered.get(event.requestId);
+      live.answered.delete(event.requestId);
+      if (by) event = { ...event, answeredBy: by };
+    }
     if (event.type === 'permission.requested')
       live.permissions.set(event.requestId, {
         options: event.options,
@@ -2076,11 +2127,12 @@ export class ChatService {
     // The thread is read at ask time, so a mode or policy changed during the turn applies to this
     // ask. Adapters register an ask before they emit it, so this answer finds it.
     if (event.type === 'permission.requested') {
-      const choice = this.covered(this.thread(turn.taskId), live, event.requestId, true);
-      if (choice) {
+      const covered = this.covered(this.thread(turn.taskId), live, event.requestId, true);
+      if (covered) {
         live.permissions.delete(event.requestId);
+        live.answered.set(event.requestId, covered.by);
         const respond = () =>
-          this.call(() => live.handle?.respondPermission(event.requestId, choice));
+          this.call(() => live.handle?.respondPermission(event.requestId, covered.choice));
         // An ask emitted before startTurn returned has no handle yet. It has one a tick later.
         if (live.handle) respond();
         else queueMicrotask(respond);
@@ -2102,7 +2154,7 @@ export class ChatService {
     live: LiveTurn,
     requestId: string,
     fresh: boolean,
-  ): string | null {
+  ): { choice: string; by: 'flight-mode' | 'policy' } | null {
     const open = live.permissions.get(requestId);
     const allow =
       open?.options.find((option) => option.kind === 'allow-once') ??
@@ -2120,18 +2172,19 @@ export class ChatService {
     const scratch = live.scratch;
     // Balanced and Glide run a read-only command inside the scratch copy without asking, on every
     // family and under every policy. Other commands follow the policy.
+    const mode = { choice: allow.id, by: 'flight-mode' } as const;
+    const policed = { choice: allow.id, by: 'policy' } as const;
     if (thread.flightMode !== 'manual' && kind === 'command')
-      if (readOnlyCommand(call?.input, scratch)) return allow.id;
+      if (readOnlyCommand(call?.input, scratch)) return mode;
     if (balanced) {
       // A delete or move is marked by the adapter from the client's own change type.
-      if (kind === 'edit')
-        return !open.deletes && editsInside(call?.input, scratch) ? allow.id : null;
+      if (kind === 'edit') return !open.deletes && editsInside(call?.input, scratch) ? mode : null;
       return null;
     }
     if (fresh && policy === live.applied.policy) return null;
     if (kind === 'edit')
-      return policy !== 'ask' && editsInside(call?.input, scratch) ? allow.id : null;
-    return policy === 'allow-all' ? allow.id : null;
+      return policy !== 'ask' && editsInside(call?.input, scratch) ? policed : null;
+    return policy === 'allow-all' ? policed : null;
   }
 
   private finish(turnId: string, live: LiveTurn, raw: ChatTurnResult, left: number[]) {
@@ -2155,7 +2208,9 @@ export class ChatService {
     let seen = false;
     try {
       this.deps.store.transaction(() => {
-        const end = { ...ending(result, live.items, left), effort: live.effort };
+        const end: Ending = { ...ending(result, live.items, left), effort: live.effort };
+        if (end.state === 'stopped')
+          end.stop = live.stop ?? (this.closed ? STOPS.restart : clientStop(result.failure));
         seen =
           !!turn &&
           turn.slice === undefined &&
@@ -2257,6 +2312,7 @@ export class ChatService {
           failure: end.failure,
           assistantMessageId: reply?.id ?? null,
           stopReason: end.stopReason,
+          ...(end.stop ? { stopCause: end.stop.cause } : {}),
           ...(end.outputLimit ? { outputLimit: end.outputLimit } : {}),
         },
         end.groups,
@@ -2278,10 +2334,11 @@ export class ChatService {
             ...(notesSent ? { notesDigest: notesSent } : {}),
           }
         : null;
-    // Plan slices run side by side. The thread stays busy while any of its turns is open.
+    // Plan slices run side by side. The thread stays busy while any of its turns is open, except
+    // a side question, which never holds the thread.
     const other = this.deps.store.db
       .prepare(
-        "SELECT id FROM chat_turns WHERE task_id=? AND id<>? AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') ORDER BY sequence LIMIT 1",
+        "SELECT id FROM chat_turns WHERE task_id=? AND id<>? AND json_extract(body,'$.state') IN ('queued','running','waiting-permission') AND NOT (json_extract(body,'$.role')='ask' AND json_extract(body,'$.slice') IS NULL) ORDER BY sequence LIMIT 1",
       )
       .get(task.id, turn.id) as { id: string } | undefined;
     this.putThread(task, {
@@ -2294,6 +2351,14 @@ export class ChatService {
       ...(end.groups.length ? { ownershipUnknown: true } : {}),
     });
     if (end.stopReason === 'limit') this.appendLimitLine(task, turn, end.failure);
+    // Stop, Send now, the plan, a restart and the client all end a turn as stopped. The line says
+    // which one, so a stop the person did not ask for never reads like one they did.
+    if (end.stop)
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: turn.id },
+        text: fitText(end.stop.line, 16_384),
+      });
     if (end.outputLimit) {
       const count = (value: number) => value.toLocaleString('en-US');
       const { reasoningTokens, replyTokens, allowedTokens } = end.outputLimit;
@@ -3006,9 +3071,10 @@ export class ChatService {
     });
     this.putTurn(task, turn);
     // A fixer runs on the crew's pick, so the thread keeps the person's own. Plan slices run side
-    // by side, and the thread names one of them as its running turn. An orchestrator answers in
-    // place of the builder, so a thread with no pick yet takes the crew builder: the composer then
-    // offers the builder for the next message, not a catalog default.
+    // by side, and the thread names one of them as its running turn. A side question runs beside
+    // and never becomes the running turn. An orchestrator answers in place of the builder, so a
+    // thread with no pick yet takes the crew builder: the composer then offers the builder for
+    // the next message, not a catalog default.
     const builder = thread.crew?.members.find((member) => member.role === 'builder')?.selection;
     this.putThread(task, {
       ...thread,
@@ -3019,7 +3085,12 @@ export class ChatService {
           : role === 'orchestrator' && slice === undefined
             ? (thread.selection ?? builder ?? null)
             : thread.selection,
-      activeTurnId: slice !== undefined && thread.activeTurnId ? thread.activeTurnId : turn.id,
+      activeTurnId:
+        role === 'ask' && slice === undefined
+          ? thread.activeTurnId
+          : slice !== undefined && thread.activeTurnId
+            ? thread.activeTurnId
+            : turn.id,
     });
     effects.push(() => this.launch(turn));
   }
@@ -3071,9 +3142,22 @@ export class ChatService {
   private activeLive(taskId: string, turnId: string): LiveTurn | undefined {
     const live = this.live.get(turnId);
     if (!live || live.finished || live.taskId !== taskId) return;
-    // A plan slice's open turn answers its own asks and Stop, beside the thread's running turn.
-    if (this.turn(turnId)?.slice !== undefined) return live;
+    // A plan slice's open turn and a side question answer their own asks and Stop, beside the
+    // thread's running turn.
+    if (this.turn(turnId)?.slice !== undefined || this.beside(turnId)) return live;
     return this.thread(taskId).activeTurnId === turnId ? live : undefined;
+  }
+
+  /** A side question: an ask outside a plan slice. It runs beside the thread's active turn. */
+  private beside(turnId: string): boolean {
+    const turn = this.turn(turnId);
+    return turn?.role === 'ask' && turn.slice === undefined;
+  }
+
+  /** Ask a live turn to stop. The first cause asked for is the one the thread shows. */
+  private requestStop(live: LiveTurn, stop: Stop) {
+    live.stopRequested = true;
+    live.stop ??= stop;
   }
 
   /** Provider calls run after commit. A throwing adapter must not undo a committed command. */
@@ -4117,6 +4201,13 @@ function fitHistory(
     kept = kept.map((entry) => ({ ...entry, text: clip(entry.text, PACKET_ENTRY_CHARACTERS) }));
   while (kept.length > 0 && !fits(kept)) kept = kept.slice(1);
   return kept;
+}
+
+/** A stop CrewKite did not ask for. The adapter's message says why, when it sent one. */
+function clientStop(failure: unknown): Stop {
+  const reported = ChatFailureSchema.safeParse(failure);
+  const message = reported.success ? reported.data.message.trim() : '';
+  return { cause: 'client', line: `Stopped: ${message || 'the provider ended the turn.'}` };
 }
 
 function ending(

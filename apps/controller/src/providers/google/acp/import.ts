@@ -11,19 +11,19 @@ import {
   readdirSync,
   writeFileSync,
 } from 'node:fs';
-import { open } from 'node:fs/promises';
 import { basename, dirname, join, relative } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { groupAbsent, type Schedule } from '../../../host/worker.ts';
 import {
-  ACP_READ_PIECE_BYTES,
   type AcpClientIdentity,
   type AcpClientPin,
   AcpHarnessMaximumBytes,
+  type AcpHash,
   AcpImportIdentitySchema,
   AcpImportPinSchema,
   AcpServerMaximumBytes,
   acpClientPin,
+  copyAcpPrivateFile,
   googleAcpDeveloperIdRequirement,
   hashAcpPrivateFileAsync,
   readAcpPrivateFile,
@@ -54,6 +54,16 @@ export type AcpImportDependencies = {
   schedule?: Schedule;
   spawn?: Spawn;
   lifecycle?: { beforePhase(): void; owned(group: number): void; quiescent(group: number): void };
+  /**
+   * How many of the two client files have been copied and hashed. The install shows it as
+   * "Checking file 1 of 2".
+   */
+  onCheck?: (done: number) => void;
+  /**
+   * The hashing the import does, so a test can count it. `create` starts the hash that runs while a
+   * staged file is copied. `file` hashes a file that is already in place.
+   */
+  hashing?: { create?: () => AcpHash; file?: typeof hashAcpPrivateFileAsync };
 };
 export type AcpImportResult = {
   imported: boolean;
@@ -87,7 +97,7 @@ function synchronous(callback: (() => unknown) | undefined) {
 }
 
 /** A signature check owns its process group until both pipes close and the group is absent. */
-function signaturePhase(
+export function signaturePhase(
   executable: string,
   args: string[],
   deadline: number,
@@ -116,6 +126,7 @@ function signaturePhase(
     let timedOut = false;
     let stopping = false;
     let killedAt: number | undefined;
+    let exitedAt: number | undefined;
     let code: number | null = null;
     let size = 0;
     const output: Buffer[] = [];
@@ -141,7 +152,10 @@ function signaturePhase(
       }
       // A check that ran out of time proves nothing about the signature. It is a separate reason,
       // so the connect can run it again. A finished check that codesign refused stays refused.
-      if (timedOut || now() >= deadline) return reject(new Error('signature-timeout'));
+      // The close event can reach this loop long after the child exited. The time the check took is
+      // the time of the exit, and a busy loop must not turn a check that finished into a timeout.
+      if (timedOut || (exitedAt ?? now()) >= deadline)
+        return reject(new Error('signature-timeout'));
       if (failed || code !== 0) return reject(new Error('signature-refused'));
       try {
         resolve(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(output)));
@@ -216,6 +230,7 @@ function signaturePhase(
       stop();
     });
     child.on('close', (status) => {
+      exitedAt ??= now();
       closed = true;
       code = status;
       if (absent()) settle();
@@ -289,52 +304,6 @@ function writePrivate(path: string, bytes: Buffer, mode: number) {
     fsyncSync(directory);
   } finally {
     closeSync(directory);
-  }
-}
-
-/**
- * Copies a staged client file into the managed folder one piece at a time, then syncs it and its
- * folder. The caller hashes the copy before trusting it.
- */
-async function copyPrivate(source: string, path: string, maximum: number, mode: number) {
-  const input = await open(
-    source,
-    constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK,
-  );
-  try {
-    const output = await open(
-      path,
-      constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-      0o600,
-    );
-    try {
-      const piece = Buffer.allocUnsafe(ACP_READ_PIECE_BYTES);
-      let total = 0;
-      for (;;) {
-        const { bytesRead } = await input.read(piece, 0, piece.length, null);
-        if (bytesRead === 0) break;
-        total += bytesRead;
-        if (total > maximum) throw new Error('Invalid private file.');
-        let written = 0;
-        while (written < bytesRead)
-          written += (await output.write(piece, written, bytesRead - written)).bytesWritten;
-      }
-      await output.chmod(mode);
-      await output.sync();
-    } finally {
-      await output.close();
-    }
-  } finally {
-    await input.close();
-  }
-  const directory = await open(
-    dirname(path),
-    constants.O_RDONLY | constants.O_DIRECTORY | constants.O_NOFOLLOW,
-  );
-  try {
-    await directory.sync();
-  } finally {
-    await directory.close();
   }
 }
 
@@ -414,19 +383,22 @@ export async function importGoogleAcp(
         maximum: AcpHarnessMaximumBytes,
       },
     ].map((file) => ({ ...file, source: join(staging, file.name) }));
-    // The client files are hashed and copied in pieces. A Local connect or any other socket in the
-    // controller keeps running while the import reads about 400 MB several times.
+    // The client files are copied and hashed in pieces, so a Local connect or any other socket in
+    // the controller keeps running while the import moves about 400 MB. Each file is read once
+    // from staging, where the copy gives its digest, and once from the managed folder, where the
+    // hash proves what reached the disk.
+    const hashFile = dependencies.hashing?.file ?? hashAcpPrivateFileAsync;
     const holds = async (path: string, file: (typeof files)[number], executable = false) =>
-      (await hashAcpPrivateFileAsync(path, file.maximum, executable)) === file.sha256;
-    for (const file of files)
-      if (!(await holds(file.source, file))) return refused('invalid-import');
+      (await hashFile(path, file.maximum, executable)) === file.sha256;
     const root = join(options.home, 'providers/google-acp-v1');
     const pinPath = join(root, 'pin.json');
     const matchesIdentity = (current: AcpClientIdentity) =>
       JSON.stringify(acpClientPin(current)) === JSON.stringify(client) &&
       current.harnessSha256 === identity.harnessSha256;
     if (existsSync(pinPath)) {
-      const current = await readGoogleAcpPinAsync(options.home);
+      for (const file of files)
+        if (!(await holds(file.source, file))) return refused('invalid-import');
+      const current = await readGoogleAcpPinAsync(options.home, true);
       return matchesIdentity(current)
         ? { imported: true, reason: 'already-imported', client: current }
         : refused('pin-conflict');
@@ -435,27 +407,47 @@ export async function importGoogleAcp(
     privateDirectory(root, options.home);
     const managed = join(root, client.sha256);
     privateDirectory(managed, options.home);
-    for (const file of files) {
+    dependencies.onCheck?.(0);
+    for (const [index, file] of files.entries()) {
       const destination = join(managed, file.name);
-      if (!existsSync(destination))
-        await copyPrivate(file.source, destination, file.maximum, 0o500);
+      if (existsSync(destination)) {
+        if (!(await holds(file.source, file))) return refused('invalid-import');
+      } else
+        await copyAcpPrivateFile(
+          file.source,
+          destination,
+          { maximum: file.maximum, mode: 0o500, sha256: file.sha256 },
+          dependencies.hashing?.create,
+        );
       if (!(await holds(destination, file, true))) return refused('invalid-import');
+      dependencies.onCheck?.(index + 1);
     }
     if (
       JSON.stringify(readdirSync(managed).sort()) !== JSON.stringify(files.map((file) => file.name))
     )
       return refused('invalid-import');
     const executable = join(managed, 'agy_acp_server.par');
+    // The identity of the files, with the hashes above, is what the signature checks run on. A
+    // write, chmod, link or replacement changes the inode or ctime, so the same snapshot after
+    // the checks proves the bytes did not change under them. No file is hashed again.
     const snapshot = managedSnapshot(options.home, executable);
     const receipts: SignatureReceipt[] = [];
     const clock = dependencies.now ?? (() => performance.now());
     try {
-      for (const file of files) {
-        const deadline = clock() + ACP_SIGNATURE_MS;
-        const receipt = await (
-          dependencies.verifySignature ??
-          ((input) => verifyOsSignature(input, dependencies, deadline))
-        )({ executable: join(managed, file.name), client: { ...client, sha256: file.sha256 } });
+      // The two files are checked at the same time, each in its own window. A failed check does
+      // not return before the other one has ended, so no process outlives the import.
+      const started = clock();
+      const outcomes = await Promise.allSettled(
+        files.map((file) =>
+          (
+            dependencies.verifySignature ??
+            ((input) => verifyOsSignature(input, dependencies, started + ACP_SIGNATURE_MS))
+          )({ executable: join(managed, file.name), client: { ...client, sha256: file.sha256 } }),
+        ),
+      );
+      for (const outcome of outcomes) if (outcome.status === 'rejected') throw outcome.reason;
+      for (const outcome of outcomes) {
+        const receipt = (outcome as PromiseFulfilledResult<SignatureReceipt>).value;
         if (
           receipt.verified !== true ||
           receipt.quiescent !== true ||
@@ -464,20 +456,12 @@ export async function importGoogleAcp(
         )
           return refused('signature-refused');
         receipts.push(receipt);
-        if (managedSnapshot(options.home, executable) !== snapshot)
-          return refused('invalid-import');
-        for (const entry of files)
-          if (
-            !(await holds(join(managed, entry.name), entry, true)) ||
-            !(await holds(entry.source, entry))
-          )
-            return refused('invalid-import');
-        if (
-          !readAcpPrivateFile(join(staging, 'identity.json'), 4096).equals(identityBytes) ||
-          managedSnapshot(options.home, executable) !== snapshot
-        )
-          return refused('invalid-import');
       }
+      if (
+        managedSnapshot(options.home, executable) !== snapshot ||
+        !readAcpPrivateFile(join(staging, 'identity.json'), 4096).equals(identityBytes)
+      )
+        return refused('invalid-import');
     } catch (error) {
       const message = error instanceof Error ? error.message : '';
       return refused(
@@ -503,7 +487,7 @@ export async function importGoogleAcp(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
     }
-    const current = await readGoogleAcpPinAsync(options.home);
+    const current = await readGoogleAcpPinAsync(options.home, true);
     if (!matchesIdentity(current)) return refused('pin-conflict');
     return { imported: true, reason: 'imported', client: current };
   } catch {

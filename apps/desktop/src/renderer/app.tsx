@@ -25,6 +25,7 @@ import { Dialog, short, titleCase } from './components.tsx';
 import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
+import { useLocalReconnect } from './local-setup.tsx';
 import { Onboarding } from './onboarding/onboarding.tsx';
 import { useOnboarding } from './onboarding/use-onboarding.ts';
 import {
@@ -510,6 +511,7 @@ export function App() {
   const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
   const onboarding = useOnboarding(workspace);
+  useLocalReconnect(workspace);
   const [prefill, setPrefill] = useState<string | null>(null);
   // Threads deleted here leave the rail at once, before the workspace read catches up.
   const [removed, setRemoved] = useState<ReadonlySet<string>>(() => new Set());
@@ -959,6 +961,8 @@ export function App() {
             <span>Interface preview. No worker, checks or provider calls run here.</span>
           </div>
         )}
+        {/* Only commands that keep a receipt raise this, such as candidate, source and publication
+            changes. Provider setup sends again with a new key and never shows it. */}
         {workspace.retryAvailable && (
           <div className="recovery-banner" role="status">
             <AlertTriangle size={15} />

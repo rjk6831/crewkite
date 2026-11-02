@@ -3,11 +3,13 @@ import {
   type SpawnSyncReturns,
   spawnSync,
 } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync, type Stats } from 'node:fs';
+import { lstatSync, realpathSync, type Stats } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { ClientVersionState, ClientVersionStatus } from '@crewkite/contracts';
+import { timed } from '../diagnostics/timing.ts';
+import { clientRecord } from './client-record.ts';
+import { fileDigestSync } from './file-digest.ts';
 import { platformGate } from './platform.ts';
 
 // The chat path and the Google quota reader accept a range of client builds (ADR 0009, amendment
@@ -18,9 +20,13 @@ export const CLIENT_VERSIONS = {
     name: 'Codex',
     command: 'codex',
     tested: '0.163.0',
-    // The launch passes --strict-config with settings keys the tested build reads, and a build
-    // that lacks one of them exits before it answers initialize. No older build has a run.
-    minimum: '0.163.0',
+    // For this client the version is information (ADR 0048). Every build runs; the replies and the
+    // connect-time probe decide what a turn may use. checkedOn is the day the protocol check last
+    // passed against the tested build. 0.133.0 is the oldest build whose read-only turns read
+    // through a permission profile; older ones ask before each command.
+    checkedOn: '2 Nov 2026',
+    information: true,
+    minimum: '0.133.0',
     update: 'npm install -g @openai/codex@latest',
     maximumBytes: 256 * 1024 * 1024,
     environment: {},
@@ -28,10 +34,13 @@ export const CLIENT_VERSIONS = {
   anthropic: {
     name: 'Claude Code',
     command: 'claude',
-    tested: '2.1.302',
-    // The stream-json control protocol, --setting-sources and the attribution settings the turn
-    // passes all predate the 2.1 line.
-    minimum: '2.1.0',
+    tested: '2.1.316',
+    // checkedOn is the day the protocol check last passed against the tested build.
+    checkedOn: '3 Nov 2026',
+    // 2.1.259 is the first build with --permission-prompts, which the usage read and the writer
+    // pass. An older build answers the flag with an unknown option error. Optional flags are
+    // probed per build, so a later build that drops one still runs.
+    minimum: '2.1.259',
     update: 'claude update',
     maximumBytes: 512 * 1024 * 1024,
     environment: { DISABLE_UPDATES: '1', DISABLE_AUTOUPDATER: '1' },
@@ -174,14 +183,31 @@ export function clientVersionStatus(
         : found.state;
   const version = parsed?.text ?? (found.state === 'pinned' ? found.version : null);
   const tested = parseClientVersion(row.tested)?.core[0] ?? 0;
+  const checked = 'checkedOn' in row ? `Checked with ${row.tested} on ${row.checkedOn}` : null;
+  // A row marked as information accepts every build and says what the probe decides. Other rows
+  // refuse a build below the minimum and a new major version.
+  const information = 'information' in row;
+  const informed = information && (state === 'older' || state === 'new-major' || state === 'newer');
   const message = (() => {
+    if (information && checked !== null)
+      switch (state) {
+        case 'tested':
+          return `${row.name} ${version} found. ${checked}.`;
+        case 'supported':
+          return `${row.name} ${version} found. ${checked}; builds from ${row.minimum} on are supported.`;
+        case 'newer':
+        case 'new-major':
+          return `${row.name} ${version} found. ${checked}; this build is newer than the last checked build.`;
+        case 'older':
+          return `${row.name} ${version} found. ${checked}; this build is older than ${row.minimum}, so read-only turns ask before each command.`;
+      }
     switch (state) {
       case 'tested':
-        return `${row.name} ${version} found. This is the build CrewKite was tested with.`;
+        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}.`;
       case 'newer':
-        return `${row.name} ${version} found. Tested with ${row.tested}; newer builds usually work.`;
+        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}; a newer build runs while its flags and replies match what CrewKite sends.`;
       case 'supported':
-        return `${row.name} ${version} found. Tested with ${row.tested}; builds from ${row.minimum} on are supported.`;
+        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}; builds from ${row.minimum} on are supported.`;
       case 'older':
         return `${row.name} ${version} is older than the minimum ${row.minimum}. Update it with ${row.update}, then press Check again.`;
       case 'new-major':
@@ -207,11 +233,22 @@ export function clientVersionStatus(
   })();
   return {
     state,
-    accepted: ACCEPTED.has(state),
+    accepted: informed || ACCEPTED.has(state),
     version,
     tested: row.tested,
     minimum: row.minimum,
     message: message.slice(0, 1024),
+    ...('checkedOn' in row ? { checkedOn: row.checkedOn } : {}),
+    ...recordFields(family, version),
+  };
+}
+
+/** What the client reported about itself, for the build found. */
+function recordFields(family: ClientFamily, version: string | null) {
+  const record = clientRecord(family, version);
+  return {
+    ...(record?.capabilities.length ? { capabilities: [...record.capabilities] } : {}),
+    ...(record?.probe ? { probe: record.probe } : {}),
   };
 }
 
@@ -426,7 +463,9 @@ function inspect(
     : { status };
 }
 
-const digest = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
+// The profiles and every launch read the same digest cache, so a build is hashed once per file
+// identity whichever of them sees it first.
+const digest = (path: string) => fileDigestSync(path);
 
 // shortcut: the read is synchronous, so a client that ignores the bound blocks the controller for
 // up to the timeout once per changed build. The result is cached by the file's identity. An
@@ -452,7 +491,9 @@ function readVersion(executable: string, row: Row, options: FindOptions): string
   };
   let result: SpawnSyncReturns<string>;
   try {
-    result = spawnSync(executable, ['--version'], spawnOptions);
+    result = timed(`spawnSync ${row.command} --version`, () =>
+      spawnSync(executable, ['--version'], spawnOptions),
+    );
   } catch {
     return null;
   }

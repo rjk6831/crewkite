@@ -4,6 +4,7 @@ import type {
   ChatFailure,
   ChatFamily,
   ChatOutputLimit,
+  ChatPermissionAnswer,
   ChatPermissionOption,
   ChatRole,
   ChatToolKind,
@@ -37,6 +38,8 @@ export type ToolBlock = {
   diff: FileDiff | null;
   summary: string | null;
   subagents: SubagentActivity | null;
+  /** Who answered the call's ask when nobody asked the person, such as a thread grant. */
+  note?: string;
 };
 export type PermissionBlock = {
   kind: 'permission';
@@ -47,6 +50,10 @@ export type PermissionBlock = {
   detail: string | null;
   options: ChatPermissionOption[];
   choice: string | null;
+  /** Who answered. Missing means the person. */
+  answeredBy?: ChatPermissionAnswer;
+  /** Why the ask reached the person although the thread allowed its kind. */
+  reason?: string;
 };
 export type NoticeBlock = {
   kind: 'notice';
@@ -107,6 +114,8 @@ export type TurnView = {
   /** Set when the reply stopped at its output limit. */
   outputLimit: ChatOutputLimit | null;
   failure: ChatFailure | null;
+  /** The thread's line that says why a stopped turn stopped. */
+  stopNote?: string;
   /** The brief a plan slice turn ran on. It shows folded under the chip. */
   brief?: string;
 };
@@ -174,11 +183,56 @@ const liveStatus = (blocks: readonly Block[]): TurnStatus =>
     : 'running';
 
 function withBlocks(view: TurnView, blocks: Block[]): TurnView {
-  return { ...view, blocks, status: view.ended ? view.status : liveStatus(blocks) };
+  const shown = answeredLines(blocks);
+  return { ...view, blocks: shown, status: view.ended ? view.status : liveStatus(shown) };
 }
 
-// Adapters report a stop with a failure of kind 'stopped'. A stop is something the person asked
-// for, so it ends the turn as stopped and leaves no failure to show.
+/** An answer nobody asked the person for. A cancelled ask was never answered. */
+export const automatic = (block: PermissionBlock) =>
+  block.choice !== null &&
+  block.choice !== 'cancelled' &&
+  block.answeredBy !== undefined &&
+  block.answeredBy !== 'person';
+
+/** The one line an automatic answer shows. */
+export function answerNote(block: PermissionBlock, toolKind?: ChatToolKind): string {
+  if (block.options.find((option) => option.id === block.choice)?.kind === 'deny')
+    return 'Declined: this turn only reads';
+  if (block.answeredBy === 'thread-grant') return 'Allowed for this thread';
+  if (block.answeredBy === 'policy') return 'Allowed by the Permissions policy';
+  if (block.answeredBy === 'read-only') return 'Allowed: read-only command in the scratch copy';
+  return toolKind === 'command'
+    ? 'Allowed: read-only command in the scratch copy'
+    : 'Allowed: edit inside the scratch copy';
+}
+
+/**
+ * An ask CrewKite or the client answered on its own folds into one line on its tool card, so it
+ * never looks like a choice the person made. Until the tool card exists the ask keeps its block,
+ * which shows the same line. A client may ask before the tool starts, so this runs on every fold.
+ */
+function answeredLines(blocks: Block[]): Block[] {
+  const notes = new Map<string, PermissionBlock>();
+  for (const block of blocks)
+    if (block.kind === 'permission' && block.callId && automatic(block))
+      notes.set(`tool:${block.callId}`, block);
+  if (!notes.size) return blocks;
+  const tools = new Set(
+    blocks.flatMap((block) => (block.kind === 'tool' && notes.has(block.id) ? [block.id] : [])),
+  );
+  if (!tools.size) return blocks;
+  return blocks.flatMap((block): Block[] => {
+    if (block.kind === 'permission' && automatic(block) && tools.has(`tool:${block.callId}`))
+      return [];
+    const asked = block.kind === 'tool' ? notes.get(block.id) : undefined;
+    if (block.kind === 'tool' && asked)
+      return [{ ...block, note: answerNote(asked, block.toolKind) }];
+    return [block];
+  });
+}
+
+// Adapters report a stop with a failure of kind 'stopped'. A stop is no failure: the turn ends as
+// stopped, and the thread's stop line says why.
 export const isStop = (failure: ChatFailure | null | undefined) => failure?.kind === 'stopped';
 
 function finish(view: TurnView, event: Extract<AgentEvent, { type: 'turn.completed' }>): TurnView {
@@ -206,6 +260,7 @@ const routine = (block: ToolBlock, asked: ReadonlySet<string>) =>
   (block.toolKind === 'read' || block.toolKind === 'search') &&
   block.status === 'ok' &&
   block.diff === null &&
+  block.note === undefined &&
   !asked.has(block.id);
 
 // A text item with no text yet, and a thinking block that ended with none, such as a redacted one
@@ -386,6 +441,10 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
           detail: event.detail,
           options: event.options,
           choice: current?.kind === 'permission' ? current.choice : null,
+          ...(current?.kind === 'permission' && current.answeredBy
+            ? { answeredBy: current.answeredBy }
+            : {}),
+          ...(event.reason ? { reason: event.reason } : {}),
         })),
       );
     }
@@ -395,7 +454,11 @@ export function applyEvent(view: TurnView, event: AgentEvent): TurnView {
         view,
         view.blocks.map((block) =>
           block.id === id && block.kind === 'permission'
-            ? { ...block, choice: event.choice }
+            ? {
+                ...block,
+                choice: event.choice,
+                ...(event.answeredBy ? { answeredBy: event.answeredBy } : {}),
+              }
             : block,
         ),
       );

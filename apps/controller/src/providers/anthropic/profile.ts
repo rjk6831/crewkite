@@ -1,17 +1,21 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
 import { z } from 'zod';
+import { clientRecord, liveModelDefault } from '../client-record.ts';
 import {
   clientDirectories,
   clientHostGate,
   clientVersionStatus,
   findClient,
 } from '../client-versions.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import type { ChatClientResolution, NativeProfileResolution } from '../openai/profile.ts';
+import { probeClient } from './client-probe.ts';
 import { nativeAuthEnvironment } from './native-discovery.ts';
+import { liveModelIds } from './protocol.ts';
 
 const descriptor = {
   id: 'anthropic-file-v1',
@@ -36,6 +40,18 @@ const compactDescriptor = {
   displayName: 'Anthropic compact single-file proposal',
   model: 'claude-haiku-5-5',
 } as const;
+// The descriptor names a default model. The client's own list, read at connect, wins when it has
+// a model of the same family, so a release that retires the default does not pin the writer to it.
+function writerModel(fallback: string) {
+  const initialize = clientRecord('anthropic')?.kept.initialize as
+    | { models?: unknown[] }
+    | undefined;
+  return liveModelDefault(
+    fallback,
+    fallback.split('-')[1] ?? '',
+    initialize?.models ? liveModelIds(initialize.models) : null,
+  );
+}
 const clientHash = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c6662d37';
 
 const subscriptionMetadata = z.strictObject({
@@ -82,11 +98,11 @@ function resolve(
       const stat = lstatSync(executable);
       if (!stat.isFile() || stat.size > 512 * 1024 * 1024) continue;
       found = true;
-      if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== clientHash)
-        continue;
+      if (fileDigestSync(executable) !== clientHash) continue;
       return {
         facts: AnthropicNativeProfileSchema.parse({
           ...selected,
+          model: writerModel(selected.model),
           available: true,
           reason: 'qualification-pending',
         }),
@@ -140,8 +156,19 @@ export function resolveAnthropicChatClient(
     path: environment.PATH,
   });
   if (!found.client) return { status: found.status };
+  // A changed build is probed once, before the first turn, and the card shows the result.
+  probeClient({
+    executable: found.client.executable,
+    sha256: found.client.sha256,
+    version: found.client.version,
+    environment,
+  });
   return {
-    status: found.status,
+    status: clientVersionStatus('anthropic', {
+      state: 'version',
+      path: found.client.executable,
+      version: found.client.version,
+    }),
     profile: {
       facts: AnthropicNativeProfileSchema.parse({
         ...descriptor,

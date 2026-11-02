@@ -3,7 +3,9 @@ import { mkdirSync } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
 import { z } from 'zod';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { recordClient } from '../client-record.ts';
 import { chatEnvironment, type Spawn, verifiedExecutable } from './chat.ts';
+import { parseInitializeReply } from './protocol.ts';
 
 /** One row of the client's own model picker, as the account sees it now. */
 export type AnthropicLiveModel = {
@@ -23,14 +25,6 @@ const row = z.object({
   description: z.string().max(500).optional().catch(undefined),
   supportsEffort: z.boolean().optional().catch(undefined),
   supportedEffortLevels: z.array(z.string().max(32)).max(16).optional().catch(undefined),
-});
-const reply = z.object({
-  type: z.literal('control_response'),
-  response: z.object({
-    subtype: z.literal('success'),
-    request_id: z.literal('models'),
-    response: z.object({ models: z.array(z.unknown()).max(64) }),
-  }),
 });
 const MAX_BYTES = 4 * 1024 * 1024;
 
@@ -138,10 +132,10 @@ export function readAnthropicModels(options: {
         } catch {
           continue;
         }
-        const parsed = reply.safeParse(value);
-        if (!parsed.success) continue;
+        const parsed = parseInitializeReply(value);
+        if (parsed?.requestId !== 'models') continue;
         const models: AnthropicLiveModel[] = [];
-        for (const raw of parsed.data.response.response.models) {
+        for (const raw of parsed.models) {
           const entry = row.safeParse(raw);
           if (!entry.success) continue;
           const {
@@ -158,6 +152,20 @@ export function readAnthropicModels(options: {
             efforts: supportsEffort ? (entry.data.supportedEffortLevels ?? []) : [],
           });
         }
+        // The whole reply stays on the client's record: Settings lists its capabilities, and the
+        // writer defaults read its model ids.
+        recordClient('anthropic', {
+          build: options.sha256,
+          ...(parsed.version ? { version: parsed.version } : {}),
+          capabilities: parsed.capabilities,
+          kept: {
+            initialize: {
+              models: parsed.models,
+              commands: parsed.commands,
+              account: parsed.account,
+            },
+          },
+        });
         return finish(models.length ? models : null);
       }
     });

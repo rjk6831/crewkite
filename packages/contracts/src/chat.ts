@@ -294,6 +294,26 @@ export type ChatPlanState = z.infer<typeof ChatPlanStateSchema>;
 
 export const ChatToolKindSchema = z.enum(['read', 'search', 'edit', 'command', 'other']);
 
+/**
+ * Who answered a permission ask: the person, a kind the thread allowed, the Permissions policy,
+ * the flight mode, or the rule that a read-only turn never changes anything.
+ */
+export const ChatPermissionAnswerSchema = z.enum([
+  'person',
+  'thread-grant',
+  'policy',
+  'flight-mode',
+  'read-only',
+]);
+export type ChatPermissionAnswer = z.infer<typeof ChatPermissionAnswerSchema>;
+
+/**
+ * Why a turn stopped: the person pressed Stop, Send now started the next message, the plan
+ * stopped it, CrewKite shut down, or the client ended it on its own.
+ */
+export const ChatStopCauseSchema = z.enum(['person', 'send-now', 'plan', 'restart', 'client']);
+export type ChatStopCause = z.infer<typeof ChatStopCauseSchema>;
+
 export const ChatPermissionOptionSchema = z.strictObject({
   id: short,
   label: short,
@@ -413,12 +433,21 @@ export const AgentEventSchema = z.discriminatedUnion('type', [
     options: z.array(ChatPermissionOptionSchema).min(1).max(6),
     /** The client said the change deletes or moves a file. Balanced sends these to the person. */
     deletes: z.literal(true).optional(),
+    /**
+     * The kind of tool the ask is about, when the adapter knows it. A client may ask before the
+     * tool event that names the kind, and Allow for this thread still needs it.
+     */
+    kind: ChatToolKindSchema.optional(),
+    /** Why the ask reached the person although the thread allowed its kind. */
+    reason: z.string().min(1).max(512).optional(),
   }),
   z.strictObject({
     type: z.literal('permission.resolved'),
     ...turnRef,
     requestId: short,
     choice: short,
+    /** Who answered. Missing means the person, as before the field existed. */
+    answeredBy: ChatPermissionAnswerSchema.optional(),
   }),
   z.strictObject({
     type: z.literal('usage.context'),
@@ -484,6 +513,8 @@ export const ChatTurnSchema = z.strictObject({
   handoffFrom: ChatFamilySchema.nullable().default(null),
   /** Set when the turn settles. A reopened view uses it where live events are gone. */
   stopReason: z.enum(['done', 'stopped', 'limit', 'error']).nullable().optional(),
+  /** Set when the turn stopped. The thread holds a line that says the same in words. */
+  stopCause: ChatStopCauseSchema.optional(),
   /** Process groups of the turn not yet proven gone. The next command and startup check again. */
   groups: z.array(z.number().int().positive()).max(64).optional(),
   /** The last turn.stats the adapter reported. */

@@ -10,6 +10,7 @@
   "scripts": {
     "prepare": "git config core.hooksPath .githooks",
     "policy": "node scripts/policy.mjs all",
+    "protocol:check": "node scripts/protocol-check.mjs",
     "lint": "biome check .",
     "format": "biome check --write .",
     "types": "tsc --noEmit",

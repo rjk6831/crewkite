@@ -536,8 +536,14 @@ async function nativeSetup(
     Promise.resolve().then(() => setup(t, nativeOptions, close)),
   );
   // A Google writer row prepares a Google run, which the terms gate holds until the person
-  // acknowledges the current text. These rows protect the writer, so the person has done that.
-  if (google) await acknowledgeGoogleTerms(context);
+  // acknowledges the current text and has connected Google once on this device. These rows
+  // protect the writer, so the person has done both.
+  if (google) {
+    await acknowledgeGoogleTerms(context);
+    context.controller.store.transaction(() =>
+      context.controller.store.markConnectedOnce('google'),
+    );
+  }
   if (targetPath !== 'net.mjs') {
     const files = [
       { path: targetPath, content: Buffer.from('# Provider notes\nOriginal café notes.\n') },

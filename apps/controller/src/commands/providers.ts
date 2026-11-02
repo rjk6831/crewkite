@@ -15,6 +15,7 @@ import {
   NativeProfileSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { timed } from '../diagnostics/timing.ts';
 import { groupAbsent } from '../host/worker.ts';
 import {
   ConnectionRecordSchema,
@@ -70,6 +71,7 @@ const GOOGLE_DIAGNOSTIC_OPERATIONS = 50;
 // The connection revision at which a no-authentication connect met a runtime that wants a token.
 // Memory only: the next connect probes again.
 const tokenAsked = new WeakMap<object, number>();
+const profileReads = new WeakMap<object, { profiles?: NativeProfileResolution[] }>();
 
 export class ProviderCommands {
   executeAcpSetup(
@@ -335,6 +337,7 @@ export class ProviderCommands {
   googleAcpPreparationStep(this: Controller): 'initialize' | 'discover' | null {
     if (
       !this.options.registerGoogleAcp ||
+      !this.store.hasConnectedOnce('google') ||
       this.closed ||
       !googleTermsAcknowledged(this.store) ||
       this.acpSetupRuntime ||
@@ -841,7 +844,34 @@ export class ProviderCommands {
     } catch {
       return { outcome: 'blocked', reason: 'anthropic-connection-storage-failed' };
     }
+    // The card's Connect is this check. A signed-in client connects Anthropic on this device.
+    if (this.nativeConnections().status().state === 'signed-in') this.connectedNow('anthropic');
     return result;
+  }
+
+  /**
+   * The launch-time sign-in check for an Anthropic connection made on this device. It reads the
+   * client's own sign-in, so the card says when that sign-in ended. Nothing is journaled as a
+   * click.
+   */
+  async checkAnthropicAtLaunch(this: Controller): Promise<void> {
+    if (this.closed || !this.store.hasConnectedOnce('anthropic')) return;
+    if (this.anthropicUsage().blocker()) return;
+    const key = this.id('cmd');
+    const directory = join(this.home, 'native', `connection-${key}`);
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      await this.nativeConnections().check(
+        {
+          key,
+          requestHash: hashCanonical({ key, launch: true }),
+          profile: this.anthropicChatProfile(),
+          directory,
+          repositoryRoot: this.home,
+        },
+        { spawn: this.options.nativeSpawn, schedule: this.options.schedule },
+      );
+    } catch {}
   }
 
   localControl(this: Controller): LocalControl {
@@ -1107,6 +1137,7 @@ export class ProviderCommands {
       return { outcome: 'applied', revision: setup.revision };
     };
     if (command.command === 'DisconnectLocal') {
+      this.store.forgetConnectedOnce('local');
       this.revokeLocalSecret();
       control = this.saveLocal({
         ...control,
@@ -1164,6 +1195,10 @@ export class ProviderCommands {
     }
     const blocker = this.store.localStartBlocker();
     if (blocker) return { outcome: 'blocked', reason: blocker };
+    // A Connect on the card connects Local on this device. Later launches reconnect the saved
+    // endpoint with no click.
+    if (command.command === 'ConfigureLocal' || command.command === 'BeginLocalConnectionInput')
+      this.store.markConnectedOnce('local');
     if (command.command === 'ConfigureLocal') {
       const authMode = command.payload.authMode ?? 'token';
       const refusal = authMode === 'token' ? this.localTokenRefusal() : null;
@@ -1228,6 +1263,16 @@ export class ProviderCommands {
     }
     if (command.command === 'RefreshLocalModels' && !this.localConnected(control))
       return { outcome: 'blocked', reason: 'local-connection-required' };
+    // Connect on a setup that is connected, with a current read and nothing running, has nothing
+    // to do. A second press, or a resend after a lost answer, keeps the model selection.
+    if (
+      command.command === 'BeginLocalConnectionInput' &&
+      this.localConnected(control) &&
+      control.observation &&
+      !control.observationStale &&
+      !control.connectionFailed
+    )
+      return applied();
     const kind = command.command === 'BeginLocalConnectionInput' ? 'input' : 'discovery';
     // A token the desktop supplied for this connection survives the connect that uses it.
     if (kind === 'input' && !(this.localSecret?.supplied && this.localSecretMatches(control)))
@@ -1678,7 +1723,31 @@ export class ProviderCommands {
     }
   }
 
+  /**
+   * Runs one synchronous read with the profiles resolved once. A workspace read asks for them from
+   * the header, from the Anthropic reader's binding and again from the snapshot around it, and
+   * nothing inside one synchronous read can change them. The kept answer ends when the read
+   * returns, so a command that waits and resolves again sees fresh profiles.
+   */
+  withProfiles<T>(this: Controller, read: () => T): T {
+    if (profileReads.has(this)) return read();
+    profileReads.set(this, {});
+    try {
+      return read();
+    } finally {
+      profileReads.delete(this);
+    }
+  }
+
   resolveProfiles(this: Controller): NativeProfileResolution[] {
+    const kept = profileReads.get(this);
+    if (kept?.profiles) return [...kept.profiles];
+    const profiles = timed('resolveProfiles', () => this.resolveProfilesNow());
+    if (kept) kept.profiles = profiles;
+    return kept ? [...profiles] : profiles;
+  }
+
+  resolveProfilesNow(this: Controller): NativeProfileResolution[] {
     const profiles = [
       ...(this.options.nativeProfiles?.() ?? [
         this.options.nativeProfile?.() ?? unavailableNativeProfile(),

@@ -364,7 +364,7 @@ test('a failed turn adds a system line with the cause and the next action', () =
   assert.equal(line.failure.nextAction, 'Continue on another provider.');
 });
 
-test('a stopped turn ends quietly with its partial text and no failure line', () => {
+test('a stopped turn shows its partial text and the line that says why, and no failure line', () => {
   const stop: ChatFailure = {
     stage: 'stream',
     kind: 'stopped',
@@ -377,10 +377,28 @@ test('a stopped turn ends quietly with its partial text and no failure line', ()
   };
   const end = (cursor: number) =>
     agent(cursor, { type: 'turn.completed', stopReason: 'stopped', failure: stop });
+  // The controller writes one line per stop, naming the turn it stopped.
+  const why: ChatMessage = {
+    id: id('msg', 13),
+    taskId: task,
+    at: stamp,
+    cursor: '13',
+    author: { kind: 'system', turnId: turn },
+    text: 'Stopped: Send now started the next message.',
+    attachments: [],
+    files: [],
+  };
+  const line: ThreadEvent = {
+    type: 'conversation.entry',
+    cursor: '13',
+    taskId: task,
+    payload: why,
+  };
   const items = run([
     started(10),
     agent(11, { type: 'text.delta', itemId: 'a', text: 'The guard ' }),
     end(12),
+    line,
   ]);
   assert.deepEqual(
     items.map((item) => item.kind),
@@ -389,9 +407,63 @@ test('a stopped turn ends quietly with its partial text and no failure line', ()
   const view = turnOf(items);
   assert.equal(view.status, 'stopped');
   assert.equal(view.failure, null);
+  assert.equal(view.stopNote, 'Stopped: Send now started the next message.');
   assert.equal(view.blocks[0].kind === 'text' && view.blocks[0].text, 'The guard ');
   // A stop before any output still leaves a row, so the person sees that it stopped.
   assert.equal(turnOf(run([started(10), end(11)])).status, 'stopped');
+});
+
+test('an ask nobody put to the person folds into one line on its tool card', () => {
+  const options = [
+    { id: 'allow-once', label: 'Allow once', kind: 'allow-once' },
+    { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
+    { id: 'deny', label: 'Deny', kind: 'deny' },
+  ] as const;
+  const rows = [
+    { by: 'thread-grant', choice: 'allow-thread', note: 'Allowed for this thread' },
+    { by: 'policy', choice: 'allow-once', note: 'Allowed by the Permissions policy' },
+    {
+      by: 'flight-mode',
+      choice: 'allow-once',
+      note: 'Allowed: read-only command in the scratch copy',
+    },
+    { by: 'read-only', choice: 'deny', note: 'Declined: this turn only reads' },
+    { by: 'person', choice: 'allow-thread', note: undefined },
+  ] as const;
+  for (const row of rows) {
+    // The client asks before the tool starts, so the line lands once the card exists.
+    const view = turnOf(
+      run([
+        started(10),
+        agent(11, {
+          type: 'permission.requested',
+          requestId: 'p1',
+          callId: 'c1',
+          kind: 'command',
+          question: 'Run this command?',
+          detail: 'ls',
+          options: [...options],
+        }),
+        agent(12, {
+          type: 'permission.resolved',
+          requestId: 'p1',
+          choice: row.choice,
+          answeredBy: row.by,
+        }),
+        agent(13, { type: 'tool.started', callId: 'c1', kind: 'command', title: 'ls' }),
+      ]),
+    );
+    assert.deepEqual(
+      view.blocks.map((block) => [block.kind, block.kind === 'tool' ? block.note : undefined]),
+      row.by === 'person'
+        ? [
+            ['permission', undefined],
+            ['tool', undefined],
+          ]
+        : [['tool', row.note]],
+      row.by,
+    );
+  }
 });
 
 // The view only guesses whether a message will wait. When the controller queues one the view

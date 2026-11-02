@@ -1,5 +1,6 @@
 import { userInfo } from 'node:os';
 import { type ClientVersionStatus, GoogleNativeProfileSchema } from '@crewkite/contracts';
+import { clientRecord, liveModelDefault } from '../client-record.ts';
 import {
   CLIENT_VERSIONS,
   clientDirectories,
@@ -29,11 +30,23 @@ const descriptor = {
   maximumFileBytes: 65536,
   maximumSubmissions: 1,
 } as const;
+// The descriptor names a default model. The model list the client reported for its last session
+// wins when it has a model of the same family.
+const writerModel = () => {
+  const live = clientRecord('google')?.kept.models;
+  return liveModelDefault(
+    descriptor.model,
+    'flash',
+    Array.isArray(live) ? live.filter((id): id is string => typeof id === 'string') : null,
+  );
+};
+
 /** Consumer headless mode excludes third-party application wrappers. */
 export function resolveGoogleNativeProfile(_environment = process.env): NativeProfileResolution {
   return {
     facts: GoogleNativeProfileSchema.parse({
       ...descriptor,
+      model: writerModel(),
       available: false,
       reason: 'provider-policy-restricted',
     }),

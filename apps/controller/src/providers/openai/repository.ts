@@ -16,6 +16,7 @@ import {
   type OpenAiUsageHook,
 } from './discovery.ts';
 import { type NativeLaunch, startNativeTask } from './native-discovery.ts';
+import { turnInterruptParams, writableSandbox } from './protocol.ts';
 import {
   NoticeCensus,
   nativeTaskAdmitted,
@@ -327,13 +328,7 @@ export class RepositoryTranscript {
         ...common,
         threadId: this.threadId,
         effort: this.plan.effort,
-        sandboxPolicy: {
-          type: 'workspaceWrite',
-          writableRoots: [this.plan.scratchPath],
-          networkAccess: false,
-          excludeTmpdirEnvVar: false,
-          excludeSlashTmp: false,
-        },
+        sandboxPolicy: writableSandbox(this.plan.scratchPath),
         input: [
           {
             type: 'text',
@@ -636,7 +631,7 @@ export class RepositoryTranscript {
     return encode({
       id: 12,
       method: 'turn/interrupt',
-      params: { threadId: this.threadId, turnId: this.turnId },
+      params: turnInterruptParams(this.threadId, this.turnId),
     });
   }
   finish() {

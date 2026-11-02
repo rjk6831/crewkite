@@ -4201,22 +4201,18 @@ test('Local reads keep the selection while its model key is loaded and clear it 
       true,
     ],
     [
-      'reconnect with the token, same model loaded',
+      'connect again on the connected setup',
       async () => {
-        const shown = context.setupState()?.observation?.observationHash;
-        await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
-        await context.operationDone();
-        // The last read stays on view, marked stale, and nothing can be picked from it.
+        const shown = context.setupState();
+        // A repeat Connect, or a resend after a lost answer, starts nothing and keeps the pick.
+        const again = await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
+        assert.equal(again.outcome, 'applied');
         const between = context.setupState();
-        assert.equal(between?.observation?.observationHash, shown);
-        assert.equal(between?.observationStale, true);
-        assert.equal(between?.selection, null);
-        assert.equal(between?.reason, 'discovery-required');
-        const pick = await context.local('SelectLocalModel', {
-          selectionId: selected.selection?.selectionId,
-          observationHash: shown,
-        });
-        assert.equal(pick.reason, 'local-selection-stale');
+        assert.equal(between?.operation, null);
+        assert.equal(between?.observation?.observationHash, shown?.observation?.observationHash);
+        assert.equal(between?.observationStale ?? false, false);
+        assert.equal(between?.selection?.selectionId, selected.selection?.selectionId);
+        assert.equal(between?.revision, shown?.revision);
         return refresh('completed');
       },
       true,
@@ -6795,6 +6791,16 @@ test('stop or restart cannot submit or apply late native work', async (t) => {
     }
     if (row === 'input-cancel' || row === 'input-disconnect') {
       context.mode('input-hold');
+      // Connect on a connected setup with a current read does nothing. A stale read makes it
+      // open the token window, which is the state these rows stop from.
+      const control = controller.store.localControl() as Record<string, unknown>;
+      controller.store.transaction(() =>
+        controller.store.putLocalControl({
+          ...control,
+          revision: (control.revision as number) + 1,
+          observationStale: true,
+        }),
+      );
       const before = context.setupState();
       await context.local('BeginLocalConnectionInput', { consent: 'explicit' });
       const operation = context.setupState()?.operation;
@@ -7980,6 +7986,8 @@ test('google quota authority survives retries and restart while sharing one oper
   // and google-quota-gate.test.ts: the person acknowledged the terms and Google is connected.
   const connectGoogle = (target: Controller) => {
     const acknowledged = target.store.googleAcpSetup();
+    // The person connected Google on this device, so the timed reads run on their own.
+    target.store.transaction(() => target.store.markConnectedOnce('google'));
     target.store.transaction(() =>
       target.store.putGoogleAcpSetup(
         GoogleAcpSetupSchema.parse({
@@ -8529,7 +8537,7 @@ test('google quota authority survives retries and restart while sharing one oper
     openAiUsageClient: () => {
       if (metadataMode === 'late-publication' && latePublication) {
         latePublication = false;
-        metadata.clock.advance(20000);
+        metadata.clock.advance(40000);
       }
       return nativeProfile;
     },
@@ -8570,7 +8578,7 @@ test('google quota authority survives retries and restart while sharing one oper
       const child = spawn(executable, ['-e', script, 'success', phase], spawnOptions);
       child.stderr.once('data', () => readStarted.resolve());
       if (phase === 'prepare' && metadataMode === 'late-protocol')
-        child.once('close', () => metadata.clock.advance(20000));
+        child.once('close', () => metadata.clock.advance(40000));
       if (phase === 'prepare' && metadataMode === 'late-publication')
         child.once('close', () => {
           latePublication = true;
@@ -8596,6 +8604,8 @@ test('google quota authority survives retries and restart while sharing one oper
       groups: number[];
     };
   };
+  // The OpenAI card's sign-in connects the device. Quota reads run only after it.
+  openController.store.transaction(() => openController.store.markConnectedOnce('openai'));
   const manualRead = metadata.command('ObserveUsage', { family: 'openai' }, 0);
   const firstRead = await openController.execute(manualRead, 'local-owner');
   assert.equal(firstRead.outcome, 'applied');
@@ -8981,6 +8991,8 @@ test('a catalog read with no stored model list starts one model read and the pic
     assert(data?.kind === 'chat-catalog');
     return data.families.find((entry) => entry.family === 'openai');
   };
+  // The model read starts the OpenAI client, so it runs on a device that connected OpenAI.
+  controller.store.transaction(() => controller.store.markConnectedOnce('openai'));
   const ended = new Promise<unknown>((resolve) => {
     const stop = controller.subscribe((event) => {
       if (event.type !== 'chat.catalog') return;

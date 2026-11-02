@@ -425,7 +425,14 @@ function ThreadBody({
     const rejected =
       newest && item.kind === 'failure' && item.failure.kind === 'attachment-rejected';
     const limit = item.kind === 'turn' && newest && item.turn.ended ? item.turn.outputLimit : null;
-    if (!note && !retryable && !regenerate && !limit) return null;
+    // A side question runs beside the builder, so it stops from its own row.
+    const side =
+      item.kind === 'turn' &&
+      !item.turn.ended &&
+      item.turn.identity?.role === 'ask' &&
+      sliceId === undefined &&
+      item.turn.identity.slice === undefined;
+    if (!note && !retryable && !regenerate && !limit && !side) return null;
     const choices =
       rejected && catalog
         ? tryWithChoices(
@@ -438,6 +445,23 @@ function ThreadBody({
     return (
       <div className="th-row th-turn-actions">
         {note && <p className="th-muted">{note}</p>}
+        {side && (
+          <button
+            type="button"
+            className="th-option"
+            onClick={() =>
+              void stopTurn(source, { taskId: task.id, turnId }).then(
+                () => setNotice(null),
+                (failure: unknown) =>
+                  setNotice(
+                    failure instanceof Error ? failure.message : 'The side question did not stop.',
+                  ),
+              )
+            }
+          >
+            Stop side question
+          </button>
+        )}
         {(retryable || regenerate) && !activeTurn && (
           <RerunControl
             label={regenerate ? 'Regenerate' : 'Retry'}

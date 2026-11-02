@@ -2633,6 +2633,10 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('StopAnthropicUsage', z.strictObject({ operationId: CommandIdSchema })),
+  // CrewKite's own OpenAI client home has its own sign-in. Sign-in opens a browser, so only a person
+  // starts it, and sign-out also ends a sign-in that is still waiting.
+  mutate('SignInOpenAi', z.strictObject({ consent: z.literal('explicit') })),
+  mutate('SignOutOpenAi', empty),
   // Initialize and discover run on their own at launch as well as on a click. Authenticate opens
   // a browser, so only a person starts it.
   mutate(
@@ -3470,6 +3474,19 @@ export const TaskActivityOutputPageSchema = z
   }, 'Activity output needs ordered distinct identities and bounded pages.');
 export type TaskActivityOutputPage = z.infer<typeof TaskActivityOutputPageSchema>;
 export const MAX_WORKSPACE_PAGE_BYTES = 524288;
+/**
+ * The providers this device connected once, which reconnect on their own at every later launch,
+ * and where the sign-in of CrewKite's own OpenAI client home stands. The address is the browser page the
+ * sign-in waits on.
+ */
+export const ProviderConnectionsSchema = z.strictObject({
+  connectedOnce: z.array(FamilySchema).max(4),
+  openAiSignIn: z.strictObject({
+    state: z.enum(['idle', 'waiting', 'failed']),
+    url: z.string().url().max(2048).nullable(),
+  }),
+});
+export type ProviderConnections = z.infer<typeof ProviderConnectionsSchema>;
 export const WorkspaceStateSchema = z
   .strictObject({
     kind: z.literal('workspace-state'),
@@ -3486,6 +3503,7 @@ export const WorkspaceStateSchema = z
     nativeProfiles: SnapshotSchema.shape.nativeProfiles,
     routes: SnapshotSchema.shape.routes,
     usage: SnapshotSchema.shape.usage,
+    providerConnections: ProviderConnectionsSchema.optional(),
   })
   .refine(
     (value) => new TextEncoder().encode(JSON.stringify(value)).byteLength <= MAX_FRAME_BYTES - 4096,

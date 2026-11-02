@@ -26,8 +26,9 @@ test('the Google quota read waits until Google is connected', async (t) => {
   assert.equal(resolved, before, 'the reads stop before they look for the reader client');
   assert.deepEqual(controller.store.googleMetadataOperations(), [], 'no Google process ran');
 
-  // A ready setup is connected, and the reads go ahead to the client.
+  // A ready setup the person connected on this device reads, and the reads go ahead to the client.
   const current = controller.store.googleAcpSetup();
+  controller.store.transaction(() => controller.store.markConnectedOnce('google'));
   controller.store.transaction(() =>
     controller.store.putGoogleAcpSetup(
       GoogleAcpSetupSchema.parse({

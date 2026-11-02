@@ -1,10 +1,10 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { stripVTControlCharacters } from 'node:util';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import {
   type DiscoveryEnvelope,
   type DiscoveryMetadata,
@@ -12,6 +12,7 @@ import {
   OpenAiDiscovery,
   type RefusedEnvelope,
 } from './discovery.ts';
+import { configArguments, launchArguments, launchSettings } from './protocol.ts';
 
 export type NativeLaunch = {
   executable: string;
@@ -36,7 +37,13 @@ function synchronous(result: unknown) {
   }
 }
 type NativeEnvelope = DiscoveryEnvelope | 'notification' | 'request';
-type NativeRequest = DiscoveryRequest | 'thread/start' | 'turn/start' | 'turn/completed';
+type NativeRequest =
+  | DiscoveryRequest
+  | 'thread/start'
+  | 'turn/start'
+  | 'turn/completed'
+  | 'account/login/start'
+  | 'account/logout';
 type Outcome<T = DiscoveryMetadata> = {
   metadata: T | null;
   reason: 'stopped' | 'deadline' | 'launch' | 'protocol' | 'output-limit' | 'ownership' | null;
@@ -120,45 +127,51 @@ function childDirectory(root: string, name: string) {
   return path;
 }
 
-/** Run-local settings do not change the existing native authentication location. */
-export function nativeDiscoveryArguments(
-  directory: string,
-  disabledMcpServers: readonly string[] = [],
-): string[] {
+// Discovery keeps the read-only sandbox mode and its own approval policy, which its config/read
+// check expects literally (discovery.ts).
+const discoverySettings = (directory: string) =>
+  launchSettings(directory, {
+    approvalPolicy: 'on-request',
+    sandboxMode: 'read-only',
+    subagents: false,
+  });
+
+function mcpOverrides(disabledMcpServers: readonly string[]) {
   // The native override parser splits dots without interpreting quoted key segments.
   if (
     disabledMcpServers.length > 128 ||
     disabledMcpServers.some((name) => !/^[A-Za-z0-9_-]{1,200}$/.test(name))
   )
     throw new Error('MCP override identifiers cannot be represented safely.');
-  const settings = {
-    model_provider: 'openai',
-    openai_base_url: '',
-    chatgpt_base_url: 'https://chatgpt.com/backend-api/',
-    service_tier: 'default',
-    approval_policy: 'on-request',
-    approvals_reviewer: 'user',
-    sandbox_mode: 'read-only',
-    web_search: 'disabled',
-    'features.plugins': false,
-    'features.remote_plugin': false,
-    'features.apps': false,
-    'features.hooks': false,
-    'features.multi_agent': false,
-    log_dir: join(directory, 'logs'),
-  };
-  return [
-    ...Object.entries(settings).flatMap(([key, value]) => [
-      '-c',
-      `${key}=${JSON.stringify(value)}`,
-    ]),
-    ...disabledMcpServers.flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]),
-    'app-server',
-    '--stdio',
-    '--strict-config',
-  ];
+  return disabledMcpServers.flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]);
 }
 
+/** Run-local settings do not change the existing native authentication location. */
+export function nativeDiscoveryArguments(
+  directory: string,
+  disabledMcpServers: readonly string[] = [],
+): string[] {
+  return launchArguments(discoverySettings(directory), mcpOverrides(disabledMcpServers));
+}
+
+/** Where CrewKite keeps its own Codex home, under the controller home. */
+export const CODEX_HOME_PATH = 'providers/openai/codex-home';
+
+/**
+ * CrewKite's own Codex home. Codex keeps its sign-in, config and saved threads there, so nothing
+ * CrewKite runs reads the person's ~/.codex or shows in their own Codex app. The controller home
+ * is CREWKITE_HOME, or ~/.crewkite as the controller's entry point chooses it.
+ */
+export function crewKiteCodexHome(source: NodeJS.ProcessEnv): string {
+  const home = source.CREWKITE_HOME ?? (source.HOME ? join(source.HOME, '.crewkite') : undefined);
+  if (!home || !isAbsolute(home)) throw new Error('Discovery requires the CrewKite home.');
+  return join(home, CODEX_HOME_PATH);
+}
+
+/**
+ * The one place the client's environment is built, for discovery, tasks, sign-in and chat turns.
+ * CODEX_HOME is always CrewKite's own. A CODEX_HOME the person set is never passed on.
+ */
 export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     LANG: 'C',
@@ -166,7 +179,7 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
   };
   for (const key of [
     'HOME',
-    'CODEX_HOME',
+    'CREWKITE_HOME',
     'PATH',
     'TMPDIR',
     'USER',
@@ -177,9 +190,22 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
     if (source[key] !== undefined) environment[key] = source[key];
   if (!environment.HOME || !isAbsolute(environment.HOME))
     throw new Error('Discovery requires the existing absolute native home.');
-  if (environment.CODEX_HOME && !isAbsolute(environment.CODEX_HOME))
-    throw new Error('Discovery requires an absolute native configuration location.');
+  environment.CODEX_HOME = crewKiteCodexHome(environment);
   return environment;
+}
+
+/**
+ * Codex refuses a CODEX_HOME that does not exist. It holds the sign-in, so it is private to the
+ * person, and a symlink or a folder someone else owns is refused.
+ */
+export function prepareCodexHome(environment: NodeJS.ProcessEnv) {
+  const home = environment.CODEX_HOME;
+  if (!home || !isAbsolute(home)) throw new Error("Codex needs CrewKite's own home.");
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(home);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
+    throw new Error("CrewKite's Codex home must be a private directory.");
+  return home;
 }
 
 /** Metadata completion requires closed streams and absence of the owned process group. */
@@ -215,7 +241,7 @@ function startTranscript<T>(
   const executable = realpathSync(launch.executable);
   if (!lstatSync(executable).isFile())
     throw new Error('Discovery executable must be a regular file.');
-  if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== launch.sha256)
+  if (fileDigestSync(executable) !== launch.sha256)
     throw new Error('Discovery executable identity changed.');
   if (!isAbsolute(launch.directory) || !isAbsolute(launch.repositoryRoot))
     throw new Error('Discovery requires absolute repository and run directories.');
@@ -249,9 +275,11 @@ function startTranscript<T>(
   childDirectory(directory, 'sqlite');
   if (options.task && now() >= deadline - 2000)
     throw new Error('Native task deadline elapsed before launch.');
+  const env = nativeDiscoveryEnvironment(launch.environment);
+  prepareCodexHome(env);
   const child = (options.spawn ?? spawn)(executable, options.arguments(directory), {
     cwd: directory,
-    env: nativeDiscoveryEnvironment(launch.environment),
+    env,
     detached: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
@@ -549,7 +577,7 @@ function nativeSession<T>(
     ...(options.task ? { deadline } : {}),
     closeInput: true,
     arguments: (directory) => [
-      ...nativeDiscoveryArguments(directory).slice(0, -3),
+      ...configArguments(discoverySettings(directory)),
       'features',
       'list',
     ],
@@ -586,7 +614,10 @@ function nativeSession<T>(
           return { ...prepared, metadata: null, reason: 'protocol' };
         disabledMcpServers = Object.keys(prepared.metadata.mcpServers);
       }
-      const remaining = Math.floor(deadline - now());
+      // A metadata read gives the app-server transcript its whole window after the preflight. The
+      // preflight is a second launch, and on a busy start it used up the read's time before the
+      // read began. A task keeps one deadline because its caller bounds the whole turn.
+      const remaining = options.task ? Math.floor(deadline - now()) : options.timeoutMs;
       if (remaining < (options.task ? 2001 : 1))
         return { ...outcome, metadata: null, reason: 'deadline' };
       const reader = createReader(remaining);
