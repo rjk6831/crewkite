@@ -520,7 +520,8 @@ export function App() {
     void workspace.selectTask(selected);
   }, [selected, workspace.selectTask]);
   // Saved crews live in the controller. They are read once it answers, and the first read after
-  // the move brings over the crews this window kept before.
+  // the move brings over the crews this window kept before. A failed read shows in Settings >
+  // Crews with a way to try again.
   useEffect(() => {
     if (connection === 'connected' && workspace.source)
       void loadCrews(workspace.source).catch(() => {});

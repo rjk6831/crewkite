@@ -161,6 +161,14 @@
   flex-direction: column;
   align-items: flex-start;
 }
+.st-crews-failed {
+  display: grid;
+  gap: 8px;
+  justify-items: start;
+}
+.st-crews-failed .st-note {
+  color: var(--red);
+}
 .st-saved-list {
   display: grid;
   gap: 8px;

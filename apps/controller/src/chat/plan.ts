@@ -53,12 +53,25 @@ export function parsePlan(reply: string): { plan: ChatPlan } | { error: string }
   return { error: `The plan does not match the schema. ${issues.join('; ')}` };
 }
 
-// A provider the person rules out in the message, such as "Do not assign anything to Local AI".
-// The negation and the name sit in one clause, at most 40 characters apart.
-const RULED_OUT =
-  /\b(?:do not|don't|dont|never|no|not|without|avoid|exclude|except|skip)\b[^.;\n]{0,40}?\b(openai|gpt|anthropic|google|gemini|local(?: ai| models?)?|lm studio)\b/gi;
-const LISTED =
-  /^\s*(?:,|or|and|nor)\s*(?:to\s+|the\s+)?(openai|gpt|anthropic|google|gemini|local(?: ai| models?)?|lm studio)\b/i;
+// A provider the person rules out as a worker, such as "don't use Google" or "no OpenAI for this".
+// The negation leads straight to the name, with at most a use verb, its object, a preposition and
+// an article between, and the name ends the clause or takes a word like model, provider or crew.
+// "Without breaking the Google sign-in button" and "no local changes" name a provider as a subject
+// of the work, so they rule nothing out.
+const PROVIDER = '(openai|gpt|anthropic|google|gemini|local(?: ai| models?)?|lm studio)';
+const NEGATION = "(?:do not|don't|don’t|dont|never|no|not|without|avoid|skip|exclude|except)";
+const VERB =
+  '(?:use|using|run|running|route|routing|send|sending|put|putting|involve|involving|assign|assigning)';
+const OBJECT = '(?:this|it|that|anything|any of (?:this|it)|any work|work|slices?|tasks?)';
+const PREP = '(?:on|to|with|through|via|for)';
+const ARTICLE = '(?:the|a|an|any)';
+const LIST = String.raw`(?:\s*(?:,\s*(?:(?:or|and|nor)\s+)?|\s(?:or|and|nor)\s+)(?:${ARTICLE}\s+)?${PROVIDER.replace('(', '(?:')})*`;
+const CLAUSE_END = String.raw`(?=\s*(?:[.,;:!?)\n]|$)|\s+(?:models?|providers?|crew|roles?|at all|for (?:this|it|that|now|anything)|here|either|but|so|because|since|then)\b)`;
+const RULED_OUT = new RegExp(
+  String.raw`\b${NEGATION}\s+(?:${VERB}\s+)?(?:${OBJECT}\s+)?(?:${PREP}\s+)?(?:${ARTICLE}\s+)?${PROVIDER}\b(${LIST})${CLAUSE_END}`,
+  'gi',
+);
+const LISTED = new RegExp(PROVIDER, 'gi');
 const RULED_OUT_FAMILY: Record<string, ChatFamily> = {
   openai: 'openai',
   gpt: 'openai',
@@ -75,13 +88,7 @@ export function ruledOut(message: string): ChatFamily[] {
   for (const match of message.matchAll(RULED_OUT)) {
     add(match[1] ?? '');
     // A list after the first name, as in "Google or OpenAI", rules out each name in it.
-    let rest = message.slice((match.index ?? 0) + match[0].length);
-    for (;;) {
-      const more = LISTED.exec(rest);
-      if (!more) break;
-      add(more[1] ?? '');
-      rest = rest.slice(more[0].length);
-    }
+    for (const more of (match[2] ?? '').matchAll(LISTED)) add(more[1] ?? '');
   }
   return [...found];
 }

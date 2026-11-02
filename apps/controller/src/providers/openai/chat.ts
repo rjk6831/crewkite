@@ -36,7 +36,7 @@ import {
   stripTurnNotes,
   withoutThreadToolsLine,
 } from '../../chat/prompt.ts';
-import { outsidePaths } from '../../chat/read-only-command.ts';
+import { outsidePaths, scratchCommand } from '../../chat/read-only-command.ts';
 import { readableType, SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
@@ -122,6 +122,16 @@ const sandboxMode = (request: ChatTurnRequest) =>
 // scratch copy and the platform's own files, so a command cannot read a file outside the copy,
 // such as the client's memory files under the home folder (H11). The turn also stops when a
 // command names a path outside the copy, in case a client build ignores the narrower policy.
+//
+// A client build that refuses the narrower shape gets the plain read-only sandbox, which reads
+// the whole disk. That turn runs under `untrusted`, so the client asks before each command an
+// explicit rule of its own does not allow, and CrewKite allows only a command that provably
+// reads inside the copy (scratchCommand). Any other error from turn/start ends the turn.
+const WIDE_APPROVAL_POLICY = 'untrusted';
+// The refusal a client build gives for a sandbox shape it does not know: invalid params that name
+// an unknown variant or field. Any other turn/start error is the turn's own failure.
+const refusesRestricted = (error: ProviderError) =>
+  error?.code === -32602 && /\bunknown (?:variant|field)\b/i.test(error.message ?? '');
 const readOnlySandbox = (directory: string) => ({
   type: 'readOnly',
   access: { type: 'restricted', includePlatformDefaults: true, readableRoots: [directory] },
@@ -129,8 +139,8 @@ const readOnlySandbox = (directory: string) => ({
 });
 // `other` spans every tool CrewKite cannot name, so no thread grant covers it. Only commands and
 // file changes ask here today; the guard holds if another request kind starts asking.
-const threadGrant = (request: ChatTurnRequest, kind: ChatToolKind) =>
-  kind !== 'other' && request.permissionGrants?.includes(kind) === true;
+const threadGrant = (request: ChatTurnRequest, kind: ChatToolKind, allowed: Set<ChatToolKind>) =>
+  kind !== 'other' && (request.permissionGrants?.includes(kind) === true || allowed.has(kind));
 
 /** Chat edits the scratch copy, and every question the client asks comes back to CrewKite. */
 function nativeChatArguments(directory: string, request: ChatTurnRequest): string[] {
@@ -234,8 +244,9 @@ const OPTIONS: ChatPermissionOption[] = [
   { id: 'allow-thread', label: 'Allow for this thread', kind: 'allow-thread' },
   { id: 'deny', label: 'Deny', kind: 'deny' },
 ];
-// acceptForSession lasts as long as the client process, and that is one turn here. The controller
-// keeps the thread's grants, and serverRequest answers a granted kind on every later turn.
+// acceptForSession lasts as long as the client process, and that is one turn here, and the client
+// applies it to the one command it asked about. The controller keeps the thread's grants for
+// later turns, and the adapter applies an Allow for this thread to the rest of its own turn.
 const DECISIONS = new Map([
   ['allow-once', 'accept'],
   ['allow-thread', 'acceptForSession'],
@@ -493,6 +504,8 @@ class OpenAiChatTurn {
   private mcpConfig: Record<string, unknown> | null = null;
   private threadEffort: z.output<typeof threadReply>['reasoningEffort'];
   private turnId: string | null = null;
+  /** The read-only turn runs on the plain read-only sandbox, which reads the whole disk. */
+  private wideSandbox = false;
   // A terminal error notice. The failure is built when the turn ends, so a rate-limit update
   // that lands in between still supplies the reset time.
   private terminal: ProviderError | undefined;
@@ -516,6 +529,10 @@ class OpenAiChatTurn {
   private readonly output = new Map<string, number>();
   private readonly changed = new Set<string>();
   private readonly approvals = new Map<string, RpcId>();
+  /** The tool kind each open approval asks about. */
+  private readonly approvalKinds = new Map<string, ChatToolKind>();
+  /** Kinds the person allowed for the thread during this turn. */
+  private readonly allowed = new Set<ChatToolKind>();
   private readonly subagents: SubagentTracker;
   private approvalCount = 0;
   private reported = false;
@@ -566,6 +583,9 @@ class OpenAiChatTurn {
       // client still asks follows the narrower policy from here.
       setPermissionPolicy: (permissionPolicy, permissionGrants) => {
         this.request = { ...this.request, permissionPolicy, permissionGrants };
+        // A narrower policy, such as Ask each time again, takes back what was allowed here too.
+        for (const kind of this.allowed)
+          if (!permissionGrants.includes(kind)) this.allowed.delete(kind);
       },
       groups: this.group > 0 ? [this.group] : [],
       result,
@@ -916,20 +936,23 @@ class OpenAiChatTurn {
           input: [...this.media.map((file) => file.input), { type: 'text', text }],
           ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
           ...(this.request.readOnly
-            ? {
-                sandboxPolicy: narrow
-                  ? readOnlySandbox(this.request.scratch.directory)
-                  : { type: 'readOnly', networkAccess: false },
-              }
+            ? narrow
+              ? { sandboxPolicy: readOnlySandbox(this.request.scratch.directory) }
+              : {
+                  sandboxPolicy: { type: 'readOnly', networkAccess: false },
+                  approvalPolicy: WIDE_APPROVAL_POLICY,
+                }
             : {}),
         },
         (reply) => onStart(reply, narrow),
       );
     // A client build that does not know the narrower read-only policy refuses it. The turn then
-    // starts on the plain read-only sandbox, and the path check on each command still stops a read
-    // outside the scratch copy.
+    // starts on the plain read-only sandbox, where each command asks first.
     const onStart = (reply: Reply, narrow: boolean) => {
-      if ('error' in reply && narrow && this.request.readOnly) return start(false);
+      if ('error' in reply && narrow && this.request.readOnly && refusesRestricted(reply.error)) {
+        this.wideSandbox = true;
+        return start(false);
+      }
       if ('error' in reply)
         return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
       this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
@@ -1045,6 +1068,7 @@ class OpenAiChatTurn {
       .join('\n\n');
     const answerId = `approval-${++this.approvalCount}`;
     this.approvals.set(answerId, requestId);
+    this.approvalKinds.set(answerId, kind);
     this.send({
       type: 'permission.requested',
       turnId: this.request.turnId,
@@ -1060,8 +1084,17 @@ class OpenAiChatTurn {
       ...(kind === 'edit' && callId && this.deleting.has(callId) ? { deletes: true as const } : {}),
     });
     const policy = this.request.permissionPolicy;
-    // Review and advice turns read only.
-    if (this.request.readOnly) return this.answer(answerId, 'deny');
+    // Review and advice turns read only. On the wide sandbox a command runs only when it provably
+    // reads inside the scratch copy.
+    if (this.request.readOnly) {
+      const call = { command: value?.command ?? '', cwd: value?.cwd ?? null };
+      const inside =
+        this.wideSandbox &&
+        kind === 'command' &&
+        !network &&
+        scratchCommand(call, this.request.scratch.directory);
+      return this.answer(answerId, inside ? 'allow-once' : 'deny');
+    }
     // Network access reaches past the scratch copy, and no policy or grant covers a host, so the
     // person decides each one.
     if (network) return;
@@ -1082,7 +1115,7 @@ class OpenAiChatTurn {
       return this.answer(answerId, 'allow-once');
     // Thread grant: the person allowed this kind for the whole thread. Both events still go out,
     // so the thread shows what was allowed and why nobody was asked.
-    if (threadGrant(this.request, kind)) this.answer(answerId, 'allow-thread');
+    if (threadGrant(this.request, kind, this.allowed)) this.answer(answerId, 'allow-thread');
   }
 
   private answer(requestId: string, choice: string) {
@@ -1090,6 +1123,12 @@ class OpenAiChatTurn {
     const decision = DECISIONS.get(choice);
     if (target === undefined || !decision || this.outcome) return;
     this.approvals.delete(requestId);
+    const kind = this.approvalKinds.get(requestId);
+    this.approvalKinds.delete(requestId);
+    // Allow for this thread covers the same kind for the rest of the turn, under the same checks
+    // a thread grant gets. The client's own acceptForSession covers only the one command.
+    if (choice === 'allow-thread' && kind && kind !== 'other' && !this.request.readOnly)
+      this.allowed.add(kind);
     this.write({ id: target, result: { decision } });
     this.send({ type: 'permission.resolved', turnId: this.request.turnId, requestId, choice });
   }
@@ -1207,17 +1246,20 @@ class OpenAiChatTurn {
       title = detail || 'Run a command';
       input = { command: detail, cwd: value?.cwd ?? null };
       // A read-only turn runs commands without a question, so one that reaches past the copy
-      // ends the turn here.
-      const outside = this.request.readOnly
-        ? outsidePaths(input, this.request.scratch.directory)
-        : [];
-      if (outside.length) {
+      // ends the turn here. On the wide sandbox a command the client ran under a rule of its own
+      // ends the turn too unless it provably reads inside the copy.
+      const directory = this.request.scratch.directory;
+      const outside = this.request.readOnly ? outsidePaths(input, directory) : [];
+      const unproven = this.wideSandbox && !outside.length && !scratchCommand(input, directory);
+      if (outside.length || unproven) {
         this.interrupt();
         this.fail(
           chatFailure({
             stage: 'tool',
             kind: 'internal',
-            message: `The turn stopped: a read-only command named a path outside the scratch copy (${clip(outside.join(', '), 400)}).`,
+            message: outside.length
+              ? `The turn stopped: a read-only command named a path outside the scratch copy (${clip(outside.join(', '), 400)}).`
+              : `The turn stopped: a read-only command ran that CrewKite could not confirm stays in the scratch copy (${clip(detail, 400)}).`,
             nextAction: 'Ask again. Read-only turns read only inside the scratch copy.',
           }),
         );

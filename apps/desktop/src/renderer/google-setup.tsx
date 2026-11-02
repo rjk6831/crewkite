@@ -15,9 +15,12 @@ import {
   GOOGLE_PROGRESS_STEPS,
   type GoogleSetupProgress,
   type GoogleSetupStage,
+  googleConnectButton,
+  googleConnectError,
   googleSetupProgress,
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
+  startingGoogleStage,
 } from './google-setup-flow.ts';
 import type { Workspace } from './source.ts';
 import './google-setup.css';
@@ -100,6 +103,8 @@ const refusalText: Record<string, string> = {
   'acp-capability-missing':
     'The client did not report the model choices CrewKite needs. Press Try again.',
   'authentication-required': 'The Google sign-in did not finish. Press Try again to sign in.',
+  'google-status-unreadable':
+    'Setup status could not be read three times in a row, so Connect paused. Press it again to continue.',
   'google-connect-limit':
     'Connect did not finish within 20 minutes. Press Try again to continue from this step.',
 };
@@ -151,6 +156,8 @@ export function GoogleSetup({
   const [requested, setRequested] = useState<GoogleSetupStage | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [pollTimedOut, setPollTimedOut] = useState(false);
+  // A follow that could not read the status three times in a row stays off until the card opens again.
+  const [pollUnreadable, setPollUnreadable] = useState(false);
   const [cancelBusy, setCancelBusy] = useState(false);
   const [termsChecked, setTermsChecked] = useState(false);
   const pollAbort = useRef<AbortController | null>(null);
@@ -182,8 +189,9 @@ export function GoogleSetup({
   // Follow it, so the card shows the step and turns Connect off until it ends.
   useEffect(() => {
     // After a 15-minute follow times out the card stops reading every second and says so.
-    if (!(active || installing) || requested || pollAbort.current || pollTimedOut) return;
-    startPolling(generation.current);
+    if (!(active || installing) || requested || pollAbort.current || pollTimedOut || pollUnreadable)
+      return;
+    startPolling(generation.current, false);
   });
 
   function stopPolling() {
@@ -192,7 +200,11 @@ export function GoogleSetup({
     pollAbort.current = null;
   }
 
-  function startPolling(currentGeneration: number) {
+  /**
+   * Reads the status each second so the card follows a running step. During a Connect the flow
+   * reads the state itself and decides when to pause, so a poll that cannot read leaves it alone.
+   */
+  function startPolling(currentGeneration: number, connecting: boolean) {
     const controller = new AbortController();
     pollAbort.current = controller;
     void pollGoogleSetupStatus({
@@ -212,30 +224,29 @@ export function GoogleSetup({
       active: () =>
         mounted.current && generation.current === currentGeneration && !controller.signal.aborted,
       attempts: POLL_ATTEMPTS,
-    })
-      .then((result) => {
-        if (pollAbort.current === controller) pollAbort.current = null;
-        if (result === 'timeout' && mounted.current && generation.current === currentGeneration) {
-          setPollTimedOut(true);
-        }
-      })
-      .catch(() => {
-        if (!mounted.current || generation.current !== currentGeneration) return;
-        generation.current += 1;
-        controller.abort();
-        if (pollAbort.current === controller) pollAbort.current = null;
-        setRequested(null);
-        setMessage('Setup status could not be read. Automatic setup is paused.');
-      });
+    }).then((result) => {
+      if (pollAbort.current === controller) pollAbort.current = null;
+      if (!mounted.current || generation.current !== currentGeneration) return;
+      if (result === 'timeout') setPollTimedOut(true);
+      if (result === 'unreadable' && !connecting) {
+        setPollUnreadable(true);
+        setMessage(
+          'Setup status could not be read three times in a row. Open Settings again to read it.',
+        );
+      }
+    });
   }
 
   async function connectGoogle() {
     if (!connected || working || installUnknown || !termsAccepted) return;
     stopPolling();
     const currentGeneration = generation.current;
+    // The press shows its first step at once. The first status read can take a few seconds.
+    setRequested(startingGoogleStage({ googleAcpInstall: installation, googleAcpSetup: setup }));
     setMessage(null);
     setPollTimedOut(false);
-    startPolling(currentGeneration);
+    setPollUnreadable(false);
+    startPolling(currentGeneration, true);
     try {
       const result = await runGoogleSetupFlow({
         read: workspace.refresh,
@@ -270,8 +281,9 @@ export function GoogleSetup({
         );
       }
     } catch {
+      const state = await workspace.refresh().catch(() => null);
       if (mounted.current && generation.current === currentGeneration) {
-        setMessage('The setup outcome could not be confirmed. Review status before retrying.');
+        setMessage(googleConnectError(state));
       }
     } finally {
       if (mounted.current && generation.current === currentGeneration) {
@@ -338,6 +350,12 @@ export function GoogleSetup({
   // One button. Connect runs every step to the end, sign-in included, and Try again resumes at
   // the step that failed, clearing a stuck step first when its process has ended.
   const primaryLabel = needsRepair ? 'Try again' : 'Connect Google';
+  const primary = googleConnectButton({
+    working,
+    running: active || installing,
+    cancelling: cancelBusy,
+    label: primaryLabel,
+  });
   const profileReason =
     profile && !profile.available && 'reason' in profile
       ? profile.reason === 'acp-capability-missing'
@@ -431,19 +449,20 @@ export function GoogleSetup({
         <Fact label="Quota available" value={quotaAvailable} />
       </div>
       <div className="gs-actions">
-        {!ready && !working && !installUnknown && (
+        {/* The button stays where it is while Connect runs, so Cancel never takes its place. */}
+        {!ready && !installUnknown && (
           <button
             className="button primary"
             type="button"
-            disabled={!connected || !termsAccepted}
+            disabled={!connected || !termsAccepted || primary.disabled}
             onClick={() => void connectGoogle()}
           >
-            {primaryLabel}
+            {primary.label}
           </button>
         )}
         {working && (active || installing) && (
           <button
-            className="button secondary"
+            className="button secondary gs-cancel"
             type="button"
             disabled={!connected || cancelBusy}
             onClick={() => void cancelCurrent()}

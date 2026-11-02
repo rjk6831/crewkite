@@ -15,6 +15,7 @@ import {
   WorkspaceStateSchema,
 } from '@crewkite/contracts';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { coalescedRead } from './coalesced-read.ts';
 import { createPreviewSource } from './preview.ts';
 import { isStreamEvent, isThreadEvent } from './thread/commands.ts';
 
@@ -173,10 +174,93 @@ export function useWorkspace() {
   const [pending, setPending] = useState(0);
   const [retryAvailable, setRetryAvailable] = useState(false);
   const connectionState = useRef('connecting');
-  const reading = useRef<Promise<WorkspaceState> | null>(null);
-  const dirty = useRef(false);
+  // One read at a time. Each call gets the next read that starts after it.
+  const read = useMemo(() => {
+    const bridge = source;
+    if (!bridge) return null;
+    return coalescedRead<WorkspaceState>(async () => {
+      const next = WorkspaceStateSchema.parse(await bridge.workspaceState());
+      const previous = headerRef.current;
+      const stampKey = `${next.stamp.epoch}:${next.stamp.revision}`;
+      const changed = navigationStamp.current !== stampKey;
+      headerRef.current = next;
+      setHeader(next);
+      if (changed) {
+        setNavigationStale(Boolean(previous));
+        if (previous?.stamp.epoch !== next.stamp.epoch) {
+          detailCache.current.clear();
+          setDetailStale(Boolean(previous && selectedTask.current));
+        }
+        let page: ProjectPage;
+        try {
+          page = ProjectPageSchema.parse(
+            await queuePage(() => bridge.projectPage({ stamp: next.stamp })),
+          );
+        } catch (failure) {
+          setNavigationStale(true);
+          throw failure;
+        }
+        if (headerRef.current !== next) return undefined;
+        setProjects(page.projects);
+        setProjectPage(page);
+        navigationStamp.current = stampKey;
+        setTaskPages({});
+        setNavigationStale(false);
+      }
+      const taskId = selectedTask.current;
+      if (taskId) {
+        try {
+          const detail = SnapshotSchema.parse(await bridge.getSnapshot({ taskId }));
+          if (selectedTask.current === taskId && headerRef.current === next) {
+            setDetailStale(false);
+            detailCache.current.set(taskId, detail);
+            const newEpoch = detailEpoch.current !== next.stamp.epoch;
+            detailEpoch.current = next.stamp.epoch;
+            setSnapshot((current) =>
+              newEpoch || !current || BigInt(detail.cursor) >= BigInt(current.cursor)
+                ? detail
+                : current,
+            );
+            const task = detail.tasks.find((row) => row.id === taskId);
+            if (task)
+              setTaskPages((pages) =>
+                Object.fromEntries(
+                  Object.entries(pages).map(([id, page]) => [
+                    id,
+                    {
+                      ...page,
+                      tasks: page.tasks.map((row) =>
+                        row.id === task.id
+                          ? {
+                              ...row,
+                              state: task.state,
+                              waitingReason: task.waitingReason,
+                              revision: task.revision,
+                              runId: task.runId,
+                              next: task.next,
+                            }
+                          : row,
+                      ),
+                    },
+                  ]),
+                ),
+              );
+          }
+        } catch (failure) {
+          if (selectedTask.current === taskId) setSnapshot(null);
+          throw failure;
+        }
+      }
+      setTransportError(null);
+      if (!bridge.onNotice && !bridge.onConnection) {
+        connectionState.current = 'connected';
+        setConnection('connected');
+      }
+      return next;
+    });
+  }, [source, queuePage]);
   const refresh = useCallback((): Promise<WorkspaceState> => {
-    if (!source)
+    if (!source || !read)
       return Promise.reject(
         new Error('The desktop bridge is unavailable. Start the desktop demo to connect.'),
       );
@@ -190,98 +274,8 @@ export function useWorkspace() {
           'Workspace paging is unavailable with this controller connection. Open the matching desktop package.',
         ),
       );
-    if (reading.current) {
-      dirty.current = true;
-      return reading.current;
-    }
-    const read = async () => {
-      for (;;) {
-        dirty.current = false;
-        const next = WorkspaceStateSchema.parse(await source.workspaceState());
-        const previous = headerRef.current;
-        const stampKey = `${next.stamp.epoch}:${next.stamp.revision}`;
-        const changed = navigationStamp.current !== stampKey;
-        headerRef.current = next;
-        setHeader(next);
-        if (changed) {
-          setNavigationStale(Boolean(previous));
-          if (previous?.stamp.epoch !== next.stamp.epoch) {
-            detailCache.current.clear();
-            setDetailStale(Boolean(previous && selectedTask.current));
-          }
-          let page: ProjectPage;
-          try {
-            page = ProjectPageSchema.parse(
-              await queuePage(() => source.projectPage({ stamp: next.stamp })),
-            );
-          } catch (failure) {
-            setNavigationStale(true);
-            throw failure;
-          }
-          if (headerRef.current !== next) continue;
-          setProjects(page.projects);
-          setProjectPage(page);
-          navigationStamp.current = stampKey;
-          setTaskPages({});
-          setNavigationStale(false);
-        }
-        const taskId = selectedTask.current;
-        if (taskId) {
-          try {
-            const detail = SnapshotSchema.parse(await source.getSnapshot({ taskId }));
-            if (selectedTask.current === taskId && headerRef.current === next) {
-              setDetailStale(false);
-              detailCache.current.set(taskId, detail);
-              const newEpoch = detailEpoch.current !== next.stamp.epoch;
-              detailEpoch.current = next.stamp.epoch;
-              setSnapshot((current) =>
-                newEpoch || !current || BigInt(detail.cursor) >= BigInt(current.cursor)
-                  ? detail
-                  : current,
-              );
-              const task = detail.tasks.find((row) => row.id === taskId);
-              if (task)
-                setTaskPages((pages) =>
-                  Object.fromEntries(
-                    Object.entries(pages).map(([id, page]) => [
-                      id,
-                      {
-                        ...page,
-                        tasks: page.tasks.map((row) =>
-                          row.id === task.id
-                            ? {
-                                ...row,
-                                state: task.state,
-                                waitingReason: task.waitingReason,
-                                revision: task.revision,
-                                runId: task.runId,
-                                next: task.next,
-                              }
-                            : row,
-                        ),
-                      },
-                    ]),
-                  ),
-                );
-            }
-          } catch (failure) {
-            if (selectedTask.current === taskId) setSnapshot(null);
-            throw failure;
-          }
-        }
-        setTransportError(null);
-        if (!source.onNotice && !source.onConnection) {
-          connectionState.current = 'connected';
-          setConnection('connected');
-        }
-        if (!dirty.current) return next;
-      }
-    };
-    reading.current = read().finally(() => {
-      reading.current = null;
-    });
-    return reading.current;
-  }, [source, queuePage]);
+    return read();
+  }, [source, read]);
   useEffect(() => {
     let active = true;
     void refresh().catch((failure: unknown) => {

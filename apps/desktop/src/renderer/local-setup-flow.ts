@@ -38,6 +38,55 @@ export const DISCOVERY_FOLLOW_MS = 30_000;
 
 export const WITHOUT_TOKEN = 'Connected without a token. The runtime has auth off on loopback.';
 
+/** The line while a Connect waits for the connection and the first model read. */
+export const WAITING_LINE = 'Waiting for the connection and model metadata.';
+
+const ready = (
+  setup:
+    | Pick<LocalSetup, 'connected' | 'observation' | 'observationStale' | 'operation'>
+    | null
+    | undefined,
+) => !!setup?.connected && !!setup.observation && !setup.observationStale && !setup.operation;
+
+/**
+ * The notices under the status line, kept to what is true now. The line from the last action
+ * goes when its condition ends: the waiting line once the connection is read or the follow
+ * stops. The last-seen age shows while the list is not being read again, and the no-token line
+ * once a Connect has finished.
+ */
+export function localNotices({
+  setup,
+  message,
+  following,
+  connected,
+  stamp,
+}: {
+  setup:
+    | Pick<
+        LocalSetup,
+        'connected' | 'observation' | 'observationStale' | 'operation' | 'connectedWithoutToken'
+      >
+    | null
+    | undefined;
+  message: string | null;
+  /** A Connect is following the connection to its first read. */
+  following: boolean;
+  /** The connection the card counts as up. */
+  connected: boolean;
+  stamp: string | null;
+}): { message: string | null; stamp: string | null; withoutToken: boolean } {
+  const done = ready(setup);
+  const settling = (following && !done) || !!setup?.operation;
+  return {
+    message: message === WAITING_LINE && (!following || done) ? null : message,
+    stamp: stamp && !(connected && settling) ? stamp : null,
+    withoutToken: connected && setup?.connectedWithoutToken === true && !settling,
+  };
+}
+
+/** The port the Local runtime listens on unless the person changed it. */
+export const DEFAULT_LOCAL_ENDPOINT = 'ws://127.0.0.1:1234';
+
 /**
  * The label on a cached observation. Null when nothing says when it was read. `connected` is a new
  * connection whose first read has not landed, so only the age shows.
@@ -257,15 +306,41 @@ const applied = (result: CommandResult) =>
 export async function connectLocalFlow({
   setup,
   endpoint,
-  command,
+  command: send,
   active,
+  wait,
+  tries = 30,
 }: {
   setup: LocalSetup;
   endpoint: string;
   command: (input: DesktopCommand) => Promise<CommandResult>;
   active: () => boolean;
+  /**
+   * Pause before a command the controller refused because a model read runs. Without it the
+   * refusal ends the connect.
+   */
+  wait?: () => Promise<void>;
+  tries?: number;
 }): Promise<LocalConnectResult> {
   let revision = setup.revision;
+  // A model read started elsewhere holds the runtime until it ends. Connect waits for it and
+  // then goes on, on the revision the read left.
+  const command = async (
+    input: Extract<DesktopCommand, { command: 'ConfigureLocal' | 'BeginLocalConnectionInput' }>,
+  ) => {
+    let result = await send(input);
+    for (let attempt = 1; wait && attempt < tries; attempt++) {
+      if (result.reason !== 'local-operation-active' || !active()) break;
+      await wait();
+      if (!active()) break;
+      result = await send({ ...input, expectedRevision: result.revision ?? revision });
+      if (result.outcome === 'stale-revision' && result.revision !== undefined) {
+        revision = result.revision;
+        result = await send({ ...input, expectedRevision: revision });
+      }
+    }
+    return result;
+  };
   const saved = setup.authMode ?? 'token';
   const configure = async (authMode: 'token' | 'none') => {
     const result = await command({
@@ -299,10 +374,16 @@ export async function connectLocalFlow({
 // Set once this computer refuses token mode, so a later Connect does not ask again.
 let tokenModeRefused = false;
 
+/**
+ * Follows one Connect until the models are read. A connect that ends with the endpoint saved, no
+ * failure and still no connection is sent once more: on a first Connect the card stopped there and
+ * the person had to press Connect a second time. `reconnect` sends it and is false when refused.
+ */
 export async function waitForLocalReadiness({
   endpoint,
   read,
   discover,
+  reconnect,
   wait,
   active,
   attempts = 20,
@@ -310,11 +391,13 @@ export async function waitForLocalReadiness({
   endpoint: string;
   read: () => Promise<LocalSetup | null | undefined>;
   discover: (setup: LocalSetup) => Promise<boolean>;
+  reconnect?: (setup: LocalSetup) => Promise<boolean>;
   wait: () => Promise<void>;
   active: () => boolean;
   attempts?: number;
 }): Promise<LocalReadinessResult> {
   let discoveryRequested = false;
+  let reconnected = false;
   for (let attempt = 0; attempt < attempts; attempt++) {
     await wait();
     if (!active()) return 'stopped';
@@ -322,6 +405,17 @@ export async function waitForLocalReadiness({
     if (!active() || !setup || setup.endpoint !== endpoint) return 'stopped';
     if (setup.observation && !setup.observationStale && !setup.operation) return 'ready';
     if (setup.operation) continue;
+    if (
+      !setup.connected &&
+      reconnect &&
+      !reconnected &&
+      setup.reason === 'connection-required' &&
+      !setup.notice
+    ) {
+      reconnected = true;
+      if (!(await reconnect(setup))) return 'stopped';
+      continue;
+    }
     if (!setup.connected) return 'stopped';
     if (!discoveryRequested) {
       discoveryRequested = true;

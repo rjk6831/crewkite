@@ -101,6 +101,10 @@
 .gs-actions:empty {
   display: none;
 }
+/* Cancel sits at the far end, away from where Connect was pressed. */
+.gs-actions .gs-cancel {
+  margin-left: auto;
+}
 .gs-sr-only {
   position: absolute;
   width: 1px;

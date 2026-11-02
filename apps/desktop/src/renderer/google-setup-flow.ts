@@ -31,6 +31,11 @@ const applied = (result: CommandResult) =>
 
 /** Tries per step: the first and up to two more when the step ends by a transient failure. */
 export const GOOGLE_STEP_TRIES = 3;
+/**
+ * Status reads in a row that may fail before Connect pauses. A read can fail once while the
+ * browser sign-in ends and the controller saves it, and the next read a second later succeeds.
+ */
+export const GOOGLE_READ_TRIES = 3;
 /** One Connect runs for at most this long, whatever it waits on. */
 export const GOOGLE_CONNECT_LIMIT_MS = 20 * 60_000;
 
@@ -146,6 +151,46 @@ export function nextGoogleStage(state: GoogleState): GoogleSetupStage | 'ready' 
 }
 
 /**
+ * What the card says when a Connect ended on an error it could not read, such as a command the
+ * desktop refused before it reached the controller. Only a step that ended in an unknown state
+ * leaves the outcome unconfirmed. `state` is null when it could not be read.
+ */
+export function googleConnectError(state: GoogleState | null): string {
+  return state?.googleAcpSetup?.state === 'unknown' || state?.googleAcpInstall?.state === 'unknown'
+    ? 'The setup outcome could not be confirmed. Review status before retrying.'
+    : 'Connect stopped. Press Connect to try again.';
+}
+
+/**
+ * The step a Connect press shows at once, before its first status read lands: the step the saved
+ * state names next, or the download when it names none.
+ */
+export function startingGoogleStage(state: GoogleState): GoogleSetupStage {
+  const next = nextGoogleStage(state);
+  return next && next !== 'ready' ? next : 'install';
+}
+
+/**
+ * The primary button. It stays in its place, off, while a Connect runs, so a second press lands
+ * on it and never on Cancel, which shows beside it.
+ */
+export function googleConnectButton({
+  working,
+  running,
+  cancelling,
+  label,
+}: {
+  working: boolean;
+  /** The controller reports a step of this connect running. */
+  running: boolean;
+  cancelling: boolean;
+  label: string;
+}): { label: string; disabled: boolean } {
+  if (!working) return { label, disabled: false };
+  return { label: cancelling ? label : running ? 'Connecting…' : 'Starting…', disabled: true };
+}
+
+/**
  * One Connect: the terms, then install, initialize, sign-in and discovery in order until the
  * setup is ready. The step to take always comes from the saved state, so a Connect pressed again
  * resumes at the step that failed. Sign-in is an ordinary step; the client opens the browser.
@@ -185,9 +230,25 @@ export async function runGoogleSetupFlow({
     await wait();
     return active();
   };
+  let failedReads = 0;
   for (;;) {
     if (now() >= deadline) return limit();
-    const state = await read();
+    let state: GoogleState;
+    try {
+      state = await read();
+      failedReads = 0;
+    } catch {
+      if (!active()) return { kind: 'stopped' };
+      // The steps already sent are saved in the controller, so the next good read resumes them.
+      failedReads += 1;
+      if (failedReads >= GOOGLE_READ_TRIES)
+        return {
+          kind: 'blocked',
+          result: { outcome: 'blocked', reason: 'google-status-unreadable' },
+        };
+      if (!(await pause())) return { kind: 'stopped' };
+      continue;
+    }
     if (!active()) return { kind: 'stopped' };
     // The person ticked the box in this click. The controller stores it and refuses every
     // connection step until it holds the current text version.
@@ -284,6 +345,10 @@ function googleStepCommand(stage: GoogleSetupStage, state: GoogleState): GoogleC
       };
 }
 
+/**
+ * Reads the status once a second. A failed read is tried again at the next tick, and the poll
+ * ends as 'unreadable' only after GOOGLE_READ_TRIES failed reads in a row.
+ */
 export async function pollGoogleSetupStatus({
   wait,
   read,
@@ -294,12 +359,19 @@ export async function pollGoogleSetupStatus({
   read: () => Promise<unknown>;
   active: () => boolean;
   attempts?: number;
-}): Promise<'stopped' | 'timeout'> {
+}): Promise<'stopped' | 'timeout' | 'unreadable'> {
+  let failed = 0;
   for (let attempt = 0; attempt < attempts; attempt++) {
     await wait();
     if (!active()) return 'stopped';
-    await read();
+    try {
+      await read();
+      failed = 0;
+    } catch {
+      failed += 1;
+    }
     if (!active()) return 'stopped';
+    if (failed >= GOOGLE_READ_TRIES) return 'unreadable';
   }
   return 'timeout';
 }

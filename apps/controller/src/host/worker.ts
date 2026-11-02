@@ -50,6 +50,9 @@ export const defaultSchedule: Schedule = (work, milliseconds) => {
 };
 type Exit = { code: number | null; signal: NodeJS.Signals | null; quiescent: boolean };
 const maximumCommandChunkBytes = 64 * 1024;
+// The largest client build any provider accepts. The Anthropic client passed 256 MiB in 2.1.316,
+// and its resolver already allows 512 MiB.
+const maximumExecutableBytes = 512n * 1024n * 1024n;
 const commandEnvironmentNames = new Set([
   'CI',
   'GH_CONFIG_DIR',
@@ -132,7 +135,7 @@ export function verifyOwnedCommandExecutable(executable: string, sha256: string)
   );
   try {
     const before = fstatSync(descriptor, { bigint: true });
-    if (!before.isFile() || before.size > 256n * 1024n * 1024n)
+    if (!before.isFile() || before.size > maximumExecutableBytes)
       throw Error('Command executable identity is invalid.');
     const hash = createHash('sha256');
     const buffer = Buffer.allocUnsafe(maximumCommandChunkBytes);
@@ -142,7 +145,7 @@ export function verifyOwnedCommandExecutable(executable: string, sha256: string)
       if (count === 0) break;
       hash.update(buffer.subarray(0, count));
       bytes += BigInt(count);
-      if (bytes > before.size || bytes > 256n * 1024n * 1024n)
+      if (bytes > before.size || bytes > maximumExecutableBytes)
         throw Error('Command executable identity changed.');
     }
     const after = fstatSync(descriptor, { bigint: true });

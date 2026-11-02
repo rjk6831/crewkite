@@ -24,24 +24,60 @@ const browserStore = (): LegacyStore | null => {
   }
 };
 
+/** Where the read of the saved crews stands, so Settings can say it is loading or failed. */
+export type CrewLoad =
+  | { state: 'waiting' }
+  | { state: 'loading' }
+  | { state: 'loaded' }
+  | { state: 'failed'; message: string };
+
+let load: CrewLoad = { state: 'waiting' };
+const loadListeners = new Set<() => void>();
+const setLoad = (next: CrewLoad) => {
+  load = next;
+  for (const listener of loadListeners) listener();
+};
+
+export const readCrewLoad = (): CrewLoad => load;
+
+/** Calls `listener` when the read of the saved crews starts, ends or fails. */
+export function onCrewLoad(listener: () => void): () => void {
+  loadListeners.add(listener);
+  return () => void loadListeners.delete(listener);
+}
+
 /**
  * Reads the crews from the controller. On the first launch after the move, the crews this window
  * kept go to the controller once, and their keys are removed after the controller holds them.
+ * A failed read or import is kept for Settings to show, and the promise rejects with it.
  */
 export async function loadCrews(
   source: ThreadSource,
   store: LegacyStore | null = browserStore(),
 ): Promise<SavedCrewsRead> {
   connected = source;
-  let read = await readCrews(source);
-  if (!read.imported) {
-    const legacy = readLegacyCrews(store);
-    read = await importCrews(source, legacy.crews, legacy.defaultCrew);
-    clearLegacyCrews(store);
+  setLoad({ state: 'loading' });
+  try {
+    let read = await readCrews(source);
+    if (!read.imported) {
+      const legacy = readLegacyCrews(store);
+      read = await importCrews(source, legacy.crews, legacy.defaultCrew);
+      clearLegacyCrews(store);
+    }
+    setSavedCrews(read);
+    setLoad({ state: 'loaded' });
+    return read;
+  } catch (failure) {
+    setLoad({
+      state: 'failed',
+      message: failure instanceof Error ? failure.message : 'The controller did not answer.',
+    });
+    throw failure;
   }
-  setSavedCrews(read);
-  return read;
 }
+
+/** Reads the crews again from the controller the last read used. */
+export const reloadCrews = () => (connected ? loadCrews(connected) : Promise.resolve(null));
 
 const source = () => {
   if (!connected) throw new Error('The controller is offline. Crews could not be changed.');

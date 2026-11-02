@@ -1,16 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import type { LocalSetup } from '@crewkite/contracts';
+import { LocalEndpointSchema, type LocalSetup } from '@crewkite/contracts';
 import {
   connectInPlace,
   connectLocalFlow,
+  DEFAULT_LOCAL_ENDPOINT,
   DISCOVERY_FOLLOW_MS,
   followDiscovery,
   lastSeen,
+  localNotices,
   lowMemory,
   selectionConfirmed,
   selectionLost,
   statusLine,
+  WAITING_LINE,
   WITHOUT_TOKEN,
   waitForLocalReadiness,
 } from './local-setup-flow.ts';
@@ -124,6 +127,48 @@ test('local readiness polling stops after twenty fake clock ticks', async () => 
   assert.equal(result, 'timeout');
   assert.equal(ticks, 20);
   assert.equal(reads, 20);
+});
+
+test('one Connect sends the connection again when it ends saved and unconnected with no failure', async () => {
+  const follow = async (states: LocalSetup[]) => {
+    const calls: string[] = [];
+    const result = await waitForLocalReadiness({
+      endpoint: 'ws://127.0.0.1:1234',
+      wait: async () => {},
+      read: async () => states.shift() ?? setup({ operation: null }),
+      discover: async () => {
+        calls.push('discover');
+        return true;
+      },
+      reconnect: async () => {
+        calls.push('reconnect');
+        return true;
+      },
+      active: () => true,
+    });
+    return { result, calls };
+  };
+  const idle = setup({ operation: null, reason: 'connection-required' });
+  const connected = setup({ operation: null, connected: true, reason: 'discovery-required' });
+  const read = setup({
+    operation: null,
+    connected: true,
+    observation: {} as LocalSetup['observation'],
+    reason: 'model-selection-required',
+  });
+  // The field starts on the usual runtime port, a value Connect accepts as it is.
+  assert(LocalEndpointSchema.safeParse(DEFAULT_LOCAL_ENDPOINT).success);
+  // The first press ends unconnected with nothing failed: Connect goes out once more, then reads.
+  assert.deepEqual(await follow([setup(), idle, connected, read]), {
+    result: 'ready',
+    calls: ['reconnect', 'discover'],
+  });
+  // A second unconnected end stops, and a failed connection is never sent again.
+  assert.deepEqual(await follow([idle, idle]), { result: 'stopped', calls: ['reconnect'] });
+  assert.deepEqual(await follow([setup({ operation: null, reason: 'connection-unavailable' })]), {
+    result: 'stopped',
+    calls: [],
+  });
 });
 
 test('Local connect saves token mode wherever it can and no-token mode where token mode is refused', async () => {
@@ -425,4 +470,96 @@ test('a background model read is followed past ten seconds and stops at its dead
     await followDiscovery({ read: async () => running, wait: async () => {}, active: () => false }),
     false,
   );
+});
+
+test('the Local card shows only the notices that describe the current state', () => {
+  const observation = {} as LocalSetup['observation'];
+  const connected = setup({
+    operation: null,
+    connected: true,
+    connectedWithoutToken: true,
+    observation,
+    observationStale: true,
+  });
+  const read = setup({
+    operation: null,
+    connected: true,
+    connectedWithoutToken: true,
+    observation,
+  });
+  const notices = (change: Partial<Parameters<typeof localNotices>[0]>) =>
+    localNotices({
+      setup: connected,
+      message: null,
+      following: false,
+      connected: true,
+      stamp: 'Last seen just now.',
+      ...change,
+    });
+  // While a Connect follows a new connection, only the waiting line shows.
+  assert.deepEqual(notices({ message: WAITING_LINE, following: true }), {
+    message: WAITING_LINE,
+    stamp: null,
+    withoutToken: false,
+  });
+  // Once the models are read, the waiting line goes and the no-token line is the one left.
+  assert.deepEqual(notices({ setup: read, message: WAITING_LINE, following: true, stamp: null }), {
+    message: null,
+    stamp: null,
+    withoutToken: true,
+  });
+  // A follow that stopped leaves no waiting line either.
+  assert.equal(notices({ message: WAITING_LINE }).message, null);
+  // A line from an action stays.
+  assert.equal(notices({ message: 'Disconnect confirmed.' }).message, 'Disconnect confirmed.');
+  // Offline, the cached list keeps its age.
+  assert.deepEqual(
+    notices({
+      setup: { ...connected, connected: false },
+      connected: false,
+      stamp: 'Last seen 2 h ago. Not connected.',
+    }),
+    { message: null, stamp: 'Last seen 2 h ago. Not connected.', withoutToken: false },
+  );
+});
+
+test('Local connect waits out a model read the controller is running and then connects', async () => {
+  const sent: string[] = [];
+  let busy = 2;
+  let waits = 0;
+  const result = await connectLocalFlow({
+    setup: setup({ operation: null, revision: 3 }),
+    endpoint: 'ws://127.0.0.1:1234',
+    active: () => true,
+    wait: async () => {
+      waits++;
+    },
+    command: async (input) => {
+      sent.push(`${input.command} ${'expectedRevision' in input ? input.expectedRevision : ''}`);
+      if (busy > 0) {
+        busy--;
+        return { outcome: 'blocked', reason: 'local-operation-active' };
+      }
+      // The read that ended moved the revision on.
+      return 'expectedRevision' in input && input.expectedRevision !== 5
+        ? { outcome: 'stale-revision', revision: 5 }
+        : { outcome: 'applied', revision: 6 };
+    },
+  });
+  assert.deepEqual(result, { kind: 'started' });
+  assert.equal(waits, 2);
+  assert.deepEqual(sent, [
+    'BeginLocalConnectionInput 3',
+    'BeginLocalConnectionInput 3',
+    'BeginLocalConnectionInput 3',
+    'BeginLocalConnectionInput 5',
+  ]);
+  // Without a wait the refusal ends the connect, as before.
+  const refused = await connectLocalFlow({
+    setup: setup({ operation: null }),
+    endpoint: 'ws://127.0.0.1:1234',
+    active: () => true,
+    command: async () => ({ outcome: 'blocked', reason: 'local-operation-active' }),
+  });
+  assert.equal(refused.kind, 'blocked');
 });
