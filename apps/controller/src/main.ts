@@ -67,6 +67,9 @@ function runtimeBytes(path: string, maximum: number) {
   }
 }
 
+/** Where a chat thread's scratch copy lives under a controller home. */
+export { chatScratchDirectory } from './chat/scratch-folder.ts';
+
 /** The helper, source and manifest must belong to the same fixed runtime. */
 export function resolvePackagedLocalInput(root: string) {
   const runtimeRoot = realpathSync(root);

@@ -51,6 +51,7 @@ import { ProjectNotes } from '../chat/project-notes.ts';
 import { notesCommand, notesMutations } from '../chat/project-notes-command.ts';
 import { crewsCommand, crewsMutations, SavedCrews } from '../chat/saved-crews.ts';
 import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
+import { chatScratchDirectory } from '../chat/scratch-folder.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
@@ -1664,7 +1665,7 @@ export class Controller {
           {
             store: this.store,
             projectPath: (projectId) => this.projectPath(projectId),
-            scratchDirectory: (taskId) => join(this.home, 'chat', taskId, 'scratch'),
+            scratchDirectory: (taskId) => chatScratchDirectory(this.home, taskId),
             homes: [homedir()],
           },
           command.payload,

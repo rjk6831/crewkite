@@ -499,6 +499,10 @@ class OpenAiChatTurn {
   private nextId = 1;
   private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
   private threadId: string | null = null;
+  /** The controller resumes this thread on a later turn. Every other thread is ephemeral. */
+  private get resumable() {
+    return this.request.resumable !== false;
+  }
   private readonly threadTools: ThreadToolsServer | null;
   // Thread config for the tools: our one server, and every other configured server off.
   private mcpConfig: Record<string, unknown> | null = null;
@@ -850,10 +854,16 @@ class OpenAiChatTurn {
       approvalsReviewer: 'user',
       sandbox: sandboxMode(this.request),
       serviceTier: 'default',
+      // CrewKite's framing goes in as developer instructions, so the person's own message is the
+      // first user input and the client titles the thread with it. The client puts these in the
+      // context it rebuilds after a compaction, so a resumed thread names them again.
+      ...(this.request.systemContext ? { developerInstructions: this.request.systemContext } : {}),
       ...(this.mcpConfig ? { config: this.mcpConfig } : {}),
     };
+    // The client saves a thread that is not ephemeral and lists it in the person's own app,
+    // grouped by its folder. Only a thread CrewKite resumes later is saved.
     const start = (history: boolean) =>
-      this.call('thread/start', { ...settings, ephemeral: false }, (reply) => {
+      this.call('thread/start', { ...settings, ephemeral: !this.resumable }, (reply) => {
         if ('error' in reply)
           return this.fail(this.providerFailure('session', 'thread/start', reply.error));
         const thread = threadReply.safeParse(reply.result);
@@ -909,11 +919,11 @@ class OpenAiChatTurn {
   }
 
   private startTurn(fresh: boolean, history: boolean) {
-    const { systemContext, selection } = this.request;
+    const { selection } = this.request;
     // A client that did not list its servers runs this turn without the tools, so the packet
     // must not name them.
-    // A new thread reads the notes in the system context. When a resume failed, the prompt still
-    // carries the block meant for the resumed thread, which would repeat them.
+    // A new thread reads the notes in its developer instructions. When a resume failed, the prompt
+    // still carries the block meant for the resumed thread, which would repeat them.
     const asked = fresh ? stripTurnNotes(this.request.prompt) : this.request.prompt;
     const prompt = this.mcpConfig ? asked : withoutThreadToolsLine(asked);
     const transcript = history
@@ -922,7 +932,7 @@ class OpenAiChatTurn {
           .join('\n\n')
       : '';
     const lines = attachedSection(this.lines);
-    const text = (fresh ? [systemContext, transcript, prompt, lines] : [prompt, lines])
+    const text = (fresh ? [transcript, prompt, lines] : [prompt, lines])
       .filter(Boolean)
       .join('\n\n');
     // turn/start sets the effort for this turn and the ones after it. thread/start and
@@ -1809,14 +1819,16 @@ class OpenAiChatTurn {
         }),
       }),
       assistantText: this.texts.join('\n\n'),
-      session: this.threadId
-        ? {
-            family: 'openai',
-            sessionId: this.threadId,
-            model: selection.model,
-            updatedAt: new Date(now()).toISOString(),
-          }
-        : session,
+      // An ephemeral thread is gone with the process, so there is nothing to resume.
+      session:
+        this.threadId && this.resumable
+          ? {
+              family: 'openai',
+              sessionId: this.threadId,
+              model: selection.model,
+              updatedAt: new Date(now()).toISOString(),
+            }
+          : session,
       usage: this.usage,
       changedPaths: [...this.changed],
     });

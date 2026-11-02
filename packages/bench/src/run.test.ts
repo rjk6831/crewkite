@@ -13,6 +13,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join, relative } from 'node:path';
 import { type TestContext, test } from 'node:test';
+import { chatScratchDirectory } from '@crewkite/controller';
 import type { Task } from './manifest.ts';
 import { TaskSchema } from './manifest.ts';
 import { RunReportSchema, writeRun } from './report.ts';
@@ -290,7 +291,7 @@ test('the work folder sits outside the checkout and a repository lookup in a scr
   });
   const chats = join(work, 'home', 'chat');
   const [thread] = readdirSync(chats);
-  const scratch = join(chats, thread ?? '', 'scratch');
+  const scratch = chatScratchDirectory(join(work, 'home'), thread ?? '');
   assert.equal(existsSync(scratch), true, 'the run kept a scratch copy to inspect');
   // The scratch copy has no repository of its own. A lookup from there, with the run's ceiling,
   // finds none, so it cannot reach the checkout the tasks were read from.

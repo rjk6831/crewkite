@@ -48,6 +48,12 @@ export type ChatTurnRequest = Readonly<{
   /** Native session to resume when the provider supports it. Null on the first turn. */
   session: ChatSession | null;
   /**
+   * False when the controller never resumes this turn's native session: a side question, a review
+   * or opinion, the orchestrator and a plan slice. An adapter whose client keeps a saved session
+   * list opens such a turn without saving it. Absent means the session may be resumed.
+   */
+  resumable?: boolean;
+  /**
    * False when the controller decided this turn runs without the thread tools. The packet does not
    * name them, and the adapter starts no thread tools server and sends an empty MCP config.
    */

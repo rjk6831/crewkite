@@ -13,7 +13,7 @@ import {
   ProjectSchema,
   TaskSchema,
 } from '@crewkite/contracts';
-import { startController } from '@crewkite/controller';
+import { chatScratchDirectory, startController } from '@crewkite/controller';
 import { checkEnvironment, runChecks } from './checks.ts';
 import { isVerified, type Task } from './manifest.ts';
 import type { Exclusion, RunReport, TaskResult } from './report.ts';
@@ -350,7 +350,7 @@ async function runTask(
       };
     }
 
-    const scratch = join(home, 'chat', created.id, 'scratch');
+    const scratch = chatScratchDirectory(home, created.id);
     if (!existsSync(scratch)) throw new Error('The scratch copy is missing after the turn.');
     const checkDirectory = join(options.workDirectory, 'checks', task.id);
     copyTree(scratch, checkDirectory);

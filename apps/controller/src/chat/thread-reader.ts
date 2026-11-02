@@ -1,4 +1,3 @@
-import { join } from 'node:path';
 import {
   type AgentEvent,
   AgentEventSchema,
@@ -27,6 +26,7 @@ import { ScratchTooLarge } from '../host/source.ts';
 import type { Store } from '../store/index.ts';
 import { scratchChanges } from './changes.ts';
 import { redact } from './redact.ts';
+import { chatScratchDirectory } from './scratch-folder.ts';
 import { AskingTurnError } from './thread-tools/broker.ts';
 
 export { redact };
@@ -265,7 +265,7 @@ export function createThreadReader(
             );
       let all: ReturnType<typeof scratchChanges>;
       try {
-        const scratch = source.scratch ?? join(source.home, 'chat', taskId, 'scratch');
+        const scratch = source.scratch ?? chatScratchDirectory(source.home, taskId);
         all = scratchChanges(root, scratch, base);
       } catch (error) {
         if (!(error instanceof ScratchTooLarge)) throw error;
