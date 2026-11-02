@@ -16,7 +16,8 @@
 //   {"id":4,"method":"config/read","params":{"includeLayers":false,"cwd":SCRATCH}}, only with the
 //     thread tools; the reply's config.mcp_servers names each configured server, and the ids after
 //     it move up by one
-//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request"|"never","approvalsReviewer":"user","sandbox":"workspace-write"|"read-only","serviceTier":"default","ephemeral":B}},
+//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request"|"never","approvalsReviewer":"user","sandbox":"workspace-write"|"read-only","serviceTier":"default","developerInstructions":CONTEXT,"ephemeral":B}},
+//     where CONTEXT is CrewKite's framing for the turn, so TEXT below starts with the person's message
 //     where B is false only for a thread the controller resumes later (a writer outside a plan slice)
 //     with the thread tools also "config":{"mcp_servers.NAME.enabled":false for each other server,
 //     "mcp_servers.crewkite":{"command","args","enabled":true,"default_tools_approval_mode":"approve"}}
@@ -771,7 +772,7 @@ test('an image or audio file goes as a local input only to a model that takes it
       input: [
         {
           type: 'text',
-          text: `${systemContext}\n\n${prompt}`,
+          text: prompt,
         },
       ],
     },
@@ -784,7 +785,7 @@ test('an image or audio file goes as a local input only to a model that takes it
         { type: 'localAudio', path: voice.path },
         {
           type: 'text',
-          text: `${systemContext}\n\n${prompt}\n\nFiles attached to this message:\nscreen.png, image/png, 10 bytes, sent as an image input above\nspec.pdf, application/pdf, 8 bytes, Path: ${pdf.path}\ncall.ogg, audio/ogg, 8 bytes, sent as an audio input above`,
+          text: `${prompt}\n\nFiles attached to this message:\nscreen.png, image/png, 10 bytes, sent as an image input above\nspec.pdf, application/pdf, 8 bytes, Path: ${pdf.path}\ncall.ogg, audio/ogg, 8 bytes, sent as an audio input above`,
         },
       ],
     },
@@ -843,7 +844,7 @@ test('a thread the client lost starts again with the notes once, in the system c
   // the notes in its system context, so the block must not ride in the message a second time.
   const rows = [
     { name: 'a resumed thread keeps the block', lost: false, text: `${block}\n\n${prompt}` },
-    { name: 'a lost thread drops the block', lost: true, text: `${systemContext}\n\n${prompt}` },
+    { name: 'a lost thread drops the block', lost: true, text: prompt },
   ];
   for (const row of rows) {
     const run = turn('reply', {
@@ -885,6 +886,9 @@ test('the next turn resumes the thread with its own approval policy and effort a
     approvalsReviewer: 'user',
     sandbox: 'workspace-write',
     serviceTier: 'default',
+    // CrewKite's framing rides as developer instructions on both calls, so the person's own
+    // message is the thread's first user input and its title in the client's own app.
+    developerInstructions: systemContext,
   };
   // The launch never names untrusted, which the client refuses at startup. The thread calls
   // carry each turn's own policy.
@@ -899,7 +903,7 @@ test('the next turn resumes the thread with its own approval policy and effort a
       method: 'turn/start',
       params: {
         threadId: 'thread-1',
-        input: [{ type: 'text', text: `${systemContext}\n\n${prompt}` }],
+        input: [{ type: 'text', text: prompt }],
       },
     },
   ]);

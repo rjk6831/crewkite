@@ -854,6 +854,10 @@ class OpenAiChatTurn {
       approvalsReviewer: 'user',
       sandbox: sandboxMode(this.request),
       serviceTier: 'default',
+      // CrewKite's framing goes in as developer instructions, so the person's own message is the
+      // first user input and the client titles the thread with it. The client puts these in the
+      // context it rebuilds after a compaction, so a resumed thread names them again.
+      ...(this.request.systemContext ? { developerInstructions: this.request.systemContext } : {}),
       ...(this.mcpConfig ? { config: this.mcpConfig } : {}),
     };
     // The client saves a thread that is not ephemeral and lists it in the person's own app,
@@ -915,11 +919,11 @@ class OpenAiChatTurn {
   }
 
   private startTurn(fresh: boolean, history: boolean) {
-    const { systemContext, selection } = this.request;
+    const { selection } = this.request;
     // A client that did not list its servers runs this turn without the tools, so the packet
     // must not name them.
-    // A new thread reads the notes in the system context. When a resume failed, the prompt still
-    // carries the block meant for the resumed thread, which would repeat them.
+    // A new thread reads the notes in its developer instructions. When a resume failed, the prompt
+    // still carries the block meant for the resumed thread, which would repeat them.
     const asked = fresh ? stripTurnNotes(this.request.prompt) : this.request.prompt;
     const prompt = this.mcpConfig ? asked : withoutThreadToolsLine(asked);
     const transcript = history
@@ -928,7 +932,7 @@ class OpenAiChatTurn {
           .join('\n\n')
       : '';
     const lines = attachedSection(this.lines);
-    const text = (fresh ? [systemContext, transcript, prompt, lines] : [prompt, lines])
+    const text = (fresh ? [transcript, prompt, lines] : [prompt, lines])
       .filter(Boolean)
       .join('\n\n');
     // turn/start sets the effort for this turn and the ones after it. thread/start and
