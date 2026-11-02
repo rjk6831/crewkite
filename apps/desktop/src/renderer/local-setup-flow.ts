@@ -472,3 +472,21 @@ export async function observeOpenConnection(
     }),
   );
 }
+
+/** How often a launch reconnect tries again while the runtime is not running. */
+export const LAUNCH_RETRY_MS = 5_000;
+
+/**
+ * Whether a launch reconnects Local now. Only a device that connected Local once reconnects, with
+ * the saved endpoint. With the runtime's auth on, only a remembered token reconnects, so no token
+ * window opens at launch. With auth off the endpoint alone is enough.
+ */
+export function launchReconnect(
+  setup: LocalSetup | null | undefined,
+  connectedOnce: boolean,
+  tokenRemembered: boolean,
+): boolean {
+  if (!connectedOnce || !setup?.endpoint || setup.connected) return false;
+  if (setup.operation || setup.generation !== 'idle') return false;
+  return setup.authMode === 'none' || tokenRemembered;
+}

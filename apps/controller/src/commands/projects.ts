@@ -68,6 +68,7 @@ export class ProjectCommands {
         .map((observation) =>
           deriveWindow(observation, { nowMs: Date.parse(this.now()), maxAgeMs: 300000 }),
         ),
+      providerConnections: this.providerConnections(),
     });
   }
 

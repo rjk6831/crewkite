@@ -333,6 +333,8 @@ export async function installBridge(
         'DiscoverGoogleAcp',
         'StopGoogleAcpSetup',
         'AcknowledgeGoogleTerms',
+        'SignInOpenAi',
+        'SignOutOpenAi',
         'ConfigureLocal',
         'BeginLocalConnectionInput',
         'CancelLocalConnectionInput',

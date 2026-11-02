@@ -6,6 +6,8 @@ import { refreshModels } from '../thread/commands.ts';
 import { usageCards } from '../thread/usage-cards.ts';
 import { ClientStatus, QuotaRefresh } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
+import { ConnectLine } from './providers/connect.tsx';
+import { connectedOnce } from './providers/connect-copy.ts';
 
 export function OpenAiCard({
   header,
@@ -28,13 +30,16 @@ export function OpenAiCard({
       detail="Signs in through its own client"
       main={
         <ClientStatus family="openai" header={header} now={now}>
-          <QuotaRefresh
-            family="openai"
-            header={header}
-            workspace={workspace}
-            now={now}
-            actions={actions}
-          />
+          <ConnectLine family="openai" header={header} workspace={workspace} />
+          {connectedOnce(header, 'openai') && (
+            <QuotaRefresh
+              family="openai"
+              header={header}
+              workspace={workspace}
+              now={now}
+              actions={actions}
+            />
+          )}
         </ClientStatus>
       }
       side={
@@ -42,7 +47,11 @@ export function OpenAiCard({
           label="OpenAI"
           cards={cards}
           now={now}
-          none="No usage has been read. Refresh quota to read it."
+          none={
+            connectedOnce(header, 'openai')
+              ? 'No usage has been read. Refresh quota to read it.'
+              : 'Connect OpenAI to read its usage.'
+          }
         />
       }
       models={entry?.connected && <ModelRefresh workspace={workspace} modelRead={modelRead} />}

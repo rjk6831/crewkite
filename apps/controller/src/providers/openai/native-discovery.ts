@@ -37,7 +37,13 @@ function synchronous(result: unknown) {
   }
 }
 type NativeEnvelope = DiscoveryEnvelope | 'notification' | 'request';
-type NativeRequest = DiscoveryRequest | 'thread/start' | 'turn/start' | 'turn/completed';
+type NativeRequest =
+  | DiscoveryRequest
+  | 'thread/start'
+  | 'turn/start'
+  | 'turn/completed'
+  | 'account/login/start'
+  | 'account/logout';
 type Outcome<T = DiscoveryMetadata> = {
   metadata: T | null;
   reason: 'stopped' | 'deadline' | 'launch' | 'protocol' | 'output-limit' | 'ownership' | null;
@@ -148,9 +154,23 @@ export function nativeDiscoveryArguments(
   return launchArguments(discoverySettings(directory), mcpOverrides(disabledMcpServers));
 }
 
+/** Where CrewKite keeps its own Codex home, under the controller home. */
+export const CODEX_HOME_PATH = 'providers/openai/codex-home';
+
 /**
- * The one place the client's environment is built, for discovery, tasks and chat turns. HOME and
- * CODEX_HOME pass through, so the client reads the person's own sign-in.
+ * CrewKite's own Codex home. Codex keeps its sign-in, config and saved threads there, so nothing
+ * CrewKite runs reads the person's ~/.codex or shows in their own Codex app. The controller home
+ * is CREWKITE_HOME, or ~/.crewkite as the controller's entry point chooses it.
+ */
+export function crewKiteCodexHome(source: NodeJS.ProcessEnv): string {
+  const home = source.CREWKITE_HOME ?? (source.HOME ? join(source.HOME, '.crewkite') : undefined);
+  if (!home || !isAbsolute(home)) throw new Error('Discovery requires the CrewKite home.');
+  return join(home, CODEX_HOME_PATH);
+}
+
+/**
+ * The one place the client's environment is built, for discovery, tasks, sign-in and chat turns.
+ * CODEX_HOME is always CrewKite's own. A CODEX_HOME the person set is never passed on.
  */
 export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
@@ -159,7 +179,7 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
   };
   for (const key of [
     'HOME',
-    'CODEX_HOME',
+    'CREWKITE_HOME',
     'PATH',
     'TMPDIR',
     'USER',
@@ -170,9 +190,22 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
     if (source[key] !== undefined) environment[key] = source[key];
   if (!environment.HOME || !isAbsolute(environment.HOME))
     throw new Error('Discovery requires the existing absolute native home.');
-  if (environment.CODEX_HOME && !isAbsolute(environment.CODEX_HOME))
-    throw new Error('Discovery requires an absolute native configuration location.');
+  environment.CODEX_HOME = crewKiteCodexHome(environment);
   return environment;
+}
+
+/**
+ * Codex refuses a CODEX_HOME that does not exist. It holds the sign-in, so it is private to the
+ * person, and a symlink or a folder someone else owns is refused.
+ */
+export function prepareCodexHome(environment: NodeJS.ProcessEnv) {
+  const home = environment.CODEX_HOME;
+  if (!home || !isAbsolute(home)) throw new Error("Codex needs CrewKite's own home.");
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const stat = lstatSync(home);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
+    throw new Error("CrewKite's Codex home must be a private directory.");
+  return home;
 }
 
 /** Metadata completion requires closed streams and absence of the owned process group. */
@@ -242,9 +275,11 @@ function startTranscript<T>(
   childDirectory(directory, 'sqlite');
   if (options.task && now() >= deadline - 2000)
     throw new Error('Native task deadline elapsed before launch.');
+  const env = nativeDiscoveryEnvironment(launch.environment);
+  prepareCodexHome(env);
   const child = (options.spawn ?? spawn)(executable, options.arguments(directory), {
     cwd: directory,
-    env: nativeDiscoveryEnvironment(launch.environment),
+    env,
     detached: true,
     stdio: ['pipe', 'pipe', 'pipe'],
   });

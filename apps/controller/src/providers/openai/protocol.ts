@@ -130,6 +130,11 @@ export const initializeParams = () =>
     capabilities: { experimentalApi: false, explicitGatewayOauth: true },
   }) as const;
 export const accountReadParams = () => ({ refreshToken: false as const });
+// Sign-in of CrewKite's own Codex home. The client opens a loopback callback, answers with the
+// browser page to open, and sends account/login/completed when the browser comes back. A wait
+// that ends early sends account/login/cancel with the login id.
+export const loginStartParams = () => ({ type: 'chatgpt' as const });
+export const loginCancelParams = (loginId: string) => ({ loginId });
 export const RATE_LIMITS_PARAMS = {
   supportsLunaReserve: false,
   excludeResetCreditDetails: true,
@@ -225,6 +230,9 @@ export const turnStartParams = (turn: {
   ...(turn.approvalPolicy ? { approvalPolicy: turn.approvalPolicy } : {}),
 });
 
+// The client titles a saved thread with its first user input. A handoff or a rerun opens with
+// CrewKite's packet, so a saved thread gets the CrewKite thread's own title.
+export const threadNameParams = (threadId: string, name: string) => ({ threadId, name });
 export const turnInterruptParams = (threadId: string, turnId: string) => ({ threadId, turnId });
 
 export type Decision = 'accept' | 'acceptForSession' | 'decline';

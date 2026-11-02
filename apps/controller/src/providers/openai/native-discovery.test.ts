@@ -169,7 +169,11 @@ test('native discovery returns metadata only after its owned process and descend
             }
             assert.equal(options.detached, true);
             assert.equal(options.env.HOME, root);
-            assert.equal(options.env.CODEX_HOME, sourceEnvironment.CODEX_HOME);
+            // The person's CODEX_HOME never reaches the client. CrewKite's own home does.
+            assert.equal(
+              options.env.CODEX_HOME,
+              resolve(root, '.crewkite/providers/openai/codex-home'),
+            );
             assert.equal(options.env.OPENAI_API_KEY, undefined);
             assert.equal(options.env.OPENAI_BASE_URL, undefined);
             assert.equal(options.env.CODEX_REMOTE, undefined);

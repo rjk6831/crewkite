@@ -31,6 +31,8 @@ const PROVIDER_SETUP: ReadonlySet<string> = new Set([
   'RefreshLocalModels',
   'SelectLocalModel',
   'AcknowledgeGoogleTerms',
+  'SignInOpenAi',
+  'SignOutOpenAi',
 ]);
 
 /** Whether a command keeps a receipt for exact retry: every change except provider setup. */

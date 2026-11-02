@@ -78,11 +78,13 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   realpathSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from 'node:fs';
@@ -265,6 +267,7 @@ input.on('line', (line) => {
   if (value.method === 'turn/start') result = { turn: running };
   if (value.method === 'model/list') result = { data: [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', hidden: false, inputModalities: given.modalities ?? ['text', 'image'] }], nextCursor: null };
   if (value.method === 'turn/interrupt') result = {};
+  if (value.method === 'thread/name/set') result = {};
   // Unknown keys come back flattened into config, mcp_servers among them.
   // The settings CrewKite launched with come back, nested under features as 0.163 does it.
   if (value.method === 'config/read') {
@@ -348,6 +351,10 @@ function turn(
     readOnly?: boolean;
     /** False for a turn whose session the controller never resumes. */
     resumable?: boolean;
+    /** The CrewKite thread's title. */
+    title?: string;
+    /** Extra variables in the environment CrewKite starts from. */
+    environment?: NodeJS.ProcessEnv;
     allowanceLeft?: number | null;
     files?: File[];
     /** Runs on the empty scratch copy before the turn starts. */
@@ -367,7 +374,7 @@ function turn(
   const events: AgentEvent[] = [];
   const listeners: Array<(event: AgentEvent) => void> = [];
   const usage: OpenAiUsage[] = [];
-  const environment = { HOME: home, PATH: process.env.PATH };
+  const environment = { HOME: home, PATH: process.env.PATH, ...options.environment };
   let args: string[] = [];
   let launchEnvironment: NodeJS.ProcessEnv = {};
   const adapter = openAiChatAdapter({
@@ -418,6 +425,7 @@ function turn(
     files: options.files ?? [],
     readOnly: options.readOnly,
     ...(options.resumable !== undefined ? { resumable: options.resumable } : {}),
+    ...(options.title !== undefined ? { title: options.title } : {}),
     ...(options.allowanceLeft !== undefined ? { allowanceLeft: options.allowanceLeft } : {}),
   };
   const handle = adapter.startTurn(request, (event) => {
@@ -428,6 +436,7 @@ function turn(
     handle,
     events,
     usage,
+    home,
     scratch,
     work,
     args: () => args,
@@ -1099,6 +1108,56 @@ test('a turn the controller never resumes opens an ephemeral thread and keeps no
     assert.equal(started?.params.ephemeral, row.ephemeral, JSON.stringify(row.options));
     assert.equal(result.session?.sessionId ?? null, row.kept ? 'thread-1' : null);
   }
+});
+
+test("a resumable writer thread is named after the person's request and internal turns stay ephemeral", async () => {
+  const title = 'Add a dark mode toggle to settings';
+  // The writer turn opens with a handoff packet, whose first line is CrewKite prose.
+  const packet = 'CrewKite handoff from anthropic.\n\nAdd a dark mode toggle to settings';
+  const rows = [
+    { options: { resumable: true, title, prompt: packet }, ephemeral: false, named: true },
+    {
+      options: { resumable: true, title, session: { family: 'openai', sessionId: 'thread-9' } },
+      ephemeral: null,
+      named: true,
+    },
+    { options: { resumable: false, title, readOnly: true }, ephemeral: true, named: false },
+    { options: { resumable: false, title }, ephemeral: true, named: false },
+  ] as const;
+  for (const row of rows) {
+    const run = turn('reply', row.options as Parameters<typeof turn>[1]);
+    assert.equal((await run.settled()).stopReason, 'done', JSON.stringify(row.options));
+    const frames = run.frames();
+    const opened = frames.findIndex((frame) => /^thread\/(start|resume)$/.test(frame.method));
+    if (row.ephemeral !== null) assert.equal(frames[opened].params.ephemeral, row.ephemeral);
+    const naming = frames.filter((frame) => frame.method === 'thread/name/set');
+    assert.deepEqual(
+      naming.map((frame) => frame.params),
+      row.named
+        ? [
+            {
+              threadId: frames[opened].method === 'thread/start' ? 'thread-1' : 'thread-9',
+              name: title,
+            },
+          ]
+        : [],
+      JSON.stringify(row.options),
+    );
+    if (row.named) assert.ok(frames.indexOf(naming[0]) > opened);
+  }
+});
+
+test("every Codex chat turn runs in CrewKite's own Codex home and leaves the person's alone", async () => {
+  const run = turn('reply', {
+    environment: { CODEX_HOME: '/nonexistent/person-codex', OPENAI_API_KEY: 'person-key' },
+  });
+  assert.equal((await run.settled()).stopReason, 'done');
+  const codexHome = join(run.home, '.crewkite', 'providers', 'openai', 'codex-home');
+  assert.equal(run.launchEnvironment().CODEX_HOME, codexHome);
+  assert.equal(run.launchEnvironment().OPENAI_API_KEY, undefined);
+  assert.equal(statSync(codexHome).mode & 0o777, 0o700);
+  assert.equal(existsSync('/nonexistent/person-codex'), false);
+  assert.equal(existsSync(join(run.home, '.codex')), false);
 });
 
 test("a client usage warning shows in the thread only when CrewKite's reading is low or missing", async () => {

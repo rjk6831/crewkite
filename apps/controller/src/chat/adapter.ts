@@ -54,6 +54,11 @@ export type ChatTurnRequest = Readonly<{
    */
   resumable?: boolean;
   /**
+   * The thread's title, at most 80 characters: the person's first line until they rename the
+   * thread. A client that lists saved sessions names a resumable one with it.
+   */
+  title?: string;
+  /**
    * False when the controller decided this turn runs without the thread tools. The packet does not
    * name them, and the adapter starts no thread tools server and sends an empty MCP config.
    */

@@ -48,7 +48,12 @@ import {
   projectOpenAiUsage,
   type UsageReporter,
 } from './discovery.ts';
-import { type NativeLaunch, nativeDiscoveryEnvironment, StderrTail } from './native-discovery.ts';
+import {
+  type NativeLaunch,
+  nativeDiscoveryEnvironment,
+  prepareCodexHome,
+  StderrTail,
+} from './native-discovery.ts';
 import {
   type ApprovalRequest,
   accountReadParams,
@@ -71,6 +76,7 @@ import {
   readProfileConfig,
   refusedField,
   type ThreadSettings,
+  threadNameParams,
   threadResumeParams,
   threadStartParams,
   turnInterruptParams,
@@ -651,6 +657,7 @@ class OpenAiChatTurn {
         nativeDiscoveryEnvironment(launch.environment),
         this.request.scratch.directory,
       );
+      prepareCodexHome(env);
       step = 'spawn';
       this.settings = chatLaunchSettings(directory, this.request);
       const args = launchArguments(this.settings);
@@ -930,6 +937,7 @@ class OpenAiChatTurn {
         this.observe(thread.data, profile);
         this.threadId = thread.data.thread.id;
         this.threadEffort = thread.data.reasoningEffort;
+        this.nameThread();
         this.startTurn(true, history);
       });
     if (session?.family !== 'openai') return start(false);
@@ -944,6 +952,7 @@ class OpenAiChatTurn {
         this.observe(thread.data, profile);
         this.threadId = thread.data.thread.id;
         this.threadEffort = thread.data.reasoningEffort;
+        this.nameThread();
         return this.startTurn(false, false);
       }
       // A thread can vanish from the client's history. Starting fresh with the transcript keeps
@@ -1777,6 +1786,17 @@ class OpenAiChatTurn {
       const { [field]: _dropped, ...rest } = params;
       this.call(method, rest, then);
     });
+  }
+
+  /**
+   * A saved thread carries the CrewKite thread's title in the person's own app. A resumed thread
+   * is named again, so a rename in CrewKite reaches it on the next turn. The turn never waits on
+   * this, and a refusal stays in the frame trace.
+   */
+  private nameThread() {
+    const title = this.request.title;
+    if (!this.resumable || !title || !this.threadId) return;
+    this.call('thread/name/set', threadNameParams(this.threadId, title), () => {});
   }
 
   private call(method: string, params: unknown, then: (reply: Reply) => void) {

@@ -1955,6 +1955,7 @@ export class ChatService {
       // The finish keeps a session only for a writer outside a plan slice. Every other turn's
       // session is never resumed.
       resumable: writer && !lane,
+      title: task.title.slice(0, 80),
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
       permissionPolicy,

@@ -2,6 +2,7 @@ import { GoogleSetup } from '../google-setup.tsx';
 import { usageCards } from '../thread/usage-cards.ts';
 import { ClientStatus, QuotaRefresh } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
+import { ConnectLine } from './providers/connect.tsx';
 
 export function GoogleCard({ header, workspace, entry, now, actions, scopes }: CardProps) {
   // The quota read waits for Connect. Until then the card shows no gauge and no refresh, even when
@@ -19,6 +20,7 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
       onCheck={() => actions.checkClient('google')}
       main={
         <>
+          <ConnectLine family="google" header={header} workspace={workspace} />
           <GoogleSetup snapshot={header} workspace={workspace} />
           <ClientStatus family="google" header={header} now={now} facts={false}>
             {connected && (

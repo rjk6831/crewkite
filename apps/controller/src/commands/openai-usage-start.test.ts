@@ -82,13 +82,18 @@ test('the quota read waits for the first OpenAI connect on this device', async (
   assert.equal(context.reads.length, 0, 'no client starts before Connect');
   assert.equal(controller.openAiUsageState(), null);
 
-  // The person's own read is the connect. It runs, and the launch read runs from then on.
-  const read = await controller.execute(
+  // A quota read before the sign-in is refused and connects nothing.
+  const early = await controller.execute(
     context.command('ObserveUsage', { family: 'openai' }, 0) as never,
     'local-owner',
   );
-  assert.equal(read.outcome, 'applied');
-  assert.equal(controller.store.hasConnectedOnce('openai'), true);
+  assert.equal(early.outcome, 'blocked');
+  assert.equal(controller.store.hasConnectedOnce('openai'), false);
+  assert.equal(context.reads.length, 0);
+
+  // The card's sign-in is the connect. The launch read runs from then on.
+  controller.store.transaction(() => controller.store.markConnectedOnce('openai'));
+  await controller.refreshOpenAiUsageWithRetry('start');
   assert.equal(context.reads.length, 1);
   context.clock.advance(300000);
   await controller.refreshOpenAiUsageWithRetry('start');

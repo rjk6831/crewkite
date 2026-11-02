@@ -433,7 +433,7 @@ export function useWorkspace() {
         const result = value === null ? null : CommandResultSchema.parse(value);
         if (!result) return value;
         if (reportError && result.outcome !== 'applied' && result.outcome !== 'already-applied') {
-          setError([result.reason ?? result.outcome, result.next].filter(Boolean).join(' '));
+          setError(result.next ?? 'That did not go through. Try again.');
         }
         try {
           await refresh();

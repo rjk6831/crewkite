@@ -4,6 +4,7 @@ import { usageCards } from '../thread/usage-cards.ts';
 import { anthropicReadReason } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
+import { ConnectLine } from './providers/connect.tsx';
 
 const signInText = (state: string | undefined) =>
   state === 'signed-in'
@@ -34,6 +35,13 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
       detail={connection?.state === 'signed-in' ? 'Signed in with a subscription' : undefined}
       main={
         <ClientStatus family="anthropic" header={header} now={now}>
+          {/* Connect is the sign-in check. A signed-in client connects Anthropic on this device. */}
+          <ConnectLine
+            family="anthropic"
+            header={header}
+            workspace={workspace}
+            connect={clientReady ? () => actions.checkAnthropic() : undefined}
+          />
           <p role="status">{signInText(connection?.state)}</p>
           <div className="st-actions">
             <button

@@ -25,6 +25,7 @@ import { Dialog, short, titleCase } from './components.tsx';
 import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
+import { useLocalReconnect } from './local-setup.tsx';
 import { Onboarding } from './onboarding/onboarding.tsx';
 import { useOnboarding } from './onboarding/use-onboarding.ts';
 import {
@@ -510,6 +511,7 @@ export function App() {
   const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
   const [selected, setSelected] = useState<string | null>(null);
   const onboarding = useOnboarding(workspace);
+  useLocalReconnect(workspace);
   const [prefill, setPrefill] = useState<string | null>(null);
   // Threads deleted here leave the rail at once, before the workspace read catches up.
   const [removed, setRemoved] = useState<ReadonlySet<string>>(() => new Set());

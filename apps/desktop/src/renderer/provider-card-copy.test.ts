@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import { setupReasons } from './local-setup-flow.ts';
+import { CONNECT_COPY, EXPIRED, LOCAL_NOT_RUNNING } from './settings/providers/connect-copy.ts';
 import { LOCAL_UNANSWERED, localResultLine, usageReadLine } from './source.ts';
 
 // Codes the controller and the client use between themselves. A card that prints one tells the
@@ -10,6 +11,15 @@ const raw = ['response-timeout', 'deadline', 'signature-timeout', 'protocol', 'r
 test('no provider card line shows a raw reason code', () => {
   const lines: [where: string, line: string][] = [
     ...Object.entries(setupReasons).map(([key, line]): [string, string] => [`setup ${key}`, line]),
+    ...Object.entries(EXPIRED).map(([family, line]): [string, string] => [
+      `expired ${family}`,
+      line,
+    ]),
+    ['Local not running', LOCAL_NOT_RUNNING],
+    ...Object.entries(CONNECT_COPY).map(([key, line]): [string, string] => [
+      `connect ${key}`,
+      typeof line === 'string' ? line : line('2.1.302'),
+    ]),
   ];
   for (const reason of raw) {
     for (const outcome of ['outcome-unknown', 'blocked'])

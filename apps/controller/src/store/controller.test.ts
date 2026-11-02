@@ -7986,6 +7986,8 @@ test('google quota authority survives retries and restart while sharing one oper
   // and google-quota-gate.test.ts: the person acknowledged the terms and Google is connected.
   const connectGoogle = (target: Controller) => {
     const acknowledged = target.store.googleAcpSetup();
+    // The person connected Google on this device, so the timed reads run on their own.
+    target.store.transaction(() => target.store.markConnectedOnce('google'));
     target.store.transaction(() =>
       target.store.putGoogleAcpSetup(
         GoogleAcpSetupSchema.parse({
@@ -8987,6 +8989,8 @@ test('a catalog read with no stored model list starts one model read and the pic
     assert(data?.kind === 'chat-catalog');
     return data.families.find((entry) => entry.family === 'openai');
   };
+  // The model read starts the OpenAI client, so it runs on a device that connected OpenAI.
+  controller.store.transaction(() => controller.store.markConnectedOnce('openai'));
   const ended = new Promise<unknown>((resolve) => {
     const stop = controller.subscribe((event) => {
       if (event.type !== 'chat.catalog') return;

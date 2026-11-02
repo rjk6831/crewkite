@@ -337,6 +337,7 @@ export class ProviderCommands {
   googleAcpPreparationStep(this: Controller): 'initialize' | 'discover' | null {
     if (
       !this.options.registerGoogleAcp ||
+      !this.store.hasConnectedOnce('google') ||
       this.closed ||
       !googleTermsAcknowledged(this.store) ||
       this.acpSetupRuntime ||
@@ -843,7 +844,34 @@ export class ProviderCommands {
     } catch {
       return { outcome: 'blocked', reason: 'anthropic-connection-storage-failed' };
     }
+    // The card's Connect is this check. A signed-in client connects Anthropic on this device.
+    if (this.nativeConnections().status().state === 'signed-in') this.connectedNow('anthropic');
     return result;
+  }
+
+  /**
+   * The launch-time sign-in check for an Anthropic connection made on this device. It reads the
+   * client's own sign-in, so the card says when that sign-in ended. Nothing is journaled as a
+   * click.
+   */
+  async checkAnthropicAtLaunch(this: Controller): Promise<void> {
+    if (this.closed || !this.store.hasConnectedOnce('anthropic')) return;
+    if (this.anthropicUsage().blocker()) return;
+    const key = this.id('cmd');
+    const directory = join(this.home, 'native', `connection-${key}`);
+    try {
+      mkdirSync(directory, { recursive: true, mode: 0o700 });
+      await this.nativeConnections().check(
+        {
+          key,
+          requestHash: hashCanonical({ key, launch: true }),
+          profile: this.anthropicChatProfile(),
+          directory,
+          repositoryRoot: this.home,
+        },
+        { spawn: this.options.nativeSpawn, schedule: this.options.schedule },
+      );
+    } catch {}
   }
 
   localControl(this: Controller): LocalControl {
@@ -1109,6 +1137,7 @@ export class ProviderCommands {
       return { outcome: 'applied', revision: setup.revision };
     };
     if (command.command === 'DisconnectLocal') {
+      this.store.forgetConnectedOnce('local');
       this.revokeLocalSecret();
       control = this.saveLocal({
         ...control,
@@ -1166,6 +1195,10 @@ export class ProviderCommands {
     }
     const blocker = this.store.localStartBlocker();
     if (blocker) return { outcome: 'blocked', reason: blocker };
+    // A Connect on the card connects Local on this device. Later launches reconnect the saved
+    // endpoint with no click.
+    if (command.command === 'ConfigureLocal' || command.command === 'BeginLocalConnectionInput')
+      this.store.markConnectedOnce('local');
     if (command.command === 'ConfigureLocal') {
       const authMode = command.payload.authMode ?? 'token';
       const refusal = authMode === 'token' ? this.localTokenRefusal() : null;

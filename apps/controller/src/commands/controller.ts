@@ -248,6 +248,15 @@ export class Controller {
     handle?: { stop: () => void };
     done: Promise<void>;
   };
+  /** The sign-in of CrewKite's own OpenAI client home while it waits for the browser, or how it ended. */
+  openAiSignIn?: {
+    key: string;
+    state: 'waiting' | 'failed';
+    url: string | null;
+    stopped: boolean;
+    handle?: { stop: () => void };
+    done: Promise<void>;
+  };
   usageResolution: GoogleUsageClientResolution;
   googleUsageReport?: {
     commandId: string;
@@ -536,7 +545,7 @@ export class Controller {
 
   /** Starts a picker read when the last one is old. A catalog read never waits for it. */
   private refreshAnthropicModels(profiles: NativeProfileResolution[]) {
-    if (this.options.anthropicModels) return;
+    if (this.options.anthropicModels || !this.store.hasConnectedOnce('anthropic')) return;
     const read = this.anthropicModelRead;
     const client = this.chatClientFor('anthropic', profiles).profile?.client;
     const now = Date.parse(this.now());
@@ -652,7 +661,8 @@ export class Controller {
    */
   private refreshStaleChatModels() {
     try {
-      if (this.closed || this.chatModelRead) return;
+      // The model read starts the OpenAI client, so it waits for the first OpenAI connect on this device.
+      if (this.closed || this.chatModelRead || !this.store.hasConnectedOnce('openai')) return;
       const profiles = this.resolveProfiles();
       if (!this.chatOpenAiProfile(profiles)) return;
       const now = Date.parse(this.now());
@@ -697,6 +707,23 @@ export class Controller {
       outcome: 'applied',
       entity: artifact,
     });
+  }
+
+  /**
+   * The person connected a provider on this device. The record makes every later launch
+   * reconnect it with no click, and the reads a launch would run start now.
+   */
+  connectedNow(family: 'openai' | 'anthropic' | 'google' | 'local') {
+    if (this.closed) return;
+    this.store.transaction(() => this.store.markConnectedOnce(family));
+    if (family === 'openai') {
+      void this.refreshOpenAiUsage('manual');
+      this.refreshStaleChatModels();
+    }
+    if (family === 'anthropic') {
+      void this.anthropicUsage().refreshWhenDue(this.id('cmd'));
+      this.refreshAnthropicModels(this.resolveProfiles());
+    }
   }
 
   /** Settles when no model read is running. A quota retry waits for it before it starts. */
@@ -1036,14 +1063,23 @@ export class Controller {
         'DiscoverGoogleAcp',
         'StopGoogleAcpSetup',
       ].includes(command.command)
-    )
+    ) {
+      // A setup step the person pressed connects Google on this device. The launch-time steps
+      // run from then on.
+      if ('consent' in command.payload && command.payload.consent === 'explicit')
+        this.connectedNow('google');
       return this.executeAcpSetup(command as AcpSetupCommand, principal);
+    }
     if (command.command === 'StartRun' && this.isPreparedAcp(command.payload.runId))
       return this.executeAcpStart(command, principal);
-    if (command.command === 'InstallGoogleAcp' || command.command === 'StopGoogleAcpInstall')
+    if (command.command === 'InstallGoogleAcp' || command.command === 'StopGoogleAcpInstall') {
+      if (command.command === 'InstallGoogleAcp') this.connectedNow('google');
       return this.executeGoogleInstall(command, principal);
+    }
     if (command.command === 'CheckNativeConnection')
       return this.checkNativeConnection(command, principal);
+    if (command.command === 'SignInOpenAi') return this.signInOpenAi(command);
+    if (command.command === 'SignOutOpenAi') return this.signOutOpenAi(command);
     if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
       return this.anthropicUsage().execute(command);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
@@ -1309,6 +1345,11 @@ export class Controller {
       this.openAiUsageRead.stopped = true;
       this.openAiUsageRead.handle?.stop();
       native.push(this.openAiUsageRead.done);
+    }
+    if (this.openAiSignIn?.state === 'waiting') {
+      this.openAiSignIn.stopped = true;
+      this.openAiSignIn.handle?.stop();
+      native.push(this.openAiSignIn.done);
     }
     if (this.usageRead) {
       this.usageRead.abort.abort();

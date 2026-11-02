@@ -23,7 +23,7 @@ import {
 const cursor = z.string().regex(/^(0|[1-9][0-9]{0,19})$/);
 const taskId = z.string().regex(/^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
 /** The `v` of every line. Change it with `CLI_JSON_LINE_SHAPE`. */
-export const CLI_JSON_LINE_VERSION = 5;
+export const CLI_JSON_LINE_VERSION = 6;
 const line = { v: z.literal(CLI_JSON_LINE_VERSION) };
 
 /** One stream event of one thread. A stored message arrives as a `message`. */
@@ -79,7 +79,7 @@ export type CliJsonLine = z.infer<typeof CliJsonLineSchema>;
 
 /** The hash of the shape `CLI_JSON_LINE_VERSION` names. Change them together. */
 export const CLI_JSON_LINE_SHAPE =
-  'e29c7cd8890bc859d2469ead5750b737450e719b9362de98e85eb287f1f69f3c';
+  'e2ce8f369193fb529e2ef37fd9f818fcabe48c2f1c75054d58e547bc523cdf26';
 
 /**
  * Exit codes of every CLI command. 0: the request applied, or the followed turn finished. 1: it

@@ -502,6 +502,12 @@ export class Store {
       .get(`connected-once:${provider}`);
   }
 
+  /** Sign-out or Disconnect ends it, so the next launch asks again. */
+  forgetConnectedOnce(provider: Route['family']) {
+    if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
+    this.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`connected-once:${provider}`);
+  }
+
   markConnectedOnce(provider: Route['family']) {
     if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
     const key = `connected-once:${provider}`;

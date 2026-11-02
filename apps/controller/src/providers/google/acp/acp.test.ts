@@ -2330,7 +2330,7 @@ setInterval(() => {}, 1000);
   output.destroy();
 });
 
-test('a controller that registers the Google client sets it up at launch and leaves the sign-in to the person', async () => {
+test('a registered Google client starts only after the person connects it, then sets up at each launch and leaves the sign-in to the person', async () => {
   const f = fixture('complete');
   const started: string[] = [];
   const clock = createTestClock();
@@ -2367,8 +2367,8 @@ test('a controller that registers the Google client sets it up at launch and lea
     assert.deepEqual(started, []);
     assert.deepEqual(steps(controller), []);
 
-    // Acknowledging Google's terms runs the launch steps at once. A fresh client initializes on
-    // its own and stops before the browser sign-in, which is the person's choice.
+    // Acknowledging Google's terms connects nothing. Connect is the person's initialize, which
+    // stops before the browser sign-in. From then on the launch steps run on their own.
     const acknowledged = await controller.execute(
       CommandSchema.parse({
         protocol: 1,
@@ -2381,6 +2381,21 @@ test('a controller that registers the Google client sets it up at launch and lea
       'local-owner',
     );
     assert.equal(acknowledged.outcome, 'applied');
+    await controller.googleAcpPreparation;
+    assert.deepEqual(started, []);
+    assert.equal(controller.store.googleAcpSetup().state, 'uninitialized');
+    const connect = await controller.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: id('cmd'),
+        actor: { id: 'terminal', kind: 'cli' },
+        command: 'InitializeGoogleAcp',
+        expectedRevision: controller.store.googleAcpSetup().revision,
+        payload: { profileId: 'google-acp-v1', consent: 'explicit' },
+      }),
+      'local-owner',
+    );
+    assert.notEqual(connect.outcome, 'denied');
     await controller.googleAcpPreparation;
     setup = controller.store.googleAcpSetup();
     assert.equal(setup.state, 'authentication-required');
@@ -2470,6 +2485,7 @@ test('an initialize with no sign-in method retries initialize and a cancelled si
       f.dispose();
     });
     await command('AcknowledgeGoogleTerms', { textVersion: GOOGLE_TERMS_VERSION });
+    await command('InitializeGoogleAcp', { profileId: 'google-acp-v1', consent: 'explicit' });
     await controller.googleAcpPreparation;
     return { command, setup: () => controller.store.googleAcpSetup() };
   };

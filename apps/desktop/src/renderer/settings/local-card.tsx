@@ -4,6 +4,7 @@ import { formatSize } from '../format-size.ts';
 import { LocalSetup } from '../local-setup.tsx';
 import { localFacts } from '../usage-presentation.ts';
 import { type CardProps, type CatalogEntry, ProviderCard } from './provider-card.tsx';
+import { ConnectLine } from './providers/connect.tsx';
 
 const sizeText = (bytes: number | null | undefined) =>
   bytes === null || bytes === undefined ? 'Unknown' : formatSize(bytes);
@@ -52,7 +53,12 @@ export function LocalCard({ header, workspace, entry }: CardProps) {
       family="local"
       entry={entry}
       detail={header.localSetup?.endpoint ?? undefined}
-      main={<LocalSetup snapshot={header} workspace={workspace} />}
+      main={
+        <>
+          <ConnectLine family="local" header={header} workspace={workspace} />
+          <LocalSetup snapshot={header} workspace={workspace} />
+        </>
+      }
       side={<Hardware header={header} entry={entry} />}
     />
   );

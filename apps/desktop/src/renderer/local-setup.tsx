@@ -9,10 +9,13 @@ import { Fact } from './components.tsx';
 import { ExternalLink } from './external-link.tsx';
 import { formatSize } from './format-size.ts';
 import {
+  connectInPlace,
   connectLocalFlow,
   DEFAULT_LOCAL_ENDPOINT,
   followDiscovery,
+  LAUNCH_RETRY_MS,
   lastSeen,
+  launchReconnect,
   localNotices,
   lowMemory,
   REOBSERVE_MS,
@@ -678,4 +681,64 @@ export function LocalSetup({
       </button>
     </section>
   );
+}
+
+/**
+ * Reconnects Local at launch on a device that connected it once, with no click. While the runtime
+ * is not running the card says so and this tries again every few seconds until it answers.
+ */
+export function useLocalReconnect(workspace: Workspace) {
+  const { source, header, preview, refresh } = workspace;
+  const once = header?.providerConnections?.connectedOnce.includes('local') ?? false;
+  const setup = header?.localSetup;
+  const live = workspace.connection === 'connected' && !preview;
+  const [remembered, setRemembered] = useState(false);
+  const [attempt, setAttempt] = useState(0);
+  const running = useRef(false);
+  const mounted = useRef(true);
+  const timer = useRef(0);
+  useEffect(
+    () => () => {
+      mounted.current = false;
+      window.clearTimeout(timer.current);
+    },
+    [],
+  );
+  // biome-ignore lint/correctness/useExhaustiveDependencies: the kept token belongs to the endpoint and mode
+  useEffect(() => {
+    if (!live || !once || !source?.localTokenStatus) return;
+    let active = true;
+    void source
+      .localTokenStatus()
+      .then((status) => active && setRemembered(status.remembered))
+      .catch(() => {});
+    return () => {
+      active = false;
+    };
+  }, [live, once, source, setup?.endpoint, setup?.authMode]);
+  const due = live && launchReconnect(setup, once, remembered);
+  // The attempt outlives this effect on purpose. Its own connect command starts an operation,
+  // which turns `due` off for a moment; cancelling there would drop the attempt and never set
+  // the next try. A try that ends without a connection always schedules the next one.
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `attempt` schedules the next try
+  useEffect(() => {
+    if (!due || !setup || running.current) return;
+    running.current = true;
+    void connectInPlace({
+      setup,
+      command: (input) => workspace.command(input),
+      read: async () => (await refresh()).localSetup,
+      wait: () => new Promise((resolve) => window.setTimeout(resolve, 500)),
+      active: () => mounted.current,
+    })
+      .catch(() => null)
+      .then((result) => {
+        running.current = false;
+        if (mounted.current && result?.kind !== 'connected')
+          timer.current = window.setTimeout(
+            () => setAttempt((value) => value + 1),
+            LAUNCH_RETRY_MS,
+          );
+      });
+  }, [due, attempt]);
 }
