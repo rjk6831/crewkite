@@ -148,6 +148,7 @@ import {
 import { inScratch, readOnlyCommand } from './read-only-command.ts';
 import { failedByRestart, restartFailure } from './restart-failure.ts';
 import { copyScratch } from './scratch-copy.ts';
+import { chatScratchDirectory, claimScratchDirectory } from './scratch-folder.ts';
 import { turnAllowsSubagents } from './subagents.ts';
 import { createThreadReader, type ThreadReads } from './thread-reader.ts';
 import { THREAD_TOOLS_ABSENT } from './thread-tools/turn.ts';
@@ -1959,7 +1960,10 @@ export class ChatService {
       this.pinBase(task, root, thread.base);
       return thread;
     }
-    const directory = this.scratchDirectory(task.id);
+    // A new thread's copy is named after the project, so a client that lists saved sessions by
+    // folder shows the project name.
+    const project = this.deps.store.get<Project>('project', task.projectId);
+    const directory = claimScratchDirectory(this.deps.home, task.id, project?.name ?? '');
     // An interrupted copy leaves a partial directory that no turn has used yet.
     rmSync(directory, { recursive: true, force: true });
     const source = scratchPlan(root, thread.base);
@@ -3270,7 +3274,7 @@ export class ChatService {
   }
 
   private scratchDirectory(taskId: string) {
-    return join(this.deps.home, 'chat', taskId, 'scratch');
+    return chatScratchDirectory(this.deps.home, taskId);
   }
 
   private filesFolder(taskId: string) {

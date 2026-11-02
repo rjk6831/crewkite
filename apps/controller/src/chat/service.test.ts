@@ -21,7 +21,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { type TestContext, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type {
@@ -67,6 +67,7 @@ import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
 import { detectType } from './files.ts';
 import { McpRegistry } from './mcp-servers.ts';
 import { parsePlan } from './plan.ts';
+import { chatScratchDirectory } from './scratch-folder.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
 import { AskingTurnError, answer } from './thread-tools/broker.ts';
@@ -175,6 +176,9 @@ test('a sent message streams agent events and saves the reply when the turn fini
   assert.match(request.systemContext, /demo-shop/);
   assert.match(request.systemContext, /no `\.git` folder and no installed dependencies/);
   assert.ok(existsSync(join(request.scratch.directory, 'net.mjs')));
+  // A new thread's copy is named after the project, so a client that lists saved sessions by
+  // folder shows the project name.
+  assert.equal(basename(request.scratch.directory), 'demo-shop');
 });
 
 test('a permission request parks the turn until the person answers through the command', {
@@ -2761,7 +2765,7 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       row.card,
       row.name,
     );
-    const scratch = join(dirname(thread.root), 'chat', taskId, 'scratch');
+    const scratch = chatScratchDirectory(dirname(thread.root), taskId);
     // A null file is absent from the thread copy.
     for (const [path, content] of Object.entries(row.files as Record<string, string | null>))
       assert.equal(
@@ -4185,7 +4189,7 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
   const configure = (patch: object) =>
     store.transaction(() => service.configure({ taskId, ...patch }));
   // The same script as the merged copies hold, in the scratch copy the person turns it on from.
-  writeFileSync(join(dirname(thread.root), 'chat', taskId, 'scratch', 'gate.mjs'), gate);
+  writeFileSync(join(chatScratchDirectory(dirname(thread.root), taskId), 'gate.mjs'), gate);
   for (const add of [
     'sh -c x',
     'npm test | cat',
@@ -4488,7 +4492,7 @@ test('a Local slice that cannot fit goes to the crew builder in balanced and gli
       flightMode,
     );
     assert.equal(read.thread.plan?.slices[0]?.assignment?.family, 'openai', flightMode);
-    const scratch = join(dirname(thread.root), 'chat', taskId, 'scratch');
+    const scratch = chatScratchDirectory(dirname(thread.root), taskId);
     assert.equal(readFileSync(join(scratch, 'a.txt'), 'utf8'), 'taxed\n', flightMode);
   }
 });
