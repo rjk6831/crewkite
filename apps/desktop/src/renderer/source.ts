@@ -433,10 +433,17 @@ export function useWorkspace() {
       const result = CommandResultSchema.parse(await source.command(input));
       try {
         await refresh();
-      } catch (failure) {
-        setTransportError(
-          `Workspace refresh failed: ${failure instanceof Error ? failure.message : 'reconnect to recover current state.'}`,
-        );
+      } catch {
+        // A setup step can keep the controller busy for a moment, so one slow read is tried
+        // again before the person sees an error.
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        try {
+          await refresh();
+        } catch (failure) {
+          setTransportError(
+            `Workspace refresh failed: ${failure instanceof Error ? failure.message : 'reconnect to recover current state.'}`,
+          );
+        }
       }
       return result;
     },
