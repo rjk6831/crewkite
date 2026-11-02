@@ -179,10 +179,42 @@ export class UsageCommands {
   refreshUsage(this: Controller, trigger: 'start' | 'connect' | 'interval'): Promise<void> {
     return Promise.allSettled([
       this.refreshGoogleUsage(trigger),
-      this.refreshOpenAiUsage(trigger),
+      this.refreshOpenAiUsageWithRetry(trigger),
       // The Anthropic gauge reads once at start. Turns and the card's Refresh read it after that.
       trigger === 'start' ? this.anthropicUsage().refreshWhenDue(this.id('cmd')) : undefined,
     ]).then(() => {});
+  }
+
+  /**
+   * The read at start or connect runs while the chat catalog read starts its own client, and on
+   * some launches the client answers the first read out of step. One more read a few seconds later
+   * settles it, so the rail does not open on "unknown" until the person presses Refresh.
+   */
+  async refreshOpenAiUsageWithRetry(
+    this: Controller,
+    trigger: 'start' | 'connect' | 'interval',
+  ): Promise<void> {
+    await this.refreshOpenAiUsage(trigger);
+    if (trigger === 'interval' || this.closed) return;
+    let state: ReturnType<Controller['openAiUsageState']>;
+    try {
+      state = this.openAiUsageState();
+    } catch {
+      return;
+    }
+    if (
+      state?.state !== 'quiescent' ||
+      (state.reason !== 'protocol' && state.reason !== 'read-failed')
+    )
+      return;
+    const schedule =
+      this.options.schedule ??
+      ((run: () => void, ms: number) => {
+        const timer = setTimeout(run, ms);
+        return () => clearTimeout(timer);
+      });
+    await new Promise<void>((resolve) => schedule(resolve, 5000));
+    if (!this.closed) await this.refreshOpenAiUsage(trigger);
   }
 
   openAiUsageState(this: Controller) {
