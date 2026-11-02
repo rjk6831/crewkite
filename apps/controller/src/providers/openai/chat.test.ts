@@ -1,43 +1,60 @@
-// Native frames this adapter assumes, one JSON object per line. A live run on the pinned client
-// should confirm each of them.
+// Native frames this adapter assumes, one JSON object per line, checked against Codex 0.163.0 by
+// scripts/protocol-check.mjs and the sign-in-free probes it runs.
 //
-// Launch: `-c approval_policy="on-request"` under every policy of a turn that edits. The client's
-// config loader refuses "untrusted" and the app-server exits before it answers initialize. The thread's own policy goes
-// in approvalPolicy below: "untrusted" for the ask and allow-edits policies, "on-request" for
-// allow-all. Under untrusted the client asks before every file change and every command outside
-// its own read-only list. A read-only turn launches and opens its thread with "never" and the
-// "read-only" sandbox, so its commands run in the sandbox and nothing asks.
+// Launch: `-c` settings, then `app-server --listen stdio://`, with no --strict-config. Every
+// turn that edits launches with `approval_policy="on-request"` and `sandbox_mode="workspace-write"`.
+// The client's config loader refuses "untrusted" and the app-server exits before it answers
+// initialize. The thread's own policy goes in approvalPolicy below: "untrusted" for the ask and
+// allow-edits policies, "on-request" for allow-all. Under untrusted the client asks before every
+// file change and every command outside its own read-only list. A read-only turn launches with
+// "never" and no sandbox mode, and its thread runs under the crewkite-read permission profile.
 //
 // Client to server, ids counted from 1 per process:
 //   {"id":1,"method":"initialize","params":{"clientInfo":{"name":"crewkite","title":"CrewKite","version":"0.1.0"},"capabilities":{"experimentalApi":false,"explicitGatewayOauth":true}}}
 //   {"method":"initialized"}
 //   {"id":2,"method":"account/read","params":{"refreshToken":false}}
-//   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}}
-//   {"id":4,"method":"config/read","params":{"includeLayers":false,"cwd":SCRATCH}}, only with the
-//     thread tools; the reply's config.mcp_servers names each configured server, and the ids after
-//     it move up by one
-//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request"|"never","approvalsReviewer":"user","sandbox":"workspace-write"|"read-only","serviceTier":"default","developerInstructions":CONTEXT,"ephemeral":B}},
+//   {"id":3,"method":"account/rateLimits/read","params":{"supportsLunaReserve":false,"excludeResetCreditDetails":true}},
+//     with no params before 0.154.0
+//   {"id":4,"method":"config/read","params":{"includeLayers":false,"cwd":SCRATCH}}; the reply
+//     confirms approval_policy, sandbox_mode, web_search and features.plugins, and its
+//     config.mcp_servers names each configured server
+//   {"id":5,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request"|"never","approvalsReviewer":"user","sandbox":"workspace-write","serviceTier":"default","developerInstructions":CONTEXT,"ephemeral":B}},
 //     where CONTEXT is CrewKite's framing for the turn, so TEXT below starts with the person's message
 //     where B is false only for a thread the controller resumes later (a writer outside a plan slice)
 //     with the thread tools also "config":{"mcp_servers.NAME.enabled":false for each other server,
 //     "mcp_servers.crewkite":{"command","args","enabled":true,"default_tools_approval_mode":"approve"}}
-//   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings and config without ephemeral,"excludeTurns":true}}
-//   {"id":4,"method":"model/list","params":{"limit":100,"includeHidden":true}}, before the thread
+//     on a read-only turn no sandbox, and "config" also holds {"default_permissions":"crewkite-read",
+//     "permissions":{"crewkite-read":{"filesystem":{":minimal":"read",SCRATCH:"read",FOLDER:"read"}}}}
+//     with each attached file's FOLDER; before 0.133.0 "sandbox":"read-only" and no profile
+//   {"id":5,"method":"thread/resume","params":{"threadId":T, same settings and config without ephemeral,"excludeTurns":true}},
+//     excludeTurns from 0.151.0
+//   {"id":5,"method":"model/list","params":{"limit":100,"includeHidden":true}}, before the thread
 //     only when the turn carries an image or audio file
-//   {"id":5,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}],"effort":E}}, effort left out for default,
-//     on a read-only turn with "sandboxPolicy":{"type":"readOnly","access":{"type":"restricted",
-//     "includePlatformDefaults":true,"readableRoots":[SCRATCH]},"networkAccess":false}
+//   {"id":6,"method":"turn/start","params":{"threadId":T,"input":[{"type":"text","text":TEXT}],"effort":E}}, effort left out for default,
+//     on a read-only thread that did not prove the profile also "sandboxPolicy":{"type":"readOnly",
+//     "networkAccess":false},"approvalPolicy":"untrusted"
 //     with {"type":"localImage","path":P} or {"type":"localAudio","path":P} before the text for each such file
 //   {"id":R,"result":{"decision":"accept"|"acceptForSession"|"decline"}}, the answer to approval request R
+//   {"id":R,"result":{"permissions":GRANTED,"scope":"turn"}}, the answer to a permissions request,
+//     GRANTED being the access it asked for or {}
+//   {"id":R,"error":{"code":-32601,"message":S}}, the answer to any other server request
 //   {"id":N,"method":"turn/interrupt","params":{"threadId":T,"turnId":U}}
+//
+// A request refused with -32600 or -32602 over a field CrewKite can drop (thread/start ephemeral
+// and serviceTier, thread/resume excludeTurns and serviceTier, turn/start effort) goes again once
+// without it.
 //
 // Server to client:
 //   {"id":n,"result":...} or {"id":n,"error":{"code":C,"message":S}}
 //   account/read result {"account":{"type":"chatgpt"}|null}
 //   account/rateLimits/read result {"ordinaryUsageAllowed":B,"rateLimits":{"limitId","primary":{"usedPercent","windowDurationMins","resetsAt"}}}
 //   model/list result {"data":[{"model","inputModalities":["text","image","audio"],...}],"nextCursor"}
-//   thread/start and thread/resume result {"thread":{"id":T},"reasoningEffort":E}, the effort a
-//     turn that sends none runs at; turn/start result {"turn":{"id":U}}
+//   thread/start and thread/resume result {"thread":{"id":T},"reasoningEffort":E,
+//     "activePermissionProfile":{"id":P},"sandbox":{"type":S}}, the effort a turn that sends none
+//     runs at and, for a read-only thread, the profile and sandbox it got; turn/start result
+//     {"turn":{"id":U}}
+//   a refused shape {"code":-32600,"message":"Invalid request: readOnly.access is no longer supported; use permissionProfile for restricted reads"}
+//   {"id":R,"method":"item/permissions/requestApproval","params":{"threadId","turnId","itemId","cwd","reason","permissions":{"fileSystem","network"},"startedAtMs"}}
 //   {"id":R,"method":"item/commandExecution/requestApproval","params":{"threadId","turnId","itemId","reason","command","cwd"}},
 //     or for a network access prompt {"threadId","turnId","itemId","reason","networkApprovalContext":{"host","protocol"}}
 //     with no command and no cwd
@@ -191,6 +208,11 @@ const scripts = {
   'wide-run': () => [
     ['item/started', { ...ids(), item: { ...command, command: given.command, cwd: here('') } }],
   ],
+  // A command that asks for access past its sandbox, then a request no build CrewKite knows sends.
+  'more-access': () => [
+    { id: 0, method: 'item/permissions/requestApproval', params: { ...ids(), itemId: 'command-1', cwd: here(''), reason: 'Needs the network.', permissions: { network: { enabled: true } }, startedAtMs: 1 } },
+  ],
+  'new-request': () => [{ id: 0, method: 'item/fixture/requestSomething', params: ids() }],
   'usage-warning': () => [
     ['warning', { message: 'You have used 80% of your usage limit.' }],
     ['warning', { message: 'A setting in config.toml is deprecated.' }],
@@ -206,31 +228,48 @@ input.on('line', (line) => {
   if (scenario === 'crash') return;
   appendFileSync(frames, line + '\n');
   const value = JSON.parse(line);
-  // An older client build refuses the narrower read-only sandbox policy.
-  if (value.method === 'turn/start' && given.refuseRestricted && value.params.sandboxPolicy?.access)
-    return send({ id: value.id, error: { code: -32602, message: 'Invalid params: unknown variant access' } });
+  // Codex 0.126 and later refuse the removed restricted read shape, before any thread lookup.
+  if (value.method === 'turn/start' && value.params.sandboxPolicy?.access)
+    return send({ id: value.id, error: { code: -32600, message: 'Invalid request: readOnly.access is no longer supported; use permissionProfile for restricted reads' } });
+  // A build that refuses a request once while it carries the field, or every time.
+  if (given.refuse && value.method === given.refuse.method && (given.refuse.always || (!given.refused && given.refuse.field in value.params))) {
+    given.refused = true;
+    return send({ id: value.id, error: given.refuse.error });
+  }
   if (value.method === 'turn/start' && scenario === 'refuse')
     return send({ id: value.id, error: { code: -32602, message: 'Invalid params: thread not loaded\nretry later' } });
   if (value.method === 'thread/resume' && given.lostThread)
     return send({ id: value.id, error: { code: -32600, message: 'no rollout found for thread' } });
   if (value.method === undefined && scenario === 'two-commands')
     return value.id === 0 ? play('second-command') : send({ method: 'turn/completed', params: { threadId, turn: { ...running, status: 'completed' } } });
-  if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : 'approved');
+  if (value.method === undefined) return play(scenario === 'edit' ? 'reply' : scenario === 'more-access' || scenario === 'new-request' ? 'reply' : 'approved');
   if (value.id === undefined) return;
   // A hung client never answers the interrupt.
   if (value.method === 'turn/interrupt' && given.silent) return;
   let result = replies[value.method];
   // Fields CrewKite does not read change shape between client builds.
-  if (value.method === 'thread/start') result = { thread: { id: threadId, preview: '' }, model: value.params.model, reasoningEffort: 'medium', sandbox: { type: 'futureSandbox' }, ...(scenario === 'ignored-policy' ? { approvalPolicy: 'never' } : {}) };
+  // A thread opened with a permission profile names it and a read-only sandbox, as 0.163 does.
+  // given.profile stands in for a build that answers with another profile, or none.
+  const profile = value.params?.config?.default_permissions;
+  const applied = profile ? { activePermissionProfile: given.profile === null ? undefined : { id: given.profile ?? profile, extends: null }, sandbox: { type: 'readOnly', networkAccess: false } } : { sandbox: { type: 'futureSandbox' } };
+  if (value.method === 'thread/start') result = { thread: { id: threadId, preview: '' }, model: value.params.model, reasoningEffort: 'medium', ...applied, ...(scenario === 'ignored-policy' ? { approvalPolicy: 'never' } : {}) };
   if (value.method === 'thread/resume') {
     threadId = value.params.threadId;
-    result = { thread: { id: threadId } };
+    result = { thread: { id: threadId }, ...applied };
   }
   if (value.method === 'turn/start') result = { turn: running };
   if (value.method === 'model/list') result = { data: [{ id: 'gpt-6.1-sol', model: 'gpt-6.1-sol', hidden: false, inputModalities: given.modalities ?? ['text', 'image'] }], nextCursor: null };
   if (value.method === 'turn/interrupt') result = {};
   // Unknown keys come back flattened into config, mcp_servers among them.
-  if (value.method === 'config/read') result = { config: { model: null, mcp_servers: given.mcp ?? {} }, origins: {} };
+  // The settings CrewKite launched with come back, nested under features as 0.163 does it.
+  if (value.method === 'config/read') {
+    const features = {};
+    const config = { model: null, features, mcp_servers: given.mcp ?? {} };
+    for (const [key, setting] of Object.entries(given.settings ?? {}))
+      if (key.startsWith('features.')) features[key.slice(9)] = setting;
+      else config[key] = setting;
+    result = { config, origins: {} };
+  }
   send({ id: value.id, result });
   if (value.method === 'turn/start') play(scenario);
   if (value.method === 'turn/interrupt') send({ method: 'turn/completed', params: { threadId, turn: { ...running, status: 'interrupted' } } });
@@ -275,7 +314,15 @@ function turn(
     detail?: {
       cwd?: string;
       network?: boolean;
-      refuseRestricted?: boolean;
+      /** The profile a read-only thread reply names. Null leaves it out. */
+      profile?: string | null;
+      /** A request the peer refuses while it carries the field, once or every time. */
+      refuse?: {
+        method: string;
+        field: string;
+        always?: boolean;
+        error: { code: number; message: string };
+      };
       /** The command line in a wide-ask or wide-run scenario. */
       command?: string;
       path?: string;
@@ -329,7 +376,19 @@ function turn(
     spawn: (path, clientArgs, spawnOptions) => {
       args = clientArgs;
       launchEnvironment = spawnOptions.env;
-      const input = JSON.stringify(options.detail ?? null);
+      // The peer answers config/read with the settings it was launched with.
+      const settings = Object.fromEntries(
+        clientArgs.flatMap((arg, index) => {
+          if (clientArgs[index - 1] !== '-c') return [];
+          const [key, ...value] = arg.split('=');
+          try {
+            return [[key, JSON.parse(value.join('='))]];
+          } catch {
+            return [];
+          }
+        }),
+      );
+      const input = JSON.stringify({ ...options.detail, settings });
       return spawn(process.execPath, [path, scenario, frames, input], spawnOptions);
     },
     schedule: options.schedule,
@@ -445,7 +504,7 @@ test('a Codex build newer than the tested one, found by version range, launches 
   assert.equal(found.status.state, 'newer');
   assert.equal(
     found.status.message,
-    'Codex 0.170.2 found. Tested with 0.163.0; newer builds usually work.',
+    'Codex 0.170.2 found. Checked with 0.163.0 on 2 Nov 2026; this build is newer than the last checked build.',
   );
   assert(found.client);
   const run = turn('reply', { client: found.client });
@@ -648,7 +707,7 @@ test('stop interrupts the native turn, waits for the client to confirm it and en
     if (silent) waits[0]();
     const result = await run.settled();
     assert.deepEqual(run.frames().at(-1), {
-      id: 6,
+      id: 7,
       method: 'turn/interrupt',
       params: { threadId: 'thread-1', turnId: 'turn-1' },
     });
@@ -750,7 +809,7 @@ test('an image or audio file goes as a local input only to a model that takes it
   const opus = file('call.flac', 'audio/flac');
   const voice = file('call.ogg', 'audio/ogg');
   const missing = { ...png, path: join(root, 'files', 'gone', 'screen.png') };
-  const listing = { id: 4, method: 'model/list', params: { limit: 100, includeHidden: true } };
+  const listing = { id: 5, method: 'model/list', params: { limit: 100, includeHidden: true } };
   const rows: Array<{
     files: File[];
     modalities?: string[];
@@ -815,13 +874,13 @@ test('an image or audio file goes as a local input only to a model that takes it
       assert.equal(failure?.kind, 'attachment-rejected');
       assert.equal(failure?.message, row.failure);
       // No thread opened and no turn spent.
-      if (row.spawned) assert.deepEqual(run.frames().slice(4), [listing]);
+      if (row.spawned) assert.deepEqual(run.frames().slice(5), [listing]);
       continue;
     }
     assert.equal(stopReason, 'done');
     const frames = run.frames();
-    const at = row.listed === false ? 4 : 5;
-    if (at === 5) assert.deepEqual(frames[4], listing);
+    const at = row.listed === false ? 5 : 6;
+    if (at === 6) assert.deepEqual(frames[5], listing);
     assert.deepEqual(
       frames.slice(at).map((frame) => frame.method),
       ['thread/start', 'turn/start'],
@@ -896,10 +955,10 @@ test('the next turn resumes the thread with its own approval policy and effort a
     assert(run.args().includes('approval_policy="on-request"'));
     assert(!run.args().some((arg) => arg.includes('untrusted')));
   }
-  assert.deepEqual(first.frames().slice(4), [
-    { id: 4, method: 'thread/start', params: { ...settings, ephemeral: false } },
+  assert.deepEqual(first.frames().slice(5), [
+    { id: 5, method: 'thread/start', params: { ...settings, ephemeral: false } },
     {
-      id: 5,
+      id: 6,
       method: 'turn/start',
       params: {
         threadId: 'thread-1',
@@ -914,13 +973,14 @@ test('the next turn resumes the thread with its own approval policy and effort a
       'initialized',
       'account/read',
       'account/rateLimits/read',
+      'config/read',
       'thread/resume',
       'turn/start',
     ],
   );
-  assert.deepEqual(second.frames().slice(4), [
+  assert.deepEqual(second.frames().slice(5), [
     {
-      id: 4,
+      id: 5,
       method: 'thread/resume',
       params: {
         threadId: 'thread-1',
@@ -931,15 +991,16 @@ test('the next turn resumes the thread with its own approval policy and effort a
       },
     },
     {
-      id: 5,
+      id: 6,
       method: 'turn/start',
       params: { threadId: 'thread-1', input: [{ type: 'text', text: prompt }], effort: 'low' },
     },
   ]);
   assert.equal(result.session?.sessionId, 'thread-1');
 
-  // With the thread tools, config/read comes before the thread, and the thread config holds the
-  // one server and turns off each server the person configured. A read-only turn gets it too.
+  // config/read comes before the thread, and with the thread tools the thread config holds the
+  // one server and turns off each server the person configured. A read-only turn gets it too,
+  // beside its permission profile.
   const broker = new ThreadToolsBroker({ home: root });
   const minted: Array<readonly string[]> = [];
   const threadTools = (request: ChatTurnRequest) => {
@@ -962,7 +1023,13 @@ test('the next turn resumes the thread with its own approval policy and effort a
       params: { includeLayers: false, cwd: run.scratch },
     });
     const opened = frames.find((frame) => frame.method === row.method);
-    assert.deepEqual(opened?.params.config, {
+    const {
+      default_permissions: profile,
+      permissions: _table,
+      ...servers
+    } = opened?.params.config ?? {};
+    assert.equal(profile, row.options.readOnly ? 'crewkite-read' : undefined);
+    assert.deepEqual(servers, {
       'mcp_servers.docs.enabled': false,
       'mcp_servers.crewkite': {
         command: process.execPath,
@@ -1019,17 +1086,18 @@ test("a client usage warning shows in the thread only when CrewKite's reading is
   }
 });
 
-test('a read-only turn runs in the read-only sandbox under never, and an edit turn keeps its policy', async () => {
+test('a read-only turn runs under never, and an edit turn keeps its policy', async () => {
   // Under untrusted the client asked about pwd, ls -la and rg --files, and a read-only turn could
-  // only deny each one. Under never the commands run inside the read-only sandbox, which refuses
-  // writes and network on its own.
+  // only deny each one. Under never the commands run inside the read-only profile, which refuses
+  // writes and network on its own. A sandbox mode would switch the client off profiles, so a
+  // read-only turn names none.
   const rows = [
-    { options: { readOnly: true }, approval: 'never', launch: 'never', sandbox: 'read-only' },
+    { options: { readOnly: true }, approval: 'never', launch: 'never', sandbox: undefined },
     {
       options: { readOnly: true, permissionPolicy: 'allow-all' as const },
       approval: 'never',
       launch: 'never',
-      sandbox: 'read-only',
+      sandbox: undefined,
     },
     { options: {}, approval: 'untrusted', launch: 'on-request', sandbox: 'workspace-write' },
     {
@@ -1047,37 +1115,135 @@ test('a read-only turn runs in the read-only sandbox under never, and an edit tu
     assert.equal(started?.params.approvalPolicy, row.approval);
     assert.equal(started?.params.sandbox, row.sandbox);
     assert(run.args().includes(`approval_policy="${row.launch}"`));
-    assert(run.args().includes(`sandbox_mode="${row.sandbox}"`));
-    // A read-only turn reads only the scratch copy and the platform's own files.
-    const turned = run.frames().find((frame) => frame.method === 'turn/start');
+    assert.equal(
+      run.args().find((arg) => arg.startsWith('sandbox_mode=')),
+      row.sandbox && `sandbox_mode="${row.sandbox}"`,
+    );
+    assert(!run.args().includes('--strict-config'));
+  }
+});
+
+test('a read-only turn on 0.163 never sends readOnly.access and runs under the crewkite-read profile', async () => {
+  // The peer refuses the removed shape with the 0.163 words. The profile reads the scratch copy,
+  // the attached file's folder and the platform's own files, and the reply proves it applied.
+  const run = turn('reply', { readOnly: true, files: [pdf] });
+  const { stopReason } = await run.settled();
+  assert.equal(stopReason, 'done');
+  const started = run.frames().find((frame) => frame.method === 'thread/start');
+  assert.equal(started?.params.config.default_permissions, 'crewkite-read');
+  assert.deepEqual(started?.params.config.permissions['crewkite-read'].filesystem, {
+    ':minimal': 'read',
+    ...Object.fromEntries(
+      [...new Set([run.scratch, realpathSync(run.scratch)])].map((root) => [root, 'read']),
+    ),
+    [dirname(pdf.path)]: 'read',
+  });
+  const turns = run.frames().filter((frame) => frame.method === 'turn/start');
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].params.sandboxPolicy, undefined);
+  assert.equal(turns[0].params.approvalPolicy, undefined);
+  assert.ok(!run.events.some((event) => event.type === 'provider.notice'));
+});
+
+test('a thread that opens under another profile runs the read-only turn on the plain sandbox and says so', async () => {
+  // More questions, never wider access: the plain sandbox reads the whole disk, so the client
+  // asks before each command and CrewKite checks it.
+  for (const profile of [':read-only', null]) {
+    const run = turn('reply', { readOnly: true, detail: { profile } });
+    const { stopReason } = await run.settled();
+    assert.equal(stopReason, 'done', String(profile));
+    const turns = run.frames().filter((frame) => frame.method === 'turn/start');
+    assert.equal(turns.length, 1);
+    assert.deepEqual(turns[0].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
+    assert.equal(turns[0].params.approvalPolicy, 'untrusted');
     assert.deepEqual(
-      turned?.params.sandboxPolicy,
-      row.sandbox === 'read-only'
-        ? {
-            type: 'readOnly',
-            access: {
-              type: 'restricted',
-              includePlatformDefaults: true,
-              readableRoots: [run.scratch],
-            },
-            networkAccess: false,
-          }
-        : undefined,
+      run.events.flatMap((event) => (event.type === 'provider.notice' ? [event.message] : [])),
+      [
+        `Codex opened the thread under ${profile ? `the ${profile} profile` : 'no named profile'}, so this read-only turn reads through the plain read-only sandbox and CrewKite checks each command first.`,
+      ],
     );
   }
 });
 
-test('a read-only turn falls back to the plain read-only sandbox when the client refuses the narrower one', async () => {
-  const run = turn('reply', { readOnly: true, detail: { refuseRestricted: true } });
-  const { stopReason } = await run.settled();
-  assert.equal(stopReason, 'done');
-  const starts = run.frames().filter((frame) => frame.method === 'turn/start');
-  assert.equal(starts.length, 2);
-  assert.ok(starts[0].params.sandboxPolicy.access);
-  assert.deepEqual(starts[1].params.sandboxPolicy, { type: 'readOnly', networkAccess: false });
-  // The plain sandbox reads the whole disk, so the client asks before each command.
-  assert.equal(starts[0].params.approvalPolicy, undefined);
-  assert.equal(starts[1].params.approvalPolicy, 'untrusted');
+test("a refused optional field is dropped once with a notice, and a second refusal ends the turn in the client's words", async () => {
+  const error = {
+    code: -32600,
+    message: 'Invalid request: unknown field `effort`, expected one of `threadId`, `input`',
+  };
+  const once = turn('reply', {
+    detail: { refuse: { method: 'turn/start', field: 'effort', error } },
+  });
+  const result = await once.settled();
+  assert.equal(result.stopReason, 'done');
+  const turns = once.frames().filter((frame) => frame.method === 'turn/start');
+  assert.deepEqual(
+    turns.map((frame) => frame.params.effort),
+    ['low', undefined],
+  );
+  assert.deepEqual(
+    once.events.flatMap((event) => (event.type === 'provider.notice' ? [event.message] : [])),
+    ['Codex refused a setting CrewKite sends (turn/start.effort). The turn runs without it.'],
+  );
+  // A refusal that names no field CrewKite can drop, or a second refusal, ends the turn with
+  // what the client said.
+  for (const refuse of [
+    {
+      method: 'turn/start',
+      field: 'input',
+      always: true,
+      error: { code: -32600, message: 'Invalid request: invalid type: map, expected unit' },
+    },
+    {
+      method: 'thread/start',
+      field: 'ephemeral',
+      always: true,
+      error: { code: -32602, message: '`ephemeral` is no longer supported for `thread/start`' },
+    },
+  ]) {
+    const run = turn('reply', { detail: { refuse } });
+    const { stopReason, failure } = await run.settled();
+    assert.equal(stopReason, 'error', refuse.field);
+    assert.equal(failure?.providerMessage, refuse.error.message, refuse.field);
+    assert.equal(
+      run.frames().filter((frame) => frame.method === refuse.method).length,
+      refuse.field === 'input' ? 1 : 2,
+      refuse.field,
+    );
+  }
+});
+
+test('a server request that widens access or that CrewKite does not know never passes silently', async () => {
+  // A read-only turn denies more access by itself. An edit turn asks the person, and a grant
+  // answers with exactly the access the request named, for this turn.
+  const denied = turn('more-access', { readOnly: true });
+  assert.equal((await denied.settled()).stopReason, 'done');
+  assert.deepEqual(denied.frames().find((frame) => frame.id === 0)?.result, {
+    permissions: {},
+    scope: 'turn',
+  });
+  const granted = turn('more-access', {
+    permissionPolicy: 'allow-all',
+    permissionGrants: ['command'],
+  });
+  const asked = await granted.when('permission.requested');
+  assert.equal(asked.question, 'Allow access outside the sandbox for this turn?');
+  assert.ok(!asked.options.some((option) => option.kind === 'allow-thread'));
+  granted.handle.respondPermission(asked.requestId, 'allow-once');
+  assert.equal((await granted.settled()).stopReason, 'done');
+  assert.deepEqual(granted.frames().find((frame) => frame.id === 0)?.result, {
+    permissions: { network: { enabled: true } },
+    scope: 'turn',
+  });
+  // A request no build CrewKite knows sends gets a refusal and a line in the thread.
+  const unknown = turn('new-request');
+  assert.equal((await unknown.settled()).stopReason, 'done');
+  assert.equal(unknown.frames().find((frame) => frame.id === 0)?.error.code, -32601);
+  assert.deepEqual(
+    unknown.events.flatMap((event) => (event.type === 'provider.notice' ? [event.message] : [])),
+    [
+      'Codex asked a question CrewKite cannot answer (item/fixture/requestSomething). The turn may stop.',
+    ],
+  );
 });
 
 test('a read-only turn keeps the first turn/start error when it is not a refused sandbox shape', async () => {
@@ -1110,7 +1276,7 @@ test('on the plain read-only sandbox only a command that provably stays in the c
   for (const row of rows) {
     const run = turn('wide-ask', {
       readOnly: true,
-      detail: { refuseRestricted: true, command: row.command },
+      detail: { profile: null, command: row.command },
     });
     await run.settled();
     const answer = run.frames().find((frame) => frame.id === 0 && frame.result);
@@ -1119,7 +1285,7 @@ test('on the plain read-only sandbox only a command that provably stays in the c
   // A command the client ran under a rule of its own ends the turn unless it stays in the copy.
   const run = turn('wide-run', {
     readOnly: true,
-    detail: { refuseRestricted: true, command: '/bin/zsh -lc "cd && cat .ssh/id_rsa"' },
+    detail: { profile: null, command: '/bin/zsh -lc "cd && cat .ssh/id_rsa"' },
   });
   const { stopReason, failure } = await run.settled();
   assert.equal(stopReason, 'error');
@@ -1149,7 +1315,7 @@ test('a client that fails before its turn runs leaves its error output and last 
       failure: {
         stage: 'session',
         kind: 'client-exit',
-        message: 'Codex exited with code 1 before the turn finished.',
+        message: 'Codex closed before it answered initialize, with code 1.',
         providerMessage: 'Error: invalid configuration',
         method: null,
         code: null,
@@ -1168,14 +1334,14 @@ test('a client that fails before its turn runs leaves its error output and last 
         method: 'thread/start',
         code: null,
         detail: [
-          'received #1 result',
-          'sent initialized',
           'sent #2 account/read',
           'received #2 result',
           'sent #3 account/rateLimits/read',
           'received #3 result',
-          'sent #4 thread/start',
+          'sent #4 config/read',
           'received #4 result',
+          'sent #5 thread/start',
+          'received #5 result',
         ].join('\n'),
       },
     },
@@ -1189,14 +1355,14 @@ test('a client that fails before its turn runs leaves its error output and last 
         method: 'turn/start',
         code: -32602,
         detail: [
-          'sent #2 account/read',
-          'received #2 result',
           'sent #3 account/rateLimits/read',
           'received #3 result',
-          'sent #4 thread/start',
+          'sent #4 config/read',
           'received #4 result',
-          'sent #5 turn/start',
-          'received #5 error -32602: Invalid params: thread not loaded retry later',
+          'sent #5 thread/start',
+          'received #5 result',
+          'sent #6 turn/start',
+          'received #6 error -32602: Invalid params: thread not loaded retry later',
         ].join('\n'),
       },
     },
@@ -1207,14 +1373,11 @@ test('a client that fails before its turn runs leaves its error output and last 
     const { nextAction: _nextAction, resetsAt: _resetsAt, ...kept } = failure ?? {};
     assert.deepEqual(kept, row.failure, row.scenario);
   }
-  // A newer build that closes before it starts names its version and the tested one. The tested
-  // build and an older one keep the plain exit line.
+  // A build that closes before it answers initialize names its own version. Without
+  // --strict-config the version no longer predicts a refused setting, so no build gets more.
   for (const [version, message] of [
-    [
-      '0.170.2',
-      'Codex 0.170.2 closed before it started, and CrewKite was tested with 0.163.0. A newer build can refuse a setting CrewKite passes; install 0.163.0 or update CrewKite.',
-    ],
-    ['0.163.0', 'Codex exited with code 1 before the turn finished.'],
+    ['0.170.2', 'Codex 0.170.2 closed before it answered initialize, with code 1.'],
+    ['0.163.0', 'Codex 0.163.0 closed before it answered initialize, with code 1.'],
   ] as const) {
     const { failure } = await turn('crash', {
       client: { executable, sha256, version },

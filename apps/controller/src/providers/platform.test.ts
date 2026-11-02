@@ -186,7 +186,7 @@ test('a Linux npm layout resolves to the native build through the shared trust c
       writeFileSync(path, `#!/bin/sh\n[ "$1" = --version ] || exit 2\necho '${output}'\n`);
       chmodSync(path, mode);
     };
-    // The script entry would be refused as too old; the native build beside it is accepted.
+    // The native build beside the script entry comes first, and its version is the one reported.
     script(join(lib, 'bin/codex.js'), 'codex-cli 0.100.0');
     script(join(native, 'codex'), 'codex-cli 0.170.2');
     symlinkSync(join(lib, 'bin/codex.js'), join(bin, 'codex'));
@@ -203,11 +203,12 @@ test('a Linux npm layout resolves to the native build through the shared trust c
     assert.equal(found.client?.executable, join(native, 'codex'));
     assert.equal(found.client?.version, '0.170.2');
 
-    // Another user can write the native build, so it never runs and the older script explains.
+    // Another user can write the native build, so it never runs. A Codex version only informs, so
+    // the script entry is what is found.
     chmodSync(join(native, 'codex'), 0o757);
     const shared = find();
-    assert.equal(shared.client, undefined);
-    assert.equal(shared.status.state, 'untrusted');
+    assert.notEqual(shared.client?.executable, join(native, 'codex'));
+    assert.equal(shared.client?.executable, join(lib, 'bin/codex.js'));
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

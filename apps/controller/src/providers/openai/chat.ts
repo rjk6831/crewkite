@@ -8,7 +8,7 @@ import {
   openSync,
   realpathSync,
 } from 'node:fs';
-import { extname, isAbsolute, join, relative, resolve } from 'node:path';
+import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   type AgentEvent,
   type ChatFailure,
@@ -16,7 +16,6 @@ import {
   ChatSetEffortSchema,
   type ChatToolKind,
 } from '@crewkite/contracts';
-import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { z } from 'zod';
 import {
   type ChatAdapter,
@@ -41,7 +40,6 @@ import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
-import { CLIENT_VERSIONS, clientVersionState } from '../client-versions.ts';
 import { fileDigestSync } from '../file-digest.ts';
 import {
   type OpenAiUsageHook,
@@ -51,6 +49,33 @@ import {
   type UsageReporter,
 } from './discovery.ts';
 import { type NativeLaunch, nativeDiscoveryEnvironment, StderrTail } from './native-discovery.ts';
+import {
+  type ApprovalRequest,
+  accountReadParams,
+  approvalReply,
+  approvalRequest,
+  type CodexFeatures,
+  configReadParams,
+  confirmSettings,
+  type Decision,
+  features,
+  initializeParams,
+  type LaunchSettings,
+  launchArguments,
+  launchSettings,
+  modelListParams,
+  permissionsReply,
+  READ_ONLY_SANDBOX,
+  READ_PROFILE,
+  rateLimitsParams,
+  readProfileConfig,
+  refusedField,
+  type ThreadSettings,
+  threadResumeParams,
+  threadStartParams,
+  turnInterruptParams,
+  turnStartParams,
+} from './protocol.ts';
 
 // One chat turn on the app-server: one owned client process, one thread opened or resumed, one
 // turn. The process lives for the turn because a turn is the unit of Stop and cleanup. The thread
@@ -99,78 +124,45 @@ export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
 // for a turn that edits.
 //
 // Every read-only role (review, advice, challenge, ask, the orchestrator and a read-only slice)
-// runs in the read-only sandbox under `never`. The client reads and searches through shell
-// commands, and under `untrusted` it asked about most of them (pwd, ls -la, rg --files), which a
-// read-only turn could only deny, so the model was left with no way to read. Under `never` each
-// command runs inside the sandbox without a question, and the sandbox refuses every write and
-// every network call; a refused command fails in place and is never escalated. turn/start narrows
-// what the sandbox reads to the scratch copy (readOnlySandbox below). The brief keeps
-// the model to read-only commands (readOnlyRules in chat/prompt.ts). serverRequest still denies a
-// question that arrives on a read-only turn.
+// runs under `never`. The client reads and searches through shell commands, and under `untrusted`
+// it asked about most of them (pwd, ls -la, rg --files), which a read-only turn could only deny,
+// so the model was left with no way to read. Under `never` each command runs inside the sandbox
+// without a question, and the sandbox refuses every write and every network call; a refused
+// command fails in place and is never escalated. The brief keeps the model to read-only commands
+// (readOnlyRules in chat/prompt.ts). serverRequest still denies a question that arrives on a
+// read-only turn.
 const approvalPolicy = (request: ChatTurnRequest) =>
   request.readOnly
     ? 'never'
     : request.permissionPolicy === 'allow-all'
       ? 'on-request'
       : 'untrusted';
-const launchApprovalPolicy = (request: ChatTurnRequest) =>
-  request.readOnly ? 'never' : 'on-request';
-const sandboxMode = (request: ChatTurnRequest) =>
-  request.readOnly ? 'read-only' : 'workspace-write';
-// The read-only sandbox reads the whole disk by default. A read-only turn narrows it to the
-// scratch copy and the platform's own files, so a command cannot read a file outside the copy,
-// such as the client's memory files under the home folder (H11). The turn also stops when a
-// command names a path outside the copy, in case a client build ignores the narrower policy.
-//
-// A client build that refuses the narrower shape gets the plain read-only sandbox, which reads
-// the whole disk. That turn runs under `untrusted`, so the client asks before each command an
-// explicit rule of its own does not allow, and CrewKite allows only a command that provably
-// reads inside the copy (scratchCommand). Any other error from turn/start ends the turn.
+// A read-only thread runs under the crewkite-read permission profile (ADR 0048): the platform's
+// own files, the scratch copy and the turn's attached files, all read only, so a command cannot
+// read a file outside them, such as the client's memory files under the home folder (H11). The
+// thread/start reply names the profile and sandbox the thread got. When it does not prove the
+// profile, the turn falls back to the plain read-only sandbox, which reads the whole disk. That
+// turn runs under `untrusted`, so the client asks before each command an explicit rule of its own
+// does not allow, and CrewKite allows only a command that provably reads inside the copy
+// (scratchCommand). Either way the turn stops when a command names a path outside the copy.
 const WIDE_APPROVAL_POLICY = 'untrusted';
-// The refusal a client build gives for a sandbox shape it does not know: invalid params that name
-// an unknown variant or field. Any other turn/start error is the turn's own failure.
-const refusesRestricted = (error: ProviderError) =>
-  error?.code === -32602 && /\bunknown (?:variant|field)\b/i.test(error.message ?? '');
-const readOnlySandbox = (directory: string) => ({
-  type: 'readOnly',
-  access: { type: 'restricted', includePlatformDefaults: true, readableRoots: [directory] },
-  networkAccess: false,
-});
 // `other` spans every tool CrewKite cannot name, so no thread grant covers it. Only commands and
 // file changes ask here today; the guard holds if another request kind starts asking.
 const threadGrant = (request: ChatTurnRequest, kind: ChatToolKind, allowed: Set<ChatToolKind>) =>
   kind !== 'other' && (request.permissionGrants?.includes(kind) === true || allowed.has(kind));
 
 /** Chat edits the scratch copy, and every question the client asks comes back to CrewKite. */
-function nativeChatArguments(directory: string, request: ChatTurnRequest): string[] {
-  const settings = {
-    model_provider: 'openai',
-    openai_base_url: '',
-    chatgpt_base_url: 'https://chatgpt.com/backend-api/',
-    service_tier: 'default',
-    approval_policy: launchApprovalPolicy(request),
-    approvals_reviewer: 'user',
-    sandbox_mode: sandboxMode(request),
-    web_search: 'disabled',
-    'features.plugins': false,
-    'features.remote_plugin': false,
-    'features.apps': false,
-    'features.hooks': false,
+function chatLaunchSettings(directory: string, request: ChatTurnRequest): LaunchSettings {
+  return launchSettings(directory, {
+    approvalPolicy: request.readOnly ? 'never' : 'on-request',
+    // A read-only thread gets its access from the profile in thread/start, and a sandbox mode at
+    // launch would put the client back on the older sandbox settings.
+    ...(request.readOnly ? {} : { sandboxMode: 'workspace-write' as const }),
     // The client's own switch for subagents. The process lives for one turn, so the crew role's
     // choice holds for exactly this turn. It stays off unless the role turned it on, since child
     // approvals rely on the client passing this turn's approval policy to each child.
-    'features.multi_agent': request.subagents === true,
-    log_dir: join(directory, 'logs'),
-  };
-  return [
-    ...Object.entries(settings).flatMap(([key, value]) => [
-      '-c',
-      `${key}=${JSON.stringify(value)}`,
-    ]),
-    'app-server',
-    '--stdio',
-    '--strict-config',
-  ];
+    subagents: request.subagents === true,
+  });
 }
 
 // Identity and storage checks copied from startTranscript and childDirectory in
@@ -246,7 +238,7 @@ const OPTIONS: ChatPermissionOption[] = [
 // acceptForSession lasts as long as the client process, and that is one turn here, and the client
 // applies it to the one command it asked about. The controller keeps the thread's grants for
 // later turns, and the adapter applies an Allow for this thread to the rest of its own turn.
-const DECISIONS = new Map([
+const DECISIONS = new Map<string, Decision>([
   ['allow-once', 'accept'],
   ['allow-thread', 'acceptForSession'],
   ['deny', 'decline'],
@@ -328,10 +320,22 @@ const limitsReply = z.object({ ordinaryUsageAllowed: maybe(z.boolean()) });
 // word; one that names another policy than the one sent is not, since edits would then run
 // without asking. The reply also names the thread's reasoning effort, which a default turn
 // keeps.
+// A read-only thread also names the permission profile and sandbox it got, the proof that the
+// narrow read applied. A build that leaves them out gets the wide fallback.
 const threadReply = z.object({
   thread: z.object({ id: z.string().min(1).max(512) }),
   approvalPolicy: z.unknown().optional(),
   reasoningEffort: ChatSetEffortSchema.optional().catch(undefined),
+  activePermissionProfile: maybe(z.object({ id: z.string() })),
+  sandbox: maybe(z.object({ type: z.string() })),
+});
+// initialize names the server's own build, which can differ from what --version printed when a
+// wrapper script sits on PATH.
+const serverVersion = z.object({
+  userAgent: z
+    .string()
+    .transform((agent) => /\/(\d+\.\d+\.\d+[^\s(]*)/.exec(agent)?.[1])
+    .catch(undefined),
 });
 const turnReply = z.object({ turn: z.object({ id }) });
 const scope = z.object({ threadId: z.string() });
@@ -456,6 +460,11 @@ const approval = z.object({
     z.object({ host: z.string().min(1), protocol: maybe(z.string().min(1)) }),
   ),
 });
+const permissionsAsk = z.object({
+  itemId: maybe(id),
+  reason: maybe(z.string()),
+  permissions: z.unknown().optional(),
+});
 const PROTOCOLS = new Map([
   ['http', 'HTTP'],
   ['https', 'HTTPS'],
@@ -491,8 +500,17 @@ class OpenAiChatTurn {
   private readonly roots: string[];
   private child: ChildProcessWithoutNullStreams | null = null;
   private group = 0;
-  /** The version of the client this turn runs, when the launch named one. */
+  /** The version of the client this turn runs, when the launch or initialize named one. */
   private version: string | undefined;
+  /** What this build accepts. Each request sends only fields the build knows. */
+  private codex: CodexFeatures = features(null);
+  /** The launch settings, which config/read confirms. */
+  private settings: LaunchSettings = {};
+  private get codexName() {
+    return this.version ? `Codex ${this.version}` : 'Codex';
+  }
+  /** Requests already sent again without a field the build refused. */
+  private readonly degraded = new Set<string>();
   /** True once the client answered initialize, so it accepted the settings it was started with. */
   private initialized = false;
   private nextId = 1;
@@ -534,6 +552,11 @@ class OpenAiChatTurn {
   private readonly approvals = new Map<string, RpcId>();
   /** The tool kind each open approval asks about. */
   private readonly approvalKinds = new Map<string, ChatToolKind>();
+  /** The request each open approval answers, and the access a permissions request named. */
+  private readonly approvalRequests = new Map<
+    string,
+    { request: ApprovalRequest; requested: unknown }
+  >();
   /** Kinds the person allowed for the thread during this turn. */
   private readonly allowed = new Set<ChatToolKind>();
   private readonly subagents: SubagentTracker;
@@ -620,6 +643,7 @@ class OpenAiChatTurn {
     try {
       const launch = deps.launch(this.request);
       this.version = launch.version;
+      this.codex = features(launch.version);
       const executable = verifiedClient(launch);
       step = 'storage';
       const directory = privateStorage(launch);
@@ -628,7 +652,8 @@ class OpenAiChatTurn {
         this.request.scratch.directory,
       );
       step = 'spawn';
-      const args = nativeChatArguments(directory, this.request);
+      this.settings = chatLaunchSettings(directory, this.request);
+      const args = launchArguments(this.settings);
       const child = (deps.spawn ?? spawn)(executable, args, {
         cwd: this.request.scratch.directory,
         env,
@@ -680,84 +705,103 @@ class OpenAiChatTurn {
   // The same metadata requests as the discovery transcript. Admission here acts only on the
   // sign-in and on whether included usage remains.
   private initialize() {
-    this.call(
-      'initialize',
-      {
-        clientInfo: { name: 'crewkite', title: 'CrewKite', version: CREWKITE_VERSION },
-        capabilities: { experimentalApi: false, explicitGatewayOauth: true },
-      },
-      (reply) => {
+    this.call('initialize', initializeParams(), (reply) => {
+      if ('error' in reply)
+        return this.fail(this.providerFailure('session', 'initialize', reply.error));
+      this.initialized = true;
+      const served = serverVersion.safeParse(reply.result).data?.userAgent;
+      if (served) {
+        this.version = served;
+        this.codex = features(served);
+      }
+      this.write({ method: 'initialized' });
+      this.call('account/read', accountReadParams(), (reply) => {
         if ('error' in reply)
-          return this.fail(this.providerFailure('session', 'initialize', reply.error));
-        this.initialized = true;
-        this.write({ method: 'initialized' });
-        this.call('account/read', { refreshToken: false }, (reply) => {
-          if ('error' in reply)
-            return this.fail(this.providerFailure('session', 'account/read', reply.error));
-          const account = accountReply.safeParse(reply.result);
-          if (!account.success)
-            return this.fail(
-              chatFailure({
-                stage: 'session',
-                kind: 'protocol',
-                method: 'account/read',
-                message: 'Codex sent account details CrewKite could not read.',
-              }),
-            );
-          // A subscription sign-in is the billing premise. An API key or other account would bill
-          // per token, so chat does not run on one.
-          if (account.data.account?.type !== 'chatgpt')
-            return this.fail(
-              chatFailure({
-                stage: 'session',
-                kind: 'signed-out',
-                method: 'account/read',
-                message:
-                  account.data.account === null
-                    ? 'Codex is not signed in.'
-                    : 'Codex is not signed in with a ChatGPT plan.',
-              }),
-            );
-          this.call(
-            'account/rateLimits/read',
-            { supportsLunaReserve: false, excludeResetCreditDetails: true },
-            (reply) => {
-              // Usage is advisory, so a failed read does not stop the turn.
-              if ('result' in reply) {
-                this.rateLimits('account/rateLimits/read', reply.result);
-                if (limitsReply.safeParse(reply.result).data?.ordinaryUsageAllowed === false)
-                  return this.fail(
-                    chatFailure({
-                      stage: 'session',
-                      kind: 'usage-limit',
-                      method: 'account/rateLimits/read',
-                      message: 'The ChatGPT plan has no included Codex usage left.',
-                      resetsAt: this.resetsAt(),
-                    }),
-                  );
-              }
-              this.readMcpServers();
-            },
+          return this.fail(this.providerFailure('session', 'account/read', reply.error));
+        const account = accountReply.safeParse(reply.result);
+        if (!account.success)
+          return this.fail(
+            chatFailure({
+              stage: 'session',
+              kind: 'protocol',
+              method: 'account/read',
+              message: 'Codex sent account details CrewKite could not read.',
+            }),
           );
+        // A subscription sign-in is the billing premise. An API key or other account would bill
+        // per token, so chat does not run on one.
+        if (account.data.account?.type !== 'chatgpt')
+          return this.fail(
+            chatFailure({
+              stage: 'session',
+              kind: 'signed-out',
+              method: 'account/read',
+              message:
+                account.data.account === null
+                  ? 'Codex is not signed in.'
+                  : 'Codex is not signed in with a ChatGPT plan.',
+            }),
+          );
+        this.call('account/rateLimits/read', rateLimitsParams(this.codex) ?? undefined, (reply) => {
+          // Usage is advisory, so a failed read does not stop the turn.
+          if ('result' in reply) {
+            this.rateLimits('account/rateLimits/read', reply.result);
+            if (limitsReply.safeParse(reply.result).data?.ordinaryUsageAllowed === false)
+              return this.fail(
+                chatFailure({
+                  stage: 'session',
+                  kind: 'usage-limit',
+                  method: 'account/rateLimits/read',
+                  message: 'The ChatGPT plan has no included Codex usage left.',
+                  resetsAt: this.resetsAt(),
+                }),
+              );
+          }
+          this.readConfig();
         });
-      },
-    );
+      });
+    });
   }
 
   /**
-   * The thread tools go on the thread's config. That config merges into the person's own, so a
-   * server they configured would still load. config/read names every configured server for the
-   * scratch copy, and each one goes off for this thread. A client that does not answer runs the
-   * turn without the tools and with its servers as they were.
+   * One config/read after launch. It proves the settings that decide what the turn may reach,
+   * since the launch no longer refuses a key the build does not know. It also names every
+   * configured MCP server for the scratch copy: the thread tools go on the thread's config, which
+   * merges into the person's own, so each other server goes off for this thread. A client that
+   * does not answer runs the turn without the tools and with its servers as they were.
    */
-  private readMcpServers() {
+  private readConfig() {
     const next = () => (this.media.length ? this.listModels(null, 1) : this.openThread());
     const tools = this.threadTools;
-    if (!tools) return next();
-    const params = { includeLayers: false, cwd: this.request.scratch.directory };
-    this.call('config/read', params, (reply) => {
-      const read = 'result' in reply ? mcpNames.safeParse(reply.result) : null;
-      if (!read?.success) {
+    this.call('config/read', configReadParams(this.request.scratch.directory), (reply) => {
+      if ('error' in reply) {
+        this.notice(
+          'warning',
+          tools
+            ? 'Codex did not answer config/read, so CrewKite could not confirm its settings and this turn runs without the thread tools.'
+            : 'Codex did not answer config/read, so CrewKite could not confirm its settings.',
+        );
+        return next();
+      }
+      const { missing, different } = confirmSettings(this.settings, reply.result);
+      if (different.length)
+        return this.fail(
+          chatFailure({
+            stage: 'session',
+            kind: 'protocol',
+            method: 'config/read',
+            message: `Codex runs with ${different.map(({ key, value }) => `${key} = ${value}`).join(', ')}, and CrewKite set ${different.map(({ key }) => `${key} = ${JSON.stringify(this.settings[key])}`).join(', ')}.`,
+            nextAction: 'Check the Codex configuration for a setting that overrides these.',
+          }),
+        );
+      if (missing.length)
+        this.notice(
+          'warning',
+          `${this.codexName} does not report ${missing.join(', ')}, so CrewKite could not confirm ${missing.length === 1 ? 'that setting' : 'those settings'}.`,
+        );
+      if (!tools) return next();
+      const read = mcpNames.safeParse(reply.result);
+      if (!read.success) {
         this.notice(
           'warning',
           'Codex did not list its MCP servers, so this turn runs without the thread tools.',
@@ -786,8 +830,8 @@ class OpenAiChatTurn {
    * Sorts the files before the client starts. The client turns a local image or audio file it
    * cannot use into placeholder text and runs the turn anyway, so a file it would drop refuses
    * the turn here. The client reads localImage and localAudio paths itself, outside the sandbox.
-   * Under both sandbox modes CrewKite sets, the sandbox reads the whole disk, so the model's
-   * tools can open the file a path line names in the controller home. A file from an earlier
+   * A writer's sandbox reads the whole disk, and a read-only profile reads each file's folder,
+   * so the model's tools can open the file a path line names in the controller home. A file from an earlier
    * message always goes as a path line in the packet and never refuses the turn.
    */
   private sortFiles(): ChatFailure | null {
@@ -820,8 +864,7 @@ class OpenAiChatTurn {
    */
   private listModels(cursor: string | null, page: number) {
     const { model } = this.request.selection;
-    const params = { limit: 100, includeHidden: true, ...(cursor ? { cursor } : {}) };
-    this.call('model/list', params, (reply) => {
+    this.call('model/list', modelListParams(100, true, cursor), (reply) => {
       if ('error' in reply)
         return this.fail(this.providerFailure('session', 'model/list', reply.error));
       const list = modelPage.safeParse(reply.result).data;
@@ -845,24 +888,32 @@ class OpenAiChatTurn {
 
   private openThread() {
     const { selection, scratch, session } = this.request;
-    const settings = {
+    const readOnly = this.request.readOnly === true;
+    // A build without permission profiles reads through the plain read-only sandbox from the
+    // start. It gets the older sandbox setting on the thread and the guards on every command.
+    const profile = readOnly && this.codex.readProfile;
+    if (readOnly && !profile) this.widen('has no permission profiles');
+    const settings: ThreadSettings = {
       model: selection.model,
-      modelProvider: 'openai',
       cwd: scratch.directory,
       approvalPolicy: approvalPolicy(this.request),
-      approvalsReviewer: 'user',
-      sandbox: sandboxMode(this.request),
-      serviceTier: 'default',
+      ...(readOnly
+        ? profile
+          ? {}
+          : { sandbox: 'read-only' as const }
+        : { sandbox: 'workspace-write' as const }),
       // CrewKite's framing goes in as developer instructions, so the person's own message is the
       // first user input and the client titles the thread with it. The client puts these in the
       // context it rebuilds after a compaction, so a resumed thread names them again.
       ...(this.request.systemContext ? { developerInstructions: this.request.systemContext } : {}),
-      ...(this.mcpConfig ? { config: this.mcpConfig } : {}),
+      ...(this.mcpConfig || profile
+        ? { config: { ...this.mcpConfig, ...(profile ? readProfileConfig(this.readRoots()) : {}) } }
+        : {}),
     };
     // The client saves a thread that is not ephemeral and lists it in the person's own app,
     // grouped by its folder. Only a thread CrewKite resumes later is saved.
     const start = (history: boolean) =>
-      this.call('thread/start', { ...settings, ephemeral: !this.resumable }, (reply) => {
+      this.tolerant('thread/start', threadStartParams(settings, !this.resumable), (reply) => {
         if ('error' in reply)
           return this.fail(this.providerFailure('session', 'thread/start', reply.error));
         const thread = threadReply.safeParse(reply.result);
@@ -876,18 +927,21 @@ class OpenAiChatTurn {
             }),
           );
         if (!this.policyApplied(thread.data, 'thread/start')) return;
+        this.observe(thread.data, profile);
         this.threadId = thread.data.thread.id;
         this.threadEffort = thread.data.reasoningEffort;
         this.startTurn(true, history);
       });
     if (session?.family !== 'openai') return start(false);
     // The client keeps the history and CrewKite reads only the thread ID. With every turn in the
-    // reply, a long thread outgrows the line limit and the resume fails.
-    const resume = { threadId: session.sessionId, ...settings, excludeTurns: true };
-    this.call('thread/resume', resume, (reply) => {
+    // reply, a long thread outgrows the line limit and the resume fails, so a build that takes
+    // excludeTurns gets it.
+    const resume = threadResumeParams(session.sessionId, settings, this.codex);
+    this.tolerant('thread/resume', resume, (reply) => {
       const thread = 'result' in reply ? threadReply.safeParse(reply.result) : null;
       if (thread?.success) {
         if (!this.policyApplied(thread.data, 'thread/resume')) return;
+        this.observe(thread.data, profile);
         this.threadId = thread.data.thread.id;
         this.threadEffort = thread.data.reasoningEffort;
         return this.startTurn(false, false);
@@ -901,6 +955,35 @@ class OpenAiChatTurn {
       );
       start(true);
     });
+  }
+
+  /** What a read-only profile reads: the scratch copy as given and resolved, and each file's folder. */
+  private readRoots() {
+    const folders = turnFiles(this.request).map((file) => dirname(file.path));
+    return [...new Set([...this.roots, ...folders])];
+  }
+
+  /**
+   * A read-only thread proves the narrow read by naming the crewkite-read profile and a read-only
+   * sandbox in its reply. Anything else means the build ignored or changed the profile, and the
+   * turn runs on the plain read-only sandbox with every command checked. More questions, never
+   * wider access.
+   */
+  private observe(reply: z.infer<typeof threadReply>, profile: boolean) {
+    if (!profile || this.wideSandbox) return;
+    if (reply.activePermissionProfile?.id === READ_PROFILE && reply.sandbox?.type === 'readOnly')
+      return;
+    this.widen(
+      `opened the thread under ${reply.activePermissionProfile?.id ? `the ${clip(reply.activePermissionProfile.id, 60)} profile` : 'no named profile'}`,
+    );
+  }
+
+  private widen(why: string) {
+    this.wideSandbox = true;
+    this.notice(
+      'warning',
+      `${this.codexName} ${why}, so this read-only turn reads through the plain read-only sandbox and CrewKite checks each command first.`,
+    );
   }
 
   private policyApplied(reply: z.infer<typeof threadReply>, method: string): boolean {
@@ -936,32 +1019,17 @@ class OpenAiChatTurn {
       .join('\n\n');
     // turn/start sets the effort for this turn and the ones after it. thread/start and
     // thread/resume have no effort field, so every turn names its own and a resumed thread follows
-    // the composer. Default sends none and leaves the thread's level as it is.
-    const start = (narrow: boolean) =>
-      this.call(
-        'turn/start',
-        {
-          threadId: this.threadId,
-          input: [...this.media.map((file) => file.input), { type: 'text', text }],
-          ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
-          ...(this.request.readOnly
-            ? narrow
-              ? { sandboxPolicy: readOnlySandbox(this.request.scratch.directory) }
-              : {
-                  sandboxPolicy: { type: 'readOnly', networkAccess: false },
-                  approvalPolicy: WIDE_APPROVAL_POLICY,
-                }
-            : {}),
-        },
-        (reply) => onStart(reply, narrow),
-      );
-    // A client build that does not know the narrower read-only policy refuses it. The turn then
-    // starts on the plain read-only sandbox, where each command asks first.
-    const onStart = (reply: Reply, narrow: boolean) => {
-      if ('error' in reply && narrow && this.request.readOnly && refusesRestricted(reply.error)) {
-        this.wideSandbox = true;
-        return start(false);
-      }
+    // the composer. Default sends none and leaves the thread's level as it is. A read-only turn
+    // under the profile sends no sandbox: the thread already carries it.
+    const params = turnStartParams({
+      threadId: this.threadId ?? '',
+      input: [...this.media.map((file) => file.input), { type: 'text', text }],
+      ...(selection.effort === 'default' ? {} : { effort: selection.effort }),
+      ...(this.wideSandbox
+        ? { sandboxPolicy: READ_ONLY_SANDBOX, approvalPolicy: WIDE_APPROVAL_POLICY }
+        : {}),
+    });
+    this.tolerant('turn/start', params, (reply) => {
       if ('error' in reply)
         return this.fail(this.providerFailure('prompt', 'turn/start', reply.error));
       this.turnId ??= turnReply.safeParse(reply.result).data?.turn.id ?? null;
@@ -972,11 +1040,12 @@ class OpenAiChatTurn {
         family: 'openai',
         model: selection.model,
         effort:
-          selection.effort === 'default' ? (this.threadEffort ?? 'default') : selection.effort,
+          selection.effort === 'default' || this.degraded.has('turn/start.effort')
+            ? (this.threadEffort ?? 'default')
+            : selection.effort,
         role: this.request.role,
       });
-    };
-    start(true);
+    });
   }
 
   /** Frames matter until the turn ends, and after an interrupt until the client confirms it. */
@@ -1046,20 +1115,22 @@ class OpenAiChatTurn {
   }
 
   private serverRequest(requestId: RpcId, method: string, params: unknown) {
-    const kind =
-      method === 'item/commandExecution/requestApproval'
-        ? 'command'
-        : method === 'item/fileChange/requestApproval'
-          ? 'edit'
-          : null;
-    if (!kind) {
+    const request = approvalRequest(method);
+    if (!request) {
       this.unknown(method, requestId);
+      // The client may stop the turn over a refused request, so the thread says why.
+      this.notice(
+        'warning',
+        `Codex asked a question CrewKite cannot answer (${clip(method, 200)}). The turn may stop.`,
+      );
       // An unanswered request would hold the turn until its deadline.
       return this.write({
         id: requestId,
         error: { code: -32601, message: `CrewKite does not handle ${method}.` },
       });
     }
+    if (request === 'permissions') return this.permissionsRequest(requestId, params);
+    const kind = request === 'command' ? 'command' : 'edit';
     const value = approval.safeParse(params).data;
     const callId = value?.itemId ?? null;
     const network = kind === 'command' ? value?.networkApprovalContext : null;
@@ -1078,6 +1149,7 @@ class OpenAiChatTurn {
     const answerId = `approval-${++this.approvalCount}`;
     this.approvals.set(answerId, requestId);
     this.approvalKinds.set(answerId, kind);
+    this.approvalRequests.set(answerId, { request, requested: null });
     this.send({
       type: 'permission.requested',
       turnId: this.request.turnId,
@@ -1127,6 +1199,35 @@ class OpenAiChatTurn {
     if (threadGrant(this.request, kind, this.allowed)) this.answer(answerId, 'allow-thread');
   }
 
+  /**
+   * A command asking for access past its sandbox: more folders or the network. No policy or
+   * thread grant covers that, so the person decides each one, for this turn only. A read-only turn
+   * never widens.
+   */
+  private permissionsRequest(requestId: RpcId, params: unknown) {
+    const value = permissionsAsk.safeParse(params).data;
+    const answerId = `approval-${++this.approvalCount}`;
+    this.approvals.set(answerId, requestId);
+    this.approvalKinds.set(answerId, 'other');
+    this.approvalRequests.set(answerId, {
+      request: 'permissions',
+      requested: value?.permissions ?? null,
+    });
+    const detail = [value?.reason ?? '', clip(JSON.stringify(value?.permissions ?? {}), 8192)]
+      .filter(Boolean)
+      .join('\n\n');
+    this.send({
+      type: 'permission.requested',
+      turnId: this.request.turnId,
+      requestId: answerId,
+      callId: value?.itemId ?? null,
+      question: 'Allow access outside the sandbox for this turn?',
+      detail: clip(detail, 16_384),
+      options: OPTIONS.filter((option) => option.kind !== 'allow-thread'),
+    });
+    if (this.request.readOnly) this.answer(answerId, 'deny');
+  }
+
   private answer(requestId: string, choice: string) {
     const target = this.approvals.get(requestId);
     const decision = DECISIONS.get(choice);
@@ -1134,11 +1235,19 @@ class OpenAiChatTurn {
     this.approvals.delete(requestId);
     const kind = this.approvalKinds.get(requestId);
     this.approvalKinds.delete(requestId);
+    const asked = this.approvalRequests.get(requestId);
+    this.approvalRequests.delete(requestId);
     // Allow for this thread covers the same kind for the rest of the turn, under the same checks
     // a thread grant gets. The client's own acceptForSession covers only the one command.
     if (choice === 'allow-thread' && kind && kind !== 'other' && !this.request.readOnly)
       this.allowed.add(kind);
-    this.write({ id: target, result: { decision } });
+    this.write({
+      id: target,
+      result:
+        asked?.request === 'permissions'
+          ? permissionsReply(decision === 'decline' ? null : asked.requested)
+          : approvalReply(decision),
+    });
     this.send({ type: 'permission.resolved', turnId: this.request.turnId, requestId, choice });
   }
 
@@ -1614,6 +1723,26 @@ class OpenAiChatTurn {
     });
   }
 
+  /**
+   * A request a build may refuse over one optional field. The refusal that names a field it
+   * carried sends the request again without that field, once, and the thread says so. A second
+   * refusal reaches the caller with the client's own words.
+   */
+  private tolerant(method: string, params: Record<string, unknown>, then: (reply: Reply) => void) {
+    this.call(method, params, (reply) => {
+      const field = 'error' in reply ? refusedField(reply.error, method, params) : null;
+      if (!field || this.degraded.has(method)) return then(reply);
+      this.degraded.add(method);
+      this.degraded.add(`${method}.${field}`);
+      this.notice(
+        'warning',
+        `${this.codexName} refused a setting CrewKite sends (${method}.${field}). The turn runs without it.`,
+      );
+      const { [field]: _dropped, ...rest } = params;
+      this.call(method, rest, then);
+    });
+  }
+
   private call(method: string, params: unknown, then: (reply: Reply) => void) {
     const requestId = this.nextId++;
     this.waiting.set(requestId, then);
@@ -1686,7 +1815,7 @@ class OpenAiChatTurn {
     this.write({
       id: this.nextId++,
       method: 'turn/interrupt',
-      params: { threadId: this.threadId, turnId: this.turnId },
+      params: turnInterruptParams(this.threadId, this.turnId),
     });
   }
 
@@ -1765,23 +1894,18 @@ class OpenAiChatTurn {
   private exited(code: number | null, signal: NodeJS.Signals | null) {
     this.closed = true;
     if (this.terminal !== undefined) this.fail(this.providerFailure('stream', null, this.terminal));
-    // A build newer than the tested one that closes before it answers initialize most often
-    // refused a setting passed under --strict-config. Its own words stay in the detail.
-    const tested = CLIENT_VERSIONS.openai.tested;
-    const refusedSettings =
-      !this.initialized &&
-      !signal &&
-      this.version !== undefined &&
-      clientVersionState(this.version, CLIENT_VERSIONS.openai) === 'newer';
+    // A client that closes before it answers initialize refused its command line or its config
+    // file. Its own words stay in the detail.
     this.fail(
       chatFailure({
         stage: this.threadId ? 'stream' : 'session',
         kind: 'client-exit',
-        message: refusedSettings
-          ? `Codex ${this.version} closed before it started, and CrewKite was tested with ${tested}. A newer build can refuse a setting CrewKite passes; install ${tested} or update CrewKite.`
-          : signal
-            ? `Codex stopped on ${signal} before the turn finished.`
-            : `Codex exited with code ${code} before the turn finished.`,
+        message:
+          !this.initialized && !signal
+            ? `${this.codexName} closed before it answered initialize, with code ${code}.`
+            : signal
+              ? `Codex stopped on ${signal} before the turn finished.`
+              : `Codex exited with code ${code} before the turn finished.`,
       }),
     );
     if (this.group === 0 || groupAbsent(this.group)) this.settle();

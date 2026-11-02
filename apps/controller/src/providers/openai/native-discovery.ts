@@ -12,6 +12,7 @@ import {
   OpenAiDiscovery,
   type RefusedEnvelope,
 } from './discovery.ts';
+import { configArguments, launchArguments, launchSettings } from './protocol.ts';
 
 export type NativeLaunch = {
   executable: string;
@@ -120,45 +121,37 @@ function childDirectory(root: string, name: string) {
   return path;
 }
 
-/** Run-local settings do not change the existing native authentication location. */
-export function nativeDiscoveryArguments(
-  directory: string,
-  disabledMcpServers: readonly string[] = [],
-): string[] {
+// Discovery keeps the read-only sandbox mode and its own approval policy, which its config/read
+// check expects literally (discovery.ts).
+const discoverySettings = (directory: string) =>
+  launchSettings(directory, {
+    approvalPolicy: 'on-request',
+    sandboxMode: 'read-only',
+    subagents: false,
+  });
+
+function mcpOverrides(disabledMcpServers: readonly string[]) {
   // The native override parser splits dots without interpreting quoted key segments.
   if (
     disabledMcpServers.length > 128 ||
     disabledMcpServers.some((name) => !/^[A-Za-z0-9_-]{1,200}$/.test(name))
   )
     throw new Error('MCP override identifiers cannot be represented safely.');
-  const settings = {
-    model_provider: 'openai',
-    openai_base_url: '',
-    chatgpt_base_url: 'https://chatgpt.com/backend-api/',
-    service_tier: 'default',
-    approval_policy: 'on-request',
-    approvals_reviewer: 'user',
-    sandbox_mode: 'read-only',
-    web_search: 'disabled',
-    'features.plugins': false,
-    'features.remote_plugin': false,
-    'features.apps': false,
-    'features.hooks': false,
-    'features.multi_agent': false,
-    log_dir: join(directory, 'logs'),
-  };
-  return [
-    ...Object.entries(settings).flatMap(([key, value]) => [
-      '-c',
-      `${key}=${JSON.stringify(value)}`,
-    ]),
-    ...disabledMcpServers.flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]),
-    'app-server',
-    '--stdio',
-    '--strict-config',
-  ];
+  return disabledMcpServers.flatMap((name) => ['-c', `mcp_servers.${name}.enabled=false`]);
 }
 
+/** Run-local settings do not change the existing native authentication location. */
+export function nativeDiscoveryArguments(
+  directory: string,
+  disabledMcpServers: readonly string[] = [],
+): string[] {
+  return launchArguments(discoverySettings(directory), mcpOverrides(disabledMcpServers));
+}
+
+/**
+ * The one place the client's environment is built, for discovery, tasks and chat turns. HOME and
+ * CODEX_HOME pass through, so the client reads the person's own sign-in.
+ */
 export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
   const environment: NodeJS.ProcessEnv = {
     LANG: 'C',
@@ -549,7 +542,7 @@ function nativeSession<T>(
     ...(options.task ? { deadline } : {}),
     closeInput: true,
     arguments: (directory) => [
-      ...nativeDiscoveryArguments(directory).slice(0, -3),
+      ...configArguments(discoverySettings(directory)),
       'features',
       'list',
     ],

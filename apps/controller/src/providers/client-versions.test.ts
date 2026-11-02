@@ -102,7 +102,7 @@ test('each family names its own tested build, minimum and update command, with t
     assert.equal(clientVersionState(value.tested, value), 'tested', family);
     assert.equal(
       clientVersionState(value.minimum, value),
-      value.minimum === value.tested ? 'tested' : 'supported',
+      (value.minimum as string) === value.tested ? 'tested' : 'supported',
       family,
     );
     assert(value.update.length > 0, family);
@@ -114,7 +114,7 @@ test('each family names its own tested build, minimum and update command, with t
         [value.tested, value.minimum],
       ]),
     ),
-    { openai: ['0.163.0', '0.163.0'], anthropic: ['2.1.302', '2.1.0'], google: ['1.4.2', '1.4.0'] },
+    { openai: ['0.163.0', '0.133.0'], anthropic: ['2.1.302', '2.1.0'], google: ['1.4.2', '1.4.0'] },
   );
 });
 
@@ -122,15 +122,22 @@ test('Settings and the CLI name the found version and the state in plain words',
   const at = (family: keyof typeof CLIENT_VERSIONS, version: string | null) =>
     clientVersionStatus(family, { state: 'version', path: '/opt/homebrew/bin/client', version });
   for (const [status, accepted, message] of [
+    // The Codex version is information: every build runs, and the card says what was checked.
     [
       at('openai', 'codex-cli 0.170.2'),
       true,
-      'Codex 0.170.2 found. Tested with 0.163.0; newer builds usually work.',
+      'Codex 0.170.2 found. Checked with 0.163.0 on 2 Nov 2026; this build is newer than the last checked build.',
+    ],
+    [at('openai', '0.163.0'), true, 'Codex 0.163.0 found. Checked with 0.163.0 on 2 Nov 2026.'],
+    [
+      at('openai', '1.0.0'),
+      true,
+      'Codex 1.0.0 found. Checked with 0.163.0 on 2 Nov 2026; this build is newer than the last checked build.',
     ],
     [
-      at('openai', '0.163.0'),
+      at('openai', '0.125.0'),
       true,
-      'Codex 0.163.0 found. This is the build CrewKite was tested with.',
+      'Codex 0.125.0 found. Checked with 0.163.0 on 2 Nov 2026; this build is older than 0.133.0, so read-only turns ask before each command.',
     ],
     [
       at('anthropic', '1.9.0 (Claude Code)'),
@@ -300,7 +307,8 @@ test('finding a client runs its version flag once per build and refuses an unsaf
     link(client('codex-old', "echo '0.120.0'"));
     const old = find();
     assert.equal(old.status.state, 'older');
-    assert.equal(old.client, undefined);
+    // An old Codex still runs. Its version only decides what its turns may use.
+    assert.equal(old.client?.version, '0.120.0');
 
     link(client('codex-silent', "echo 'no version here'"));
     assert.equal(find().status.state, 'unreadable');

@@ -19,9 +19,12 @@ export const CLIENT_VERSIONS = {
     name: 'Codex',
     command: 'codex',
     tested: '0.163.0',
-    // The launch passes --strict-config with settings keys the tested build reads, and a build
-    // that lacks one of them exits before it answers initialize. No older build has a run.
-    minimum: '0.163.0',
+    // For this client the version is information (ADR 0048). Every build runs; the replies and the
+    // connect-time probe decide what a turn may use. checkedOn is the day the protocol check last
+    // passed against the tested build. 0.133.0 is the oldest build whose read-only turns read
+    // through a permission profile; older ones ask before each command.
+    checkedOn: '2 Nov 2026',
+    minimum: '0.133.0',
     update: 'npm install -g @openai/codex@latest',
     maximumBytes: 256 * 1024 * 1024,
     environment: {},
@@ -175,7 +178,22 @@ export function clientVersionStatus(
         : found.state;
   const version = parsed?.text ?? (found.state === 'pinned' ? found.version : null);
   const tested = parseClientVersion(row.tested)?.core[0] ?? 0;
+  const checked = 'checkedOn' in row ? `Checked with ${row.tested} on ${row.checkedOn}` : null;
+  const informed =
+    checked !== null && (state === 'older' || state === 'new-major' || state === 'newer');
   const message = (() => {
+    if (checked !== null)
+      switch (state) {
+        case 'tested':
+          return `${row.name} ${version} found. ${checked}.`;
+        case 'supported':
+          return `${row.name} ${version} found. ${checked}; builds from ${row.minimum} on are supported.`;
+        case 'newer':
+        case 'new-major':
+          return `${row.name} ${version} found. ${checked}; this build is newer than the last checked build.`;
+        case 'older':
+          return `${row.name} ${version} found. ${checked}; this build is older than ${row.minimum}, so read-only turns ask before each command.`;
+      }
     switch (state) {
       case 'tested':
         return `${row.name} ${version} found. This is the build CrewKite was tested with.`;
@@ -208,7 +226,7 @@ export function clientVersionStatus(
   })();
   return {
     state,
-    accepted: ACCEPTED.has(state),
+    accepted: informed || ACCEPTED.has(state),
     version,
     tested: row.tested,
     minimum: row.minimum,

@@ -1,6 +1,14 @@
 import { ConversationModelCatalogEntriesSchema, type Observation } from '@crewkite/contracts';
 import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { z } from 'zod';
+import {
+  accountReadParams,
+  configReadParams,
+  features,
+  initializeParams,
+  modelListParams,
+  rateLimitsParams,
+} from './protocol.ts';
 
 const MAX_LINE_BYTES = 65_536;
 const MAX_TOTAL_BYTES = 1_048_576;
@@ -29,13 +37,16 @@ const outgoing = z.union([
     method: z.literal('account/read'),
     params: z.strictObject({ refreshToken: z.literal(false) }),
   }),
+  // Builds before 0.154.0 take this read with no params.
   z.strictObject({
     id: z.literal(3),
     method: z.literal('account/rateLimits/read'),
-    params: z.strictObject({
-      supportsLunaReserve: z.literal(false),
-      excludeResetCreditDetails: z.literal(true),
-    }),
+    params: z
+      .strictObject({
+        supportsLunaReserve: z.literal(false),
+        excludeResetCreditDetails: z.literal(true),
+      })
+      .optional(),
   }),
   z.strictObject({
     id: z.union([z.literal(4), z.literal(7)]),
@@ -53,28 +64,25 @@ const outgoing = z.union([
   }),
   z.strictObject({ id: z.literal(6), method: z.literal('configRequirements/read') }),
 ]);
-const requests: z.input<typeof outgoing>[][] = [
-  [
-    {
-      id: 1,
-      method: 'initialize',
-      params: {
-        clientInfo: { name: 'crewkite', title: 'CrewKite', version: CREWKITE_VERSION },
-        capabilities: { experimentalApi: false, explicitGatewayOauth: true },
-      },
-    },
-  ],
-  [{ method: 'initialized' }, { id: 2, method: 'account/read', params: { refreshToken: false } }],
-  [
-    {
-      id: 3,
-      method: 'account/rateLimits/read',
-      params: { supportsLunaReserve: false, excludeResetCreditDetails: true },
-    },
-  ],
-];
+// The strict schema above stays the guard on what discovery may send; the builders are shared
+// with the chat path. The rate limit read takes params only on builds that know them, and the
+// initialize reply names the build.
+const requests = (version: string | null): z.input<typeof outgoing>[][] => {
+  const limits = rateLimitsParams(features(version));
+  return [
+    [{ id: 1, method: 'initialize', params: initializeParams() }],
+    [{ method: 'initialized' }, { id: 2, method: 'account/read', params: accountReadParams() }],
+    [{ id: 3, method: 'account/rateLimits/read', ...(limits ? { params: limits } : {}) }],
+  ];
+};
+const REQUEST_STEPS = 3;
+const serverVersion = (result: unknown) =>
+  z
+    .object({ userAgent: z.string() })
+    .safeParse(result)
+    .data?.userAgent.match(/\/(\d+\.\d+\.\d+)/)?.[1] ?? null;
 // The fixed requests, then model/list, whose page and cursor depend on the read.
-const STEPS = requests.length + 1;
+const STEPS = REQUEST_STEPS + 1;
 // A reply holds a result or an error, never both. Envelope fields a later client adds pass.
 const responseId = z.number().int().min(1).max(7);
 const response = z.union([
@@ -633,6 +641,7 @@ export class OpenAiDiscovery {
   private notificationCount = 0;
   private failed: Failure | null = null;
   private platform?: DiscoveryMetadata['platform'];
+  private version: string | null = null;
   private account?: DiscoveryMetadata['account'];
   private limits?: DiscoveryMetadata['limits'];
   private models?: DiscoveryMetadata['models'];
@@ -702,7 +711,7 @@ export class OpenAiDiscovery {
       this.configurationRequested = true;
       this.awaiting = true;
       return new TextEncoder().encode(
-        `${JSON.stringify(outgoing.parse({ id: 5, method: 'config/read', params: { includeLayers: false, cwd: this.configurationDirectory } }))}\n`,
+        `${JSON.stringify(outgoing.parse({ id: 5, method: 'config/read', params: configReadParams(this.configurationDirectory ?? '') }))}\n`,
       );
     }
     if (this.readConfiguration && this.step === 2 && !this.requirements) {
@@ -714,19 +723,15 @@ export class OpenAiDiscovery {
     }
     const cursor = this.modelCursor;
     const messages = (
-      this.step === requests.length
+      this.step === REQUEST_STEPS
         ? [
             {
               id: cursor ? 7 : 4,
               method: 'model/list',
-              params: {
-                limit: 20,
-                includeHidden: this.includeHidden,
-                ...(cursor ? { cursor } : {}),
-              },
+              params: modelListParams(20, this.includeHidden, cursor),
             },
           ]
-        : requests[this.step]
+        : requests(this.version)[this.step]
     ).map((message) => outgoing.parse(message));
     this.awaiting = true;
     return new TextEncoder().encode(
@@ -799,6 +804,7 @@ export class OpenAiDiscovery {
         switch (this.step) {
           case 0:
             this.platform = platform.parse(value.result);
+            this.version = serverVersion(value.result);
             break;
           case 1:
             this.account = account.parse(value.result);
@@ -873,7 +879,7 @@ export class OpenAiDiscovery {
   private expectedId(): number {
     if (this.configurationRequested) return 5;
     if (this.requirementsRequested) return 6;
-    return this.step === requests.length && this.modelCursor ? 7 : this.step + 1;
+    return this.step === REQUEST_STEPS && this.modelCursor ? 7 : this.step + 1;
   }
 
   get lastEnvelope(): DiscoveryEnvelope {
