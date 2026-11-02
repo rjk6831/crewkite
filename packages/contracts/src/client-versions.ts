@@ -33,6 +33,12 @@ export const ClientVersionStatusSchema = z.strictObject({
   minimum: z.string().min(1).max(200),
   /** One plain line for Settings and the CLI. */
   message: z.string().min(1).max(1024),
+  /** The day the protocol check last passed against the tested build. */
+  checkedOn: z.string().min(1).max(40).optional(),
+  /** The names the client's own handshake listed, for the version found. */
+  capabilities: z.array(z.string().min(1).max(80)).max(64).optional(),
+  /** The result of the connect-time self-test of the build found, in one plain line. */
+  probe: z.string().min(1).max(400).optional(),
 });
 export type ClientVersionStatus = z.infer<typeof ClientVersionStatusSchema>;
 

@@ -1,0 +1,48 @@
+name: protocol-drift
+
+# Provider clients ship every few days. This job installs the newest published build of each one
+# and checks what CrewKite sends against it. It needs no account and runs no model, so it spends
+# no subscription. A flag the build no longer lists, a request shape it refuses or a frame the
+# parsers cannot read fails the run.
+on:
+  schedule:
+    - cron: '17 6 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: protocol-drift
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Install pinned package manager
+        run: |
+          npm install --prefix .ci-tools --no-package-lock pnpm@12.11.2
+          echo "$PWD/.ci-tools/node_modules/.bin" >> "$GITHUB_PATH"
+      - name: Install workspace
+        run: pnpm install --frozen-lockfile
+      # pipefail keeps the exit code of the check while tee keeps the log for the summary.
+      - name: Check each client's latest build
+        shell: bash
+        run: pnpm protocol:check 2>&1 | tee "$RUNNER_TEMP/protocol-check.log"
+      - name: Put the result in the job summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo '```'
+            cat "$RUNNER_TEMP/protocol-check.log"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

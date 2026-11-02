@@ -1123,6 +1123,55 @@ test('an unknown event goes to the turn trace and never the thread, routine syst
   assert.equal(result.assistantText, 'Still here.');
 });
 
+test("a request or a result with a subtype CrewKite does not know ends the turn as a failure in the client's words", async (t) => {
+  const cases = [
+    {
+      script: [
+        'read',
+        { out: init() },
+        {
+          out: {
+            type: 'control_request',
+            request_id: 'req_9',
+            request: { subtype: 'elicitation', message: 'Pick a colour for the chart.' },
+          },
+        },
+        'hold',
+      ] as Step[],
+      method: 'control_request/elicitation',
+      said: 'Pick a colour for the chart.',
+    },
+    {
+      script: [
+        'read',
+        { out: init() },
+        {
+          out: {
+            type: 'result',
+            subtype: 'success_with_notes',
+            is_error: false,
+            session_id: fresh,
+            result: 'Finished, with two notes.',
+          },
+        },
+        'drain',
+      ] as Step[],
+      method: 'result/success_with_notes',
+      said: 'Finished, with two notes.',
+    },
+  ];
+  for (const { script, method, said } of cases) {
+    const turn = run(script);
+    t.after(turn.cleanup);
+    const result = await turn.handle.result;
+    assert.equal(result.stopReason, 'error', method);
+    assert.equal(result.failure?.kind, 'protocol', method);
+    assert.equal(result.failure?.method, method, method);
+    assert.equal(result.failure?.providerMessage, said, method);
+    assert.match(result.failure?.message ?? '', /does not know/, method);
+  }
+});
+
 test('the model read sends one initialize request and no prompt, keeps the picker rows it can read, and gives null when the client answers none', async (t) => {
   const root = mkdtempSync(join(tmpdir(), 'crewkite-models-'));
   t.after(() => rmSync(root, { recursive: true }));

@@ -18,6 +18,8 @@ const root = new URL('../', import.meta.url);
 /** Family to section module. A section exports name, npmPackage, executable(prefix) and check(). */
 export const sections = {
   openai: () => import(new URL('apps/controller/src/providers/openai/protocol-check.ts', root)),
+  anthropic: () =>
+    import(new URL('apps/controller/src/providers/anthropic/protocol-check.ts', root)),
 };
 
 const kind = (value) =>

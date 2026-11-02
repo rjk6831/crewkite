@@ -10,6 +10,7 @@ import type { Workspace } from '../source.ts';
 import { FamilyMark } from '../thread/family-mark.tsx';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import type { UsageGaugeCard } from '../usage-presentation.ts';
+import { ClientRecord } from './client-status.tsx';
 import { readFamilyDefaults, writeFamilyDefault } from './preferences.ts';
 import type { ProviderActions } from './provider-actions.ts';
 
@@ -222,6 +223,7 @@ export function ProviderCard({
             </button>
           )}
           {checkedAt && !checking && <small className="st-hint">Checked at {checkedAt}.</small>}
+          <ClientRecord status={found} capabilities={family !== 'openai'} />
         </div>
       )}
       <div className="st-body">

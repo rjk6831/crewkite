@@ -1,4 +1,4 @@
-import type { WorkspaceState } from '@crewkite/contracts';
+import type { ClientVersionStatus, WorkspaceState } from '@crewkite/contracts';
 import { RefreshCw } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Fact } from '../components.tsx';
@@ -139,5 +139,35 @@ export function QuotaRefresh({
       )}
       {message && <p role="status">{message}</p>}
     </>
+  );
+}
+
+/**
+ * What the build found reports about itself: the build the last protocol check passed against and
+ * its date, the connect-time self-test and the capability list from the client's own handshake.
+ */
+export function ClientRecord({
+  status,
+  capabilities = true,
+}: {
+  status: ClientVersionStatus;
+  /** A family that reports no list leaves the line out. */
+  capabilities?: boolean;
+}) {
+  if (!status.checkedOn && !status.probe && !status.capabilities?.length) return null;
+  return (
+    <div className="facts-grid compact">
+      {status.version && <Fact label="Found" value={status.version} />}
+      {status.checkedOn && (
+        <Fact label="Last checked" value={`${status.tested} on ${status.checkedOn}`} />
+      )}
+      {status.probe && <Fact label="Self-test" value={status.probe} />}
+      {capabilities && (
+        <Fact
+          label="Capabilities"
+          value={status.capabilities?.length ? status.capabilities.join(', ') : 'Not reported yet'}
+        />
+      )}
+    </div>
   );
 }

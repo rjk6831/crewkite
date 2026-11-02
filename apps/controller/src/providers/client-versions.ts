@@ -8,6 +8,7 @@ import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { ClientVersionState, ClientVersionStatus } from '@crewkite/contracts';
 import { timed } from '../diagnostics/timing.ts';
+import { clientRecord } from './client-record.ts';
 import { fileDigestSync } from './file-digest.ts';
 import { platformGate } from './platform.ts';
 
@@ -24,6 +25,7 @@ export const CLIENT_VERSIONS = {
     // passed against the tested build. 0.133.0 is the oldest build whose read-only turns read
     // through a permission profile; older ones ask before each command.
     checkedOn: '2 Nov 2026',
+    information: true,
     minimum: '0.133.0',
     update: 'npm install -g @openai/codex@latest',
     maximumBytes: 256 * 1024 * 1024,
@@ -32,10 +34,13 @@ export const CLIENT_VERSIONS = {
   anthropic: {
     name: 'Claude Code',
     command: 'claude',
-    tested: '2.1.302',
-    // The stream-json control protocol, --setting-sources and the attribution settings the turn
-    // passes all predate the 2.1 line.
-    minimum: '2.1.0',
+    tested: '2.1.316',
+    // checkedOn is the day the protocol check last passed against the tested build.
+    checkedOn: '3 Nov 2026',
+    // 2.1.259 is the first build with --permission-prompts, which the usage read and the writer
+    // pass. An older build answers the flag with an unknown option error. Optional flags are
+    // probed per build, so a later build that drops one still runs.
+    minimum: '2.1.259',
     update: 'claude update',
     maximumBytes: 512 * 1024 * 1024,
     environment: { DISABLE_UPDATES: '1', DISABLE_AUTOUPDATER: '1' },
@@ -179,10 +184,12 @@ export function clientVersionStatus(
   const version = parsed?.text ?? (found.state === 'pinned' ? found.version : null);
   const tested = parseClientVersion(row.tested)?.core[0] ?? 0;
   const checked = 'checkedOn' in row ? `Checked with ${row.tested} on ${row.checkedOn}` : null;
-  const informed =
-    checked !== null && (state === 'older' || state === 'new-major' || state === 'newer');
+  // A row marked as information accepts every build and says what the probe decides. Other rows
+  // refuse a build below the minimum and a new major version.
+  const information = 'information' in row;
+  const informed = information && (state === 'older' || state === 'new-major' || state === 'newer');
   const message = (() => {
-    if (checked !== null)
+    if (information && checked !== null)
       switch (state) {
         case 'tested':
           return `${row.name} ${version} found. ${checked}.`;
@@ -196,11 +203,11 @@ export function clientVersionStatus(
       }
     switch (state) {
       case 'tested':
-        return `${row.name} ${version} found. This is the build CrewKite was tested with.`;
+        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}.`;
       case 'newer':
-        return `${row.name} ${version} found. Tested with ${row.tested}; newer builds usually work.`;
+        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}; a newer build runs while its flags and replies match what CrewKite sends.`;
       case 'supported':
-        return `${row.name} ${version} found. Tested with ${row.tested}; builds from ${row.minimum} on are supported.`;
+        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}; builds from ${row.minimum} on are supported.`;
       case 'older':
         return `${row.name} ${version} is older than the minimum ${row.minimum}. Update it with ${row.update}, then press Check again.`;
       case 'new-major':
@@ -231,6 +238,17 @@ export function clientVersionStatus(
     tested: row.tested,
     minimum: row.minimum,
     message: message.slice(0, 1024),
+    ...('checkedOn' in row ? { checkedOn: row.checkedOn } : {}),
+    ...recordFields(family, version),
+  };
+}
+
+/** What the client reported about itself, for the build found. */
+function recordFields(family: ClientFamily, version: string | null) {
+  const record = clientRecord(family, version);
+  return {
+    ...(record?.capabilities.length ? { capabilities: [...record.capabilities] } : {}),
+    ...(record?.probe ? { probe: record.probe } : {}),
   };
 }
 

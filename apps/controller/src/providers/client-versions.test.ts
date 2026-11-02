@@ -114,7 +114,11 @@ test('each family names its own tested build, minimum and update command, with t
         [value.tested, value.minimum],
       ]),
     ),
-    { openai: ['0.163.0', '0.133.0'], anthropic: ['2.1.302', '2.1.0'], google: ['1.4.2', '1.4.0'] },
+    {
+      openai: ['0.163.0', '0.133.0'],
+      anthropic: ['2.1.316', '2.1.259'],
+      google: ['1.4.2', '1.4.0'],
+    },
   );
 });
 
@@ -139,15 +143,26 @@ test('Settings and the CLI name the found version and the state in plain words',
       true,
       'Codex 0.125.0 found. Checked with 0.163.0 on 2 Nov 2026; this build is older than 0.133.0, so read-only turns ask before each command.',
     ],
+    // The minimum is the first build with every flag the usage read and the writer pass.
     [
-      at('anthropic', '1.9.0 (Claude Code)'),
+      at('anthropic', '2.1.258 (Claude Code)'),
       false,
-      'Claude Code 1.9.0 is older than the minimum 2.1.0. Update it with claude update, then press Check again.',
+      'Claude Code 2.1.258 is older than the minimum 2.1.259. Update it with claude update, then press Check again.',
     ],
     [
-      at('anthropic', '2.1.120 (Claude Code)'),
+      at('anthropic', '2.1.259 (Claude Code)'),
       true,
-      'Claude Code 2.1.120 found. Tested with 2.1.302; builds from 2.1.0 on are supported.',
+      'Claude Code 2.1.259 found. Checked with 2.1.316 on 3 Nov 2026; builds from 2.1.259 on are supported.',
+    ],
+    [
+      at('anthropic', '2.1.316 (Claude Code)'),
+      true,
+      'Claude Code 2.1.316 found. Checked with 2.1.316 on 3 Nov 2026.',
+    ],
+    [
+      at('anthropic', '2.1.340 (Claude Code)'),
+      true,
+      'Claude Code 2.1.340 found. Checked with 2.1.316 on 3 Nov 2026; a newer build runs while its flags and replies match what CrewKite sends.',
     ],
     [
       at('google', '2.0.0'),
