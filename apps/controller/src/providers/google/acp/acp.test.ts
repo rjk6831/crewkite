@@ -451,6 +451,9 @@ test('the acp writer binds an imported client and observed configuration before 
         const expected = readFileSync(executable);
         assert.equal(hash(expected), client.sha256);
         writeFileSync(join(staging, basename(executable)), 'different staged bytes');
+        // A usage read makes its own folder in the controller home while the checks run. That
+        // changes the home's times and must not fail the import.
+        mkdirSync(join(f.home, `usage-read-${signatures}`), { mode: 0o700 });
         await Promise.resolve();
         assert.deepEqual(readFileSync(executable), expected);
         writeFileSync(join(staging, basename(executable)), expected);

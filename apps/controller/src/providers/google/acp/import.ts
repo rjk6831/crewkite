@@ -346,20 +346,30 @@ function managedSnapshot(home: string, executable: string): string {
     current = join(current, part);
     paths.push(current);
   }
+  const managed = paths.at(-1);
   paths.push(executable, join(dirname(executable), 'localharness_external'));
   return JSON.stringify(
     paths.map((path) => {
       const state = lstatSync(path, { bigint: true });
-      return [
-        state.dev,
-        state.ino,
-        state.ctimeNs,
-        state.mtimeNs,
-        state.mode,
-        state.uid,
-        state.nlink,
-        state.size,
-      ].map(String);
+      // The controller home and the folders above the managed client gain and lose entries
+      // while a read or a usage check runs, so their times and link counts move during the
+      // signature checks. Their identity, owner and mode still pin them. The managed folder
+      // and the two client files keep every field.
+      const ancestor = path !== managed && !path.startsWith(`${managed}/`);
+      return (
+        ancestor
+          ? [state.dev, state.ino, state.mode, state.uid]
+          : [
+              state.dev,
+              state.ino,
+              state.ctimeNs,
+              state.mtimeNs,
+              state.mode,
+              state.uid,
+              state.nlink,
+              state.size,
+            ]
+      ).map(String);
     }),
   );
 }
