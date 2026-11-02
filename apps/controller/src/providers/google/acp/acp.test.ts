@@ -525,6 +525,7 @@ test('the acp writer binds an imported client and observed configuration before 
         );
         let clock = 0;
         let closes = 0;
+        let spawned = 0;
         const timers: Array<{ delay: number; work: () => void; live: boolean }> = [];
         let capture = true;
         const ready = Promise.withResolvers<void>();
@@ -568,20 +569,26 @@ test('the acp writer binds an imported client and observed configuration before 
                   assert(
                     args.includes(`=${googleAcpDeveloperIdRequirement(row.client.signerTeamId)}`),
                   );
-                  // A held child ignores TERM and leaves only on the kill.
-                  const child = held
-                    ? spawnCheckChild(
-                        process.execPath,
-                        [
-                          '-e',
-                          "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 10000); process.stdout.write('ready\\n');",
-                        ],
-                        options,
-                      )
-                    : spawnCheckChild(row.client.executable, [], options);
+                  // A held child ignores TERM and leaves only on the kill. Both files are
+                  // checked at once, so only the first check is held; the second one ends
+                  // refused at once and its reason comes after the first file's.
+                  const holding = held && spawned++ === 0;
+                  const child =
+                    held && !holding
+                      ? spawnCheckChild(process.execPath, ['-e', 'process.exit(1)'], options)
+                      : holding
+                        ? spawnCheckChild(
+                            process.execPath,
+                            [
+                              '-e',
+                              "process.on('SIGTERM', () => {}); setTimeout(() => process.exit(1), 10000); process.stdout.write('ready\\n');",
+                            ],
+                            options,
+                          )
+                        : spawnCheckChild(row.client.executable, [], options);
                   if (child.pid) row.groups.push(child.pid);
                   exits.push(new Promise((resolve) => child.once('close', resolve)));
-                  if (held) {
+                  if (holding) {
                     child.stdout.once('data', () => ready.resolve());
                     child.once('exit', () => onExit?.());
                     child.once('error', ready.reject);
@@ -593,7 +600,7 @@ test('the acp writer binds an imported client and observed configuration before 
                     });
                   }
                   // Each file has its own window. The bundle row spends the second one.
-                  else
+                  else if (!held)
                     child.once('close', () => {
                       // A first check after the unpack can take seconds. Five each used to
                       // spend the one shared window.
