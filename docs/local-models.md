@@ -14,6 +14,8 @@ Local connects with a token or with none, and the card shows which one it used.
 
 Every Connect clears the status lines from the attempt before it, so the card never shows a stale line beside a new result.
 
+Connect on a setup that is already connected, with a current read and nothing running, changes nothing and keeps the selected model. A second press is safe. When the controller's answer does not come back in time, the card says "Local did not answer in time. Press Connect again." and leaves every control on. Local setup commands keep no saved copy for exact retry and never raise the uncertain-outcome banner, as [ADR 0049](adr/0049-provider-setup-sends-again-without-receipt-replay.md) describes. A Local command waits up to 20 seconds for its answer, the time the controller gives a model read.
+
 ### Saved mode
 
 The card has no authentication switch. Connect always detects, so the switch had nothing left to decide. Connect from the card saves token mode, which keeps a token used for this endpoint eligible for Remember, and moves a no-token mode saved by the CLI or an earlier version to token mode. A computer without the macOS keychain refuses token mode, and there Connect saves the no-token loopback mode. The CLI still sets either mode with `local configure --authentication`. [ADR 0043](adr/0043-remember-the-local-token-on-this-device.md) records the removal in its amendment of 2026-11-01.

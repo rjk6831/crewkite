@@ -1230,6 +1230,16 @@ export class ProviderCommands {
     }
     if (command.command === 'RefreshLocalModels' && !this.localConnected(control))
       return { outcome: 'blocked', reason: 'local-connection-required' };
+    // Connect on a setup that is connected, with a current read and nothing running, has nothing
+    // to do. A second press, or a resend after a lost answer, keeps the model selection.
+    if (
+      command.command === 'BeginLocalConnectionInput' &&
+      this.localConnected(control) &&
+      control.observation &&
+      !control.observationStale &&
+      !control.connectionFailed
+    )
+      return applied();
     const kind = command.command === 'BeginLocalConnectionInput' ? 'input' : 'discovery';
     // A token the desktop supplied for this connection survives the connect that uses it.
     if (kind === 'input' && !(this.localSecret?.supplied && this.localSecretMatches(control)))

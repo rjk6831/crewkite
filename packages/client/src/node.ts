@@ -491,7 +491,18 @@ export class ControllerClient {
                                     : command.command === 'PrepareCandidateEvaluation' &&
                                         command.payload.checkRecipeId === 'crewkite-verify-v1'
                                       ? 65000
-                                      : 5000),
+                                      : // A Local command can start a model read, which the
+                                        // controller gives 20 s.
+                                        [
+                                            'ConfigureLocal',
+                                            'BeginLocalConnectionInput',
+                                            'CancelLocalConnectionInput',
+                                            'DisconnectLocal',
+                                            'RefreshLocalModels',
+                                            'SelectLocalModel',
+                                          ].includes(command.command)
+                                        ? 20000
+                                        : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);

@@ -1,6 +1,7 @@
 import type { DesktopCommand } from '@crewkite/client';
 import type { CommandResult, LocalSetup } from '@crewkite/contracts';
 import { formatSize } from './format-size.ts';
+import { localResultLine } from './source.ts';
 
 /** Why the saved setup is where it is. The card and the rail say the same sentence. */
 export const setupReasons: Record<NonNullable<LocalSetup['reason']>, string> = {
@@ -238,7 +239,7 @@ export async function connectInPlace({
     if (!applied(started))
       return {
         kind: 'blocked',
-        message: started.next ?? started.reason ?? 'Local did not connect.',
+        message: localResultLine(started, 'Local did not connect.'),
       };
   }
   let discovered = false;
@@ -278,7 +279,7 @@ export async function connectInPlace({
       if (!applied(read))
         return {
           kind: 'blocked',
-          message: read.next ?? read.reason ?? 'The models were not read.',
+          message: localResultLine(read, 'The models were not read.'),
         };
     }
   }

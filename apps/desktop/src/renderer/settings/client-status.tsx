@@ -2,7 +2,7 @@ import type { WorkspaceState } from '@crewkite/contracts';
 import { RefreshCw } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Fact } from '../components.tsx';
-import type { Workspace } from '../source.ts';
+import { usageReadLine, type Workspace } from '../source.ts';
 import { nativeUsageClients, readAgo } from '../usage-presentation.ts';
 import type { ProviderActions } from './provider-actions.ts';
 
@@ -132,11 +132,7 @@ export function QuotaRefresh({
       {reader?.readState === 'quiescent' &&
         reader.readReason &&
         reader.readReason !== 'observed' && (
-          <p className="st-note">
-            {reader.readReason === 'protocol' || reader.readReason === 'read-failed'
-              ? 'The last read did not finish. Press Refresh to read again.'
-              : `The last read failed: ${reader.readReason.replaceAll('-', ' ')}.`}
-          </p>
+          <p className="st-note">{usageReadLine(reader.readReason)}</p>
         )}
       {cooldownSeconds > 0 && (
         <p className="st-note">Refresh available in {cooldownSeconds}s. Failed reads also count.</p>

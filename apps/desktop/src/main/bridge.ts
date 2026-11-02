@@ -332,10 +332,25 @@ export async function installBridge(
         'AuthenticateGoogleAcp',
         'DiscoverGoogleAcp',
         'StopGoogleAcpSetup',
+        'AcknowledgeGoogleTerms',
+        'ConfigureLocal',
+        'BeginLocalConnectionInput',
+        'CancelLocalConnectionInput',
+        'DisconnectLocal',
+        'RefreshLocalModels',
+        'SelectLocalModel',
       ].includes(command.command)
     ) {
       if (!client) throw new Error('The controller is offline.');
+      // A remembered token goes to the controller in memory first, so the connect that follows
+      // uses it with no token window. Without one, or when the hand over fails, the window asks.
+      if (command.command === 'BeginLocalConnectionInput') {
+        await tokens.supply().catch(() => false);
+        assertSender(event, window);
+      }
       const result = CommandResultSchema.parse(await client.command(command));
+      if (command.command === 'ConfigureLocal' && applied(result))
+        await tokens.reconcile().catch(() => {});
       assertSender(event, window);
       return result;
     }
@@ -404,15 +419,7 @@ export async function installBridge(
         )
           throw new Error('The setup operation changed. Read its current state before stopping.');
       }
-      // A remembered token goes to the controller in memory first, so the connect that follows
-      // uses it with no token window. Without one, or when the hand over fails, the window asks.
-      if (command.command === 'BeginLocalConnectionInput') {
-        await tokens.supply().catch(() => false);
-        assertSender(event, window);
-      }
       const result = await execute(command, () => assertSender(event, window));
-      if (command.command === 'ConfigureLocal' && applied(result))
-        await tokens.reconcile().catch(() => {});
       assertSender(event, window);
       return result;
     } finally {

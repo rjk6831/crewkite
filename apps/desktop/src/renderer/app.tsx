@@ -959,6 +959,8 @@ export function App() {
             <span>Interface preview. No worker, checks or provider calls run here.</span>
           </div>
         )}
+        {/* Only commands that keep a receipt raise this, such as candidate, source and publication
+            changes. Provider setup sends again with a new key and never shows it. */}
         {workspace.retryAvailable && (
           <div className="recovery-banner" role="status">
             <AlertTriangle size={15} />

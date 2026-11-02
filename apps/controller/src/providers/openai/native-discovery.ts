@@ -579,7 +579,10 @@ function nativeSession<T>(
           return { ...prepared, metadata: null, reason: 'protocol' };
         disabledMcpServers = Object.keys(prepared.metadata.mcpServers);
       }
-      const remaining = Math.floor(deadline - now());
+      // A metadata read gives the app-server transcript its whole window after the preflight. The
+      // preflight is a second launch, and on a busy start it used up the read's time before the
+      // read began. A task keeps one deadline because its caller bounds the whole turn.
+      const remaining = options.task ? Math.floor(deadline - now()) : options.timeoutMs;
       if (remaining < (options.task ? 2001 : 1))
         return { ...outcome, metadata: null, reason: 'deadline' };
       const reader = createReader(remaining);

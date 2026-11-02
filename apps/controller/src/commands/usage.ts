@@ -53,6 +53,10 @@ const preparedUsage = new WeakMap<
   { key: string; openai?: ReturnType<UsageCommands['openAiUsageInputs']> }
 >();
 
+// Controllers with an OpenAI retry chain waiting. A connect during the chain reads once and leaves
+// the retries to the chain.
+const retrying = new WeakSet<Controller>();
+
 // Usage readers and the provider usage observations that admission reads.
 export class UsageCommands {
   anthropicUsage(this: Controller) {
@@ -186,35 +190,43 @@ export class UsageCommands {
   }
 
   /**
-   * The read at start or connect runs while the chat catalog read starts its own client, and on
-   * some launches the client answers the first read out of step. One more read a few seconds later
-   * settles it, so the rail does not open on "unknown" until the person presses Refresh.
+   * A read at start or connect runs while the rest of launch competes for the same seconds: the
+   * chat catalog read, the first workspace reads and the other quota reads. A read that ends with
+   * no reading, for any reason, runs again 5 s later and once more 30 s after that, so the rail
+   * does not open on "unknown" until the person presses Refresh. The interval read keeps its own
+   * cooldown. One retry chain runs at a time.
    */
   async refreshOpenAiUsageWithRetry(
     this: Controller,
     trigger: 'start' | 'connect' | 'interval',
   ): Promise<void> {
     await this.refreshOpenAiUsage(trigger);
-    if (trigger === 'interval' || this.closed) return;
-    let state: ReturnType<Controller['openAiUsageState']>;
-    try {
-      state = this.openAiUsageState();
-    } catch {
-      return;
-    }
-    if (
-      state?.state !== 'quiescent' ||
-      (state.reason !== 'protocol' && state.reason !== 'read-failed')
-    )
-      return;
+    if (trigger === 'interval' || retrying.has(this)) return;
     const schedule =
       this.options.schedule ??
       ((run: () => void, ms: number) => {
         const timer = setTimeout(run, ms);
         return () => clearTimeout(timer);
       });
-    await new Promise<void>((resolve) => schedule(resolve, 5000));
-    if (!this.closed) await this.refreshOpenAiUsage(trigger);
+    retrying.add(this);
+    try {
+      for (const delay of [5000, 30000]) {
+        if (this.closed) return;
+        let state: ReturnType<Controller['openAiUsageState']>;
+        try {
+          state = this.openAiUsageState();
+        } catch {
+          return;
+        }
+        // A read that is unknown, still running or never started has nothing to retry.
+        if (state?.state !== 'quiescent' || state.reason === 'observed') return;
+        await new Promise<void>((resolve) => schedule(resolve, delay));
+        await this.openAiModelReadSettled();
+        if (!this.closed) await this.refreshOpenAiUsage('retry');
+      }
+    } finally {
+      retrying.delete(this);
+    }
   }
 
   openAiUsageState(this: Controller) {
@@ -246,11 +258,13 @@ export class UsageCommands {
 
   refreshOpenAiUsage(
     this: Controller,
-    trigger: 'start' | 'connect' | 'interval' | 'manual',
+    trigger: 'start' | 'connect' | 'interval' | 'retry' | 'manual',
     commandId?: string,
   ): Promise<void> | undefined {
     try {
       if (this.closed || !this.options.openAiUsageClient) return;
+      // Only the person's own read connects OpenAI. Until then nothing starts the client on its own.
+      if (trigger !== 'manual' && !this.store.hasConnectedOnce('openai')) return;
       if (this.openAiUsageRead) return this.openAiUsageRead.done;
       const profile = this.options.openAiUsageClient();
       if (
@@ -270,11 +284,16 @@ export class UsageCommands {
       });
       const attemptedAt = this.now();
       const previous = this.openAiUsageState();
+      // A retry, or a connect after a read that published nothing, skips the cooldown. The cooldown
+      // spaces out reads that worked, and an unread gauge is what the person sees otherwise.
+      const unread = previous?.reason !== 'observed';
       if (
         previous &&
         (previous.state !== 'quiescent' ||
-          Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) <
-            (trigger === 'interval' ? 270000 : 60000))
+          (trigger !== 'retry' &&
+            !(trigger === 'connect' && unread) &&
+            Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) <
+              (trigger === 'interval' ? 270000 : 60000)))
       )
         return;
       if (
@@ -413,8 +432,10 @@ export class UsageCommands {
               quiescent: () => {},
             },
           };
-          const deadline = performance.now() + options.timeoutMs;
-          const wallDeadline = Date.parse(this.now()) + options.timeoutMs;
+          // The session runs two launches, the features preflight and the app-server, each with its
+          // own window. Publication has to land inside both.
+          const deadline = performance.now() + 2 * options.timeoutMs;
+          const wallDeadline = Date.parse(this.now()) + 2 * options.timeoutMs;
           invoked = true;
           const handle = startNativeSession(
             {
@@ -668,6 +689,9 @@ export class UsageCommands {
         })
       )
         return { outcome: 'blocked', reason: 'openai-task-active' };
+      // The person's own read is the OpenAI connect. Reads at launch, on connect and on the
+      // interval run from here on.
+      this.store.markConnectedOnce('openai');
       effects.push(() => void this.launchOpenAiUsage(command.key));
       return { outcome: 'outcome-unknown', reason: 'openai-usage-read-pending' };
     }

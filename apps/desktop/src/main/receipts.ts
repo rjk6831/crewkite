@@ -19,6 +19,24 @@ import { desktopActor } from './runtime.ts';
 export { syncDirectory } from '../../../../scripts/demo-state.ts';
 
 import { syncDirectory } from '../../../../scripts/demo-state.ts';
+
+// Provider setup commands are safe to send again with a new key: the controller refuses a second
+// one while the first runs and treats a repeat on a connected setup as done. A lost answer only
+// means the card reads the setup again, so these carry no receipt and never raise the retry.
+const PROVIDER_SETUP: ReadonlySet<string> = new Set([
+  'ConfigureLocal',
+  'BeginLocalConnectionInput',
+  'CancelLocalConnectionInput',
+  'DisconnectLocal',
+  'RefreshLocalModels',
+  'SelectLocalModel',
+  'AcknowledgeGoogleTerms',
+]);
+
+/** Whether a command keeps a receipt for exact retry: every change except provider setup. */
+export const exactRetry = (command: Command) =>
+  'expectedRevision' in command && !PROVIDER_SETUP.has(command.command);
+
 export class CommandReceipts {
   readonly path: string;
   commands: Command[] = [];
@@ -74,7 +92,8 @@ export class CommandReceipts {
         new Set(commands.map((item) => item.key)).size !== commands.length
       )
         throw new Error('The desktop command receipt identity is invalid.');
-      this.commands = commands;
+      // A receipt left by an older build for a setup command is not replayed.
+      this.commands = commands.filter(exactRetry);
     } finally {
       closeSync(file);
     }
@@ -140,7 +159,8 @@ export class CommandReceipts {
  * Sends a change with its receipt written first, so a crash or a lost connection leaves the exact
  * command to retry. `announce` reports whether a receipt is left once the send ends. A command in
  * flight is not uncertain, so nothing is announced before its answer: announcing it showed the
- * retry banner for the length of every write, which moved the whole page and blinked.
+ * retry banner for the length of every write, which moved the whole page and blinked. A provider
+ * setup command is sent as it is, with no receipt and no announcement.
  */
 export async function sendRetained<T extends { outcome: string }>(
   receipts: Pick<CommandReceipts, 'commands' | 'retain'>,
@@ -148,6 +168,7 @@ export async function sendRetained<T extends { outcome: string }>(
   dispatch: () => Promise<T>,
   announce: (available: boolean) => void,
 ): Promise<T> {
+  if (!exactRetry(command)) return dispatch();
   receipts.retain(command, true);
   try {
     const result = await dispatch();

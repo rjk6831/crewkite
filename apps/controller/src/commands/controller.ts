@@ -660,6 +660,13 @@ export class Controller {
       if (observed && now - Date.parse(observed.observedAt) < 86_400_000) return;
       const last = this.chatModelReadRecord();
       if (last?.reason && now - Date.parse(last.attemptedAt) < 60_000) return;
+      // Both reads start the same client. At launch they ran side by side and the quota read ran
+      // out of time, so the model read waits until the quota read settles and checks again.
+      const usage = this.openAiUsageRead?.done;
+      if (usage) {
+        void usage.then(() => this.refreshStaleChatModels());
+        return;
+      }
       void this.readChatModels();
     } catch {
       // A damaged read record leaves the catalog as it is. Refresh models reports the failure.
@@ -690,6 +697,11 @@ export class Controller {
       outcome: 'applied',
       entity: artifact,
     });
+  }
+
+  /** Settles when no model read is running. A quota retry waits for it before it starts. */
+  openAiModelReadSettled(): Promise<unknown> {
+    return this.chatModelRead?.promise ?? Promise.resolve();
   }
 
   /** At most one model read runs. A second caller gets the result of the one in flight. */
