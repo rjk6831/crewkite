@@ -15,6 +15,8 @@ CrewKite puts no plan gate of its own. Each family works on whatever plan its pr
 
 Every adapter implements `ChatAdapter` and turns its client's native events into the same `AgentEvent` stream. It parses only the fields CrewKite uses. Anything it does not recognize shows once per turn as a notice and never ends the turn. A failure carries its stage, the cause, the provider's own message and a next action. Each turn runs the client in its own process group, and Stop interrupts through the client's protocol before it signals the group.
 
+[Crew and permissions](crew-and-permissions.md) lays out what each flight mode and permission policy answers on its own and what it asks me.
+
 The tests run each adapter against a scripted peer that speaks the frames recorded at the top of its test file. They show the mechanics work. A live run on the real client qualifies a route, as [Qualification](#qualification) describes.
 
 ### Sessions

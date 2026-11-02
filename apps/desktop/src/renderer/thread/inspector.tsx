@@ -39,9 +39,11 @@ import {
   choiceNamed,
   crewFromPreset,
   crewRoleNames,
+  flightModeInfo,
   flightModes,
   flightPreset,
   handoffModes,
+  permissionInfo,
   permissionPolicies,
 } from '../settings/preferences.ts';
 import { useProviderActions } from '../settings/provider-actions.ts';
@@ -57,7 +59,7 @@ import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
 import { useModelLabel } from './model-labels.ts';
-import { RoleInfo } from './role-info.tsx';
+import { InfoMark, RoleInfo } from './role-info.tsx';
 import { SubagentSwitch } from './subagent-switch.tsx';
 
 export type InspectorTab = 'changes' | 'usage' | 'analytics' | 'crew' | 'thread' | `ext:${string}`;
@@ -451,7 +453,9 @@ function ThreadTab({
         </dl>
       )}
       <label>
-        Permissions
+        <span className="role-name">
+          Permissions <InfoMark {...permissionInfo[thread?.permissionPolicy ?? 'ask']} />
+        </span>
         <select
           value={thread?.permissionPolicy ?? 'ask'}
           disabled={!thread}
@@ -466,6 +470,14 @@ function ThreadTab({
           ))}
         </select>
       </label>
+      <p className="th-muted">
+        {
+          (
+            permissionPolicies.find(({ id }) => id === thread?.permissionPolicy) ??
+            permissionPolicies[0]
+          ).title
+        }
+      </p>
       {!draft && (
         <McpThreadMenu taskId={taskId} permissionPolicy={thread?.permissionPolicy ?? 'ask'} />
       )}
@@ -727,7 +739,9 @@ function CrewTab({
         </p>
       )}
       <label>
-        Flight mode
+        <span className="role-name">
+          Flight mode <InfoMark {...flightModeInfo[mode.id]} />
+        </span>
         <select
           value={mode.id}
           title={mode.title}
@@ -748,7 +762,9 @@ function CrewTab({
       </p>
       {/* The same setting as Permissions on the Thread tab, so mode and policy read in one place. */}
       <label>
-        Permissions
+        <span className="role-name">
+          Permissions <InfoMark {...permissionInfo[thread?.permissionPolicy ?? 'ask']} />
+        </span>
         <select
           value={thread?.permissionPolicy ?? 'ask'}
           disabled={!thread}
@@ -763,6 +779,14 @@ function CrewTab({
           ))}
         </select>
       </label>
+      <p className="th-muted">
+        {
+          (
+            permissionPolicies.find(({ id }) => id === thread?.permissionPolicy) ??
+            permissionPolicies[0]
+          ).title
+        }
+      </p>
       {crew && mode.id !== 'manual' && (
         <p className="th-muted">Read-only commands in the scratch copy run without asking.</p>
       )}

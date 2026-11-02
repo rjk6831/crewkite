@@ -102,6 +102,7 @@ Raymond J. Kraft
 - [Provider routes](docs/providers.md)
 - [Usage and routing](docs/routing.md)
 - [Continuity and recovery](docs/continuity.md)
+- [Crew and permissions](docs/crew-and-permissions.md)
 - [Testing approach](docs/testing.md)
 - [Roadmap](docs/roadmap.md)
 - [Releases](docs/releases.md)

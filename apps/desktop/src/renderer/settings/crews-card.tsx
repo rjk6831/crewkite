@@ -8,7 +8,7 @@ import {
 import { Pencil, Plus, RotateCw, Trash2 } from 'lucide-react';
 import { useEffect, useId, useState } from 'react';
 import { Dialog } from '../components.tsx';
-import { RoleInfo } from '../thread/role-info.tsx';
+import { InfoMark, RoleInfo } from '../thread/role-info.tsx';
 import { SubagentSwitch } from '../thread/subagent-switch.tsx';
 import {
   type CrewLoad,
@@ -28,6 +28,7 @@ import {
   crewNameProblem,
   crewPresetHints,
   crewRoleNames,
+  flightModeInfo,
   flightModes,
   onCrewChoices,
   readCrewPresets,
@@ -261,7 +262,9 @@ export function CrewDialog({
             })}
           </fieldset>
           <label className="crew-dialog-field" htmlFor={`${idBase}-mode`}>
-            <span className="st-name">Flight mode</span>
+            <span className="role-name st-name">
+              Flight mode <InfoMark {...flightModeInfo[flightMode]} />
+            </span>
             <select
               id={`${idBase}-mode`}
               value={flightMode}

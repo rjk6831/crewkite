@@ -1,6 +1,12 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import type { ChatCatalogRead, SavedCrew, SavedCrewsRead } from '@crewkite/contracts';
+import {
+  type ChatCatalogRead,
+  ChatFlightModeSchema,
+  ChatPermissionPolicySchema,
+  type SavedCrew,
+  type SavedCrewsRead,
+} from '@crewkite/contracts';
 import {
   deleteCrew,
   loadCrews,
@@ -21,7 +27,11 @@ import {
   draftSettings,
   familyModel,
   firstAnswer,
+  flightModeInfo,
+  flightModes,
   flightPreset,
+  permissionInfo,
+  permissionPolicies,
   preferredSelection,
   readCrewPresets,
   readDefaultCrew,
@@ -492,4 +502,27 @@ test('crews kept in the window move to the controller once and every change goes
   await reloadCrews();
   assert.deepEqual(readCrewLoad(), { state: 'loaded' });
   clearLegacyCrews(store);
+});
+
+test('every flight mode and permission policy has a title and a tooltip text', () => {
+  const groups: {
+    values: readonly string[];
+    entries: { id: string; label: string; title: string }[];
+    info: Record<string, { name: string; text: string }>;
+  }[] = [
+    { values: ChatFlightModeSchema.options, entries: flightModes, info: flightModeInfo },
+    {
+      values: ChatPermissionPolicySchema.options,
+      entries: permissionPolicies,
+      info: permissionInfo,
+    },
+  ];
+  for (const { values, entries, info } of groups)
+    for (const value of values) {
+      const entry = entries.find(({ id }) => id === value);
+      assert.ok(entry?.label.trim(), `${value} has a label`);
+      assert.ok(entry?.title.trim(), `${value} has a title`);
+      assert.ok(info[value]?.name.trim(), `${value} has a tooltip name`);
+      assert.ok(info[value]?.text.trim(), `${value} has a tooltip text`);
+    }
 });

@@ -2,7 +2,7 @@ import { Info } from 'lucide-react';
 import { useId } from 'react';
 import './role-info.css';
 
-/** What each role does, for the info mark beside its name in the Crew tab and in Settings. */
+/** What each role does, for the info mark beside its name in the Crew tab and in Settings. The flight mode and permission texts sit in settings/preferences.ts next to the values they describe. */
 export const roleInfo = {
   builder: {
     name: 'Builder',
@@ -35,23 +35,27 @@ export const roleInfo = {
 } as const;
 export type RoleInfoKey = keyof typeof roleInfo;
 
-/** A small info mark. Hover or keyboard focus shows what the role does. */
-export function RoleInfo({ of: role }: { of: RoleInfoKey }) {
+/** A small info mark. Hover or keyboard focus shows the text. */
+export function InfoMark({ name, text }: { name: string; text: string }) {
   const id = useId();
-  const info = roleInfo[role];
   return (
     <span className="role-info">
       <button
         type="button"
         className="role-info-button"
-        aria-label={`What the ${info.name} does`}
+        aria-label={`About ${name}`}
         aria-describedby={id}
       >
         <Info size={12} aria-hidden="true" />
       </button>
       <span id={id} role="tooltip" className="role-info-tip">
-        {info.text}
+        {text}
       </span>
     </span>
   );
+}
+
+/** The mark beside a role name. */
+export function RoleInfo({ of: role }: { of: RoleInfoKey }) {
+  return <InfoMark {...roleInfo[role]} />;
 }
