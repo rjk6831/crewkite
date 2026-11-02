@@ -586,7 +586,9 @@ test('the acp writer binds an imported client and observed configuration before 
                             options,
                           )
                         : spawnCheckChild(row.client.executable, [], options);
-                  if (child.pid) row.groups.push(child.pid);
+                  // The quick second check has left before the cutoff, so the row kills only
+                  // the groups that can still be present.
+                  if (child.pid && (holding || !held)) row.groups.push(child.pid);
                   exits.push(new Promise((resolve) => child.once('close', resolve)));
                   if (holding) {
                     child.stdout.once('data', () => ready.resolve());
