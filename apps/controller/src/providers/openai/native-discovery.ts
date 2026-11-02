@@ -1,10 +1,10 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { lstatSync, mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { stripVTControlCharacters } from 'node:util';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import {
   type DiscoveryEnvelope,
   type DiscoveryMetadata,
@@ -215,7 +215,7 @@ function startTranscript<T>(
   const executable = realpathSync(launch.executable);
   if (!lstatSync(executable).isFile())
     throw new Error('Discovery executable must be a regular file.');
-  if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== launch.sha256)
+  if (fileDigestSync(executable) !== launch.sha256)
     throw new Error('Discovery executable identity changed.');
   if (!isAbsolute(launch.directory) || !isAbsolute(launch.repositoryRoot))
     throw new Error('Discovery requires absolute repository and run directories.');

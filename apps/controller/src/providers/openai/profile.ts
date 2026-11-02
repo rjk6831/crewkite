@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { type ClientVersionStatus, NativeProfileSchema } from '@crewkite/contracts';
@@ -10,6 +10,7 @@ import {
   findClient,
   openAiNativeSibling,
 } from '../client-versions.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import { nativeDiscoveryEnvironment } from './native-discovery.ts';
 
 const descriptor = {
@@ -80,8 +81,7 @@ export function resolveNativeProfile(environment = process.env): NativeProfileRe
         const stat = lstatSync(executable);
         if (!stat.isFile() || stat.size > 256 * 1024 * 1024) continue;
         found = true;
-        if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== clientHash)
-          continue;
+        if (fileDigestSync(executable) !== clientHash) continue;
         return {
           facts: NativeProfileSchema.parse({ ...descriptor, available: true, reason: 'available' }),
           client: { executable, sha256: clientHash, version: descriptor.clientVersion },

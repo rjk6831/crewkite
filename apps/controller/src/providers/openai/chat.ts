@@ -1,5 +1,4 @@
 import { type ChildProcessWithoutNullStreams, spawn } from 'node:child_process';
-import { createHash } from 'node:crypto';
 import {
   closeSync,
   constants,
@@ -7,7 +6,6 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
   realpathSync,
 } from 'node:fs';
 import { extname, isAbsolute, join, relative, resolve } from 'node:path';
@@ -44,6 +42,7 @@ import { frameTrace } from '../../chat/trace.ts';
 import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { CLIENT_VERSIONS, clientVersionState } from '../client-versions.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import {
   type OpenAiUsageHook,
   type OpenAiUsageWindow,
@@ -182,7 +181,7 @@ function verifiedClient(launch: NativeLaunch) {
     throw new Error('Chat requires an exact executable identity.');
   const executable = realpathSync(launch.executable);
   if (!lstatSync(executable).isFile()) throw new Error('The client must be a regular file.');
-  if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== launch.sha256)
+  if (fileDigestSync(executable) !== launch.sha256)
     throw new Error('The client executable identity changed.');
   return executable;
 }

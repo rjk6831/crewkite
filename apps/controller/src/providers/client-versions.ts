@@ -3,11 +3,12 @@ import {
   type SpawnSyncReturns,
   spawnSync,
 } from 'node:child_process';
-import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync, type Stats } from 'node:fs';
+import { lstatSync, realpathSync, type Stats } from 'node:fs';
 import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { ClientVersionState, ClientVersionStatus } from '@crewkite/contracts';
+import { timed } from '../diagnostics/timing.ts';
+import { fileDigestSync } from './file-digest.ts';
 import { platformGate } from './platform.ts';
 
 // The chat path and the Google quota reader accept a range of client builds (ADR 0009, amendment
@@ -426,7 +427,9 @@ function inspect(
     : { status };
 }
 
-const digest = (path: string) => createHash('sha256').update(readFileSync(path)).digest('hex');
+// The profiles and every launch read the same digest cache, so a build is hashed once per file
+// identity whichever of them sees it first.
+const digest = (path: string) => fileDigestSync(path);
 
 // shortcut: the read is synchronous, so a client that ignores the bound blocks the controller for
 // up to the timeout once per changed build. The result is cached by the file's identity. An
@@ -452,7 +455,9 @@ function readVersion(executable: string, row: Row, options: FindOptions): string
   };
   let result: SpawnSyncReturns<string>;
   try {
-    result = spawnSync(executable, ['--version'], spawnOptions);
+    result = timed(`spawnSync ${row.command} --version`, () =>
+      spawnSync(executable, ['--version'], spawnOptions),
+    );
   } catch {
     return null;
   }

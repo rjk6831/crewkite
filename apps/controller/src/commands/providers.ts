@@ -15,6 +15,7 @@ import {
   NativeProfileSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
+import { timed } from '../diagnostics/timing.ts';
 import { groupAbsent } from '../host/worker.ts';
 import {
   ConnectionRecordSchema,
@@ -70,6 +71,7 @@ const GOOGLE_DIAGNOSTIC_OPERATIONS = 50;
 // The connection revision at which a no-authentication connect met a runtime that wants a token.
 // Memory only: the next connect probes again.
 const tokenAsked = new WeakMap<object, number>();
+const profileReads = new WeakMap<object, { profiles?: NativeProfileResolution[] }>();
 
 export class ProviderCommands {
   executeAcpSetup(
@@ -1678,7 +1680,31 @@ export class ProviderCommands {
     }
   }
 
+  /**
+   * Runs one synchronous read with the profiles resolved once. A workspace read asks for them from
+   * the header, from the Anthropic reader's binding and again from the snapshot around it, and
+   * nothing inside one synchronous read can change them. The kept answer ends when the read
+   * returns, so a command that waits and resolves again sees fresh profiles.
+   */
+  withProfiles<T>(this: Controller, read: () => T): T {
+    if (profileReads.has(this)) return read();
+    profileReads.set(this, {});
+    try {
+      return read();
+    } finally {
+      profileReads.delete(this);
+    }
+  }
+
   resolveProfiles(this: Controller): NativeProfileResolution[] {
+    const kept = profileReads.get(this);
+    if (kept?.profiles) return [...kept.profiles];
+    const profiles = timed('resolveProfiles', () => this.resolveProfilesNow());
+    if (kept) kept.profiles = profiles;
+    return kept ? [...profiles] : profiles;
+  }
+
+  resolveProfilesNow(this: Controller): NativeProfileResolution[] {
     const profiles = [
       ...(this.options.nativeProfiles?.() ?? [
         this.options.nativeProfile?.() ?? unavailableNativeProfile(),

@@ -11,6 +11,7 @@ import {
 } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { join } from 'node:path';
+import { performance } from 'node:perf_hooks';
 import { encodeFrame, FrameDecoder, ProtocolError } from '@crewkite/client';
 import {
   controllerSocketPlace,
@@ -25,6 +26,7 @@ import {
   type TransportMessage,
 } from '@crewkite/contracts';
 import type { Controller } from '../commands/controller.ts';
+import { logTiming } from '../diagnostics/timing.ts';
 
 export async function serve(
   controller: Controller,
@@ -79,9 +81,13 @@ export async function serve(
           throw error;
         }
       };
-      const respond = async (command: Command) => {
+      const respond = async (command: Command, received: number) => {
+        const started = performance.now();
         try {
           const result = await controller.execute(command, 'local-owner');
+          logTiming(
+            `command ${command.command} wait=${Math.round(started - received)} run=${Math.round(performance.now() - started)}`,
+          );
           try {
             encodeFrame({ type: 'result', key: command.key, result });
             send({ type: 'result', key: command.key, result });
@@ -154,6 +160,7 @@ export async function serve(
             }
             queued++;
             const command = message.command;
+            const received = performance.now();
             let detached = false;
             pending = pending
               .then(async () => {
@@ -191,8 +198,18 @@ export async function serve(
                   }
                   return;
                 }
+                // Reads and Local setup answer on their own, so a slow read never holds a write
+                // behind it in this socket's line. Their changes still commit in arrival order:
+                // execute reaches its transaction before its first wait.
                 if (
                   [
+                    'GetWorkspaceState',
+                    'GetSnapshot',
+                    'GetProjectPage',
+                    'ReadChatCatalog',
+                    'ConfigureLocal',
+                    'BeginLocalConnectionInput',
+                    'RefreshLocalModels',
                     'GetArtifactRange',
                     'GetTaskActivityPage',
                     'GetTaskOperations',
@@ -220,14 +237,14 @@ export async function serve(
                     command.payload.checkRecipeId === 'crewkite-verify-v1')
                 ) {
                   detached = true;
-                  void respond(command)
+                  void respond(command, received)
                     .catch(() => socket.destroy())
                     .finally(() => {
                       queued--;
                     });
                   return;
                 }
-                await respond(command);
+                await respond(command, received);
               })
               .catch(() => {
                 socket.destroy();

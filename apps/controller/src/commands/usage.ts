@@ -1,4 +1,4 @@
-import { mkdtempSync } from 'node:fs';
+import { mkdtempSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import {
@@ -382,9 +382,12 @@ export class UsageCommands {
           )
             throw Error('usage-read-revoked');
         };
+        // The read's private client home holds its config copy and logs. Nothing reads it after
+        // the read settles, and one was left behind for every read.
+        let directory: string | undefined;
         try {
           current();
-          const directory = mkdtempSync(join(this.home, 'openai-usage-'));
+          directory = mkdtempSync(join(this.home, 'openai-usage-'));
           const onUsage = this.providerUsageAdapter(readerRoute.id, (value, prior) => {
             current();
             const bytes = Buffer.byteLength(canonicalJson({ value, prior: [...prior.values()] }));
@@ -481,6 +484,9 @@ export class UsageCommands {
             );
           } catch {}
         } finally {
+          try {
+            if (directory) rmSync(directory, { recursive: true, force: true });
+          } catch {}
           if (this.openAiUsageRead === runtime) this.openAiUsageRead = undefined;
           completion.resolve();
         }

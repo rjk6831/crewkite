@@ -43,6 +43,7 @@ import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
 import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import { armOwnedCleanup } from './native-discovery.ts';
 
 // One chat turn on the official claude client: `--print` with stream-json in both directions,
@@ -292,19 +293,15 @@ const options: ChatPermissionOption[] = [
 ];
 
 // Copied from startReplacement in replacement.ts. The profile verified this build when it
-// resolved, and hashing again right before spawn keeps a binary replaced since then from
-// running under the old identity.
+// resolved. The digest cache answers for the same file identity without a read, and a binary
+// replaced since then has a new identity, so it is hashed again and refused.
 export function verifiedExecutable(path: string, sha256: string) {
   if (!isAbsolute(path) || !/^[a-f0-9]{64}$/.test(sha256)) throw new Error('identity');
   const executable = realpathSync(path);
   const fd = openSync(executable, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
   try {
     const file = fstatSync(fd);
-    if (
-      !file.isFile() ||
-      file.size > 512 * 1024 * 1024 ||
-      createHash('sha256').update(readFileSync(fd)).digest('hex') !== sha256
-    )
+    if (!file.isFile() || file.size > 512 * 1024 * 1024 || fileDigestSync(executable) !== sha256)
       throw new Error('identity');
   } finally {
     closeSync(fd);

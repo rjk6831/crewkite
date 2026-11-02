@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import { userInfo } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
@@ -10,6 +10,7 @@ import {
   clientVersionStatus,
   findClient,
 } from '../client-versions.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import type { ChatClientResolution, NativeProfileResolution } from '../openai/profile.ts';
 import { nativeAuthEnvironment } from './native-discovery.ts';
 
@@ -82,8 +83,7 @@ function resolve(
       const stat = lstatSync(executable);
       if (!stat.isFile() || stat.size > 512 * 1024 * 1024) continue;
       found = true;
-      if (createHash('sha256').update(readFileSync(executable)).digest('hex') !== clientHash)
-        continue;
+      if (fileDigestSync(executable) !== clientHash) continue;
       return {
         facts: AnthropicNativeProfileSchema.parse({
           ...selected,

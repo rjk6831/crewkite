@@ -8,7 +8,6 @@ import {
   mkdirSync,
   openSync,
   readdirSync,
-  readFileSync,
   realpathSync,
 } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
@@ -23,6 +22,7 @@ import {
 import { verifyHandoff } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
+import { fileDigestSync } from '../file-digest.ts';
 import {
   armOwnedCleanup,
   type NativeLifecycle,
@@ -755,7 +755,7 @@ export function startReplacement(
       if (
         !file.isFile() ||
         file.size > 512 * 1024 * 1024 ||
-        createHash('sha256').update(readFileSync(fd)).digest('hex') !== launch.sha256
+        fileDigestSync(executable) !== launch.sha256
       )
         throw new Error();
     } finally {

@@ -15,6 +15,7 @@ import { RuntimeManifestSchema } from '@crewkite/contracts';
 import { Controller, type ControllerOptions } from './commands/controller.ts';
 import { installCrashCapture } from './diagnostics/crash.ts';
 import { appendControllerLog } from './diagnostics/log.ts';
+import { startTimingLog } from './diagnostics/timing.ts';
 import { configuredIdentity } from './host/publication.ts';
 import {
   resolveAnthropicChatClient,
@@ -174,6 +175,7 @@ export async function startController(options: ControllerOptions) {
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const home = process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite');
   installCrashCapture(home);
+  startTimingLog(home);
   try {
     // The GPU report takes a moment, so it starts with the process and the first workspace read
     // after it lands carries the core count.
