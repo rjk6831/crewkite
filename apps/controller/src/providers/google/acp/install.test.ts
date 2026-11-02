@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { spawn } from 'node:child_process';
 import { createHash, randomBytes } from 'node:crypto';
 import {
   chmodSync,
@@ -19,9 +20,9 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 import { deflateRawSync } from 'node:zlib';
 import { probeLocal } from '../../local/chat-connect.ts';
-import { importGoogleAcp } from './import.ts';
+import { importGoogleAcp, signaturePhase } from './import.ts';
 import { googleAcpCacheDirectory, installGoogleAcp } from './install.ts';
-import { googleAcpDeveloperIdRequirement } from './profile.ts';
+import { googleAcpDeveloperIdRequirement, hashAcpPrivateFileAsync } from './profile.ts';
 
 const digest = (bytes: Uint8Array) => createHash('sha256').update(bytes).digest('hex');
 function fixture() {
@@ -480,4 +481,97 @@ test('a Local connect probe gets its answer while the Google import checks the c
     ).equals(server),
     true,
   );
+});
+
+test('the import hashes each client file once from staging and once in the managed folder', async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'acp-hash-count-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const staging = join(home, 'imports/google-acp-v1');
+  mkdirSync(staging, { recursive: true, mode: 0o700 });
+  const bytes = {
+    'agy_acp_server.par': Buffer.from('server bytes'),
+    localharness_external: Buffer.from('harness bytes'),
+  };
+  for (const [name, content] of Object.entries(bytes))
+    writeFileSync(join(staging, name), content, { mode: 0o600 });
+  writeFileSync(
+    join(staging, 'identity.json'),
+    JSON.stringify({
+      version: '1.4.0',
+      sha256: digest(bytes['agy_acp_server.par']),
+      harnessSha256: digest(bytes.localharness_external),
+      signerTeamId: 'EQHXZ8M8AV',
+    }),
+    { mode: 0o600 },
+  );
+  const copied: number[] = [];
+  const inPlace: string[] = [];
+  const imported = await importGoogleAcp(
+    { home, consent: 'explicit' },
+    {
+      ...signed,
+      hashing: {
+        // One hash runs per staged file while it is copied.
+        create: () => {
+          const hash = createHash('sha256');
+          let length = 0;
+          return {
+            update: (chunk) => {
+              length += chunk.length;
+              return hash.update(chunk);
+            },
+            digest: (encoding) => {
+              copied.push(length);
+              return hash.digest(encoding);
+            },
+          };
+        },
+        file: (path, maximum, executable) => {
+          inPlace.push(path);
+          return hashAcpPrivateFileAsync(path, maximum, executable);
+        },
+      },
+    },
+  );
+  assert.equal(imported.reason, 'imported');
+  assert.deepEqual(copied, [
+    bytes['agy_acp_server.par'].length,
+    bytes.localharness_external.length,
+  ]);
+  // The only in-place hashes are the two copies. A staged file is never read a second time.
+  assert.deepEqual(
+    inPlace.map((path) => path.slice(path.lastIndexOf('/') + 1)),
+    ['agy_acp_server.par', 'localharness_external'],
+  );
+  for (const path of inPlace) assert.ok(path.startsWith(join(home, 'providers/google-acp-v1')));
+});
+
+test('a signature check that exited in time is not a timeout when the loop reads the close late', async (t) => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'acp-late-close-')));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const executable = join(root, 'client');
+  const deadline = 60_000;
+  let clock = 0;
+  const result = await signaturePhase(executable, [], deadline, {
+    now: () => clock,
+    schedule: () => () => {},
+    spawn: (_program, _args, options) => {
+      const child = spawn(process.execPath, ['-e', ''], options);
+      // The child closes one millisecond before the deadline.
+      child.once('close', () => {
+        clock = deadline - 1;
+      });
+      return child;
+    },
+    lifecycle: {
+      beforePhase: () => {},
+      owned: () => {},
+      // Settlement runs here. The loop was busy, so it is one millisecond past the deadline.
+      quiescent: () => {
+        clock = deadline + 1;
+      },
+    },
+  });
+  assert.equal(result, '');
 });

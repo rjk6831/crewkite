@@ -34,12 +34,9 @@ export const InstallRecordSchema = z
       .max(2),
     status: GoogleAcpInstallStatusSchema,
   })
+  // The two checks run together, so the second one is recorded while the first still runs.
   .refine((record) =>
-    record.signatures.every(
-      (signature, index) =>
-        signature.sequence === index + 1 &&
-        (index === 0 || record.signatures[index - 1].state === 'closed'),
-    ),
+    record.signatures.every((signature, index) => signature.sequence === index + 1),
   )
   .refine((record) =>
     record.phase === 'intent'
@@ -290,6 +287,7 @@ export class GoogleAcpInstallation {
                   save('signature');
                 },
                 owned: (group) => {
+                  // Each check records its intent and then its group before the next one starts.
                   const phase = active.record.signatures.at(-1);
                   if (phase?.state !== 'intent' || !Number.isSafeInteger(group) || group <= 0)
                     throw Error('signature-owner-unavailable');
@@ -298,9 +296,8 @@ export class GoogleAcpInstallation {
                   save('signature');
                 },
                 quiescent: (group) => {
-                  const phase = active.record.signatures.at(-1);
-                  if (!phase || phase.group !== group || phase.state !== 'owned')
-                    throw Error('signature-owner-changed');
+                  const phase = active.record.signatures.find((entry) => entry.group === group);
+                  if (phase?.state !== 'owned') throw Error('signature-owner-changed');
                   phase.state = 'closed';
                   save('signature');
                 },
