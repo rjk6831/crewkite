@@ -16,7 +16,8 @@
 //   {"id":4,"method":"config/read","params":{"includeLayers":false,"cwd":SCRATCH}}, only with the
 //     thread tools; the reply's config.mcp_servers names each configured server, and the ids after
 //     it move up by one
-//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request"|"never","approvalsReviewer":"user","sandbox":"workspace-write"|"read-only","serviceTier":"default","ephemeral":false}},
+//   {"id":4,"method":"thread/start","params":{"model":M,"modelProvider":"openai","cwd":SCRATCH,"approvalPolicy":"untrusted"|"on-request"|"never","approvalsReviewer":"user","sandbox":"workspace-write"|"read-only","serviceTier":"default","ephemeral":B}},
+//     where B is false only for a thread the controller resumes later (a writer outside a plan slice)
 //     with the thread tools also "config":{"mcp_servers.NAME.enabled":false for each other server,
 //     "mcp_servers.crewkite":{"command","args","enabled":true,"default_tools_approval_mode":"approve"}}
 //   {"id":4,"method":"thread/resume","params":{"threadId":T, same settings and config without ephemeral,"excludeTurns":true}}
@@ -292,6 +293,8 @@ function turn(
     prompt?: string;
     threadTools?: OpenAiChatDeps['threadTools'];
     readOnly?: boolean;
+    /** False for a turn whose session the controller never resumes. */
+    resumable?: boolean;
     allowanceLeft?: number | null;
     files?: File[];
     /** Runs on the empty scratch copy before the turn starts. */
@@ -349,6 +352,7 @@ function turn(
     now: () => Date.parse('2026-10-23T12:00:00.000Z'),
     files: options.files ?? [],
     readOnly: options.readOnly,
+    ...(options.resumable !== undefined ? { resumable: options.resumable } : {}),
     ...(options.allowanceLeft !== undefined ? { allowanceLeft: options.allowanceLeft } : {}),
   };
   const handle = adapter.startTurn(request, (event) => {
@@ -968,6 +972,25 @@ test('the next turn resumes the thread with its own approval policy and effort a
   }
   const tokens = minted.map((args) => args[args.indexOf('--token') + 1]);
   assert.equal(new Set(tokens).size, rows.length);
+});
+
+test('a turn the controller never resumes opens an ephemeral thread and keeps no session', async () => {
+  // Rows: a side question, a review and a plan slice never resume their thread, so the client
+  // saves none of them and the person's own app lists none. The thread that resumes stays saved.
+  const rows = [
+    { options: { resumable: false, readOnly: true }, ephemeral: true, kept: false },
+    { options: { resumable: false }, ephemeral: true, kept: false },
+    { options: { resumable: true }, ephemeral: false, kept: true },
+    { options: {}, ephemeral: false, kept: true },
+  ];
+  for (const row of rows) {
+    const run = turn('reply', row.options);
+    const result = await run.settled();
+    assert.equal(result.stopReason, 'done');
+    const started = run.frames().find((frame) => frame.method === 'thread/start');
+    assert.equal(started?.params.ephemeral, row.ephemeral, JSON.stringify(row.options));
+    assert.equal(result.session?.sessionId ?? null, row.kept ? 'thread-1' : null);
+  }
 });
 
 test("a client usage warning shows in the thread only when CrewKite's reading is low or missing", async () => {

@@ -1912,6 +1912,9 @@ export class ChatService {
       // delta, the history stops where the delta starts, for an adapter that has to start over.
       history: carries ? [] : (caught?.history ?? history),
       session,
+      // The finish keeps a session only for a writer outside a plan slice. Every other turn's
+      // session is never resumed.
+      resumable: writer && !lane,
       scratch: { directory, base: thread.base, projectName: project.name },
       work: { directory: work, home: this.deps.home },
       permissionPolicy,

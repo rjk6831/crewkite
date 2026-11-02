@@ -1366,6 +1366,9 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   assert.equal(reviewer.permissionPolicy, 'ask');
   assert.equal(reviewer.readOnly, true);
   assert.equal(reviewer.session, null);
+  // Only the builder's session is resumed, so the other two open no saved session.
+  assert.equal(assistant.resumable, true);
+  assert.equal(reviewer.resumable, false);
   assert.match(reviewer.systemContext, /ordered by severity/);
   assert.match(reviewer.systemContext, /Do not edit/);
   assert.match(reviewer.systemContext, /^net\.mjs \+1 -0$/m);
@@ -1386,6 +1389,7 @@ test('a reviewer turn runs read only with the review brief and the ask policy, w
   assert.equal(side.readOnly, true);
   assert.equal(side.permissionPolicy, 'ask');
   assert.equal(side.session, null);
+  assert.equal(side.resumable, false);
   assert.match(side.systemContext, /answering a side question/);
   assert.match(side.prompt, /^This is a side question to OpenAI about the thread below\./);
   assert.match(side.prompt, /^Person:\nChange net\.mjs\.$/m);
@@ -2813,6 +2817,15 @@ test('plan slices run side by side in their own copies, merge in plan order and 
       assert.match(planning, /^Slice 2, Part 2: done, on Local \(local-model\)\.$/m, row.name);
       const fourth = read.turns.find((turn) => turn.slice === 4);
       assert.equal(held[fourth?.id ?? ''], true, row.name);
+      // A slice and the orchestrator never resume their sessions, so neither saves one.
+      const sent = openai.requests as unknown as ChatTurnRequest[];
+      const lanes = sent.filter((request) => request.slice !== undefined);
+      assert.ok(lanes.length > 0, row.name);
+      assert.ok(
+        lanes.every((request) => request.resumable === false),
+        row.name,
+      );
+      assert.equal(sent.at(-1)?.resumable, false, row.name);
       const finished = lines.filter((line) => /^Slice \d finished/.test(line));
       assert.deepEqual(
         finished,

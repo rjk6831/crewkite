@@ -499,6 +499,10 @@ class OpenAiChatTurn {
   private nextId = 1;
   private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
   private threadId: string | null = null;
+  /** The controller resumes this thread on a later turn. Every other thread is ephemeral. */
+  private get resumable() {
+    return this.request.resumable !== false;
+  }
   private readonly threadTools: ThreadToolsServer | null;
   // Thread config for the tools: our one server, and every other configured server off.
   private mcpConfig: Record<string, unknown> | null = null;
@@ -852,8 +856,10 @@ class OpenAiChatTurn {
       serviceTier: 'default',
       ...(this.mcpConfig ? { config: this.mcpConfig } : {}),
     };
+    // The client saves a thread that is not ephemeral and lists it in the person's own app,
+    // grouped by its folder. Only a thread CrewKite resumes later is saved.
     const start = (history: boolean) =>
-      this.call('thread/start', { ...settings, ephemeral: false }, (reply) => {
+      this.call('thread/start', { ...settings, ephemeral: !this.resumable }, (reply) => {
         if ('error' in reply)
           return this.fail(this.providerFailure('session', 'thread/start', reply.error));
         const thread = threadReply.safeParse(reply.result);
@@ -1809,14 +1815,16 @@ class OpenAiChatTurn {
         }),
       }),
       assistantText: this.texts.join('\n\n'),
-      session: this.threadId
-        ? {
-            family: 'openai',
-            sessionId: this.threadId,
-            model: selection.model,
-            updatedAt: new Date(now()).toISOString(),
-          }
-        : session,
+      // An ephemeral thread is gone with the process, so there is nothing to resume.
+      session:
+        this.threadId && this.resumable
+          ? {
+              family: 'openai',
+              sessionId: this.threadId,
+              model: selection.model,
+              updatedAt: new Date(now()).toISOString(),
+            }
+          : session,
       usage: this.usage,
       changedPaths: [...this.changed],
     });
