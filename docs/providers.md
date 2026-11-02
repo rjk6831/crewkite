@@ -44,7 +44,7 @@ In the picker, live models come first, then models used before on this account. 
 
 ### Concurrency
 
-One turn runs on a family at a time across threads. A message or an Ask for a family that is answering in another thread waits in its own thread's queue, which holds up to 8, and starts when that turn ends. Requests for different families in different threads do not wait on each other. Within one thread a new message always waits for the running turn. Plan slices and the review chain's turns start when their step comes and do not wait on other threads. A plan already runs its slices one at a time and a chain its steps, and the guard is for competing threads. [ADR 0045](adr/0045-the-orchestrator-proposes-and-the-controller-assigns.md) records this.
+One turn runs on a family at a time across threads. A message for a family that is answering in another thread waits in its own thread's queue, which holds up to 8, and starts when that turn ends. An Ask starts at once: it reads only and opens a session nobody resumes, so the guard does not hold it, and it runs beside the thread's own turn ([ADR 0050](adr/0050-a-side-question-runs-beside-the-active-turn.md)). Requests for different families in different threads do not wait on each other. Within one thread a new message always waits for the running turn. Plan slices and the review chain's turns start when their step comes and do not wait on other threads. A plan already runs its slices one at a time and a chain its steps, and the guard is for competing threads. [ADR 0045](adr/0045-the-orchestrator-proposes-and-the-controller-assigns.md) records this.
 
 ### Attachment delivery
 

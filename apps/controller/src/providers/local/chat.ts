@@ -791,7 +791,13 @@ function startLocalTurn(
   const { turnId } = request;
   const abort = new AbortController();
   const groups: number[] = [];
-  const pending = new Map<string, (choice: string | null) => void>();
+  const pending = new Map<
+    string,
+    (
+      choice: string | null,
+      by?: Extract<AgentEvent, { type: 'permission.resolved' }>['answeredBy'],
+    ) => void
+  >();
   const grants = new Set<'edit' | 'command'>();
   // The thread's policy can narrow during the turn, and later calls follow it.
   let limit = { policy: request.permissionPolicy, grants: request.permissionGrants ?? [] };
@@ -920,10 +926,16 @@ function startLocalTurn(
         : `${tool.title} in the scratch copy?`;
     // Register before emitting, so an answer given from inside `emit` still lands.
     const answer = new Promise<string>((resolve) => {
-      pending.set(requestId, (choice) => {
+      pending.set(requestId, (choice, by) => {
         pending.delete(requestId);
         const known = PERMISSION_OPTIONS.find((option) => option.id === choice);
-        emit({ type: 'permission.resolved', turnId, requestId, choice: known?.id ?? 'deny' });
+        emit({
+          type: 'permission.resolved',
+          turnId,
+          requestId,
+          choice: known?.id ?? 'deny',
+          ...(by ? { answeredBy: by } : {}),
+        });
         resolve(known?.kind ?? 'deny');
       });
     });
@@ -935,9 +947,10 @@ function startLocalTurn(
       question: question.slice(0, 4096),
       detail: tool.detail === null ? null : fitBytes(tool.detail, 16_384),
       options: PERMISSION_OPTIONS,
+      kind: tool.kind,
     });
-    // Thread grant: answer at once, so the thread still shows the request and the choice.
-    if (granted) pending.get(requestId)?.('allow-thread');
+    // Thread grant: answer at once. The answer names the grant, so the thread shows a line.
+    if (granted) pending.get(requestId)?.('allow-thread', 'thread-grant');
     return answer;
   };
 

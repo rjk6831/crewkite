@@ -28,7 +28,8 @@ Balanced starts every builder turn with the client set to ask each time, and the
 
 Three things apply to every row:
 
-- Allow for this thread records a kind of action, such as commands or edits, and answers it in later turns. It never covers a tool CrewKite cannot classify and never covers a file outside the scratch copy. Choosing Ask each time again clears the grants.
+- Allow for this thread records a kind of action, such as commands or edits, and answers it in later turns. It never covers a tool CrewKite cannot classify and never covers a file outside the scratch copy. Choosing Ask each time again clears the grants. An ask of an allowed kind that still comes to me says why on its card, such as "Asked because the command runs outside the scratch copy."
+- An ask answered without me shows as one muted line under its tool card, such as "Allowed for this thread" or "Allowed: read-only command in the scratch copy". A full card means I am asked, or I answered.
 - Under Allow all with the Anthropic client, every command and tool call the model proposes runs without a question, network fetches included. The sandbox that limits OpenAI is not there. [Provider routes](providers.md#anthropic) says more.
 - A delete counts as an edit under Allow edits and Allow all when its path lies inside the copy. Only Balanced asks about deletes. The OpenAI and Google clients report a delete in their own change type. The Anthropic client deletes through shell commands, which Balanced already asks about.
 
@@ -40,4 +41,4 @@ The reviewer, advisor, challenger, orchestrator, the side question and a read-on
 - Anthropic allows Read, Grep and Glob and declines any ask.
 - Google and Local refuse writes in the adapter.
 
-A turn that only reads can run while another turn does. The controls above describe the builder, so they hold whichever role runs beside it.
+A turn that only reads can run while another turn does. A side question starts at once beside the builder, even while the builder waits on an ask, and leaves that ask to me ([ADR 0050](adr/0050-a-side-question-runs-beside-the-active-turn.md)). The controls above describe the builder, so they hold whichever role runs beside it.

@@ -196,6 +196,11 @@ const scripts = {
     done('failed', given.error ?? limit),
   ],
   reply: () => [['item/completed', { ...ids(), item: message('message-1', 'Hello.') }], done()],
+  // A server request CrewKite has no answer for, then the client's own stop on its denial limit.
+  denials: () => [
+    { id: 0, method: 'item/tool/requestUserInput', params: { ...ids(), itemId: 'command-1' } },
+    done('interrupted', { message: 'Too many denials in this turn.', codexErrorInfo: 'tooManyDenials' }),
+  ],
   // A read-only command on a file outside the scratch copy, as one OpenAI turn ran it (H11).
   'outside-read': () => [
     ['item/started', { ...ids(), item: { ...command, command: "/bin/zsh -lc \"sed -n '46,51p' /Users/raykraft/.codex/memories/MEMORY.md\"", cwd: given.cwd } }],
@@ -535,6 +540,7 @@ test('a command approval holds the turn until respondPermission answers it', asy
     {
       type: 'permission.requested',
       requestId: 'approval-1',
+      kind: 'command',
       callId: 'command-1',
       question: 'Run this command?',
       detail: 'pnpm test\n\nRuns the test suite.',
@@ -562,28 +568,42 @@ test('a command approval holds the turn until respondPermission answers it', asy
 
 test('a command kind the thread allows is answered without asking only inside the scratch copy', async () => {
   // Every row holds a command grant. Only a command run from inside the copy is answered from it,
-  // with no respondPermission call. A network prompt names its host and goes to the person under
-  // every policy.
+  // with no respondPermission call, and the answer names the grant. A network prompt names its
+  // host and goes to the person under every policy. An ask the grant did not cover says why.
   const network = {
     question: 'Allow network access to registry.npmjs.org over HTTPS?',
     detail: 'Host: registry.npmjs.org\nProtocol: HTTPS\n\npnpm test\n\nRuns the test suite.',
   };
+  const offline = 'Asked because it needs network access.';
   const rows: Array<{
     policy?: ChatPermissionPolicy;
     detail: { cwd?: string; network?: boolean };
     answered: string[];
     decision: string;
     asked?: { question: string; detail: string };
+    reason?: string;
   }> = [
-    { detail: { cwd: '.' }, answered: ['allow-thread'], decision: 'acceptForSession' },
-    { detail: { cwd: '..' }, answered: [], decision: 'decline' },
-    { detail: { network: true }, answered: [], decision: 'decline', asked: network },
+    { detail: { cwd: '.' }, answered: ['allow-thread thread-grant'], decision: 'acceptForSession' },
+    {
+      detail: { cwd: '..' },
+      answered: [],
+      decision: 'decline',
+      reason: 'Asked because the command runs outside the scratch copy.',
+    },
+    {
+      detail: { network: true },
+      answered: [],
+      decision: 'decline',
+      asked: network,
+      reason: offline,
+    },
     {
       policy: 'allow-all',
       detail: { network: true },
       answered: [],
       decision: 'decline',
       asked: network,
+      reason: offline,
     },
   ];
   for (const row of rows) {
@@ -594,8 +614,9 @@ test('a command kind the thread allows is answered without asking only inside th
     });
     const asked = await run.when('permission.requested');
     if (row.asked) assert.deepEqual({ question: asked.question, detail: asked.detail }, row.asked);
+    assert.equal(asked.reason, row.reason, JSON.stringify(row));
     const answered = run.events.flatMap((event) =>
-      event.type === 'permission.resolved' ? [event.choice] : [],
+      event.type === 'permission.resolved' ? [`${event.choice} ${event.answeredBy}`] : [],
     );
     assert.deepEqual(answered, row.answered, JSON.stringify(row));
     if (!answered.length) run.handle.respondPermission(asked.requestId, 'deny');
@@ -753,6 +774,22 @@ test('an unknown notification goes to the turn trace and never the thread, and t
   );
   assert.equal(result.stopReason, 'done');
   assert.equal(result.assistantText, 'Done.');
+});
+
+test('a turn Codex stops on its own says why, and so does a question CrewKite cannot answer', async () => {
+  const run = turn('denials');
+  const result = await run.settled();
+  assert.equal(result.stopReason, 'stopped');
+  assert.equal(result.failure?.message, 'Codex interrupted the turn (too many denials).');
+  assert.equal(result.failure?.providerMessage, 'Too many denials in this turn.');
+  assert.deepEqual(
+    run.events.flatMap((event) =>
+      event.type === 'provider.notice' && !event.trace ? [event.message] : [],
+    ),
+    [
+      'Codex asked a question CrewKite cannot answer (item/tool/requestUserInput). The turn may stop.',
+    ],
+  );
 });
 
 test('only a used-up plan ends the turn as a limit with the reset time, and only a turn that sent an image names it in a bad request', async () => {

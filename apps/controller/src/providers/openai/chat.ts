@@ -1150,10 +1150,36 @@ class OpenAiChatTurn {
     this.approvals.set(answerId, requestId);
     this.approvalKinds.set(answerId, kind);
     this.approvalRequests.set(answerId, { request, requested: null });
+    // From here every automatic answer covers the scratch copy only. A change with no reported
+    // paths, a path or grant root outside scratch, or a command with no cwd or a cwd outside it
+    // goes to the person.
+    const paths = callId ? (this.edits.get(callId) ?? []) : [];
+    const grantRoot = value?.grantRoot ? this.local(value.grantRoot) : '';
+    const contained =
+      kind === 'edit'
+        ? paths.length > 0 && paths.every((entry) => entry.inside) && grantRoot !== null
+        : !!value?.cwd && this.local(value.cwd) !== null;
+    // A kind the thread allowed that still reaches the person says why on the card.
+    const reason =
+      this.request.readOnly || !threadGrant(this.request, kind, this.allowed)
+        ? null
+        : network
+          ? 'Asked because it needs network access.'
+          : contained
+            ? null
+            : kind === 'command'
+              ? value?.cwd
+                ? 'Asked because the command runs outside the scratch copy.'
+                : 'Asked because no working folder was reported.'
+              : paths.length
+                ? 'Asked because the change reaches outside the scratch copy.'
+                : 'Asked because the change named no files.';
     this.send({
       type: 'permission.requested',
       turnId: this.request.turnId,
       requestId: answerId,
+      kind,
+      ...(reason ? { reason } : {}),
       callId,
       question: network
         ? `Allow network access to ${host}${protocol ? ` over ${protocol}` : ''}?`
@@ -1174,29 +1200,22 @@ class OpenAiChatTurn {
         kind === 'command' &&
         !network &&
         scratchCommand(call, this.request.scratch.directory);
-      return this.answer(answerId, inside ? 'allow-once' : 'deny');
+      return this.answer(answerId, inside ? 'allow-once' : 'deny', 'read-only');
     }
     // Network access reaches past the scratch copy, and no policy or grant covers a host, so the
     // person decides each one.
     if (network) return;
     // allow-all answers every command. Edits land only in the scratch copy, so under allow-all an
     // edit passes the same check as under allow-edits.
-    if (policy === 'allow-all' && kind === 'command') return this.answer(answerId, 'allow-once');
-    // From here every automatic answer covers the scratch copy only. A change with no reported
-    // paths, a path or grant root outside scratch, or a command with no cwd or a cwd outside it
-    // goes to the person.
-    const paths = callId ? (this.edits.get(callId) ?? []) : [];
-    const grantRoot = value?.grantRoot ? this.local(value.grantRoot) : '';
-    const contained =
-      kind === 'edit'
-        ? paths.length > 0 && paths.every((entry) => entry.inside) && grantRoot !== null
-        : !!value?.cwd && this.local(value.cwd) !== null;
+    if (policy === 'allow-all' && kind === 'command')
+      return this.answer(answerId, 'allow-once', 'policy');
     if (!contained) return;
     if ((policy === 'allow-edits' || policy === 'allow-all') && kind === 'edit')
-      return this.answer(answerId, 'allow-once');
+      return this.answer(answerId, 'allow-once', 'policy');
     // Thread grant: the person allowed this kind for the whole thread. Both events still go out,
-    // so the thread shows what was allowed and why nobody was asked.
-    if (threadGrant(this.request, kind, this.allowed)) this.answer(answerId, 'allow-thread');
+    // and the answer names the grant, so the thread shows a line in place of a question.
+    if (threadGrant(this.request, kind, this.allowed))
+      this.answer(answerId, 'allow-thread', 'thread-grant');
   }
 
   /**
@@ -1225,10 +1244,15 @@ class OpenAiChatTurn {
       detail: clip(detail, 16_384),
       options: OPTIONS.filter((option) => option.kind !== 'allow-thread'),
     });
-    if (this.request.readOnly) this.answer(answerId, 'deny');
+    if (this.request.readOnly) this.answer(answerId, 'deny', 'read-only');
   }
 
-  private answer(requestId: string, choice: string) {
+  /** `by` names an answer the adapter gave on its own. CrewKite's own answers leave it out. */
+  private answer(
+    requestId: string,
+    choice: string,
+    by?: Extract<AgentEvent, { type: 'permission.resolved' }>['answeredBy'],
+  ) {
     const target = this.approvals.get(requestId);
     const decision = DECISIONS.get(choice);
     if (target === undefined || !decision || this.outcome) return;
@@ -1248,7 +1272,13 @@ class OpenAiChatTurn {
           ? permissionsReply(decision === 'decline' ? null : asked.requested)
           : approvalReply(decision),
     });
-    this.send({ type: 'permission.resolved', turnId: this.request.turnId, requestId, choice });
+    this.send({
+      type: 'permission.resolved',
+      turnId: this.request.turnId,
+      requestId,
+      choice,
+      ...(by ? { answeredBy: by } : {}),
+    });
   }
 
   private notification(method: string, params: unknown) {
@@ -1325,12 +1355,18 @@ class OpenAiChatTurn {
       case 'turn/completed': {
         const turn = turnDone.safeParse(params).data?.turn;
         if (turn?.id && this.turnId && turn.id !== this.turnId) return;
+        // Codex interrupts a turn on its own after too many denied asks, among other reasons.
+        // The error it sends is the only place the reason lives.
         if (turn?.status === 'interrupted')
           return this.fail(
             chatFailure({
               stage: 'stream',
               kind: 'stopped',
-              message: 'Codex interrupted the turn.',
+              message:
+                turn.error?.codexErrorInfo === 'tooManyDenials'
+                  ? 'Codex interrupted the turn (too many denials).'
+                  : 'Codex interrupted the turn.',
+              providerMessage: turn.error?.message ? clip(turn.error.message, 16_384) : null,
             }),
           );
         if (this.terminal !== undefined || turn?.status === 'failed')

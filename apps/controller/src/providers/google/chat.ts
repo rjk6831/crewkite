@@ -1157,6 +1157,7 @@ export function googleChatAdapter(deps: {
             ? (options.find((option) => option.kind === 'allow-thread') ?? allow)
             : undefined;
         const automatic = refuses ? reject : (granted ?? permitted);
+        const by = refuses ? 'read-only' : granted ? 'thread-grant' : 'policy';
         const requestId = `${turnId}:permission:${++permissionCount}`;
         const detail = permissionDetail(call.rawInput, call.paths, scratch);
         if (!automatic)
@@ -1181,11 +1182,22 @@ export function googleChatAdapter(deps: {
           detail,
           options,
           ...(call.deletes ? { deletes: true as const } : {}),
+          kind: call.kind,
+          // A grant covers the scratch copy only, so the card says why this one asks.
+          ...(!automatic && call.outside && limit.grants.includes(call.kind)
+            ? { reason: 'Asked because it touches paths outside the scratch copy.' }
+            : {}),
         });
         if (automatic) {
           if (refuses) call.denied = true;
           reply(live, id, { outcome: { outcome: 'selected', optionId: automatic.id } });
-          send({ type: 'permission.resolved', turnId, requestId, choice: automatic.id });
+          send({
+            type: 'permission.resolved',
+            turnId,
+            requestId,
+            choice: automatic.id,
+            answeredBy: by,
+          });
         }
       }
 

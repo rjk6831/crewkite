@@ -964,7 +964,13 @@ function startTurn(
         model: typeof input.model === 'string' ? input.model : null,
       });
   };
-  const answer = (requestId: string, ask: Ask, choice: string) => {
+  /** `by` names an answer the adapter gave on its own. CrewKite's own answers leave it out. */
+  const answer = (
+    requestId: string,
+    ask: Ask,
+    choice: string,
+    by?: Extract<AgentEvent, { type: 'permission.resolved' }>['answeredBy'],
+  ) => {
     const allow = choice === 'allow-once' || choice === 'allow-thread';
     if (choice === 'allow-thread') allowed.add(ask.toolName);
     if (!allow && ask.callId) denied.add(ask.callId);
@@ -978,7 +984,13 @@ function startTurn(
           : { behavior: 'deny', message: 'The user declined this action.' },
       },
     });
-    send({ type: 'permission.resolved', turnId, requestId, choice: allow ? choice : 'deny' });
+    send({
+      type: 'permission.resolved',
+      turnId,
+      requestId,
+      choice: allow ? choice : 'deny',
+      ...(by ? { answeredBy: by } : {}),
+    });
   };
 
   const onInit = (value: unknown) => {
@@ -1215,19 +1227,19 @@ function startTurn(
     const mcp = mcpToolAnswer(request.mcp, toolName);
     // Review and advice turns read only. Those three tools never ask, so any ask is declined.
     // Edits land only in the scratch copy, so allow-all sends an edit outside it to the person.
-    const automatic = request.readOnly
-      ? 'deny'
+    const [automatic, by] = request.readOnly
+      ? (['deny', 'read-only'] as const)
       : mcp !== null
         ? mcp === 'allow'
-          ? 'allow-once'
+          ? (['allow-once', 'policy'] as const)
           : allowed.has(toolName)
-            ? 'allow-thread'
-            : null
+            ? (['allow-thread', 'thread-grant'] as const)
+            : [null, undefined]
         : policy === 'allow-all' && (kind !== 'edit' || inside)
-          ? 'allow-once'
+          ? (['allow-once', 'policy'] as const)
           : granted
-            ? 'allow-thread'
-            : null;
+            ? (['allow-thread', 'thread-grant'] as const)
+            : [null, undefined];
     // The ask is open before the event goes out, so an answer given from inside the
     // controller's event handler still finds it.
     if (!automatic) asks.set(requestId, entry);
@@ -1240,8 +1252,13 @@ function startTurn(
       // The input came from JSON.parse, so it serializes again without throwing.
       detail: clip(JSON.stringify(input, null, 2), 16_384),
       options,
+      kind,
+      // An edit grant covers the scratch copy only, so the card says why this one asks.
+      ...(!automatic && kind === 'edit' && !inside && grants.includes('edit')
+        ? { reason: 'Asked because the file is outside the scratch copy.' }
+        : {}),
     });
-    if (automatic) answer(requestId, entry, automatic);
+    if (automatic) answer(requestId, entry, automatic, by);
   };
   const onCancel = (value: unknown) => {
     const parsed = cancel.safeParse(value);

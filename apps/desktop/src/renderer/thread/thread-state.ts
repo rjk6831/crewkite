@@ -381,6 +381,8 @@ export function threadItems(state: ThreadState): ThreadItem[] {
   for (const turn of Object.values(state.turnMeta))
     if (turn.slice !== undefined) briefs.set(turn.userMessageId, turn.id);
   const briefOf = new Map<string, string>();
+  // The controller writes one line for each stop, saying why. It shows on the turn it names.
+  const stopNotes = new Map<string, string>();
   for (const message of state.messages) {
     const order = BigInt(message.cursor) * STEP;
     const sliceTurn = message.author.kind === 'user' ? briefs.get(message.id) : undefined;
@@ -399,6 +401,12 @@ export function threadItems(state: ThreadState): ThreadItem[] {
         },
       });
     else if (message.author.kind === 'assistant') replies.set(message.author.turnId, message);
+    else if (
+      message.author.turnId &&
+      message.text.startsWith('Stopped: ') &&
+      (state.turnMeta[message.author.turnId] || state.turns[message.author.turnId])
+    )
+      stopNotes.set(message.author.turnId, message.text);
     else if (!message.author.turnId || !failed.has(message.author.turnId))
       rows.push({
         order,
@@ -454,6 +462,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     const stats = base.stats ?? meta?.stats ?? null;
     const outputLimit = base.outputLimit ?? meta?.outputLimit ?? null;
     const brief = briefOf.get(id);
+    const stopNote = stopNotes.get(id);
     const turn: TurnView = {
       ...base,
       identity,
@@ -464,6 +473,7 @@ export function threadItems(state: ThreadState): ThreadItem[] {
       stats,
       outputLimit,
       ...(brief ? { brief } : {}),
+      ...(stopNote ? { stopNote } : {}),
     };
     const asked = meta && byId.get(meta.userMessageId);
     const firstCursor = record?.events[0]?.cursor ?? null;
@@ -508,8 +518,14 @@ export function pausedQueueLine(count: number): string | null {
 
 export function activeTurnId(state: ThreadState): string | null {
   const candidates = [state.thread?.activeTurnId ?? null, ...Object.keys(state.turns)];
+  // A side question runs beside the thread's turn and has a Stop of its own on its row, so the
+  // composer's Stop and Send never point at it.
+  const side = (id: string) =>
+    id !== state.thread?.activeTurnId &&
+    (state.turnMeta[id]?.role ?? state.turns[id]?.view.identity?.role) === 'ask' &&
+    state.turnMeta[id]?.slice === undefined;
   for (const id of candidates) {
-    if (!id) continue;
+    if (!id || side(id)) continue;
     const record = state.turns[id];
     if (record) {
       if (!record.view.ended) return id;
