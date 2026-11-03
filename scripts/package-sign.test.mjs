@@ -184,12 +184,14 @@ test('macOS release signing freezes signed hashes before the outer seal and refu
         }
       }
       if (tool.endsWith('/codesign') && args.includes('--display')) {
-        if (args.includes('--entitlements'))
+        if (args.includes('--entitlements')) {
+          assert.ok(args.includes('--xml'));
           return {
             status: 0,
             stderr: '',
             stdout: `<plist><dict>${signatures.get(path) ? '<key>com.apple.security.cs.allow-jit</key><true/>' : ''}${scenario === 'extra-entitlement' ? '<key>com.apple.security.get-task-allow</key><true/>' : ''}</dict></plist>`,
           };
+        }
         return {
           status: 0,
           stdout: '',

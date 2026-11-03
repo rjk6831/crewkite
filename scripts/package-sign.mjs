@@ -615,6 +615,7 @@ export async function signPackage(
         '--display',
         '--entitlements',
         '-',
+        '--xml',
         path,
       ]);
       const keys = [...entitlements.stdout.matchAll(/<key>([^<]+)<\/key>/g)].map(
