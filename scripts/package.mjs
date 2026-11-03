@@ -367,20 +367,34 @@ export async function packageDesktop() {
       throw new Error(`The committed package input must be a regular file: ${path}.`);
   const lockHash = hash(join(checkout, 'pnpm-lock.yaml'));
   const workspaces = [...toolchainWorkspaces];
-  const copyBudget = {
-    deadline: Date.now() + 120000,
-    now: Date.now,
-    maximumEntries: 500000,
-    maximumBytes: 8 * 1024 * 1024 * 1024,
+  // Each bounded phase gets its own deadline, started when the phase starts. One shared deadline
+  // ran out during the dependency copy on a Mac and would also have carried the time spent
+  // compiling into the later staging phases. The entry and byte limits are the same per phase.
+  const phase = (name, minutes) => {
+    const started = Date.now();
+    return {
+      deadline: started + minutes * 60000,
+      now: Date.now,
+      maximumEntries: 500000,
+      maximumBytes: 8 * 1024 * 1024 * 1024,
+      done: () =>
+        console.log(`Package phase ${name}: ${Math.round((Date.now() - started) / 1000)} s`),
+    };
   };
   // The existing installation has already passed repository checks. No lifecycle code runs here.
-  const dependencies = await inspectInstalledDependencies(source, workspaces, copyBudget);
+  // The copy inspects the donor, copies, inspects the donor again and inspects the destination,
+  // four passes over about 19,000 files, so it gets the largest allowance.
+  const inspection = phase('dependency inspection', 5);
+  const dependencies = await inspectInstalledDependencies(source, workspaces, inspection);
+  inspection.done();
+  const dependencyCopy = phase('dependency copy', 15);
   const { buildDependencies } = await copyInstalledDependencies(
     source,
     checkout,
     dependencies,
-    copyBudget,
+    dependencyCopy,
   );
+  dependencyCopy.done();
   function validateLinks(directory) {
     for (const name of readdirSync(directory)) {
       const path = join(directory, name);
@@ -585,6 +599,7 @@ export async function packageDesktop() {
   mkdirSync(join(runtime, 'node_modules/@biomejs'), { recursive: true });
   copyPackagePayload(biome, join(runtime, 'node_modules/@biomejs/biome'), ['node_modules']);
   copyPackagePayload(biomeBinary, join(runtime, 'node_modules', biomePlatformPackage));
+  const runtimeStaging = phase('runtime package staging', 5);
   const runtimePackages = await copyRuntimePackages({
     source: checkout,
     from: 'apps/controller/package.json',
@@ -620,10 +635,13 @@ export async function packageDesktop() {
       { name: 'has-flag', version: '4.0.0', edges: [], license: 'license' },
       { name: 'color-name', version: '1.1.4', edges: [], license: 'LICENSE' },
     ],
-    budget: copyBudget,
+    budget: runtimeStaging,
   });
+  runtimeStaging.done();
   // Ink, React and the renderer modules the interactive CLI imports, in a store under apps/cli.
-  const cliRuntime = await stageCliRuntime({ source: checkout, runtime, budget: copyBudget });
+  const cliStaging = phase('CLI runtime staging', 5);
+  const cliRuntime = await stageCliRuntime({ source: checkout, runtime, budget: cliStaging });
+  cliStaging.done();
   for (const entry of verificationFiles) {
     const from = join(checkout, entry.path);
     const to = join(runtime, entry.path);
@@ -784,7 +802,7 @@ export async function packageDesktop() {
         arch: process.arch,
         version: CREWKITE_VERSION,
         icon: join(checkout, 'apps/desktop/resources/crewkite-256.png'),
-        budget: copyBudget,
+        budget: phase('Linux assembly', 5),
       })
     : values.installed
       ? assembleInstalledPackage({
