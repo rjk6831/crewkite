@@ -729,14 +729,24 @@ export async function packageDesktop() {
   ])
     inside(join(stage, entry));
   const installed = values.installed
-    ? assembleInstalledPackage({ stage, version: CREWKITE_VERSION })
+    ? assembleInstalledPackage({
+        stage,
+        version: CREWKITE_VERSION,
+        icon: join(checkout, 'apps/desktop/resources/CrewKite.icns'),
+      })
     : undefined;
   if (installed) {
     for (const entry of installed.requiredEntries) inside(join(stage, entry));
     for (const item of notices)
       item.license = `CrewKite.app/Contents/Resources/distribution/${item.license}`;
   }
-  const app = installed?.app ?? brandMacPackage({ stage, version: CREWKITE_VERSION });
+  const app =
+    installed?.app ??
+    brandMacPackage({
+      stage,
+      version: CREWKITE_VERSION,
+      icon: join(checkout, 'apps/desktop/resources/CrewKite.icns'),
+    });
   sealElectronBundle(app);
   const finalRuntime = installed?.runtime ?? runtime;
   const finalManifest = RuntimeManifestSchema.parse(json(join(finalRuntime, 'manifest.json')));
