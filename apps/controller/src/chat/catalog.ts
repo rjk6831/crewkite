@@ -47,6 +47,12 @@ export type ChatCatalogInput = {
   /** What the Google client's last initialize declared in this controller's life, or null. */
   googlePrompt?: GooglePromptCapabilities | null;
   local: LocalSetup;
+  /**
+   * The families the person connected on this device, from the connected-once receipts. A client
+   * that is installed and signed in elsewhere is not connected in CrewKite until the person
+   * presses Connect, so a cloud family outside this list is never ready.
+   */
+  connectedOnce: readonly ChatFamily[];
   /** The vision flag the runtime reported for a model at the last Local connect, or null. */
   localVision?: { modelKey: string; vision: boolean } | null;
   /**
@@ -249,16 +255,21 @@ function local(input: ChatCatalogInput): Entry {
 function entry(
   input: ChatCatalogInput,
   family: ChatFamily,
-  connected: boolean,
+  available: boolean,
   reason: string | undefined,
   models: Model[],
   defaultModel: string | undefined,
 ): Entry {
   const windows = remaining(input, family);
+  // Connect is explicit. A client found on the machine only makes the family available to
+  // connect, and the rail and picker show Connect for it until the person presses it.
+  const explicit = input.connectedOnce.includes(family);
+  const awaiting = available && !explicit;
+  const connected = available && explicit;
   return {
     family,
     connected,
-    reason: connected ? null : (reason ?? 'not-configured'),
+    reason: connected ? null : awaiting ? 'connect-required' : (reason ?? 'not-configured'),
     models: [...new Map(models.map((model) => [model.model, model])).values()].slice(0, 64),
     defaultModel: connected ? (defaultModel ?? null) : null,
     remaining: windows,
@@ -267,7 +278,7 @@ function entry(
     // composer cannot use it yet. The Google reader waits for Connect, and the rail draws no
     // Google bars before it. A percent from before a reset says nothing about the account now,
     // so it does not count.
-    needsConnect: !connected && windows.some((window) => window.percent !== null),
+    needsConnect: awaiting || (!connected && windows.some((window) => window.percent !== null)),
     lastTurnStats: lastTurnStats(input, family),
     accepts: null,
   };

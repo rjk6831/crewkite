@@ -16,6 +16,9 @@ import {
 } from './model-catalog.ts';
 import { unavailableRepositoryProfile } from './profile.ts';
 
+// Families connected in CrewKite, so these cases test what each client reports.
+const everyFamily = ['openai', 'anthropic', 'google', 'local'] as const;
+
 const peer = `
 const { createInterface } = require('node:readline');
 if (process.argv[2] === 'features') {
@@ -189,6 +192,7 @@ test('OpenAI catalog refresh retains only advertised pairs, hidden ones flagged 
           reason: 'unconfigured',
         }),
         windows: [],
+        connectedOnce: everyFamily,
         nowMs: 0,
       }).families;
     const accepts = (openAiModels: Parameters<typeof buildChatCatalog>[0]['openAiModels']) =>

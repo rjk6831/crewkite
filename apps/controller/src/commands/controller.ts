@@ -606,6 +606,9 @@ export class Controller {
       anthropicModels: this.anthropicModelRows,
       googlePrompt: this.googlePrompt,
       local: this.localSetup(),
+      connectedOnce: (['openai', 'anthropic', 'google', 'local'] as const).filter((family) =>
+        this.store.hasConnectedOnce(family),
+      ),
       localVision: this.localVision,
       windows: [
         ...this.store.list<Observation>('window').map((observation) => ({
