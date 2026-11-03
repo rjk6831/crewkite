@@ -2,7 +2,7 @@
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="apps/desktop/src/renderer/assets/crewkite-wordmark-inverse.png">
-  <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="107">
+  <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="109">
 </picture>
 
 CrewKite is a local workspace for the coding agents you already pay for. It runs the OpenAI, Anthropic and Google clients, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
