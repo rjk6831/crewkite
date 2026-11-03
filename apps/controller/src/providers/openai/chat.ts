@@ -652,12 +652,12 @@ class OpenAiChatTurn {
       this.codex = features(launch.version);
       const executable = verifiedClient(launch);
       step = 'storage';
-      const directory = privateStorage(launch);
       const env = withGitCeiling(
         nativeDiscoveryEnvironment(launch.environment),
         this.request.scratch.directory,
       );
       prepareCodexHome(env);
+      const directory = privateStorage(launch);
       step = 'spawn';
       this.settings = chatLaunchSettings(directory, this.request);
       const args = launchArguments(this.settings);

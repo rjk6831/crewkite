@@ -6,7 +6,7 @@ This file lists what changed in each release, newest first. A release is tagged 
 
 ### 0.1.0
 
-This version gathers rc-05, rc-05+ and rc-05++. Every package.json and the version CrewKite reports carry the same number.
+This version gathers the preview rounds through the provider connection and responsiveness corrections. Every package.json and the version CrewKite reports carry the same number. Installed release qualification remains pending.
 
 rc-05
 
@@ -52,14 +52,14 @@ rc-05++
 - I cut the thread history sent to a Local model to the room its prompt has left.
 - I held git to the scratch copy for every client and check.
 - I back up the database before a migration, and keep the newest backup when I prune.
-- I released the message queue after a restart, and made Stop report how many messages it cleared.
+- I released the message queue after a restart. Stop keeps queued messages paused and reports how many are waiting.
 - I made the shared redaction close more secret shapes, and made a crash capture leave the way a process fails unchanged.
 - I made the Anthropic turn refuse a pre-placed `mcp.json` or link.
 - I kept a gauge row for every provider, put the Google terms checkbox inline with its label, and showed Ctrl K for search off macOS.
 - I skipped the welcome for anyone who already has a project.
-- I let chat accept a range of client builds within the tested major version, and named the found version on each provider card.
+- I let chat accept a range of client builds within the tested major version, and named the found version on each provider card. The later OpenAI protocol checks below replace that family's version gate.
 - I added a Linux preview from source for OpenAI, Anthropic and Local, with Linux CI.
-- I moved the `--json` lines to `v: 3`, because this version added fields to the thread, turn and event shapes they embed.
+- I versioned the `--json` lines with the thread, turn and event shapes they embed. The current line version is `v: 6`.
 - I removed the 100,000-file cap on a thread's scratch copy and check free disk space before the copy instead.
 - I made the Local search cover every file and say how many were too large to search, and let it read lines of a file of any size.
 - I made pasted text longer than one message go in as a file.
@@ -67,4 +67,34 @@ rc-05++
 - I let effort levels be any name a client reports, so a new level needs no release.
 - I showed the subagents a provider client starts under the tool call that started them, with a live count on the turn chip and each subagent's latest action on the card.
 - I made a client item or tool call that CrewKite has no reader for show as a card.
-- I added an Allow subagents switch to each crew role that passes each client's own control, on by default for Anthropic and Google and off for OpenAI until a live check confirms its child approvals.
+- I added an Allow subagents switch to each crew role that passes each client's own control. It is now on by default for every family after the OpenAI child approval check.
+
+d3-rc5
+
+- I made one Google Connect follow download, verification, initialization, sign-in and model discovery, with progress and retries at the failed step. Google quota reads wait for connection.
+- I moved saved crews and the default crew into the controller, and added the same `/model` and `/crew` pickers to the CLI.
+- I kept read-only commands inside the scratch copy and assigned plan slices to the crew's models, with the fixer taking a hard slice and Local taking work only through a Local crew role. Only an explicit exclusion in the message rules out a provider.
+- I made Local Connect probe the saved endpoint, ask for a token only when needed and show a model pick while it is being saved.
+
+d3-rc7
+
+- I kept provider setup responsive while Google client verification runs and reused the verified cached client on reconnect.
+- I made Local Connect use the prefilled loopback endpoint, choose the only loaded eligible model and wait for a model read already running.
+- I made Allow for this thread answer later asks of the same kind during the running turn, under the same scratch-copy checks.
+- I named Google's extra allowance windows Non-Gemini models, 5 h and Non-Gemini models, weekly, and kept the smaller model gauge visible.
+
+Follow-up fixes (#125)
+
+- I kept Google import checks valid while unrelated work changes the controller home's directory times, with the managed client bytes and identity still checked.
+- I retried the first OpenAI quota read once when it stops early, and made the card name a read that did not finish.
+- I retried one slow workspace read after setup before showing its error.
+
+d3-rc11
+
+- I required an explicit first Connect per provider on each device. Later launches reconnect the providers already connected, using the saved endpoint and each client's sign-in.
+- I gave OpenAI its own client home and sign-in flow on the provider card. CrewKite's saved writer threads use the person's first line as their name and stay out of the person's own client app.
+- I checked OpenAI requests against the client's protocol. A named read-only permission profile must be proven by the reply; another reply uses the read-only fallback with scratch command checks and permission asks.
+- I ran side questions beside the builder, kept a reason on every stopped turn and folded automatic permission answers under their tool cards.
+- I made Local setup safe to send again and kept its card clear of uncertain command receipts.
+- I moved large client digests to a worker, checked Google's two files once per connect and ran their signature checks together. Google progress names the file being checked, elapsed time and the retry count.
+- I added descriptions to Flight mode and Permissions and account-free protocol checks for provider client changes.

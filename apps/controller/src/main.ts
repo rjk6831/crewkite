@@ -32,6 +32,7 @@ import {
   resolveRepositoryProfile,
 } from './providers/openai/profile.ts';
 import { serve } from './server/index.ts';
+import { assertSchemaCompatibility } from './store/schema-compatibility.ts';
 
 function runtimeBytes(path: string, maximum: number) {
   if (realpathSync(path) !== path) throw Error('The packaged runtime path changed.');
@@ -174,6 +175,14 @@ export async function startController(options: ControllerOptions) {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const home = process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite');
+  try {
+    assertSchemaCompatibility(join(home, 'state.sqlite'));
+  } catch (error) {
+    console.error(
+      error instanceof Error ? error.message : 'The database schema could not be checked.',
+    );
+    process.exit(1);
+  }
   installCrashCapture(home);
   startTimingLog(home);
   try {

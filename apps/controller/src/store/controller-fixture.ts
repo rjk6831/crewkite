@@ -132,6 +132,9 @@ async function nativeSetup(
   options: Partial<ControllerOptions> = {},
   targetPath = 'net.mjs',
 ) {
+  mkdirSync(resolve('internal'), { recursive: true });
+  const person = mkdtempSync(join(resolve('internal'), 'native-account-'));
+  const home = options.home ?? join(person, 'home');
   const anthropic = mode.startsWith('anthropic-') || mode === 'combined-quota';
   const google = mode.startsWith('google-');
   const repository = mode.startsWith('repository-');
@@ -175,7 +178,7 @@ async function nativeSetup(
       sha256: fixtureClientHash,
       version: process.version,
     },
-    environment: { ...process.env },
+    environment: { HOME: person, CREWKITE_HOME: home, PATH: process.env.PATH },
     locationHash: '1'.repeat(64),
   } satisfies NativeProfileResolution;
   const repositoryFields = unavailableRepositoryProfile().facts;
@@ -254,6 +257,7 @@ async function nativeSetup(
           }
         : reviewerProfile;
   const nativeOptions: Partial<ControllerOptions> = {
+    home,
     ...(anthropic || google || repository
       ? { nativeProfiles: () => [reviewerProfile, fixtureProfile] }
       : { nativeProfile: () => fixtureProfile }),
@@ -535,6 +539,7 @@ async function nativeSetup(
     `${mode}/${targetPath}/setup`,
     Promise.resolve().then(() => setup(t, nativeOptions, close)),
   );
+  t.after(() => rmSync(person, { recursive: true, force: true }));
   // A Google writer row prepares a Google run, which the terms gate holds until the person
   // acknowledges the current text and has connected Google once on this device. These rows
   // protect the writer, so the person has done both.

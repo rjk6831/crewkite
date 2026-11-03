@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=CrewKite
+Comment=Desktop workspace for supervised coding
+Exec=/opt/crewkite/crewkite
+Icon=crewkite
+Terminal=false
+Categories=Development;
+StartupWMClass=CrewKite

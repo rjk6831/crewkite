@@ -1,5 +1,6 @@
 import { join } from 'node:path';
-import { app, BrowserWindow, nativeTheme, protocol, screen, session } from 'electron';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
+import { app, BrowserWindow, Menu, nativeTheme, protocol, screen, session } from 'electron';
 import { installThreadAttention } from './attention.ts';
 import { installBridge } from './bridge.ts';
 import { watchRendererCrashes } from './diagnostics.ts';
@@ -11,6 +12,7 @@ import { BoundsStore, clampBounds, MINIMUM_SIZE } from './window-bounds.ts';
 
 let ownedController: DesktopController | null = null;
 async function start() {
+  app.setName('CrewKite');
   protocol.registerSchemesAsPrivileged([
     { scheme: 'app', privileges: { standard: true, secure: true, supportFetchAPI: true } },
   ]);
@@ -43,6 +45,16 @@ async function start() {
     });
     app.on('window-all-closed', () => app.quit());
     await app.whenReady();
+    app.setAboutPanelOptions({ applicationName: 'CrewKite', applicationVersion: CREWKITE_VERSION });
+    Menu.setApplicationMenu(
+      Menu.buildFromTemplate([
+        ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const, label: 'CrewKite' }] : []),
+        { role: 'fileMenu' },
+        { role: 'editMenu' },
+        { role: 'viewMenu' },
+        { role: 'windowMenu' },
+      ]),
+    );
     secureSession(session.defaultSession, join(app.getAppPath(), 'out/renderer'));
     const bounds = new BoundsStore(paths.profile);
     window = new BrowserWindow({

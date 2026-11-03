@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import {
   type NativeProfileResolution,
@@ -18,7 +20,7 @@ const profile = {
     clientVersion: process.version,
   },
   client: { executable: process.execPath, version: process.version, sha256: fixtureClientHash },
-  environment: { ...process.env },
+  environment: {},
   locationHash: '1'.repeat(64),
 } satisfies NativeProfileResolution;
 
@@ -32,17 +34,22 @@ const answering = fixture.replace(
 
 // Every client start the controller makes on its own, counted by the reader that made it.
 async function launchFixture(t: Parameters<typeof setup>[0]) {
+  mkdirSync(resolve('internal'), { recursive: true });
+  const person = mkdtempSync(join(resolve('internal'), 'connect-account-'));
+  const home = join(person, 'home');
+  const ownProfile = { ...profile, environment: { HOME: person, CREWKITE_HOME: home } };
   const started: string[] = [];
   const context = await setup(t, {
+    home,
     // The chat path's profile, so a catalog read would start a model read.
-    nativeProfiles: () => [profile],
+    nativeProfiles: () => [ownProfile],
     nativeSpawn: (executable, args, options) => {
       const phase = args.at(-1) === 'list' ? 'features' : 'app-server';
       started.push(`models ${phase}`);
       return spawn(executable, ['-e', fixture, 'success', phase], options);
     },
     googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
-    openAiUsageClient: () => profile,
+    openAiUsageClient: () => ownProfile,
     registerGoogleAcp: true,
     schedule: () => () => {},
     openAiUsageSpawn: (executable, args, options) => {
@@ -54,6 +61,7 @@ async function launchFixture(t: Parameters<typeof setup>[0]) {
       );
     },
   });
+  t.after(() => rmSync(person, { recursive: true, force: true }));
   const launch = async () => {
     await context.controller.refreshUsage('start');
     await context.controller.refreshUsage('connect');

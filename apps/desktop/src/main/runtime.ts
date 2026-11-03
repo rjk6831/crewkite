@@ -11,9 +11,16 @@ import {
   readSync,
   realpathSync,
 } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
-import { ControllerClient, readControllerEndpoint } from '@crewkite/client/node';
-import { type RuntimeManifest, RuntimeManifestSchema } from '@crewkite/contracts';
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
+import {
+  ControllerClient,
+  type InstalledState,
+  prepareInstalledState,
+  readControllerEndpoint,
+  resolveInstalledState,
+  verifyRuntimeIntegrity,
+} from '@crewkite/client/node';
+import type { RuntimeManifest } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 import { sourceDesktopState } from '../../../../scripts/desktop-state.ts';
 import {
@@ -32,6 +39,7 @@ export type RuntimePaths = {
   controller: string;
   home: string;
   profile: string;
+  installedStateRoot?: string;
 };
 
 function contained(root: string, path: string) {
@@ -72,29 +80,51 @@ export function resolveRuntime(
   environment: NodeJS.ProcessEnv = process.env,
 ): RuntimePaths {
   const appRoot = realpathSync(appPath);
-  const home = environment.CREWKITE_HOME;
-  const profile = environment.CREWKITE_PROFILE;
-  if (!home || !profile || !isAbsolute(home) || !isAbsolute(profile) || home === profile)
-    throw new Error('Choose separate absolute controller home and desktop profile paths.');
+  let home = environment.CREWKITE_HOME ?? '';
+  let profile = environment.CREWKITE_PROFILE ?? '';
+  const requireState = () => {
+    if (!home || !profile || !isAbsolute(home) || !isAbsolute(profile) || home === profile)
+      throw new Error('Choose separate absolute controller home and desktop profile paths.');
+  };
+  let installed: InstalledState | undefined;
+  let installedPayload: string | undefined;
+  let internalToCreate: string | undefined;
   let mode: RuntimeManifest['mode'] = 'demo';
   let stateRoots: string[];
   let root: string;
   let node: string;
-  let expectedHash: string;
+  let expectedHash: string | undefined;
   let platform: string;
   let arch: string;
   if (existsSync(join(appRoot, 'runtime'))) {
     root = contained(appRoot, join(appRoot, 'runtime'));
     stateRoots = [dirname(appRoot)];
-    const manifest = RuntimeManifestSchema.parse(
-      JSON.parse(readRegular(contained(root, join(root, 'manifest.json')), 4096).toString('utf8')),
-    );
+    const verified = verifyRuntimeIntegrity(root);
+    const manifest = verified.manifest;
+    if (manifest.layout === 'installed') {
+      const resources = dirname(appRoot);
+      if (
+        basename(appRoot) !== 'app' ||
+        basename(resources) !== (process.platform === 'darwin' ? 'Resources' : 'resources') ||
+        (process.platform === 'darwin' && basename(dirname(resources)) !== 'Contents')
+      )
+        throw new Error('The installed application layout is invalid.');
+      installedPayload =
+        process.platform === 'darwin' ? dirname(dirname(resources)) : dirname(resources);
+      if (process.platform === 'darwin' && !installedPayload.endsWith('.app'))
+        throw new Error('The installed application bundle is invalid.');
+      if (manifest.mode === 'demo' && (!environment.CREWKITE_HOME || !environment.CREWKITE_PROFILE))
+        throw new Error('An installed demo needs explicit isolated home and profile paths.');
+      installed = resolveInstalledState(environment);
+      home = installed.home;
+      profile = installed.profile;
+    } else requireState();
     mode = manifest.mode;
-    node = contained(root, join(root, 'bin/node'));
-    expectedHash = manifest.node.sha256;
+    node = verified.node;
     platform = manifest.node.platform;
     arch = manifest.node.arch;
   } else {
+    requireState();
     root = realpathSync(resolve(appRoot, '../..'));
     // `pnpm desktop` names the state root of the person's own CrewKite home and runs the real
     // controller. Its state never sits in this checkout's internal folder, which the demo uses.
@@ -104,10 +134,10 @@ export function resolveRuntime(
       stateRoots = [sourceDesktopState(root, ownState, home, profile).root];
     } else {
       const internal = join(root, 'internal');
-      if (!existsSync(internal)) mkdirSync(internal, { mode: 0o700 });
-      if (lstatSync(internal).isSymbolicLink())
+      if (!existsSync(internal)) internalToCreate = internal;
+      else if (lstatSync(internal).isSymbolicLink())
         throw new Error('The source internal directory cannot be a symlink.');
-      stateRoots = [realpathSync(internal)];
+      stateRoots = [internalToCreate ?? realpathSync(internal)];
       const check = checkOwner();
       if (check) stateRoots.push(check.stateRoot);
       if (existsSync(join(internal, 'tools')))
@@ -127,6 +157,7 @@ export function resolveRuntime(
   if (platform !== process.platform || arch !== process.arch)
     throw new Error('The bundled runtime platform or architecture does not match.');
   if (
+    expectedHash !== undefined &&
     createHash('sha256')
       .update(readRegular(node, 256 * 1024 * 1024))
       .digest('hex') !== expectedHash
@@ -147,6 +178,17 @@ export function resolveRuntime(
   );
   if (identity !== `24.22.0\n${platform}\n${arch}`)
     throw new Error('The standalone Node identity does not match.');
+  execFileSync(
+    node,
+    [
+      contained(root, join(root, 'apps/controller/src/store/schema-compatibility.ts')),
+      join(home, 'state.sqlite'),
+      contained(root, join(root, 'apps/controller/migrations')),
+    ],
+    { encoding: 'utf8', timeout: 5000, maxBuffer: 4096, env: {} },
+  );
+  if (internalToCreate) mkdirSync(internalToCreate, { mode: 0o700 });
+  if (installed) prepareInstalledState(installed, installedPayload);
   const prepare = (path: string) => {
     const base = stateRoots.find((root) => path.startsWith(`${root}${sep}`));
     if (!base) throw new Error('Choose a state path inside its selected runtime directory.');
@@ -156,8 +198,9 @@ export function resolveRuntime(
     mode,
     root,
     node,
-    home: prepare(resolve(home)),
-    profile: prepare(resolve(profile)),
+    home: installed ? installed.home : prepare(resolve(home)),
+    profile: installed ? installed.profile : prepare(resolve(profile)),
+    ...(installed ? { installedStateRoot: installed.root } : {}),
     controller: contained(
       root,
       join(root, mode === 'demo' ? 'scripts/demo-controller.ts' : 'apps/controller/src/main.ts'),
@@ -218,6 +261,8 @@ export class DesktopController {
           CLAUDE_CONFIG_DIR: process.env.CLAUDE_CONFIG_DIR,
           LANG: 'en_US.UTF-8',
           CREWKITE_HOME: this.paths.home,
+          CREWKITE_PROFILE: this.paths.profile,
+          CREWKITE_INSTALLED_STATE_ROOT: this.paths.installedStateRoot,
           CREWKITE_FIXTURE_IDENTITY:
             this.paths.mode === 'demo' && process.env.CREWKITE_FIXTURE_IDENTITY === '1'
               ? '1'

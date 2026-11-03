@@ -89,6 +89,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { after, test } from 'node:test';
 import {
   type AgentEvent,
@@ -1158,6 +1159,23 @@ test("every Codex chat turn runs in CrewKite's own Codex home and leaves the per
   assert.equal(statSync(codexHome).mode & 0o777, 0o700);
   assert.equal(existsSync('/nonexistent/person-codex'), false);
   assert.equal(existsSync(join(run.home, '.codex')), false);
+  let before: Buffer | undefined;
+  const refused = turn('reply', {
+    prepare: (scratch) => {
+      const home = join(dirname(scratch), '.crewkite');
+      mkdirSync(home, { mode: 0o700 });
+      const path = join(home, 'state.sqlite');
+      const database = new DatabaseSync(path);
+      database.exec('PRAGMA user_version=999');
+      database.close();
+      before = readFileSync(path);
+    },
+  });
+  assert.notEqual((await refused.settled()).stopReason, 'done');
+  assert.equal(existsSync(join(refused.work, 'logs')), false);
+  assert.equal(existsSync(join(refused.home, '.crewkite/providers')), false);
+  assert.deepEqual(refused.launchEnvironment(), {});
+  assert.deepEqual(readFileSync(join(refused.home, '.crewkite/state.sqlite')), before);
 });
 
 test("a client usage warning shows in the thread only when CrewKite's reading is low or missing", async () => {

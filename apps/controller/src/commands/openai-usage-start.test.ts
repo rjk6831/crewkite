@@ -1,5 +1,7 @@
 import assert from 'node:assert/strict';
 import { type ChildProcess, spawn } from 'node:child_process';
+import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { join, resolve } from 'node:path';
 import { test } from 'node:test';
 import type { Observation } from '@crewkite/contracts';
 import {
@@ -19,7 +21,7 @@ const profile = {
     clientVersion: process.version,
   },
   client: { executable: process.execPath, version: process.version, sha256: fixtureClientHash },
-  environment: { ...process.env },
+  environment: {},
   locationHash: '1'.repeat(64),
 } satisfies NativeProfileResolution;
 
@@ -32,12 +34,17 @@ const answering = fixture.replace(
 
 // The quota read's timers run when the test says, so a 20 s deadline and the retries cost nothing.
 async function startReadFixture(t: Parameters<typeof setup>[0], silentReads: number) {
+  mkdirSync(resolve('internal'), { recursive: true });
+  const person = mkdtempSync(join(resolve('internal'), 'usage-account-'));
+  const home = join(person, 'home');
+  const ownProfile = { ...profile, environment: { HOME: person, CREWKITE_HOME: home } };
   const timers = new Set<{ run: () => void; ms: number }>();
   const reads: ChildProcess[] = [];
   let launched = Promise.withResolvers<void>();
   const context = await setup(t, {
+    home,
     googleUsageClient: () => ({ available: false, reason: 'client-unavailable' }),
-    openAiUsageClient: () => profile,
+    openAiUsageClient: () => ownProfile,
     schedule: (run, ms) => {
       const timer = { run, ms };
       timers.add(timer);
@@ -59,6 +66,7 @@ async function startReadFixture(t: Parameters<typeof setup>[0], silentReads: num
       return child;
     },
   });
+  t.after(() => rmSync(person, { recursive: true, force: true }));
   const fire = (match: (ms: number) => boolean) => {
     for (const timer of [...timers])
       if (match(timer.ms)) {

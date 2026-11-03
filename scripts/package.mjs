@@ -28,6 +28,14 @@ import {
   inspectInstalledDependencies,
 } from '../apps/controller/src/host/toolchain.ts';
 import { stageCliRuntime } from './cli-runtime.ts';
+import { assembleInstalledPackage, brandMacPackage } from './package-installed.mjs';
+import {
+  assembleLinuxPackage,
+  assertLinuxExecutable,
+  buildLinuxPackages,
+  inspectLinuxPackages,
+  verifyLinuxNode,
+} from './package-linux.mjs';
 import { copyRuntimePackages } from './runtime-packages.ts';
 
 const helperSourcePath = 'apps/controller/src/providers/local/secure-input.m';
@@ -204,7 +212,7 @@ export function buildLocalInputHelper(checkout, build, dependencies = {}) {
 }
 
 /** A resource seal lets macOS check the copied runtime before its files are inventoried. */
-export function sealElectronBundle(bundle, execute = spawnSync) {
+export function sealElectronBundle(bundle, execute = spawnSync, { nested = true } = {}) {
   const options = {
     env: { LANG: 'C', PATH: '/usr/bin:/bin' },
     encoding: 'utf8',
@@ -213,7 +221,14 @@ export function sealElectronBundle(bundle, execute = spawnSync) {
     stdio: ['ignore', 'pipe', 'pipe'],
   };
   for (const args of [
-    ['--force', '--deep', '--sign', '-', '--preserve-metadata=identifier,entitlements', bundle],
+    [
+      '--force',
+      ...(nested ? ['--deep'] : []),
+      '--sign',
+      '-',
+      '--preserve-metadata=entitlements',
+      bundle,
+    ],
     ['--verify', '--deep', '--strict', '--verbose=2', bundle],
   ]) {
     const result = execute('/usr/bin/codesign', args, options);
@@ -253,22 +268,50 @@ export async function packageDesktop() {
       throw new Error('The build provenance policy must be a valid regular expression.');
     }
   const { values } = parseArgs({
-    options: { id: { type: 'string' }, demo: { type: 'boolean', default: false } },
+    options: {
+      id: { type: 'string' },
+      demo: { type: 'boolean', default: false },
+      installed: { type: 'boolean', default: false },
+    },
   });
   const mode = values.demo ? 'demo' : 'workspace';
   const controllerEntry =
     mode === 'demo' ? 'scripts/demo-controller.ts' : 'apps/controller/src/main.ts';
   if (!values.id || !/^[a-z0-9][a-z0-9-]{0,63}$/.test(values.id))
     throw new Error('Supply --id with a new lowercase build name.');
-  if (process.platform !== 'darwin' || process.arch !== 'arm64')
-    throw new Error('The local package currently supports macOS arm64.');
+  const linux = process.platform === 'linux';
+  if (
+    !(process.platform === 'darwin' && process.arch === 'arm64') &&
+    !(linux && ['x64', 'arm64'].includes(process.arch))
+  )
+    throw new Error('Packages support macOS arm64 and native Linux x64 or arm64.');
+  if (linux && !values.installed) throw new Error('Linux packages require --installed.');
+  if (linux && !process.env.CREWKITE_LINUX_INPUTS)
+    throw new Error(
+      'CREWKITE_LINUX_INPUTS must name reviewed native runtime pins and package inputs.',
+    );
+  const linuxInputs = linux
+    ? JSON.parse(regularBytes(process.env.CREWKITE_LINUX_INPUTS ?? '', 65536).toString('utf8'))
+    : undefined;
+  if (linux && (linuxInputs.platform !== 'linux' || linuxInputs.arch !== process.arch))
+    throw new Error('Reviewed Linux inputs must match the native target.');
 
   const nodeVersion = '24.22.0';
-  const nodeHash = 'b468fb9c67427c9d3aec07ee1105e63020923a631a9a2a00beb71a7ba3768bfd';
+  const nodeHash = linux
+    ? linuxInputs.nodeSha256
+    : 'b468fb9c67427c9d3aec07ee1105e63020923a631a9a2a00beb71a7ba3768bfd';
   const tools = join(primary, 'internal/tools');
-  const nodeRoot = join(tools, `node-v${nodeVersion}-darwin-arm64`);
+  const nodeRoot = join(tools, `node-v${nodeVersion}-${process.platform}-${process.arch}`);
   const node = join(nodeRoot, 'bin/node');
   const hash = (path) => createHash('sha256').update(readFileSync(path)).digest('hex');
+  if (linux)
+    verifyLinuxNode({
+      node,
+      archive: `${nodeRoot}.tar.xz`,
+      sha256: nodeHash,
+      archiveSha256: linuxInputs.nodeArchiveSha256,
+      arch: process.arch,
+    });
   if (hash(node) !== nodeHash) throw new Error('The pinned Node binary checksum changed.');
   if (execFileSync(node, ['--version'], { encoding: 'utf8' }).trim() !== `v${nodeVersion}`)
     throw new Error('The pinned Node binary version changed.');
@@ -386,7 +429,7 @@ export async function packageDesktop() {
   });
   if (built.error) throw built.error;
   if (built.status !== 0) throw new Error('The isolated package build failed.');
-  const localInput = buildLocalInputHelper(checkout, build);
+  const localInput = linux ? undefined : buildLocalInputHelper(checkout, build);
   const preload = join(checkout, 'apps/desktop/out/preload/index.cjs');
   if (!existsSync(preload) || !lstatSync(preload).isFile() || lstatSync(preload).size === 0)
     throw new Error('The desktop build must produce the sandboxed CommonJS preload.');
@@ -408,7 +451,14 @@ export async function packageDesktop() {
     throw new Error('The installed Electron version differs from the frozen desktop manifest.');
   if (readFileSync(join(electron, 'dist/version'), 'utf8').trim() !== electronVersion)
     throw new Error('The installed Electron payload version differs from its package.');
-  copy(join(electron, 'dist/Electron.app'), join(stage, 'Electron.app'));
+  if (linux) {
+    assertLinuxExecutable(
+      regularBytes(join(electron, 'dist/electron'), 512 * 1024 * 1024),
+      process.arch,
+    );
+    for (const name of readdirSync(join(electron, 'dist')))
+      copy(join(electron, 'dist', name), join(stage, name));
+  } else copy(join(electron, 'dist/Electron.app'), join(stage, 'Electron.app'));
   copy(join(checkout, 'apps/desktop/out'), join(stage, 'app/out'));
   const desktop = json(join(checkout, 'apps/desktop/package.json'));
   writeFileSync(
@@ -416,13 +466,15 @@ export async function packageDesktop() {
     `${JSON.stringify({ name: desktop.name, version: desktop.version, type: 'module', main: desktop.main }, null, 2)}\n`,
   );
   const runtime = join(stage, 'app/runtime');
-  copy(localInput.path, join(runtime, 'bin/local-secure-input'));
-  chmodSync(join(runtime, 'bin/local-secure-input'), 0o755);
-  if (
-    digest(regularBytes(join(runtime, 'bin/local-secure-input'), 1024 * 1024)) !==
-    localInput.identity.sha256
-  )
-    throw new Error('The staged native helper checksum changed.');
+  if (localInput) {
+    copy(localInput.path, join(runtime, 'bin/local-secure-input'));
+    chmodSync(join(runtime, 'bin/local-secure-input'), 0o755);
+    if (
+      digest(regularBytes(join(runtime, 'bin/local-secure-input'), 1024 * 1024)) !==
+      localInput.identity.sha256
+    )
+      throw new Error('The staged native helper checksum changed.');
+  }
   copy(node, join(runtime, 'bin/node'));
   chmodSync(join(runtime, 'bin/node'), 0o755);
   if (hash(join(runtime, 'bin/node')) !== nodeHash)
@@ -430,43 +482,55 @@ export async function packageDesktop() {
   const { RuntimeManifestSchema } = await import(
     pathToFileURL(join(checkout, 'packages/contracts/src/index.ts')).href
   );
+  const { CREWKITE_VERSION } = await import(
+    pathToFileURL(join(checkout, 'packages/contracts/src/version.ts')).href
+  );
+  if (desktop.version !== CREWKITE_VERSION)
+    throw new Error('The desktop version differs from the committed product version.');
   writeFileSync(
     join(runtime, 'manifest.json'),
     `${JSON.stringify(
       RuntimeManifestSchema.parse({
         version: 1,
-        node: { version: nodeVersion, platform: 'darwin', arch: 'arm64', sha256: nodeHash },
+        node: {
+          version: nodeVersion,
+          platform: process.platform,
+          arch: process.arch,
+          sha256: nodeHash,
+        },
         mode,
-        localInput: localInput.identity,
+        ...(localInput ? { localInput: localInput.identity } : {}),
       }),
       null,
       2,
     )}\n`,
   );
   for (const path of bootstrapFiles) copy(join(checkout, path), join(runtime, path));
-  mkdirSync(join(stage, 'bin'));
-  const launcherRoot = '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)\n';
-  writeFileSync(
-    join(stage, 'bin/crewkite'),
-    `${launcherRoot}exec "$root/app/runtime/bin/node" "$root/app/runtime/apps/cli/src/main.ts" "$@" --home "$root/state/home"\n`,
-    { mode: 0o755 },
-  );
-  writeFileSync(
-    join(stage, 'bin/desktop'),
-    `${launcherRoot}test -f "$root/app/runtime/${controllerEntry}" || { echo 'The packaged controller entry is unavailable.' >&2; exit 1; }\nexport CREWKITE_HOME="$root/state/home"\nexport CREWKITE_PROFILE="$root/state/profile"\nexec "$root/Electron.app/Contents/MacOS/Electron" "$root/app"\n`,
-    { mode: 0o755 },
-  );
-  writeFileSync(
-    join(stage, 'CrewKite.command'),
-    '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/bin/desktop"\n',
-    { mode: 0o755 },
-  );
-  copy(join(checkout, 'scripts/package-upgrade.mjs'), join(stage, 'scripts/package-upgrade.mjs'));
-  writeFileSync(
-    join(stage, 'Upgrade Existing.command'),
-    '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/app/runtime/bin/node" "$root/scripts/package-upgrade.mjs" --source "$root"\n',
-    { mode: 0o755 },
-  );
+  if (!linux) {
+    mkdirSync(join(stage, 'bin'));
+    const launcherRoot = '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")/.." && pwd -P)\n';
+    writeFileSync(
+      join(stage, 'bin/crewkite'),
+      `${launcherRoot}exec "$root/app/runtime/bin/node" "$root/app/runtime/apps/cli/src/main.ts" "$@" --home "$root/state/home"\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(stage, 'bin/desktop'),
+      `${launcherRoot}test -f "$root/app/runtime/${controllerEntry}" || { echo 'The packaged controller entry is unavailable.' >&2; exit 1; }\nexport CREWKITE_HOME="$root/state/home"\nexport CREWKITE_PROFILE="$root/state/profile"\nexec "$root/CrewKite.app/Contents/MacOS/CrewKite" "$root/app"\n`,
+      { mode: 0o755 },
+    );
+    writeFileSync(
+      join(stage, 'CrewKite.command'),
+      '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/bin/desktop"\n',
+      { mode: 0o755 },
+    );
+    copy(join(checkout, 'scripts/package-upgrade.mjs'), join(stage, 'scripts/package-upgrade.mjs'));
+    writeFileSync(
+      join(stage, 'Upgrade Existing.command'),
+      '#!/bin/sh\nset -eu\nroot=$(CDPATH= cd "$(dirname "$0")" && pwd -P)\nexec "$root/app/runtime/bin/node" "$root/scripts/package-upgrade.mjs" --source "$root"\n',
+      { mode: 0o755 },
+    );
+  }
   const workspace = [
     'apps/controller',
     'apps/cli',
@@ -505,8 +569,7 @@ export async function packageDesktop() {
   const rootPackages = createRequire(join(checkout, 'package.json'));
   const biome = dirname(rootPackages.resolve('@biomejs/biome/package.json'));
   const biomeManifest = json(join(biome, 'package.json'));
-  // The package is for macOS arm64 today. The Biome platform package comes from the same table as
-  // the controller's trusted build, so a later Linux package needs no second list.
+  // The controller and package use the same native tool selection.
   const biomePlatformPackage = biomePackageName();
   if (!biomePlatformPackage) throw new Error('No Biome build exists for this computer.');
   const biomeBinary = dirname(
@@ -603,7 +666,7 @@ export async function packageDesktop() {
     );
   for (const filename of ['LICENSE', 'NOTICE'])
     notice('CrewKite', desktop.version, join(checkout, filename), filename);
-  for (const filename of ['LICENSE', 'NOTICE', 'README.md', 'docs'])
+  for (const filename of [...(!linux ? ['LICENSE'] : []), 'NOTICE', 'README.md', 'docs'])
     copy(join(checkout, filename), join(stage, filename));
   notice('CrewKite source credits', revision, join(checkout, 'docs/credits.md'), 'credits.md');
   notice('Node', nodeVersion, join(nodeRoot, 'LICENSE'), 'node-LICENSE');
@@ -687,14 +750,20 @@ export async function packageDesktop() {
     }
   }
   for (const entry of [
-    'CrewKite.command',
-    'Upgrade Existing.command',
-    'scripts/package-upgrade.mjs',
-    'Electron.app/Contents/MacOS/Electron',
+    ...(!linux
+      ? [
+          'CrewKite.command',
+          'Upgrade Existing.command',
+          'scripts/package-upgrade.mjs',
+          'Electron.app/Contents/MacOS/Electron',
+          'app/runtime/bin/local-secure-input',
+          'bin/crewkite',
+          'bin/desktop',
+        ]
+      : ['electron']),
     `app/${desktop.main}`,
     'app/out/preload/index.cjs',
     'app/runtime/bin/node',
-    'app/runtime/bin/local-secure-input',
     'app/runtime/apps/controller/src/providers/local/sdk-child.ts',
     'app/runtime/apps/controller/src/providers/local/secure-input.ts',
     'app/runtime/apps/controller/src/providers/google/acp/writer.ts',
@@ -707,30 +776,97 @@ export async function packageDesktop() {
     'app/runtime/apps/cli/src/main.ts',
     'app/runtime/packages/testkit/src/providers/worker.ts',
     'app/runtime/packages/testkit/src/providers/review-worker.ts',
-    'bin/crewkite',
-    'bin/desktop',
   ])
     inside(join(stage, entry));
-  const electronSignature = sealElectronBundle(join(stage, 'Electron.app'));
+  const installed = linux
+    ? await assembleLinuxPackage({
+        stage,
+        arch: process.arch,
+        version: CREWKITE_VERSION,
+        icon: join(checkout, 'apps/desktop/resources/crewkite-256.png'),
+        budget: copyBudget,
+      })
+    : values.installed
+      ? assembleInstalledPackage({
+          stage,
+          version: CREWKITE_VERSION,
+          icon: join(checkout, 'apps/desktop/resources/CrewKite.icns'),
+        })
+      : undefined;
+  if (installed) {
+    for (const entry of installed.requiredEntries ?? []) inside(join(stage, entry));
+    for (const item of notices)
+      item.license = `${linux ? 'resources/distribution' : 'CrewKite.app/Contents/Resources/distribution'}/${item.license}`;
+  }
+  const app =
+    installed?.app ??
+    brandMacPackage({
+      stage,
+      version: CREWKITE_VERSION,
+      icon: join(checkout, 'apps/desktop/resources/CrewKite.icns'),
+    });
+  if (!linux) sealElectronBundle(app);
+  const finalRuntime = installed?.runtime ?? runtime;
+  const finalManifest = RuntimeManifestSchema.parse(json(join(finalRuntime, 'manifest.json')));
+  if (!linux && !finalManifest.localInput)
+    throw new Error('The staged Local input identity is missing.');
+  finalManifest.node.sha256 = hash(join(finalRuntime, 'bin/node'));
+  if (localInput)
+    finalManifest.localInput.sha256 = hash(join(finalRuntime, 'bin/local-secure-input'));
+  writeFileSync(join(finalRuntime, 'manifest.json'), `${JSON.stringify(finalManifest, null, 2)}\n`);
+  // The nested seal fixes executable bytes. Only the outer resource seal changes after hashing.
+  const electronSignature = linux
+    ? undefined
+    : sealElectronBundle(app, spawnSync, { nested: false });
+  const { verifyRuntimeIntegrity } = await import(
+    pathToFileURL(join(checkout, 'packages/client/src/runtime-integrity.ts')).href
+  );
+  verifyRuntimeIntegrity(finalRuntime);
   inspect(stage);
   writeFileSync(
     join(stage, 'manifest.json'),
     `${JSON.stringify(
       {
-        format: 1,
+        format: installed ? 2 : 1,
+        ...(installed ? { layout: 'installed' } : {}),
         id: values.id,
         mode,
         revision,
         lockHash,
         buildDependencies,
-        platform: 'darwin',
-        architecture: 'arm64',
-        minimumOS: helperMinimumOS,
-        localInput: { ...localInput.identity, compiler: localInput.compiler },
+        buildInputs: {
+          nodeSha256: nodeHash,
+          ...(linux
+            ? {
+                nodeArchiveSha256: linuxInputs.nodeArchiveSha256,
+                iconSha256: hash(join(checkout, 'apps/desktop/resources/crewkite-256.png')),
+              }
+            : { localInputSha256: localInput.identity.sha256 }),
+        },
+        platform: process.platform,
+        architecture: process.arch,
+        ...(!linux
+          ? {
+              minimumOS: helperMinimumOS,
+              localInput: { ...finalManifest.localInput, compiler: localInput.compiler },
+            }
+          : {}),
         qualification: 'static-stage-only',
         bootstrap: 'present',
-        runtime: { path: 'app/runtime/bin/node', version: nodeVersion, sha256: nodeHash },
-        electron: { version: electronVersion, signature: electronSignature },
+        runtime: {
+          path: linux
+            ? 'resources/app/runtime/bin/node'
+            : installed
+              ? 'CrewKite.app/Contents/Resources/app/runtime/bin/node'
+              : 'app/runtime/bin/node',
+          version: nodeVersion,
+          sha256: finalManifest.node.sha256,
+        },
+        electron: {
+          bundle: linux ? '.' : 'CrewKite.app',
+          version: electronVersion,
+          signature: electronSignature,
+        },
         notices,
         files,
       },
@@ -738,6 +874,26 @@ export async function packageDesktop() {
       2,
     )}\n`,
   );
+  if (linux) {
+    const packages = buildLinuxPackages({
+      stage,
+      work: join(build, 'native-packages'),
+      output: `${stage}-installers`,
+      arch: process.arch,
+      version: CREWKITE_VERSION,
+      debDepends: linuxInputs.debDepends,
+      rpmRequires: linuxInputs.rpmRequires,
+    });
+    const evidence = inspectLinuxPackages({
+      ...packages,
+      arch: process.arch,
+      version: CREWKITE_VERSION,
+    });
+    writeFileSync(
+      join(build, 'linux-package-inspection.json'),
+      `${JSON.stringify(evidence, null, 2)}\n`,
+    );
+  }
   console.log(`Static package staged at ${stage} from revision ${revision.slice(0, 7)}`);
   console.log(`Disposable build source retained at ${checkout}`);
   console.log('Desktop, relocation and recovery journeys remain unqualified.');

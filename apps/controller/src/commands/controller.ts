@@ -104,6 +104,7 @@ import type { startReplacement } from '../providers/openai/replacement.ts';
 import { activityBodyChunks, taskActivityOutputPage, taskActivityPage } from '../store/activity.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
 import { type LaunchIntent, Store } from '../store/index.ts';
+import { assertSchemaCompatibility } from '../store/schema-compatibility.ts';
 import { projectPage, taskPage } from '../store/workspace.ts';
 import { AcceptanceCommands } from './acceptance.ts';
 import { CandidateCommands } from './candidates.ts';
@@ -302,6 +303,7 @@ export class Controller {
   };
 
   constructor(options: ControllerOptions) {
+    assertSchemaCompatibility(join(options.home, 'state.sqlite'), migrations);
     this.options = options;
     this.anthropicModelRows = options.anthropicModels ?? null;
     this.usageResolution = options.googleUsageClient?.() ?? resolveGoogleUsageClient();

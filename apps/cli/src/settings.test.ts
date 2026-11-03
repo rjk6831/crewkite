@@ -1,7 +1,17 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import type { CliSettings } from '@crewkite/contracts';
 import type { Key } from 'ink';
@@ -12,12 +22,58 @@ import {
 } from '../../desktop/src/renderer/settings/preferences.ts';
 import { pressed } from './interactive/keys.ts';
 import {
+  crewkiteHome,
   defaultSettings,
   loadSettings,
   SETTINGS_FILE,
   saveSettings,
   settingsStore,
 } from './settings.ts';
+
+test('installed CLI state refuses another home and newer schemas before creating its profile', (t) => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-cli-state-')));
+  const payload = join(directory, 'CrewKite.app');
+  const home = join(directory, 'state/home');
+  const profile = join(directory, 'state/profile');
+  const keys = ['CREWKITE_INSTALLED_APP', 'CREWKITE_HOME', 'CREWKITE_PROFILE'] as const;
+  const previous = keys.map((key) => [key, process.env[key]] as const);
+  t.after(() => {
+    for (const [key, value] of previous) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    rmSync(directory, { recursive: true, force: true });
+  });
+  mkdirSync(payload);
+  process.env.CREWKITE_INSTALLED_APP = payload;
+  process.env.CREWKITE_HOME = home;
+  process.env.CREWKITE_PROFILE = profile;
+  const alternate = join(directory, 'other');
+  for (const run of [
+    () => crewkiteHome(alternate),
+    () => saveSettings(alternate, defaultSettings()),
+  ])
+    assert.throws(run, /installed CLI uses its selected workspace/);
+  assert.equal(existsSync(alternate), false);
+  assert.equal(existsSync(home), false);
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  const database = join(home, 'state.sqlite');
+  const writer = new DatabaseSync(database);
+  writer.exec('CREATE TABLE retained(value TEXT); PRAGMA user_version=999;');
+  writer.close();
+  const before = readFileSync(database);
+  for (const run of [() => crewkiteHome(), () => saveSettings(home, defaultSettings())])
+    assert.throws(run, /needs a newer controller/);
+  assert.deepEqual(readFileSync(database), before);
+  assert.equal(existsSync(profile), false);
+  assert.equal(existsSync(join(home, SETTINGS_FILE)), false);
+  rmSync(database);
+  assert.equal(crewkiteHome(), home);
+  saveSettings(home, defaultSettings());
+  for (const path of [join(directory, 'state'), home, profile])
+    assert.equal(statSync(path).mode & 0o777, 0o700);
+  assert.equal(statSync(join(home, SETTINGS_FILE)).mode & 0o777, 0o600);
+});
 
 test('cli.json is checked with the desktop schemas, saved privately and read by its preference functions', (t) => {
   const home = mkdtempSync(join(tmpdir(), 'crewkite-settings-'));

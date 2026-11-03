@@ -1,5 +1,56 @@
 # Local distribution
 
+## Installed distribution in progress
+
+I am preparing installed packages under [Proposed ADR 0041](adr/0041-installed-distribution.md). The directory package below remains the existing staging workflow. Installed runtime support does not establish signing, installation or recovery qualification.
+
+The installed design keeps application files separate from private state. The desktop and CLI share `home` under the following root; the desktop keeps its separate `profile` beside it:
+
+| Platform | State root |
+|----------|------------|
+| macOS arm64 | `~/Library/Application Support/CrewKite` |
+| Linux x64 and arm64 | `${XDG_DATA_HOME:-~/.local/share}/crewkite` |
+
+The OpenAI client's own home sits under `providers/openai/` in the installed root. It holds the client's sign-in and history for CrewKite, separate from the person's own client home. [Provider routes](providers.md#openai) gives its exact location. The controller log stays at `home/controller.log`. An absolute `XDG_DATA_HOME` selects the Linux data root; a relative value is refused.
+
+A fresh installed 0.1.0 starts fresh state. Import from an initialized directory preview and rollback qualification are deferred to 0.1.1. An incompatible database schema must be refused through a read-only check before any state write. Application replacement must preserve the selected state path and must never restore an older ledger over later records.
+
+The planned formats are a macOS arm64 DMG and Linux x64 and arm64 DEB and RPM packages. I use native platform tools and retain the existing payload checks, bundled Node identity, runtime dependency closure and notices. The manifest hashes the final signed bytes. The macOS bundle identity is `com.rootsnolimits.crewkite`. Signing and notarization claims wait for recorded verification and first-open evidence for the exact assets.
+
+AppImage is conditional. I require normal launch with the Chromium sandbox on Ubuntu 24.04. If that fails, I omit both AppImages from 0.1.0. I require real installed launch evidence on Ubuntu 24.04 x64 and arm64. RPM build, inspection and a Fedora container install qualify the RPM artifact for 0.1.0; native Fedora desktop launch remains pending and must be stated in the release notes.
+
+Linux retains the preview limits in [ADR 0013](adr/0013-macos-first-local-optional.md): OpenAI, Anthropic and Local chat without Local token authentication. Google, task writers, formatting and verification remain macOS-only. Windows is unsupported and WSL2 is untested.
+
+### Building candidates
+
+Build from a committed revision with the pinned runtime and checked dependencies. `node scripts/package.mjs --id installed-check --installed` prepares the immutable installed stage under `internal/packages/d0/`. It refuses tracked changes. After installing dependencies with lifecycle scripts disabled, run `pnpm desktop:install` and verify the Electron distribution before staging.
+
+On macOS, configure `CREWKITE_SIGN_IDENTITY` and `CREWKITE_NOTARY_PROFILE` privately. The profile must already exist. The signing commands require a new destination and the stage's exact source revision:
+
+```sh
+node scripts/package-sign.mjs --source internal/packages/d0/installed-check --destination internal/packages/d0/installed-signed --revision "$(git rev-parse HEAD)"
+node scripts/package-dmg.mjs --source internal/packages/d0/installed-signed --destination internal/packages/d0/installed-dmg --revision "$(git rev-parse HEAD)"
+```
+
+Signing preserves the original input pins, records signed runtime hashes before the outer seal, and verifies every declared runtime hash again. A missing signature, rejected notarization or failed assessment prevents a success receipt. Receipts stay outside the sealed application. Browser-download first open and provider acceptance remain separate release gates.
+
+Linux staging requires `CREWKITE_LINUX_INPUTS` to name a reviewed JSON file with `platform`, `arch`, `nodeSha256`, `nodeArchiveSha256`, `debDepends`, `rpmRequires` and `fedoraImage`. Both dependency lists must include Git. The Node executable and archive live under `internal/tools/node-v24.22.0-linux-<arch>/bin/node` and `internal/tools/node-v24.22.0-linux-<arch>.tar.xz`. The package workflow fetches that archive from nodejs.org when the input archive does not carry it, and refuses it unless it matches the pinned digest. The Fedora image uses a versioned official registry reference with a SHA-256 digest. Missing or mismatched runtime pins stop staging. Dependency lists are checked during installer construction. The smoke runner also requires the pinned Fedora image.
+
+The dispatch-only Linux workflow requires an HTTPS input archive and its reviewed SHA-256. It builds on each native architecture, records ELF requirements, installs the DEB and checks ordinary-account renderer sandboxing under Xvfb. It also inspects and installs the RPM in the pinned Fedora container. These checks must run before the packages qualify. No native execution evidence is recorded yet.
+
+### Release checksums
+
+The publication folder holds only the final binary assets and `SHA256SUMS`. Signing and stapling must finish before checksums are written. Build receipts stay outside that folder.
+
+```sh
+node scripts/release-checksums.mjs --directory internal/release-assets/v0.1.0
+node scripts/release-checksums.mjs --directory internal/release-assets/v0.1.0 --check
+```
+
+The check requires the macOS DMG and both architectures of DEB and RPM. Both AppImages may be included or both omitted. Missing, extra, linked or empty assets refuse. The writer never overwrites existing checksums. Five binary assets produce five lines; including both AppImages produces seven. These checks establish file identity, not installation or runtime qualification.
+
+## Existing directory package
+
 The local package keeps Electron and the controller's Node runtime separate, as [ADR 0003](adr/0003-typescript-electron-node-controller.md) requires. This is a macOS arm64 directory package. It carries a complete Electron distribution and a pinned Node 24.22.0 binary. The declared binary floor is macOS 13.5. The pinned Node executable requires 13.5; the copied Electron payload requires 13.0. Those load-command values establish a build floor. Runtime compatibility on 13.5 remains unqualified. Developer ID signing, notarization and a general installer remain later distribution work.
 
 This staging path is a local maintainer workflow. It expects the existing checked dependency installation, installed Electron payload and repository-local Node binary under `internal/tools/node-v24.22.0-darwin-arm64/`. A delivered package carries those runtime files. Trying it needs local Git and an existing configured Git identity for branch acceptance.
@@ -24,7 +75,7 @@ The package records compiler source and output arguments relative to the build s
 
 The controller resolves Local credential input from that fixed runtime manifest. It verifies the packaged Node, helper and native source hashes before supplying the capability. Linked, shared or changed files refuse. A source-only launch without the manifest has no Local credential-input capability. Native prompt behavior and its package launch remain separate checks; the manifest establishes no model qualification.
 
-The first directory layout resolves its trusted runtime from `app.getAppPath()/runtime`. A later branded app needs an explicit resource layout. Runtime selection never comes from page content or a fallback to an arbitrary Node on PATH.
+Directory packages keep their runtime under `app/runtime`. Installed packages keep it under `CrewKite.app/Contents/Resources/app/runtime` on macOS and `resources/app/runtime` on Linux. Runtime selection never comes from page content or a fallback to an arbitrary Node on PATH.
 
 `bin/crewkite` selects the bundled Node and CLI. `bin/desktop` selects the copied Electron app. Its manifest selects the normal controller entrypoint or the explicit demo bootstrap. Both use the package's `state/home`, and the desktop uses a separate `state/profile`. From the primary checkout, use the new stage:
 
@@ -93,4 +144,4 @@ The old folder moves to the displayed backup, then the prepared replacement take
 
 If the second rename fails, the helper restores the old folder when the original path is still vacant. It never overwrites a folder that appeared during the swap. Keep every named staging and backup folder after a failure. A crash between renames can require manual restoration. The activity checks do not contain a concurrent launch; keep the old app closed throughout.
 
-The backup preserves the old installation's bytes at a different path. Do not launch it there. To roll back, close the upgraded app, preserve its whole folder at another unused path, and restore the whole original backup to the original installed path. Runtime migrations after upgrade and rollback across changed schemas need separate qualification. Copying an initialized `state` folder into another candidate path remains unsupported.
+The backup preserves the old installation's bytes at a different path. Do not launch it there. Before the upgraded app has first opened, recovery can restore the complete original folder to its original path. After later activity, keep the current ledger and use a compatible runtime to inspect or export it; an old snapshot would forget that activity. Runtime migrations after upgrade and rollback across changed schemas need separate qualification. Copying an initialized `state` folder into another candidate path remains unsupported.

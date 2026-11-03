@@ -4,6 +4,7 @@ import { createHash } from 'node:crypto';
 import {
   chmodSync,
   copyFileSync,
+  cpSync,
   existsSync,
   linkSync,
   lstatSync,
@@ -21,6 +22,7 @@ import {
 } from 'node:fs';
 import { createRequire } from 'node:module';
 import { dirname, join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { setImmediate } from 'node:timers';
 import { canonicalJson, ReadDataSchema } from '@crewkite/contracts';
@@ -470,6 +472,7 @@ test('source inspection bounds file metadata without running filters or reading 
       .trim(),
   );
   const runtimeRootDirectory = checkOwner()?.stateRoot ?? join(primary, 'internal');
+  mkdirSync(runtimeRootDirectory, { recursive: true });
   const runtimeDirectory = mkdtempSync(join(runtimeRootDirectory, 'rt-'));
   t.after(() => rmSync(runtimeDirectory, { recursive: true, force: true }));
   const app = join(runtimeDirectory, 'app');
@@ -480,6 +483,16 @@ test('source inspection bounds file metadata without running filters or reading 
     mkdirSync(path, { recursive: true });
   writeFileSync(workspaceEntry, 'export {};\n');
   writeFileSync(demoEntry, 'export {};\n');
+  const schemaProbe = join(runtimeRoot, 'apps/controller/src/store/schema-compatibility.ts');
+  mkdirSync(dirname(schemaProbe), { recursive: true });
+  copyFileSync(new URL('../store/schema-compatibility.ts', import.meta.url), schemaProbe);
+  cpSync(
+    new URL('../../migrations/', import.meta.url),
+    join(runtimeRoot, 'apps/controller/migrations'),
+    {
+      recursive: true,
+    },
+  );
   const bundledNode = join(runtimeRoot, 'bin/node');
   copyFileSync(process.execPath, bundledNode);
   chmodSync(bundledNode, 0o700);
@@ -490,12 +503,20 @@ test('source inspection bounds file metadata without running filters or reading 
   };
   assert.ok(environment.CREWKITE_HOME.length >= 120);
   mkdirSync(environment.CREWKITE_HOME, { mode: 0o700 });
-  const retained = new Map([
-    ['demo-catalog.json', 'historical catalog'],
-    ['state.sqlite', 'historical database'],
-  ]);
-  for (const [name, bytes] of retained)
-    writeFileSync(join(environment.CREWKITE_HOME, name), bytes, { mode: 0o600 });
+  writeFileSync(join(environment.CREWKITE_HOME, 'demo-catalog.json'), 'historical catalog', {
+    mode: 0o600,
+  });
+  const database = new DatabaseSync(join(environment.CREWKITE_HOME, 'state.sqlite'));
+  database.exec(
+    "CREATE TABLE retained(value TEXT); INSERT INTO retained VALUES ('historical data');",
+  );
+  database.close();
+  const retained = new Map(
+    ['demo-catalog.json', 'state.sqlite'].map((name) => [
+      name,
+      readFileSync(join(environment.CREWKITE_HOME, name)),
+    ]),
+  );
   for (const mode of ['workspace', 'demo'] as const) {
     writeFileSync(
       join(runtimeRoot, 'manifest.json'),
@@ -515,7 +536,7 @@ test('source inspection bounds file metadata without running filters or reading 
     assert.equal(paths.controller, mode === 'workspace' ? workspaceEntry : demoEntry);
     assert.equal(paths.home, environment.CREWKITE_HOME);
     for (const [name, bytes] of retained)
-      assert.equal(readFileSync(join(paths.home, name), 'utf8'), bytes);
+      assert.deepEqual(readFileSync(join(paths.home, name)), bytes);
     assert.equal(existsSync(join(paths.home, 'demo-shop')), false);
   }
 

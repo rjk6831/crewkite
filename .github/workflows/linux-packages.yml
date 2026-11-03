@@ -1,0 +1,111 @@
+name: linux package candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      inputs_url:
+        description: Reviewed native runtime input archive URL
+        required: true
+        type: string
+      inputs_sha256:
+        description: Reviewed input archive SHA-256
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: linux package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version-file: .nvmrc
+      - name: Check reviewed prerequisites
+        env:
+          INPUTS_URL: ${{ inputs.inputs_url }}
+          INPUTS_SHA256: ${{ inputs.inputs_sha256 }}
+        run: |
+          set -euo pipefail
+          [[ "$INPUTS_SHA256" =~ ^[a-f0-9]{64}$ ]]
+          [[ "$INPUTS_URL" == https://* ]]
+          mkdir -p internal/tools internal/evidence
+          curl --fail --location --proto '=https' --tlsv1.2 "$INPUTS_URL" -o "$RUNNER_TEMP/linux-inputs.tar"
+          printf '%s  %s\n' "$INPUTS_SHA256" "$RUNNER_TEMP/linux-inputs.tar" | sha256sum --check
+          python3 -c 'import sys, tarfile; tarfile.open(sys.argv[1]).extractall("internal/tools", filter="data")' "$RUNNER_TEMP/linux-inputs.tar"
+          test -f "internal/tools/linux-${{ matrix.arch }}.json"
+      # The input archive pins the Node archive digest. The archive comes from the Node project
+      # and is refused unless it matches that pin. Staging checks the binary pin as well.
+      - name: Fetch the pinned Node runtime
+        run: |
+          set -euo pipefail
+          name="node-v24.22.0-linux-${{ matrix.arch }}"
+          want=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["nodeArchiveSha256"])' "internal/tools/linux-${{ matrix.arch }}.json")
+          [[ "$want" =~ ^[a-f0-9]{64}$ ]]
+          if [ ! -f "internal/tools/$name.tar.xz" ]; then
+            curl --fail --location --proto '=https' --tlsv1.2 "https://nodejs.org/dist/v24.22.0/$name.tar.xz" -o "internal/tools/$name.tar.xz"
+          fi
+          printf '%s  %s\n' "$want" "internal/tools/$name.tar.xz" | sha256sum --check
+          if [ ! -d "internal/tools/$name" ]; then tar -xJf "internal/tools/$name.tar.xz" -C internal/tools; fi
+          test -f scripts/package-linux-smoke.mjs || { echo 'Native renderer, sandbox and Fedora install qualification runner is required.' >&2; exit 1; }
+      - name: Install package tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes rpm xvfb binutils libgtk-3-0t64 libnss3 libasound2t64 libgbm1
+          { cat /etc/os-release; uname -a; dpkg-deb --version; rpm --version; readelf --version; } > internal/evidence/tool-versions.txt
+      - name: Install frozen dependencies
+        run: |
+          npm install --prefix "$RUNNER_TEMP/crewkite-tools" --no-package-lock pnpm@12.11.2
+          echo "$RUNNER_TEMP/crewkite-tools/node_modules/.bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/crewkite-tools/node_modules/.bin/pnpm" install --frozen-lockfile --ignore-scripts
+      - name: Install pinned desktop runtime
+        run: pnpm desktop:install
+      - name: Check source
+        timeout-minutes: 12
+        run: pnpm lint && pnpm types && pnpm policy && pnpm test && pnpm build
+        env:
+          PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
+      - name: Build and inspect native packages
+        run: node scripts/package.mjs --id "linux-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}" --installed
+        env:
+          CREWKITE_LINUX_INPUTS: ${{ github.workspace }}/internal/tools/linux-${{ matrix.arch }}.json
+      - name: Install and launch with the native sandbox
+        run: xvfb-run --auto-servernum node scripts/package-linux-smoke.mjs --arch "${{ matrix.arch }}" --id "linux-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}"
+        env:
+          CREWKITE_LINUX_INPUTS: ${{ github.workspace }}/internal/tools/linux-${{ matrix.arch }}.json
+      - name: Keep candidates and evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: linux-package-${{ matrix.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            internal/packages/d0/*-installers
+            internal/package-build/*/linux-package-inspection.json
+            internal/evidence
+          if-no-files-found: warn
+          retention-days: 14
+
+  required:
+    if: always()
+    needs: [package]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 2
+    steps:
+      - name: Both native architectures passed
+        env:
+          RESULT: ${{ needs.package.result }}
+        run: test "$RESULT" = success

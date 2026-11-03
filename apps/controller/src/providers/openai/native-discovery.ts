@@ -3,7 +3,9 @@ import { lstatSync, mkdirSync, realpathSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
 import { stripVTControlCharacters } from 'node:util';
+import { preparePrivateStateDirectory, resolveInstalledState } from '@crewkite/client/node';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
+import { assertSchemaCompatibility } from '../../store/schema-compatibility.ts';
 import { fileDigestSync } from '../file-digest.ts';
 import {
   type DiscoveryEnvelope,
@@ -154,18 +156,28 @@ export function nativeDiscoveryArguments(
   return launchArguments(discoverySettings(directory), mcpOverrides(disabledMcpServers));
 }
 
-/** Where CrewKite keeps its own Codex home, under the controller home. */
+/** The client's private subtree inside the selected state root. */
 export const CODEX_HOME_PATH = 'providers/openai/codex-home';
 
 /**
  * CrewKite's own Codex home. Codex keeps its sign-in, config and saved threads there, so nothing
- * CrewKite runs reads the person's ~/.codex or shows in their own Codex app. The controller home
- * is CREWKITE_HOME, or ~/.crewkite as the controller's entry point chooses it.
+ * CrewKite runs reads the person's ~/.codex or shows in their own Codex app. Installed builds
+ * keep this beside the controller home; source and directory builds keep it inside that home.
  */
 export function crewKiteCodexHome(source: NodeJS.ProcessEnv): string {
+  return join(providerStateRoot(source), CODEX_HOME_PATH);
+}
+
+function providerStateRoot(source: NodeJS.ProcessEnv): string {
+  if (source.CREWKITE_INSTALLED_STATE_ROOT !== undefined) {
+    const state = resolveInstalledState(source);
+    if (source.CREWKITE_INSTALLED_STATE_ROOT !== state.root)
+      throw new Error('The installed provider state root does not match its workspace.');
+    return state.root;
+  }
   const home = source.CREWKITE_HOME ?? (source.HOME ? join(source.HOME, '.crewkite') : undefined);
   if (!home || !isAbsolute(home)) throw new Error('Discovery requires the CrewKite home.');
-  return join(home, CODEX_HOME_PATH);
+  return home;
 }
 
 /**
@@ -180,6 +192,8 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
   for (const key of [
     'HOME',
     'CREWKITE_HOME',
+    'CREWKITE_PROFILE',
+    'CREWKITE_INSTALLED_STATE_ROOT',
     'PATH',
     'TMPDIR',
     'USER',
@@ -200,12 +214,15 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
  */
 export function prepareCodexHome(environment: NodeJS.ProcessEnv) {
   const home = environment.CODEX_HOME;
-  if (!home || !isAbsolute(home)) throw new Error("Codex needs CrewKite's own home.");
-  mkdirSync(home, { recursive: true, mode: 0o700 });
-  const stat = lstatSync(home);
-  if (!stat.isDirectory() || stat.isSymbolicLink() || stat.uid !== process.getuid?.())
-    throw new Error("CrewKite's Codex home must be a private directory.");
-  return home;
+  if (!home || home !== crewKiteCodexHome(environment))
+    throw new Error("Codex needs CrewKite's own home.");
+  const root = providerStateRoot(environment);
+  const controllerHome =
+    environment.CREWKITE_INSTALLED_STATE_ROOT !== undefined
+      ? resolveInstalledState(environment).home
+      : root;
+  assertSchemaCompatibility(join(controllerHome, 'state.sqlite'));
+  return preparePrivateStateDirectory(root, home);
 }
 
 /** Metadata completion requires closed streams and absence of the owned process group. */
@@ -271,12 +288,12 @@ function startTranscript<T>(
       throw new Error('Discovery requires owned private storage without symlink parents.');
   }
   const reader = options.reader;
-  childDirectory(directory, 'logs');
-  childDirectory(directory, 'sqlite');
   if (options.task && now() >= deadline - 2000)
     throw new Error('Native task deadline elapsed before launch.');
   const env = nativeDiscoveryEnvironment(launch.environment);
   prepareCodexHome(env);
+  childDirectory(directory, 'logs');
+  childDirectory(directory, 'sqlite');
   const child = (options.spawn ?? spawn)(executable, options.arguments(directory), {
     cwd: directory,
     env,

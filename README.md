@@ -5,7 +5,7 @@
   <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="107">
 </picture>
 
-CrewKite is a local workspace for the coding agents you already pay for. It runs the OpenAI, Anthropic and Google clients you have signed in, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
+CrewKite is a local workspace for the coding agents you already pay for. It runs the OpenAI, Anthropic and Google clients, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
@@ -17,7 +17,7 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 - Split large work across providers. An orchestrator proposes up to 8 slices, the controller assigns each one by allowance and difficulty, and a reviewer, fixer and challenger check the result.
 - Review before anything lands. Each thread works in its own copy of the repository. You read the diff, accept or discard each hunk, and Accept makes a new local branch while your checkout stays as it was.
 - Approve what runs. Commands, edits and tool calls ask first unless your policy allows them, and subagents a provider starts show under the step that started them.
-- Run a local model beside the cloud ones. An LM Studio model takes the easy slices that fit its context, at no cost beyond your hardware.
+- Run a local model beside the cloud ones. An LM Studio model assigned to a crew role takes slices that fit its context, at no cost beyond your hardware.
 - Work on large repositories. A thread's copy has no file count cap and checks free disk space before it starts.
 - Keep your work on your computer. CrewKite has no account, sends no telemetry and hosts nothing. It is Apache 2.0.
 
@@ -25,17 +25,23 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 CrewKite is a prerelease, version 0.1.0. I ran all four families, OpenAI, Anthropic, Google and Local, live through development. The release build gets a final check on macOS before it ships.
 
-![The thread view with all four providers in the rail: subagents under the step that started them, an edit with its diff, an inline permission prompt and a queued message.](docs/images/thread.png)
+<!-- Release screenshot pending the installed-build launch checks. -->
 
-A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan, assigns each slice by allowance and difficulty, and runs it. Builders on any family run the slices, and any model can read what another did through read-only thread tools. Local takes the easy slices that fit its context.
+A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan and assigns each slice to the crew's builder or its fixer for a hard slice. Local takes a slice only when a crew role uses Local and the slice fits its context. Any model can read what another did through read-only thread tools.
 
 ## Install
+
+Installed packages are in preparation. Their signing, first-open and Linux launch checks remain pending. The [distribution notes](docs/distribution.md#installed-distribution-in-progress) describe the fixed state paths and qualification limits. Version 0.1.0 starts fresh installed state; directory-preview import and rollback qualification wait for 0.1.1.
+
+From source:
 
 1. Install Node 24.22.0 and pnpm 12.11.2.
 2. Run `pnpm install`, then `pnpm desktop:install` to download the Electron binary.
 3. Run `pnpm demo` to open the desktop on a synthetic project with scripted providers. To use your own clients on Apple silicon, stage a package with `node scripts/package.mjs --id my-build` and open `bin/desktop` in the folder it prints. The script expects the pinned Node binary under `internal/tools` and a committed working tree.
 
-To try a published build without the source, follow the [preview guide](docs/preview.md). Each provider needs its own client, signed in on your machine. Chat accepts a range of client builds within the major version I tested: OpenAI from 0.163.0 (tested with 0.163.0), Anthropic from 2.1.259 (tested with 2.1.316) and the Google quota reader from 1.4.0 (tested with 1.4.2). Settings names the version it found. [Provider routes](docs/providers.md#client-versions) lists the update command for each and the setup.
+To try a published build without the source, follow the [preview guide](docs/preview.md). Connect each provider once from its card. OpenAI signs in through CrewKite's own client home; the person's existing client sign-in stays separate. Later launches reconnect providers that were connected before.
+
+OpenAI compatibility follows its protocol checks and replies; version 0.133.0 introduced the named read profile. Anthropic accepts builds from 2.1.259 within its tested major, and the Google quota reader accepts builds from 1.4.0 within its tested major. Settings shows the found version and its checked-build date. [Provider routes](docs/providers.md#client-versions) lists tested builds, update commands and setup.
 
 ## Platforms
 
