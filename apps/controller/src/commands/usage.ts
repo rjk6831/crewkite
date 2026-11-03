@@ -33,7 +33,7 @@ import {
   googleUsageDescriptor,
   resolveGoogleUsageClient,
 } from '../providers/google/profile.ts';
-import { OpenAiDiscovery } from '../providers/openai/discovery.ts';
+import { OpenAiDiscovery, openAiCreditReading } from '../providers/openai/discovery.ts';
 import { startOpenAiAccountStep } from '../providers/openai/login.ts';
 import { startNativeSession } from '../providers/openai/native-discovery.ts';
 import {
@@ -59,6 +59,13 @@ const preparedUsage = new WeakMap<
 // Controllers with an OpenAI retry chain waiting. A connect during the chain reads once and leaves
 // the retries to the chain.
 const retrying = new WeakSet<Controller>();
+
+// The server checks every ten seconds whether a timed quota read is due. OpenAI and Google read
+// once this long after the last attempt, so the rail stays near current between turns. A failed
+// attempt counts too, so a reader that keeps failing never reads faster than this.
+export const INTERVAL_READ_MS = 90_000;
+// A read at start, connect or Refresh waits this long after the last attempt.
+const READ_COOLDOWN_MS = 60_000;
 
 // Usage readers and the provider usage observations that admission reads.
 export class UsageCommands {
@@ -186,7 +193,9 @@ export class UsageCommands {
   refreshUsage(this: Controller, trigger: 'start' | 'connect' | 'interval'): Promise<void> {
     return Promise.allSettled([
       this.refreshGoogleUsage(trigger),
-      this.refreshOpenAiUsageWithRetry(trigger),
+      trigger === 'start' && this.store.hasConnectedOnce('openai')
+        ? this.reconnectOpenAiAtLaunch()
+        : this.refreshOpenAiUsageWithRetry(trigger),
       // The Anthropic gauge reads once at start, from the client's own sign-in, once the person
       // connected Anthropic on this device. Turns and the card's Refresh read it after that.
       trigger === 'start' && this.store.hasConnectedOnce('anthropic')
@@ -195,6 +204,24 @@ export class UsageCommands {
           )
         : undefined,
     ]).then(() => {});
+  }
+
+  /**
+   * OpenAI reconnects at launch through its quota read, with the sign-in the client keeps in
+   * CrewKite's home. A read that brings in a reading, after its retries, is the connect.
+   */
+  async reconnectOpenAiAtLaunch(this: Controller): Promise<void> {
+    this.connectLog.begin('openai', 'auto');
+    try {
+      await this.refreshOpenAiUsageWithRetry('start');
+    } finally {
+      let reason: string | null = 'unreadable-state';
+      try {
+        reason = this.openAiUsageState()?.reason ?? 'no-read';
+      } catch {}
+      if (reason === 'observed') this.connectLog.ok('openai');
+      else this.connectLog.failed('openai', reason);
+    }
   }
 
   /**
@@ -293,6 +320,7 @@ export class UsageCommands {
       done: completion.promise,
     };
     this.openAiSignIn = runtime;
+    this.connectLog.begin('openai', 'manual');
     void (async () => {
       let success = false;
       try {
@@ -331,6 +359,9 @@ export class UsageCommands {
           }
         }
         if (success) this.connectedNow('openai');
+        if (success) this.connectLog.ok('openai');
+        else
+          this.connectLog.failed('openai', runtime.stopped ? 'sign-in-stopped' : 'sign-in-failed');
         this.openAiAccountChanged();
         completion.resolve();
       }
@@ -451,7 +482,7 @@ export class UsageCommands {
           (trigger !== 'retry' &&
             !(trigger === 'connect' && unread) &&
             Date.parse(attemptedAt) - Date.parse(previous.attemptedAt) <
-              (trigger === 'interval' ? 270000 : 60000)))
+              (trigger === 'interval' ? INTERVAL_READ_MS : READ_COOLDOWN_MS)))
       )
         return;
       if (
@@ -519,6 +550,7 @@ export class UsageCommands {
         reason: null,
         lastRequest: null,
         lastObservedAt: previous?.lastObservedAt ?? null,
+        credits: previous?.credits ?? null,
         ...(commandId ? { commandId } : {}),
       });
       this.store.transaction(() => this.saveOpenAiUsage(state));
@@ -534,6 +566,7 @@ export class UsageCommands {
         let invoked = false;
         const reports: { value: unknown; prior: ReadonlyMap<string, Observation> }[] = [];
         let reportBytes = 0;
+        let credits: ReturnType<typeof openAiCreditReading> = null;
         const current = () => {
           const saved = this.openAiUsageState();
           // This runs inside transactions too, so it takes only a version already read. A client
@@ -609,7 +642,10 @@ export class UsageCommands {
                 timeoutMs: remaining,
                 readConfiguration: true,
                 configurationDirectory: directory,
-                onUsage,
+                onUsage: (usage) => {
+                  credits = openAiCreditReading(usage) ?? credits;
+                  onUsage(usage);
+                },
               }),
           );
           runtime.handle = handle;
@@ -650,6 +686,8 @@ export class UsageCommands {
                   : (outcome.reason ?? 'no-observations'),
               lastRequest: outcome.lastRequest,
               lastObservedAt: published ? this.now() : state.lastObservedAt,
+              credits:
+                published && credits ? { ...credits, observedAt: this.now() } : state.credits,
             }),
           );
         } catch {
@@ -693,7 +731,8 @@ export class UsageCommands {
       const nowMs = Date.parse(this.now());
       if (
         reader.last_attempt_at &&
-        nowMs - Date.parse(reader.last_attempt_at) < (trigger === 'interval' ? 270000 : 60000)
+        nowMs - Date.parse(reader.last_attempt_at) <
+          (trigger === 'interval' ? INTERVAL_READ_MS : READ_COOLDOWN_MS)
       )
         return;
       if (trigger === 'connect') {

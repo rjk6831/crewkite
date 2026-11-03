@@ -856,7 +856,9 @@ export class ProviderCommands {
    */
   async checkAnthropicAtLaunch(this: Controller): Promise<void> {
     if (this.closed || !this.store.hasConnectedOnce('anthropic')) return;
-    if (this.anthropicUsage().blocker()) return;
+    this.connectLog.begin('anthropic', 'auto');
+    const blocker = this.anthropicUsage().blocker();
+    if (blocker) return this.connectLog.failed('anthropic', blocker);
     const key = this.id('cmd');
     const directory = join(this.home, 'native', `connection-${key}`);
     try {
@@ -872,6 +874,40 @@ export class ProviderCommands {
         { spawn: this.options.nativeSpawn, schedule: this.options.schedule },
       );
     } catch {}
+    this.settleAnthropicConnect();
+  }
+
+  /** The Anthropic connect line: connected when the client's own sign-in reads as signed in. */
+  settleAnthropicConnect(this: Controller, result?: CommandResult) {
+    let state: string;
+    try {
+      state = this.nativeConnections().status().state;
+    } catch {
+      state = 'unknown';
+    }
+    if (state === 'signed-in') return this.connectLog.ok('anthropic');
+    const refused = result && result.outcome !== 'applied' && result.outcome !== 'already-applied';
+    this.connectLog.failed('anthropic', refused ? (result.reason ?? state) : state);
+  }
+
+  /**
+   * The Google connect line. Connected means the setup reached ready. A launch that ends short of
+   * ready failed; on the card's Connect only a refused step fails, since the steps run one by one.
+   */
+  settleGoogleConnect(this: Controller, result?: CommandResult) {
+    // A launch preparation can end after close, when the store is gone.
+    if (this.closed || !this.connectLog.mode('google')) return;
+    const setup = this.store.googleAcpSetup();
+    if (setup.state === 'ready') return this.connectLog.ok('google');
+    if (!result)
+      return this.connectLog.failed(
+        'google',
+        googleTermsAcknowledged(this.store)
+          ? (setup.reason ?? setup.state)
+          : 'google-terms-not-acknowledged',
+      );
+    if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
+      this.connectLog.failed('google', result.reason ?? setup.reason ?? setup.state);
   }
 
   localControl(this: Controller): LocalControl {
@@ -897,6 +933,15 @@ export class ProviderCommands {
       revision: bump ? control.revision + 1 : control.revision,
     });
     this.store.putLocalControl(next);
+    // The connect line for Local. A launch reconnect keeps trying while the runtime is down, so
+    // its first failure is logged and the attempt stays open until it connects.
+    if (this.localConnected(next)) this.connectLog.ok('local');
+    else if (next.connectionFailed)
+      this.connectLog.failed(
+        'local',
+        'connection-failed',
+        this.connectLog.mode('local') === 'auto',
+      );
     return next;
   }
 
@@ -1137,6 +1182,7 @@ export class ProviderCommands {
       return { outcome: 'applied', revision: setup.revision };
     };
     if (command.command === 'DisconnectLocal') {
+      this.connectLog.drop('local');
       this.store.forgetConnectedOnce('local');
       this.revokeLocalSecret();
       control = this.saveLocal({
@@ -1199,6 +1245,12 @@ export class ProviderCommands {
     // endpoint with no click.
     if (command.command === 'ConfigureLocal' || command.command === 'BeginLocalConnectionInput')
       this.store.markConnectedOnce('local');
+    // A launch reconnect sends only BeginLocalConnectionInput on the saved endpoint, and stays the
+    // auto attempt until it connects. A card Connect that saves an endpoint is manual. A card
+    // Connect on the saved endpoint before the launch reconnect connects counts as auto.
+    if (command.command === 'ConfigureLocal') this.connectLog.begin('local', 'manual');
+    if (command.command === 'BeginLocalConnectionInput' && !this.connectLog.mode('local'))
+      this.connectLog.begin('local', 'manual');
     if (command.command === 'ConfigureLocal') {
       const authMode = command.payload.authMode ?? 'token';
       const refusal = authMode === 'token' ? this.localTokenRefusal() : null;

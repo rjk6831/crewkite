@@ -38,3 +38,14 @@ export const shownEffort = (
   effort === 'default' && model && effortLevels(model.efforts).length
     ? model.defaultEffort
     : effort;
+
+/**
+ * What the picker says about a family that is not connected, in its head and its tooltip. Every
+ * cloud family reads the same whatever stopped it, and the controller's reason codes never reach
+ * the person. Local keeps what its setup last saw.
+ */
+export function offLine(entry: Pick<Entry, 'family' | 'needsConnect'>, localSeen: string | null) {
+  if (entry.family !== 'local') return 'Not connected';
+  if (localSeen) return localSeen;
+  return entry.needsConnect ? 'Connect in Settings' : 'Not connected';
+}

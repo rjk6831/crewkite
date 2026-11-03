@@ -305,8 +305,8 @@ test('the interactive /crew list offers the presets and the crews saved in the d
   assert.equal(read.flightMode, 'balanced');
   // A digit applies the crew in that place.
   screen.type('2');
-  await screen.shows('Crew: Pair.');
-  assert.equal((await client.readThread(thread.id)).thread.crew?.name, 'Pair');
+  await screen.shows('Crew: Tandem.');
+  assert.equal((await client.readThread(thread.id)).thread.crew?.name, 'Tandem');
   screen.type('\u0003');
   await app.waitUntilExit();
 });

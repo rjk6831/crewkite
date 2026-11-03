@@ -8235,7 +8235,7 @@ test('google quota authority survives retries and restart while sharing one oper
     context.clock.advance(60000);
     await controller.refreshUsage('interval');
     assert.equal(launches, beforeAutomatic + 2, 'a timed read waits its interval');
-    context.clock.advance(210000);
+    context.clock.advance(30000);
     await controller.refreshUsage('interval');
     assert.equal(launches, beforeAutomatic + 3, 'one shared timed path refreshes Google');
   } finally {
@@ -8653,7 +8653,7 @@ test('google quota authority survives retries and restart while sharing one oper
   metadata.clock.advance(60000);
   await openController.refreshUsage('connect');
   assert.equal(metadataLaunches, 1, 'fresh connect does not repeat the metadata read');
-  metadata.clock.advance(209999);
+  metadata.clock.advance(29999);
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, 1);
   metadata.clock.advance(1);
@@ -8670,7 +8670,7 @@ test('google quota authority survives retries and restart while sharing one oper
     'the current account read cannot refresh an old task route',
   );
   let valid = windows();
-  metadata.clock.advance(270000);
+  metadata.clock.advance(90000);
   metadataMode = 'invalid';
   await openController.refreshUsage('interval');
   assert.notEqual(exposedReader()?.readReason, 'observed');
@@ -8681,7 +8681,7 @@ test('google quota authority survives retries and restart while sharing one oper
   metadata.clock.advance(60000);
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, 3, 'failed reads retain the timed cooldown');
-  metadata.clock.advance(210000);
+  metadata.clock.advance(30000);
   metadataMode = 'late-protocol';
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, 4);
@@ -8691,7 +8691,7 @@ test('google quota authority survives retries and restart while sharing one oper
     valid,
     'protocol refusal cannot hide an expired publication deadline',
   );
-  metadata.clock.advance(270000);
+  metadata.clock.advance(90000);
   metadataMode = 'late-publication';
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, 5);
@@ -8701,7 +8701,7 @@ test('google quota authority survives retries and restart while sharing one oper
     valid,
     'the publication deadline is checked after current-profile validation',
   );
-  metadata.clock.advance(270000);
+  metadata.clock.advance(90000);
   metadataMode = 'over-limit';
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, 6);
@@ -8712,7 +8712,7 @@ test('google quota authority survives retries and restart while sharing one oper
     'a validated exhausted window survives a later strict admission refusal',
   );
   valid = windows();
-  metadata.clock.advance(270000);
+  metadata.clock.advance(90000);
   metadataMode = 'api-key';
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, 7);
@@ -8794,7 +8794,7 @@ test('google quota authority survives retries and restart while sharing one oper
         metadata.clock.now(),
       );
   });
-  metadata.clock.advance(270000);
+  metadata.clock.advance(90000);
   await openController.refreshUsage('interval');
   assert.equal(metadataLaunches, 7, 'unknown native ownership blocks metadata reads');
   openController.store.transaction(() => {
@@ -8868,7 +8868,7 @@ test('google quota authority survives retries and restart while sharing one oper
   await Promise.all([holding, joining]);
   assert.equal(state().state, 'quiescent');
   assert.deepEqual(windows(), valid, 'Stop cancels only the current metadata owner');
-  metadata.clock.advance(270000);
+  metadata.clock.advance(90000);
   readStarted = Promise.withResolvers<void>();
   const closingReadAgain = openController.refreshUsage('interval');
   await readStarted.promise;

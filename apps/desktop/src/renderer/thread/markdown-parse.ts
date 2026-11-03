@@ -247,10 +247,13 @@ export type InlineNode =
   // A link whose address is not http or https, an image, or an address with credentials. It shows
   // its label and the address as text and does nothing when clicked.
   | { kind: 'inert'; label: string; url: string }
+  // A link to a file on disk. It shows the file and line as text. The address stays out of view,
+  // because it can be a long host path that means nothing to the reader.
+  | { kind: 'file'; text: string }
   | { kind: 'link'; label: string; href: string };
 
 const inline =
-  /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\s][^*\n]*\*)|((?<![\w])_[^_\s][^_\n]*_(?![\w]))|(!?\[[^\]\n]+\]\((?:[^\s()]|\([^\s()]*\))+\))|(https?:\/\/[^\s<>`[\]]+)/g;
+  /(`[^`\n]+`)|(\*\*[^*\n]+\*\*)|(\*[^*\s][^*\n]*\*)|((?<![\w])_[^_\s][^_\n]*_(?![\w]))|(!?\[[^\]\n]+\]\((?:<[^<>\n]*>|(?:[^\s()]|\([^\s()]*\))+)\))|(https?:\/\/[^\s<>`[\]]+)/g;
 
 // Sentence punctuation after an address belongs to the sentence. A closing parenthesis stays when
 // the address opened one.
@@ -264,6 +267,24 @@ function trimAddress(address: string): string {
     else break;
   }
   return address.slice(0, end);
+}
+
+// A local path, absolute or relative, with an optional :line, :line:col or #L line suffix. A scheme
+// such as https: or mailto: has a colon in it, so it never reads as a path. Neither does //host.
+const filePath =
+  /^((?:[A-Za-z]:[\\/])?(?!\/\/)[^:#?<>\n]+?)(?::(\d+)(?::(\d+))?|#L(\d+)(?:C\d+)?(?:-L?\d+)?)?$/;
+const hostPath = /^(?:[A-Za-z]:[\\/]|~\/|\/)/;
+
+function fileText(label: string, url: string): string | null {
+  const found = filePath.exec(url);
+  if (!found || !/[/\\.]/.test(found[1])) return null;
+  const [, , line, column, anchor] = found;
+  let text = label.replace(/^`(.+)`$/, '$1');
+  // A label that is itself a host path would show what the link hides, so only the name stays.
+  if (hostPath.test(text)) text = text.split(/[\\/]/).filter(Boolean).pop() ?? text;
+  const at = line ?? anchor;
+  if (!at || /:\d+(?::\d+)?$/.test(text)) return text;
+  return `${text}:${at}${column ? `:${column}` : ''}`;
 }
 
 export function parseInline(text: string): InlineNode[] {
@@ -282,12 +303,17 @@ export function parseInline(text: string): InlineNode[] {
     else if (match[3] || match[4])
       nodes.push({ kind: 'em', children: parseInline(token.slice(1, -1)) });
     else if (match[5]) {
-      const [, bang, label, url] = /^(!?)\[([^\]]+)\]\((.+)\)$/.exec(token) ?? [];
+      const [, bang, label, written] = /^(!?)\[([^\]]+)\]\((.+)\)$/.exec(token) ?? [];
+      // CommonMark lets a destination sit in angle brackets, which allows spaces in it.
+      const url = written?.startsWith('<') ? written.slice(1, -1) : written;
       const target = bang ? null : externalLink(url);
+      const file = bang || target || label === undefined ? null : fileText(label, url);
       nodes.push(
         target
           ? { kind: 'link', label, href: target.href }
-          : { kind: 'inert', label: label ?? token, url: url ?? '' },
+          : file
+            ? { kind: 'file', text: file }
+            : { kind: 'inert', label: label ?? token, url: url ?? '' },
       );
     } else {
       const address = trimAddress(token);

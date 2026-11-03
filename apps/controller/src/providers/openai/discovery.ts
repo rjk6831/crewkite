@@ -327,6 +327,8 @@ export type OpenAiCredits = Readonly<{
   limitId: string;
   state: 'available' | 'unlimited' | 'none';
   balance: string | null;
+  /** Present when the client named a reached limit for the bucket. */
+  limitReached?: true;
 }>;
 export type OpenAiUsage = Readonly<{
   complete: boolean;
@@ -356,6 +358,9 @@ const usageBucket = z.object({
   primary: usageWindowValue,
   secondary: usageWindowValue,
   credits: creditSnapshot,
+  // A spend control that is reached leaves no credits to spend, whatever the balance says.
+  spendControlReached: z.boolean().nullish().catch(null),
+  rateLimitReachedType: z.string().max(64).nullish().catch(null),
 });
 const usagePayload = {
   'account/rateLimits/read': z.object({
@@ -424,13 +429,35 @@ export function projectOpenAiUsage(method: UsageMethod, payload: unknown): OpenA
         limitId,
         state: value.credits.unlimited
           ? 'unlimited'
-          : value.credits.hasCredits
+          : value.credits.hasCredits && value.spendControlReached !== true
             ? 'available'
             : 'none',
         balance: value.credits.balance ?? null,
+        ...(value.rateLimitReachedType ? { limitReached: true as const } : {}),
       });
   }
   return { complete, windows, credits };
+}
+
+/**
+ * The account's credit state from one report, without its time. Credits belong to the account,
+ * so the default codex bucket speaks for it, else the first bucket listed. Its limit counts as
+ * reached when the client names a reached type or one of its windows reads zero, and lifts at the
+ * latest reset among those windows. Null when the report carries no credits.
+ */
+export function openAiCreditReading(usage: OpenAiUsage) {
+  const bucket = usage.credits.find((value) => value.limitId === 'codex') ?? usage.credits[0];
+  if (!bucket) return null;
+  const spent = usage.windows.filter(
+    (window) => window.windowId.startsWith(`${bucket.limitId}:`) && window.remaining?.value === 0,
+  );
+  const resets = spent.flatMap((window) => (window.resetsAt ? [window.resetsAt] : [])).sort();
+  return {
+    state: bucket.state,
+    balance: bucket.balance,
+    limitReached: bucket.limitReached === true || spent.length > 0,
+    resetsAt: resets.at(-1) ?? null,
+  };
 }
 
 /**

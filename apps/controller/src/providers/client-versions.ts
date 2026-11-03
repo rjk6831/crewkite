@@ -3,8 +3,8 @@ import {
   type SpawnSyncReturns,
   spawnSync,
 } from 'node:child_process';
-import { lstatSync, realpathSync, type Stats } from 'node:fs';
-import { userInfo } from 'node:os';
+import { lstatSync, mkdtempSync, realpathSync, rmSync, type Stats } from 'node:fs';
+import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { ClientVersionState, ClientVersionStatus } from '@crewkite/contracts';
 import { timed } from '../diagnostics/timing.ts';
@@ -30,6 +30,10 @@ export const CLIENT_VERSIONS = {
     update: 'npm install -g @openai/codex@latest',
     maximumBytes: 256 * 1024 * 1024,
     environment: {},
+    // Codex finds its home from CODEX_HOME, else ~/.codex, and may create or touch it on any run.
+    // The version read gets an empty private folder of its own, so it never reaches the person's
+    // ~/.codex. CrewKite's own Codex home may not exist yet when the client is first found.
+    privateHome: 'CODEX_HOME',
   },
   anthropic: {
     name: 'Claude Code',
@@ -471,6 +475,27 @@ const digest = (path: string) => fileDigestSync(path);
 // up to the timeout once per changed build. The result is cached by the file's identity. An
 // asynchronous read with a pending state is the upgrade path if a client ever needs it.
 function readVersion(executable: string, row: Row, options: FindOptions): string | null {
+  let home: string | undefined;
+  if ('privateHome' in row)
+    try {
+      // mkdtemp creates the folder with mode 0700.
+      home = mkdtempSync(join(tmpdir(), 'crewkite-version-'));
+    } catch {
+      return null;
+    }
+  try {
+    return runVersion(executable, row, options, home);
+  } finally {
+    if (home) rmSync(home, { recursive: true, force: true });
+  }
+}
+
+function runVersion(
+  executable: string,
+  row: Row,
+  options: FindOptions,
+  home: string | undefined,
+): string | null {
   // Node honors detached for spawnSync, which puts the client in its own group; the types omit it.
   const spawnOptions: SpawnSyncOptionsWithStringEncoding & { detached: true } = {
     cwd: '/',
@@ -481,6 +506,7 @@ function readVersion(executable: string, row: Row, options: FindOptions): string
       LANG: 'C',
       NO_COLOR: '1',
       ...row.environment,
+      ...('privateHome' in row && home ? { [row.privateHome]: home } : {}),
     },
     detached: true,
     stdio: ['ignore', 'pipe', 'pipe'],

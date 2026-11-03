@@ -243,12 +243,21 @@ function finish(view: TurnView, event: Extract<AgentEvent, { type: 'turn.complet
       : event.stopReason === 'stopped' || isStop(event.failure)
         ? 'stopped'
         : 'done';
+  return { ...settle(view, status), failure, outputLimit: event.outputLimit ?? null };
+}
+
+/**
+ * The turn as it reads once it ended. Nothing in it runs any more, so a tool still marked running
+ * shows as stopped. The controller can know a turn ended before or without its completion event,
+ * so the thread settles the turn from the stored state too.
+ */
+export function settle(view: TurnView, status: TurnStatus): TurnView {
   const blocks = view.blocks.map((block): Block => {
     if (block.kind === 'text' || block.kind === 'thinking') return { ...block, done: true };
     if (block.kind === 'tool' && block.status === 'running') return { ...block, status: 'stopped' };
     return block;
   });
-  return { ...view, blocks, ended: true, status, failure, outputLimit: event.outputLimit ?? null };
+  return { ...view, blocks, ended: true, status };
 }
 
 /** Two or more finished reads and searches in a row, shown as one line that opens into the cards. */

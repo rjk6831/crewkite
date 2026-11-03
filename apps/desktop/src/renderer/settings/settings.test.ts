@@ -17,6 +17,7 @@ import {
 } from './crew-store.ts';
 import {
   applyDraft,
+  choiceNamed,
   clearLegacyCrews,
   crewChoicePatch,
   crewChoices,
@@ -154,7 +155,7 @@ test('saved thread defaults and crew presets survive bad storage and apply only 
   };
   const roles = (crew: ReturnType<typeof crewFromPreset>) =>
     crew?.members.map(({ role, selection }) => `${role}:${selection.family}`);
-  const [, pair, full] = readCrewPresets(store);
+  const [, tandem, full] = readCrewPresets(store);
   assert.deepEqual(roles(crewFromPreset(full, three, null, 'most-left', NOW, store)), [
     'builder:openai',
     'reviewer:anthropic',
@@ -162,24 +163,24 @@ test('saved thread defaults and crew presets survive bad storage and apply only 
     'fixer:openai',
     'orchestrator:openai',
   ]);
-  // Solo and Pair leave the orchestrator out.
+  // Solo and Tandem leave the orchestrator out.
   const [solo] = readCrewPresets(store);
   assert.deepEqual(roles(crewFromPreset(solo, three, null, 'most-left', NOW, store)), [
     'builder:openai',
   ]);
-  assert.deepEqual(roles(crewFromPreset(pair, three, null, 'most-left', NOW, store)), [
+  assert.deepEqual(roles(crewFromPreset(tandem, three, null, 'most-left', NOW, store)), [
     'builder:openai',
     'reviewer:anthropic',
   ]);
   const lone: ChatCatalogRead = { families: [entry('openai', true, [])] };
-  assert.deepEqual(roles(crewFromPreset(pair, lone, null, 'most-left', NOW, store)), [
+  assert.deepEqual(roles(crewFromPreset(tandem, lone, null, 'most-left', NOW, store)), [
     'builder:openai',
     'reviewer:openai',
   ]);
   const pinned = { family: 'google' as const, model: 'large-1', effort: 'low' as const };
   writeCrewPresets(
     readCrewPresets(store).map((preset) =>
-      preset.name === 'Pair'
+      preset.name === 'Tandem'
         ? { ...preset, members: [preset.members[0], { role: 'reviewer', selection: pinned }] }
         : preset,
     ),
@@ -209,7 +210,7 @@ test('a preset carries each pinned effort into the crew and drops an effort the 
   const pin = (builder: 'low' | 'high' | 'medium', reviewer: 'low' | 'high' | 'medium') =>
     writeCrewPresets(
       readCrewPresets(store).map((preset) =>
-        preset.name === 'Pair'
+        preset.name === 'Tandem'
           ? {
               ...preset,
               members: [
@@ -228,9 +229,9 @@ test('a preset carries each pinned effort into the crew and drops an effort the 
       store,
     );
   const efforts = () => {
-    const pair = readCrewPresets(store).find((p) => p.name === 'Pair');
-    assert.ok(pair);
-    return crewFromPreset(pair, catalog, null, 'most-left', NOW, store)?.members.map(
+    const tandem = readCrewPresets(store).find((p) => p.name === 'Tandem');
+    assert.ok(tandem);
+    return crewFromPreset(tandem, catalog, null, 'most-left', NOW, store)?.members.map(
       ({ role, selection }) => `${role}:${selection.effort}`,
     );
   };
@@ -320,7 +321,7 @@ test('saved crews join the presets, one is the default, and a missing one falls 
   setSavedCrews(null);
   assert.deepEqual(
     crewChoices(store).map((choice) => choice.id),
-    ['preset:Solo', 'preset:Pair', 'preset:Full crew'],
+    ['preset:Solo', 'preset:Tandem', 'preset:Full crew'],
   );
   assert.equal(readDefaultCrew(store), 'preset:Solo');
   const pinned = { family: 'openai', model: 'large-1', effort: 'high' } as const;
@@ -365,15 +366,15 @@ test('saved crews join the presets, one is the default, and a missing one falls 
 
   assert.equal(readDefaultCrew(store), 'saved:crew-a');
   assert.equal(crewForProject('prj-1', store).id, 'saved:crew-a');
-  writeProjectCrew('prj-1', 'preset:Pair', store);
-  assert.equal(crewForProject('prj-1', store).id, 'preset:Pair');
+  writeProjectCrew('prj-1', 'preset:Tandem', store);
+  assert.equal(crewForProject('prj-1', store).id, 'preset:Tandem');
   assert.equal(crewForProject('prj-2', store).id, 'saved:crew-a');
   writeProjectCrew('prj-1', null, store);
   assert.equal(crewForProject('prj-1', store).id, 'saved:crew-a');
 
   // Names are unique across presets and saved crews, and an edit may keep its own name.
   assert.equal(crewNameProblem(' ', [], null), 'Name the crew.');
-  assert.equal(crewNameProblem('pair', [], null), 'Another crew has this name.');
+  assert.equal(crewNameProblem('tandem', [], null), 'Another crew has this name.');
   const list = readSavedCrews();
   assert.equal(crewNameProblem('review HEAVY', list, null), 'Another crew has this name.');
   assert.equal(crewNameProblem('Review heavy', list, 'crew-a'), null);
@@ -381,6 +382,39 @@ test('saved crews join the presets, one is the default, and a missing one falls 
   // A default naming a crew the list no longer holds reads as Solo.
   setSavedCrews({ crews: [], defaultCrew: 'saved:crew-a', imported: true });
   assert.equal(readDefaultCrew(store), 'preset:Solo');
+});
+
+// Claim: Tandem was named Pair before 0.1.0. Pins, project crews, a window's old default and a
+// thread crew saved under Pair read as Tandem, and a pin saved as Tandem wins over one left as Pair.
+test('data saved under the Pair preset name reads as Tandem', (t) => {
+  t.after(() => setSavedCrews(null));
+  setSavedCrews(null);
+  const values = new Map<string, string>();
+  const store = {
+    getItem: (key: string) => values.get(key) ?? null,
+    setItem: (key: string, value: string) => void values.set(key, value),
+    removeItem: (key: string) => void values.delete(key),
+  };
+  const local = { family: 'local', model: 'fixture-local', effort: 'default' } as const;
+  values.set('crewkite-crew-presets-v1', JSON.stringify({ Pair: { reviewer: local } }));
+  values.set('crewkite-crew-subagents-v1', JSON.stringify({ Pair: { reviewer: false } }));
+  values.set('crewkite-project-crews-v1', JSON.stringify({ 'prj-1': 'preset:Pair' }));
+  values.set('crewkite-default-crew-v1', JSON.stringify('preset:Pair'));
+  const tandem = () => readCrewPresets(store).find((preset) => preset.name === 'Tandem');
+  assert.deepEqual(tandem()?.members[1], {
+    role: 'reviewer',
+    selection: local,
+    allowSubagents: false,
+  });
+  assert.equal(crewForProject('prj-1', store).id, 'preset:Tandem');
+  assert.equal(readLegacyCrews(store).defaultCrew, 'preset:Tandem');
+  assert.equal(choiceNamed(crewChoices(store), 'Pair')?.id, 'preset:Tandem');
+  const openai = { family: 'openai', model: 'large-1', effort: 'high' } as const;
+  values.set(
+    'crewkite-crew-presets-v1',
+    JSON.stringify({ Pair: { reviewer: local }, Tandem: { reviewer: openai } }),
+  );
+  assert.deepEqual(tandem()?.members[1].selection, openai);
 });
 
 // Claim: the crews this window kept before the controller held them read once, whole entries

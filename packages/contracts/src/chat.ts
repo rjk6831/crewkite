@@ -1050,6 +1050,28 @@ export type ThreadLiveResult = z.infer<typeof ThreadLiveResultSchema>;
 export const ChatAttachmentDeliverySchema = z.enum(['native', 'path', 'none']);
 export type ChatAttachmentDelivery = z.infer<typeof ChatAttachmentDeliverySchema>;
 
+/**
+ * OpenAI reports credits as available, none or unlimited, with a balance. Anthropic reports only
+ * whether extra usage is turned on. `limitReached` is the provider's own word that the included
+ * limit is used up, which can come before any window reads zero.
+ */
+export const ChatCreditsSchema = z.strictObject({
+  state: z.enum(['available', 'none', 'unlimited', 'unknown', 'extra-usage-on', 'extra-usage-off']),
+  balance: z
+    .string()
+    .max(128)
+    .regex(/^-?\d+(?:\.\d+)?$/)
+    .nullable(),
+  limitReached: z.boolean(),
+  observedAt: timestamp,
+});
+export type ChatCredits = z.infer<typeof ChatCreditsSchema>;
+export const CreditFamilySchema = z.enum(['openai', 'anthropic']);
+export const SetCreditSpendingPayloadSchema = z.strictObject({
+  family: CreditFamilySchema,
+  allowed: z.boolean(),
+});
+
 export const ChatCatalogEntrySchema = z.strictObject({
   family: ChatFamilySchema,
   connected: z.boolean(),
@@ -1106,6 +1128,10 @@ export const ChatCatalogEntrySchema = z.strictObject({
   unlisted: ChatAttachmentDeliverySchema.exclude(['native']).optional(),
   /** The installed client against the tested build. Missing for a family without one. */
   client: ClientVersionStatusSchema.optional(),
+  /** What the provider last said about paid use past the included allowance. Null when unread. */
+  credits: ChatCreditsSchema.nullable().optional(),
+  /** The person's Allow credit spending switch. Present for OpenAI and Anthropic only. */
+  creditSpending: z.boolean().optional(),
 });
 export const ChatCatalogReadSchema = z.strictObject({
   families: z.array(ChatCatalogEntrySchema).max(4),
@@ -1200,6 +1226,25 @@ export function windowAppliesTo(
  * reading; otherwise it goes to the turn trace.
  */
 export const LOW_ALLOWANCE_PERCENT = 20;
+
+/** The included allowance is used up: the provider says so, or a window for the model reads zero. */
+export function allowanceExhausted(
+  entry: Pick<ChatCatalogEntry, 'remaining' | 'credits'>,
+  model: string | null = null,
+): boolean {
+  return entry.credits?.limitReached === true || tightestAllowance(entry, model).percent === 0;
+}
+
+/**
+ * A turn on this family would spend credits the person has not allowed. Local and Google carry no
+ * switch, so they never pause.
+ */
+export function creditsPaused(
+  entry: Pick<ChatCatalogEntry, 'remaining' | 'credits' | 'creditSpending'>,
+  model: string | null = null,
+): boolean {
+  return entry.creditSpending === false && allowanceExhausted(entry, model);
+}
 
 export function tightestAllowance(
   entry: Pick<ChatCatalogEntry, 'remaining'>,

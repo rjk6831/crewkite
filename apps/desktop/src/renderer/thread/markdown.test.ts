@@ -33,7 +33,9 @@ function nodes(list: InlineNode[]): string {
         ? `link:${node.href}`
         : node.kind === 'text'
           ? `t:${node.text}`
-          : node.kind,
+          : node.kind === 'file'
+            ? `file:${node.text}`
+            : node.kind,
     )
     .join(' ');
 }
@@ -117,4 +119,25 @@ test('markdown keeps list numbers, reads tables and rejects links that are not h
   ];
   for (const [address, expected] of addresses)
     assert.deepEqual(externalLink(address), expected, String(address).slice(0, 40));
+});
+
+// Claim: a reply that cites a file shows the file and line as code and never the host path, in
+// either destination form CommonMark allows. Web links keep working inside angle brackets.
+test('a link to a local file shows the file and line, never the host path', () => {
+  const rows: [source: string, expected: string][] = [
+    [
+      '[src/cart.js](</Users/me/Library/Application Support/x/src/cart.js:4>)',
+      'file:src/cart.js:4',
+    ],
+    ['see [cart](src/cart.js:4:2).', 't:see  file:cart:4:2 t:.'],
+    ['[`cart.js`](./src/cart.js#L12-L20)', 'file:cart.js:12'],
+    ['[src/cart.js:4](/repo/src/cart.js:4)', 'file:src/cart.js:4'],
+    ['[/Users/me/repo/README.md](/Users/me/repo/README.md)', 'file:README.md'],
+    ['[a](C:\\repo\\a.ts)', 'file:a'],
+    ['[a](<https://x.com/p>)', 'link:https://x.com/p'],
+    ['[a](<https://x.com/a b>)', 'inert'],
+    ['[a](notes)', 'inert'],
+    ['[a](//evil.com/a.js)', 'inert'],
+  ];
+  for (const [source, expected] of rows) assert.equal(nodes(parseInline(source)), expected, source);
 });

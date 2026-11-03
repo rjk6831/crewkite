@@ -13,7 +13,7 @@ ADR 0038 ruled out a Manager role: "A Manager would decide which role runs next 
 
 This record amends the Manager paragraph of ADR 0038 and leaves that record's text as it is. A crew can have an orchestrator. It proposes. The controller validates, assigns and runs.
 
-- `orchestrator` is a fifth crew role with a model and effort. A crew still needs a builder, and each role appears at most once. The Full crew preset includes an orchestrator. Solo and Pair do not.
+- `orchestrator` is a fifth crew role with a model and effort. A crew still needs a builder, and each role appears at most once. The Full crew preset includes an orchestrator. Solo and Tandem do not.
 - When the crew has an orchestrator, the orchestrator turn replaces the single builder turn. It runs read-only and returns one fenced `json` block tagged `plan`.
 - `ChatPlanSchema` in `packages/contracts/src/chat.ts` defines the plan: `planId`, `goal` (at most 2,000 characters) and 1 to 8 slices. A slice has `id` (1 to 8, unique), `title` (at most 120), `brief` (at most 4,000), `files` (at most 40 paths inside the scratch copy, no `..`, no absolute path), `depends` (ids of other slices, no cycle), `difficulty` (easy, medium or hard), an optional `hint` (`family`, and `role` builder or fixer) and `readOnly`.
 - A plan that fails the schema goes back to the orchestrator once with the error. A second failure stops the chain with one line.

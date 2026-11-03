@@ -388,14 +388,10 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 28px 7px 8px;
+  margin: 20px 4px 4px 7px;
   color: var(--text-dim);
   font-size: 9px;
   letter-spacing: 1.15px;
-}
-.nav-label .icon-button {
-  width: 20px;
-  height: 20px;
 }
 .project-name {
   display: flex;
@@ -486,19 +482,6 @@ kbd {
 .status-dot.state-unknown,
 .status-dot.state-failed {
   background: var(--red);
-}
-.add-task {
-  display: flex;
-  align-items: center;
-  gap: 7px;
-  padding: 11px 12px;
-  border: 0;
-  background: transparent;
-  color: var(--text-dim);
-  font-size: 11px;
-}
-.add-task:hover {
-  color: var(--text);
 }
 .nav-empty {
   color: var(--text-dim);

@@ -20,6 +20,8 @@ import {
   type CrewChoiceId,
   CrewChoiceIdSchema,
   crewNameTaken,
+  currentCrewChoice,
+  currentPresetName,
   orderedCrew,
   rankFamilies,
   SAVED_CREWS_MAX,
@@ -349,7 +351,7 @@ export const crewRoleNames: Record<ChatCrewRole, string> = {
 };
 const presetRoles = {
   Solo: ['builder'],
-  Pair: ['builder', 'reviewer'],
+  Tandem: ['builder', 'reviewer'],
   'Full crew': ['builder', 'reviewer', 'challenger', 'fixer', 'orchestrator'],
 } as const satisfies Record<string, readonly ChatCrewRole[]>;
 export type CrewPresetName = keyof typeof presetRoles;
@@ -365,7 +367,7 @@ export function flightPreset(hasCrew: boolean, mode: ChatFlightMode): CrewPreset
 /** What each preset holds, in the words Settings and the Crew tab show. */
 export const crewPresetHints: Record<CrewPresetName, string> = {
   Solo: 'The builder only. Nothing runs after a reply.',
-  Pair: 'A builder and a reviewer on another family.',
+  Tandem: 'A builder and a reviewer on another family.',
   'Full crew': 'Builder, reviewer, challenger and fixer, with an orchestrator that plans the work.',
 };
 /**
@@ -391,18 +393,21 @@ export function readCrewPresets(store: Store | null = browserStore()): CrewPrese
       return null;
     }
   };
+  // Pins saved under a preset's earlier name count for the preset it is now.
+  const pinsOf = (saved: ReturnType<typeof read>, name: CrewPresetName) =>
+    saved?.[name] ??
+    Object.entries(saved ?? {}).find(([key]) => currentPresetName(key) === name)?.[1];
   const saved = read(presetKey);
   const switches = read(subagentsKey);
   return crewPresetNames.map((name) => ({
     name,
     members: presetRoles[name].map((role) => {
-      const pinned = ChatModelSelectionSchema.safeParse(saved?.[name]?.[role]);
+      const pinned = ChatModelSelectionSchema.safeParse(pinsOf(saved, name)?.[role]);
+      const allow = pinsOf(switches, name)?.[role];
       return {
         role,
         selection: pinned.success ? pinned.data : null,
-        ...(typeof switches?.[name]?.[role] === 'boolean'
-          ? { allowSubagents: switches[name][role] as boolean }
-          : {}),
+        ...(typeof allow === 'boolean' ? { allowSubagents: allow } : {}),
       };
     }),
   }));
@@ -641,9 +646,15 @@ export function crewChoices(
   ];
 }
 
-/** The choice whose name a thread's crew carries, if it is still listed. */
+/**
+ * The choice whose name a thread's crew carries, if it is still listed. A thread that started from
+ * a preset before it was renamed carries the earlier name.
+ */
 export const choiceNamed = (choices: readonly CrewChoice[], name: string | undefined) =>
-  name === undefined ? undefined : choices.find((choice) => choice.name === name);
+  name === undefined
+    ? undefined
+    : (choices.find((choice) => choice.name === name) ??
+      choices.find((choice) => choice.name === currentPresetName(name)));
 
 /** The default among `choices`: the one `wanted` names while it is listed, else Solo. */
 export const defaultChoiceId = (choices: readonly CrewChoice[], wanted: string | undefined) =>
@@ -660,7 +671,8 @@ export function readProjectCrews(store: Store | null = browserStore()): Record<s
   const crews: Record<string, string> = {};
   if (saved && typeof saved === 'object' && !Array.isArray(saved))
     for (const [project, id] of Object.entries(saved))
-      if (typeof id === 'string' && ids.has(id) && project.length <= 64) crews[project] = id;
+      if (typeof id === 'string' && ids.has(currentCrewChoice(id)) && project.length <= 64)
+        crews[project] = currentCrewChoice(id);
   return crews;
 }
 

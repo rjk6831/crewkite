@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import type { ChatCatalogRead } from '@crewkite/contracts';
-import { effortLevels, MODEL_ID, modelGroups, shownEffort } from './model-groups.ts';
+import { effortLevels, MODEL_ID, modelGroups, offLine, shownEffort } from './model-groups.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 const model = (name: string, extra: Partial<Entry['models'][number]> = {}) => ({
@@ -82,4 +82,26 @@ test('a model that lists levels offers no Default, and a saved Default shows the
   assert.equal(shownEffort('high', levels), 'high');
   assert.equal(shownEffort('default', none), 'default');
   assert.equal(shownEffort('default', undefined), 'default');
+});
+
+test('a cloud family that is not connected reads Not connected whatever its reason, and Local keeps its own words', () => {
+  const rows: [Parameters<typeof offLine>[0], string | null, string][] = [
+    [{ family: 'openai', needsConnect: false }, null, 'Not connected'],
+    [{ family: 'anthropic', needsConnect: true }, null, 'Not connected'],
+    [{ family: 'google', needsConnect: false }, null, 'Not connected'],
+    [
+      { family: 'google', needsConnect: undefined },
+      'Last seen 2 min ago. Not connected.',
+      'Not connected',
+    ],
+    [{ family: 'local', needsConnect: false }, null, 'Not connected'],
+    [{ family: 'local', needsConnect: true }, null, 'Connect in Settings'],
+    [
+      { family: 'local', needsConnect: false },
+      'Last seen 2 min ago. Not connected.',
+      'Last seen 2 min ago. Not connected.',
+    ],
+  ];
+  for (const [entry, localSeen, expected] of rows)
+    assert.equal(offLine(entry, localSeen), expected, `${entry.family} ${localSeen ?? ''}`);
 });

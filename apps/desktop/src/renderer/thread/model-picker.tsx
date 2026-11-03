@@ -14,7 +14,7 @@ import { REOBSERVE_MS } from '../local-setup-flow.ts';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import { FamilyMark } from './family-mark.tsx';
-import { effortLevels, MODEL_ID, modelGroups, shownEffort } from './model-groups.ts';
+import { effortLevels, MODEL_ID, modelGroups, offLine, shownEffort } from './model-groups.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 
@@ -276,10 +276,8 @@ export function ModelPicker({
         >
           {!catalog && <p className="th-menu-empty">Models are not available yet.</p>}
           {catalog?.families.map((family) => {
-            // Usage reads before Connect, so the family is listed and greyed with the next step.
-            const offTitle = family.needsConnect
-              ? 'Connect in Settings'
-              : (family.reason ?? 'Not connected');
+            // Usage reads before Connect, so the family is listed and greyed.
+            const offTitle = offLine(family, localSeen);
             const item = (model: Entry['models'][number]) => {
               const checked =
                 selection?.family === family.family && selection.model === model.model;
@@ -327,15 +325,7 @@ export function ModelPicker({
                 <div className={family.connected ? 'th-menu-head' : 'th-menu-head is-off'}>
                   <FamilyMark family={family.family} />
                   <strong>{familyName(family.family)}</strong>
-                  <span>
-                    {family.connected
-                      ? allowance(family, nowMs)
-                      : family.family === 'local' && localSeen
-                        ? localSeen
-                        : family.needsConnect
-                          ? 'Connect in Settings'
-                          : 'Not connected'}
-                  </span>
+                  <span>{family.connected ? allowance(family, nowMs) : offTitle}</span>
                 </div>
                 {groups.live.map(item)}
                 {older.length > 0 && (

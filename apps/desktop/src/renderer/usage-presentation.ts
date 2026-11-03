@@ -1,4 +1,5 @@
 import {
+  allowanceExhausted,
   type ChatCatalogEntry,
   type ChatCatalogRead,
   type ChatFamily,
@@ -491,6 +492,26 @@ const percentText = (percent: number | null) =>
   percent === null ? 'unknown' : `${Math.floor(percent)}%`;
 
 /**
+ * What a family's bar says once its included allowance is used up, or null to leave the bar as
+ * it is. No credits keeps the empty bar with its own words. A switch the person turned off pauses
+ * the rest. The balance shows as the provider wrote it, with no currency.
+ */
+export function creditText(
+  entry: Pick<ChatCatalogEntry, 'remaining' | 'credits' | 'creditSpending'>,
+  model: string | null,
+): string | null {
+  if (entry.creditSpending === undefined || !allowanceExhausted(entry, model)) return null;
+  const state = entry.credits?.state;
+  if (state === 'none') return 'No credits';
+  if (!entry.creditSpending) return 'Credits paused';
+  if (state === 'available')
+    return entry.credits?.balance ? `Credits ${entry.credits.balance} left` : 'Credits available';
+  if (state === 'unlimited') return 'Credits unlimited';
+  if (state === 'extra-usage-on') return 'Extra usage on';
+  return null;
+}
+
+/**
  * One row per family, connected or not. A family that is not connected reads its usage when it
  * can, and shows Connect with no bar when it has read nothing.
  * The catalog labels each window five-hour or weekly when it knows the period. Within a period the
@@ -530,6 +551,7 @@ export function railFamilies(
       applies.some((window) => window.label.toLowerCase() === label),
     );
     const tightest = tightestAllowance(entry, model);
+    const credit = creditText(entry, model);
     // A provider that is not connected and has read nothing keeps its row with Connect, so the
     // rail shows one gauge per provider. It has no bar to draw yet. Google reads its quota only
     // once it is connected, so until then its row is Connect alone, whatever an older read left.
@@ -540,18 +562,20 @@ export function railFamilies(
     const bars: RailBar[] =
       unlimited || setUp || unread
         ? []
-        : both
-          ? (['five-hour', 'weekly'] as const).map((label) => {
-              const { percent } = period(label);
-              return { text: `${barNames[label]} ${percentText(percent)}`, percent };
-            })
-          : [
-              {
-                text:
-                  tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
-                percent: tightest.percent,
-              },
-            ];
+        : credit
+          ? [{ text: credit, percent: tightest.percent }]
+          : both
+            ? (['five-hour', 'weekly'] as const).map((label) => {
+                const { percent } = period(label);
+                return { text: `${barNames[label]} ${percentText(percent)}`, percent };
+              })
+            : [
+                {
+                  text:
+                    tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
+                  percent: tightest.percent,
+                },
+              ];
     const until = tightest.resetsAt ? Date.parse(tightest.resetsAt) - nowMs : null;
     return {
       family: entry.family,

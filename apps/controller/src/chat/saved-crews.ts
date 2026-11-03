@@ -5,6 +5,7 @@ import {
   type CommandResult,
   CREW_PRESET_NAMES,
   crewNameTaken,
+  currentCrewChoice,
   orderedCrew,
   SAVED_CREWS_MAX,
   type SavedCrew,
@@ -42,11 +43,10 @@ export class SavedCrews {
     const settings = this.db
       .prepare('SELECT default_crew, imported_at FROM crew_settings WHERE id=1')
       .get() as { default_crew: string; imported_at: string | null };
+    const saved = currentCrewChoice(settings.default_crew);
     return {
       crews,
-      defaultCrew: this.known(settings.default_crew, crews)
-        ? settings.default_crew
-        : BUILT_IN_DEFAULT_CREW,
+      defaultCrew: this.known(saved, crews) ? saved : BUILT_IN_DEFAULT_CREW,
       imported: settings.imported_at !== null,
     };
   }

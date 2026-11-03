@@ -5,6 +5,7 @@ import {
   DiscoveryError,
   OpenAiDiscovery,
   type OpenAiUsage,
+  openAiCreditReading,
   openAiUsageReporter,
   projectOpenAiUsage,
   type RefusedEnvelope,
@@ -1007,4 +1008,45 @@ test('a process merges sparse updates into the windows it reported', () => {
       throw new Error('private-usage-canary');
     })('account/rateLimits/read', rateLimitRead({ codex: snapshot('codex', weekly) })),
   );
+});
+
+test('the credit reading takes the default bucket, and its limit is reached by type or a window at zero', () => {
+  const window = (usedPercent: number, resetsAt: number) => ({
+    usedPercent,
+    windowDurationMins: 300,
+    resetsAt,
+  });
+  const read = (codex: object, other: object = {}) =>
+    openAiCreditReading(
+      projectOpenAiUsage('account/rateLimits/read', {
+        rateLimits: { limitId: 'codex' },
+        rateLimitsByLimitId: {
+          codex: { limitId: 'codex', ...codex },
+          other: {
+            limitId: 'other',
+            primary: window(100, 1_800_000_000),
+            credits: { hasCredits: false, unlimited: false, balance: null },
+            ...other,
+          },
+        },
+      }),
+    );
+  const credits = { hasCredits: true, unlimited: false, balance: '4.50' };
+  assert.deepEqual(read({ credits, primary: window(40, 1_800_000_000) }), {
+    state: 'available',
+    balance: '4.50',
+    limitReached: false,
+    resetsAt: null,
+  });
+  assert.deepEqual(read({ credits, primary: window(100, 1_800_000_000) }), {
+    state: 'available',
+    balance: '4.50',
+    limitReached: true,
+    resetsAt: '2027-01-15T08:00:00.000Z',
+  });
+  assert.equal(read({ credits, rateLimitReachedType: 'rate_limit_reached' })?.limitReached, true);
+  // A reached spend control leaves nothing to spend.
+  assert.equal(read({ credits, spendControlReached: true })?.state, 'none');
+  assert.equal(read({ credits: { ...credits, unlimited: true } })?.state, 'unlimited');
+  assert.equal(read({}, { credits: null }), null);
 });
