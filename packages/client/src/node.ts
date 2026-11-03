@@ -682,4 +682,11 @@ export async function connectController(options: Options): Promise<ControllerCli
 }
 
 export { writeDiagnosticsFolder } from './diagnostics.ts';
+export {
+  type InstalledState,
+  prepareInstalledState,
+  preparePrivateStateDirectory,
+  resolveInstalledState,
+} from './installed-state.ts';
 export { transferArtifact } from './output.ts';
+export { verifyRuntimeIntegrity } from './runtime-integrity.ts';

@@ -12,7 +12,6 @@ import {
   unlinkSync,
   writeFileSync,
 } from 'node:fs';
-import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { setImmediate } from 'node:timers/promises';
 import { pathToFileURL } from 'node:url';
@@ -67,6 +66,7 @@ import {
 } from './chat/scripting.ts';
 import { runSearchCommand } from './chat/search.ts';
 import { runDiagnosticsCommand } from './diagnostics.ts';
+import { crewkiteHome } from './settings.ts';
 
 const googleAcpLabel =
   'Google’s published ACP agent, signed in with your own Google account. Google documents this agent for editors; CrewKite is not named.';
@@ -626,7 +626,7 @@ export async function runCli(
       throw new Error('Output requires an export action or its saved receipt.');
     if (area === 'task' && action === 'export' && !values.output)
       throw new Error('Export requires --output with a new file path.');
-    const home = resolve(values.home ?? process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite'));
+    const home = crewkiteHome(values.home);
     if (importingGoogle) {
       const provider = await import(
         new URL('../../controller/src/providers/google/acp/import.ts', import.meta.url).href
@@ -2171,8 +2171,7 @@ export function interactiveArgs(args: readonly string[]): boolean {
   return true;
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
-  const args = process.argv.slice(2);
+export async function runTerminal(args: string[]): Promise<number> {
   if (process.stdout.isTTY && process.stdin.isTTY && interactiveArgs(args)) {
     // Ink and the renderer modules load only here, so the commands and print mode run without them.
     const { startInteractive } = await import('./interactive/start.ts').catch((error) => {
@@ -2187,7 +2186,12 @@ if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) 
       process.stderr.write(
         'Interactive mode needs a source checkout with its dependencies installed. The thread commands and crewkite -p work here.\n',
       );
-      process.exitCode = 2;
-    } else process.exitCode = await startInteractive(args);
-  } else process.exitCode = await runCli(args);
+      return 2;
+    }
+    return startInteractive(args);
+  }
+  return runCli(args);
 }
+
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href)
+  process.exitCode = await runTerminal(process.argv.slice(2));

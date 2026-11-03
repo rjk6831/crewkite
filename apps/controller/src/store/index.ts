@@ -30,6 +30,7 @@ import {
   TimestampSchema,
   type WorkspaceStamp,
 } from '@crewkite/contracts';
+import { assertSchemaCompatibility } from './schema-compatibility.ts';
 
 export type EntityKind =
   | 'project'
@@ -188,6 +189,7 @@ export class Store {
   private readonly path: string;
 
   constructor(path: string) {
+    if (path !== ':memory:' && path !== '') assertSchemaCompatibility(path);
     this.path = path;
     mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
     try {

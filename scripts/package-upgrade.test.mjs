@@ -25,10 +25,10 @@ import { CommandReceipts } from '../apps/desktop/src/main/receipts.ts';
 import { upgradePackage } from './package-upgrade.mjs';
 
 const hash = (bytes) => createHash('sha256').update(bytes).digest('hex');
-function payload(path, id, revision) {
-  mkdirSync(join(path, 'Electron.app'), { recursive: true });
+function payload(path, id, revision, bundle = 'Electron.app') {
+  mkdirSync(join(path, bundle), { recursive: true });
   writeFileSync(join(path, 'runtime'), id, { mode: 0o755 });
-  writeFileSync(join(path, 'Electron.app/runtime'), id, { mode: 0o644 });
+  writeFileSync(join(path, bundle, 'runtime'), id, { mode: 0o644 });
   writeFileSync(
     join(path, 'manifest.json'),
     JSON.stringify({
@@ -38,10 +38,13 @@ function payload(path, id, revision) {
       architecture: 'arm64',
       id,
       revision,
-      electron: { signature: { kind: 'ad-hoc', verified: 'deep-strict' } },
+      electron: {
+        ...(bundle === 'CrewKite.app' ? { bundle } : {}),
+        signature: { kind: 'ad-hoc', verified: 'deep-strict' },
+      },
       files: [
         { path: 'runtime', bytes: id.length, sha256: hash(id), mode: 0o755 },
-        { path: 'Electron.app/runtime', bytes: id.length, sha256: hash(id), mode: 0o644 },
+        { path: `${bundle}/runtime`, bytes: id.length, sha256: hash(id), mode: 0o644 },
       ],
     }),
   );
@@ -83,6 +86,11 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
     'installed',
     'installed-initialized-owner',
     'old-re-signed',
+    'branded',
+    'branded-old-re-signed',
+    'unexpected-bundle',
+    'installed-layout',
+    'invalid-bundle',
     'finder-metadata',
     'finder-link',
     'finder-large',
@@ -108,8 +116,21 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
         t.after(() => rmSync(root, { recursive: true, force: true }));
         const source = join(root, 'new'),
           target = join(root, 'old');
-        payload(source, 'replacement', 'a'.repeat(40));
-        payload(target, 'previous', 'b'.repeat(40));
+        const sourceBundle = scenario.startsWith('branded') ? 'CrewKite.app' : 'Electron.app';
+        const targetBundle = scenario === 'branded-old-re-signed' ? 'CrewKite.app' : 'Electron.app';
+        payload(source, 'replacement', 'a'.repeat(40), sourceBundle);
+        payload(target, 'previous', 'b'.repeat(40), targetBundle);
+        if (scenario === 'unexpected-bundle') {
+          mkdirSync(join(target, 'CrewKite.app'));
+          writeFileSync(join(target, 'CrewKite.app/runtime'), 'unrecorded');
+        }
+        if (scenario === 'installed-layout' || scenario === 'invalid-bundle') {
+          const path = join(source, 'manifest.json');
+          const manifest = JSON.parse(readFileSync(path, 'utf8'));
+          if (scenario === 'installed-layout') manifest.format = 2;
+          else manifest.electron.bundle = '../outside';
+          writeFileSync(path, JSON.stringify(manifest));
+        }
         const state = join(target, 'state'),
           home = join(state, 'home'),
           profile = join(state, 'profile');
@@ -153,8 +174,8 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
         if (scenario === 'profile-lock')
           symlinkSync('stale-host-999999', join(profile, 'SingletonLock'));
         if (scenario === 'tampered') writeFileSync(join(source, 'runtime'), 'changed');
-        if (scenario === 'old-re-signed')
-          writeFileSync(join(target, 'Electron.app/runtime'), 'locally re-signed');
+        const reSigned = scenario === 'old-re-signed' || scenario === 'branded-old-re-signed';
+        if (reSigned) writeFileSync(join(target, targetBundle, 'runtime'), 'locally re-signed');
         if (scenario === 'old-payload-drift') writeFileSync(join(target, 'runtime'), 'changed');
         if (scenario === 'finder-metadata') {
           writeFileSync(join(source, '.DS_Store'), 'new folder view', { mode: 0o600 });
@@ -172,7 +193,10 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
         const originalState = stateInventory(state);
         let renames = 0;
         const execute = (path, args) => {
-          if (path !== '/usr/sbin/lsof') return { status: 0, stdout: '', stderr: '' };
+          if (path !== '/usr/sbin/lsof') {
+            assert.equal(args.at(-1), join(source, sourceBundle));
+            return { status: 0, stdout: '', stderr: '' };
+          }
           assert.deepEqual(args, ['-nP', '-t', '+D', args.at(-1)]);
           if (scenario.startsWith('installed'))
             return spawnSync(path, args, {
@@ -214,6 +238,8 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
               'installed',
               'installed-initialized-owner',
               'old-re-signed',
+              'branded',
+              'branded-old-re-signed',
               'finder-metadata',
             ].includes(scenario)
           ) {
@@ -227,7 +253,7 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
             assert.deepEqual(stateInventory(join(result.backup, 'state')), originalState);
             assert.equal(result.stateDigest, hash(JSON.stringify(originalState)));
             assert.equal(result.stateEntries, originalState.length);
-            assert.equal(result.previousRuntimeChanged, scenario === 'old-re-signed');
+            assert.equal(result.previousRuntimeChanged, reSigned);
             assert.equal(
               result.previousFinderMetadataEntries,
               scenario === 'finder-metadata' ? 1 : 0,
@@ -239,10 +265,10 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
               );
               assert.equal(readFileSync(join(target, '.DS_Store'), 'utf8'), 'new folder view');
             }
-            assert.equal(plan.previousRuntimeChanged, scenario === 'old-re-signed');
+            assert.equal(plan.previousRuntimeChanged, reSigned);
             assert.equal(
-              readFileSync(join(result.backup, 'Electron.app/runtime'), 'utf8'),
-              scenario === 'old-re-signed' ? 'locally re-signed' : 'previous',
+              readFileSync(join(result.backup, targetBundle, 'runtime'), 'utf8'),
+              reSigned ? 'locally re-signed' : 'previous',
             );
             const copied = new Store(join(home, 'state.sqlite'));
             assert.deepEqual(copied.localControl(), local);
@@ -264,6 +290,9 @@ test('package upgrade preserves fixed-path state and refuses unsafe swaps', asyn
               'profile-lock': /profile lock/,
               tampered: /inventory differs/,
               'external-link': /symbolic link leaves/,
+              'unexpected-bundle': /inventory differs/,
+              'installed-layout': /supported workspace package/,
+              'invalid-bundle': /runtime bundle is unsupported/,
             };
             await assert.rejects(pending, reasons[scenario]);
             assert.equal(

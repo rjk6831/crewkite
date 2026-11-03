@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import {
+  chmodSync,
   copyFileSync,
   mkdtempSync,
   readdirSync,
@@ -13,7 +14,9 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { type TestContext, test } from 'node:test';
+import { Controller } from '../commands/controller.ts';
 import { Store } from './index.ts';
+import { assertSchemaCompatibility } from './schema-compatibility.ts';
 
 const migrations = resolve('apps/controller/migrations');
 const newest = readdirSync(migrations).filter((file) => /^\d{3}-.*\.sql$/.test(file)).length;
@@ -57,6 +60,87 @@ const contents = (file: string) => {
     db.close();
   }
 };
+
+test('a newer schema refuses before changing database bytes, modes or sidecars', (t) => {
+  for (const journal of ['DELETE', 'WAL']) {
+    const directory = temp(t, 'ck-newer-schema-');
+    const database = join(directory, 'state.sqlite');
+    const writer = new DatabaseSync(database);
+    try {
+      writer.exec(`PRAGMA journal_mode=${journal}; CREATE TABLE retained(value TEXT);`);
+      writer.exec(
+        `INSERT INTO retained VALUES ('later ledger'); PRAGMA user_version=${newest + 1};`,
+      );
+      if (journal === 'DELETE') writer.close();
+      chmodSync(database, 0o640);
+      const inventory = () =>
+        readdirSync(directory)
+          .sort()
+          .map((name) => ({
+            name,
+            mode: statSync(join(directory, name)).mode,
+            bytes: readFileSync(join(directory, name)),
+          }));
+      const before = inventory();
+      for (const check of [
+        () => assertSchemaCompatibility(database),
+        () => new Store(database),
+        () =>
+          new Controller({
+            home: directory,
+            googleUsageClient: () => {
+              throw new Error('Schema refusal must precede client resolution.');
+            },
+          }),
+      ]) {
+        assert.throws(check, /needs a newer controller/, journal);
+        assert.deepEqual(inventory(), before, journal);
+      }
+    } finally {
+      if (journal === 'WAL') writer.close();
+    }
+  }
+});
+
+test('schema preflight refuses malformed databases and uncertain recovery files without writes', (t) => {
+  for (const kind of [
+    'database',
+    'orphan WAL',
+    'partial WAL',
+    'orphan journal',
+    'rollback journal',
+  ]) {
+    const directory = temp(t, 'ck-schema-probe-');
+    const database = join(directory, 'state.sqlite');
+    if (kind === 'database') writeFileSync(database, 'incomplete database');
+    else {
+      if (kind === 'partial WAL' || kind === 'rollback journal') {
+        const writer = new DatabaseSync(database);
+        writer.exec('CREATE TABLE retained(value TEXT)');
+        writer.close();
+      }
+      writeFileSync(
+        `${database}${kind.includes('journal') ? '-journal' : '-wal'}`,
+        'incomplete recovery file',
+      );
+    }
+    const inventory = () =>
+      readdirSync(directory)
+        .sort()
+        .map((name) => ({
+          name,
+          mode: statSync(join(directory, name)).mode,
+          bytes: readFileSync(join(directory, name)),
+        }));
+    const before = inventory();
+    assert.throws(
+      () => assertSchemaCompatibility(database),
+      /could not be checked without writes/,
+      kind,
+    );
+    assert.deepEqual(inventory(), before, kind);
+  }
+});
 
 test('a pending migration leaves a private copy at the old version, a fresh database leaves none, and only the newest two stay', (t) => {
   const directory = temp(t, 'ck-backup-');

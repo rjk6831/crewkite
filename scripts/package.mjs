@@ -28,6 +28,7 @@ import {
   inspectInstalledDependencies,
 } from '../apps/controller/src/host/toolchain.ts';
 import { stageCliRuntime } from './cli-runtime.ts';
+import { assembleInstalledPackage, brandMacPackage } from './package-installed.mjs';
 import { copyRuntimePackages } from './runtime-packages.ts';
 
 const helperSourcePath = 'apps/controller/src/providers/local/secure-input.m';
@@ -204,7 +205,7 @@ export function buildLocalInputHelper(checkout, build, dependencies = {}) {
 }
 
 /** A resource seal lets macOS check the copied runtime before its files are inventoried. */
-export function sealElectronBundle(bundle, execute = spawnSync) {
+export function sealElectronBundle(bundle, execute = spawnSync, { nested = true } = {}) {
   const options = {
     env: { LANG: 'C', PATH: '/usr/bin:/bin' },
     encoding: 'utf8',
@@ -213,7 +214,14 @@ export function sealElectronBundle(bundle, execute = spawnSync) {
     stdio: ['ignore', 'pipe', 'pipe'],
   };
   for (const args of [
-    ['--force', '--deep', '--sign', '-', '--preserve-metadata=identifier,entitlements', bundle],
+    [
+      '--force',
+      ...(nested ? ['--deep'] : []),
+      '--sign',
+      '-',
+      '--preserve-metadata=entitlements',
+      bundle,
+    ],
     ['--verify', '--deep', '--strict', '--verbose=2', bundle],
   ]) {
     const result = execute('/usr/bin/codesign', args, options);
@@ -253,7 +261,11 @@ export async function packageDesktop() {
       throw new Error('The build provenance policy must be a valid regular expression.');
     }
   const { values } = parseArgs({
-    options: { id: { type: 'string' }, demo: { type: 'boolean', default: false } },
+    options: {
+      id: { type: 'string' },
+      demo: { type: 'boolean', default: false },
+      installed: { type: 'boolean', default: false },
+    },
   });
   const mode = values.demo ? 'demo' : 'workspace';
   const controllerEntry =
@@ -430,6 +442,11 @@ export async function packageDesktop() {
   const { RuntimeManifestSchema } = await import(
     pathToFileURL(join(checkout, 'packages/contracts/src/index.ts')).href
   );
+  const { CREWKITE_VERSION } = await import(
+    pathToFileURL(join(checkout, 'packages/contracts/src/version.ts')).href
+  );
+  if (desktop.version !== CREWKITE_VERSION)
+    throw new Error('The desktop version differs from the committed product version.');
   writeFileSync(
     join(runtime, 'manifest.json'),
     `${JSON.stringify(
@@ -453,7 +470,7 @@ export async function packageDesktop() {
   );
   writeFileSync(
     join(stage, 'bin/desktop'),
-    `${launcherRoot}test -f "$root/app/runtime/${controllerEntry}" || { echo 'The packaged controller entry is unavailable.' >&2; exit 1; }\nexport CREWKITE_HOME="$root/state/home"\nexport CREWKITE_PROFILE="$root/state/profile"\nexec "$root/Electron.app/Contents/MacOS/Electron" "$root/app"\n`,
+    `${launcherRoot}test -f "$root/app/runtime/${controllerEntry}" || { echo 'The packaged controller entry is unavailable.' >&2; exit 1; }\nexport CREWKITE_HOME="$root/state/home"\nexport CREWKITE_PROFILE="$root/state/profile"\nexec "$root/CrewKite.app/Contents/MacOS/CrewKite" "$root/app"\n`,
     { mode: 0o755 },
   );
   writeFileSync(
@@ -711,26 +728,59 @@ export async function packageDesktop() {
     'bin/desktop',
   ])
     inside(join(stage, entry));
-  const electronSignature = sealElectronBundle(join(stage, 'Electron.app'));
+  const installed = values.installed
+    ? assembleInstalledPackage({ stage, version: CREWKITE_VERSION })
+    : undefined;
+  if (installed) {
+    for (const entry of installed.requiredEntries) inside(join(stage, entry));
+    for (const item of notices)
+      item.license = `CrewKite.app/Contents/Resources/distribution/${item.license}`;
+  }
+  const app = installed?.app ?? brandMacPackage({ stage, version: CREWKITE_VERSION });
+  sealElectronBundle(app);
+  const finalRuntime = installed?.runtime ?? runtime;
+  const finalManifest = RuntimeManifestSchema.parse(json(join(finalRuntime, 'manifest.json')));
+  if (!finalManifest.localInput) throw new Error('The staged Local input identity is missing.');
+  finalManifest.node.sha256 = hash(join(finalRuntime, 'bin/node'));
+  finalManifest.localInput.sha256 = hash(join(finalRuntime, 'bin/local-secure-input'));
+  writeFileSync(join(finalRuntime, 'manifest.json'), `${JSON.stringify(finalManifest, null, 2)}\n`);
+  // The nested seal fixes executable bytes. Only the outer resource seal changes after hashing.
+  const electronSignature = sealElectronBundle(app, spawnSync, { nested: false });
+  const { verifyRuntimeIntegrity } = await import(
+    pathToFileURL(join(checkout, 'packages/client/src/runtime-integrity.ts')).href
+  );
+  verifyRuntimeIntegrity(finalRuntime);
   inspect(stage);
   writeFileSync(
     join(stage, 'manifest.json'),
     `${JSON.stringify(
       {
-        format: 1,
+        format: installed ? 2 : 1,
+        ...(installed ? { layout: 'installed' } : {}),
         id: values.id,
         mode,
         revision,
         lockHash,
         buildDependencies,
+        buildInputs: { nodeSha256: nodeHash, localInputSha256: localInput.identity.sha256 },
         platform: 'darwin',
         architecture: 'arm64',
         minimumOS: helperMinimumOS,
-        localInput: { ...localInput.identity, compiler: localInput.compiler },
+        localInput: { ...finalManifest.localInput, compiler: localInput.compiler },
         qualification: 'static-stage-only',
         bootstrap: 'present',
-        runtime: { path: 'app/runtime/bin/node', version: nodeVersion, sha256: nodeHash },
-        electron: { version: electronVersion, signature: electronSignature },
+        runtime: {
+          path: installed
+            ? 'CrewKite.app/Contents/Resources/app/runtime/bin/node'
+            : 'app/runtime/bin/node',
+          version: nodeVersion,
+          sha256: finalManifest.node.sha256,
+        },
+        electron: {
+          bundle: 'CrewKite.app',
+          version: electronVersion,
+          signature: electronSignature,
+        },
         notices,
         files,
       },

@@ -1,8 +1,20 @@
 import assert from 'node:assert/strict';
 import type { ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createHash } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs';
-import { resolve } from 'node:path';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
@@ -10,9 +22,91 @@ import { OpenAiDiscovery } from './discovery.ts';
 import {
   type NativePhase,
   nativeDiscoveryArguments,
+  nativeDiscoveryEnvironment,
+  prepareCodexHome,
   startNativeDiscovery,
   startNativeTask,
 } from './native-discovery.ts';
+
+test('the owned client home follows installed state and refuses unsafe paths before creating provider data', (t) => {
+  const temporary = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-provider-home-')));
+  t.after(() => rmSync(temporary, { recursive: true, force: true }));
+  for (const kind of [
+    'installed',
+    'source',
+    'default',
+    'shared root',
+    'shared providers',
+    'shared client',
+    'linked providers',
+    'linked parent',
+    'mismatched root',
+    'newer schema',
+  ]) {
+    const person = join(temporary, kind);
+    mkdirSync(person, { mode: 0o700 });
+    const root = join(person, 'state with spaces');
+    const installed = kind !== 'source' && kind !== 'default';
+    const source: NodeJS.ProcessEnv = {
+      HOME: person,
+      CODEX_HOME: join(person, 'personal-client'),
+      ...(kind === 'default' ? {} : { CREWKITE_HOME: join(root, 'home') }),
+      ...(installed
+        ? {
+            CREWKITE_PROFILE: join(root, 'profile'),
+            CREWKITE_INSTALLED_STATE_ROOT:
+              kind === 'mismatched root' ? join(person, 'other') : root,
+          }
+        : {}),
+    };
+    const stateRoot = installed
+      ? root
+      : kind === 'source'
+        ? join(root, 'home')
+        : join(person, '.crewkite');
+    const expected = join(stateRoot, 'providers/openai/codex-home');
+    if (kind.startsWith('shared')) {
+      const shared =
+        kind === 'shared root'
+          ? root
+          : kind === 'shared providers'
+            ? join(root, 'providers')
+            : expected;
+      mkdirSync(shared, { recursive: true, mode: 0o700 });
+      chmodSync(shared, 0o755);
+    }
+    if (kind === 'linked providers') {
+      mkdirSync(root, { mode: 0o700 });
+      symlinkSync(person, join(root, 'providers'));
+    }
+    if (kind === 'linked parent') symlinkSync(person, root);
+    if (kind === 'newer schema') {
+      mkdirSync(join(root, 'home'), { recursive: true, mode: 0o700 });
+      const database = new DatabaseSync(join(root, 'home/state.sqlite'));
+      database.exec('PRAGMA user_version=999');
+      database.close();
+    }
+    const valid = ['installed', 'source', 'default'].includes(kind);
+    const run = () => {
+      const environment = nativeDiscoveryEnvironment(source);
+      assert.equal(environment.CODEX_HOME, expected);
+      assert.equal(environment.CREWKITE_INSTALLED_STATE_ROOT, source.CREWKITE_INSTALLED_STATE_ROOT);
+      return prepareCodexHome(environment);
+    };
+    if (valid) {
+      assert.equal(run(), expected);
+      for (const part of ['providers', 'providers/openai', 'providers/openai/codex-home'])
+        assert.equal(statSync(join(stateRoot, part)).mode & 0o777, 0o700);
+    } else {
+      assert.throws(
+        run,
+        kind === 'newer schema' ? /newer controller/ : /private|links|does not match/,
+      );
+      if (kind !== 'shared client') assert.equal(existsSync(expected), false, kind);
+    }
+    assert.equal(existsSync(join(person, 'personal-client')), false);
+  }
+});
 
 const fixture = `
 const { createInterface } = require('node:readline');

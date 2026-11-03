@@ -118,9 +118,17 @@ function readManifest(root) {
     !Array.isArray(value.files)
   )
     fail('Choose a supported workspace package with its original manifest.');
+  bundleName(value);
   return value;
 }
+function bundleName(manifest) {
+  const name = manifest.electron?.bundle ?? 'Electron.app';
+  if (name !== 'Electron.app' && name !== 'CrewKite.app')
+    fail('The package runtime bundle is unsupported.');
+  return name;
+}
 function verifyPayload(root, manifest, allowOldRuntimeChanges = false) {
+  const runtimePrefix = `${bundleName(manifest)}/`;
   const rows = inventory(root, { omitState: true });
   const actual = rows.filter((row) => !row.directory).map(({ link: _link, ...row }) => row);
   const normalize = (row) =>
@@ -151,13 +159,13 @@ function verifyPayload(root, manifest, allowOldRuntimeChanges = false) {
       actual
         .sort((a, b) => (a.path < b.path ? -1 : a.path > b.path ? 1 : 0))
         .filter((row) => !finderMetadata(row))
-        .filter((row) => !allowOldRuntimeChanges || !row.path.startsWith('Electron.app/'))
+        .filter((row) => !allowOldRuntimeChanges || !row.path.startsWith(runtimePrefix))
         .map(normalize),
     ) !==
       JSON.stringify(
         expected
           .filter((row) => !finderMetadata(row))
-          .filter((row) => !allowOldRuntimeChanges || !row.path.startsWith('Electron.app/'))
+          .filter((row) => !allowOldRuntimeChanges || !row.path.startsWith(runtimePrefix))
           .map(normalize),
       )
   )
@@ -168,12 +176,12 @@ function verifyPayload(root, manifest, allowOldRuntimeChanges = false) {
     runtimeChanged:
       JSON.stringify(
         actual
-          .filter((row) => row.path.startsWith('Electron.app/') && !finderMetadata(row))
+          .filter((row) => row.path.startsWith(runtimePrefix) && !finderMetadata(row))
           .map(normalize),
       ) !==
       JSON.stringify(
         expected
-          .filter((row) => row.path.startsWith('Electron.app/') && !finderMetadata(row))
+          .filter((row) => row.path.startsWith(runtimePrefix) && !finderMetadata(row))
           .map(normalize),
       ),
   };
@@ -276,7 +284,7 @@ export async function upgradePackage({ source, target, confirm }, dependencies =
     '--verify',
     '--deep',
     '--strict',
-    join(source, 'Electron.app'),
+    join(source, bundleName(candidate)),
   ]);
   if (signature.error || signature.signal || signature.status !== 0)
     fail('The replacement runtime seal failed verification.');

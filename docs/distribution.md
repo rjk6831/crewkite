@@ -1,5 +1,26 @@
 # Local distribution
 
+## Installed distribution in progress
+
+I am preparing installed packages under [Proposed ADR 0041](adr/0041-installed-distribution.md). The directory package below remains the existing staging workflow. Installed runtime support does not establish signing, installation or recovery qualification.
+
+The installed design keeps application files separate from private state. The desktop and CLI share `home` under the following root; the desktop keeps its separate `profile` beside it:
+
+| Platform | State root |
+|----------|------------|
+| macOS arm64 | `~/Library/Application Support/CrewKite` |
+| Linux x64 and arm64 | `${XDG_DATA_HOME:-~/.local/share}/crewkite` |
+
+A fresh installed 0.1.0 starts fresh state. Import from an initialized directory preview and rollback are unqualified. An incompatible database schema must be refused through a read-only check before any state write. Application replacement must preserve the selected state path and must never restore an older ledger over later records.
+
+The planned formats are a macOS arm64 DMG and Linux x64 and arm64 DEB and RPM packages. I use native platform tools and retain the existing payload checks, bundled Node identity, runtime dependency closure and notices. The manifest hashes the final signed bytes. The macOS bundle identity is `com.rootsnolimits.crewkite`. Signing and notarization claims wait for recorded verification and first-open evidence for the exact assets.
+
+AppImage is conditional. I require normal launch with the Chromium sandbox on Ubuntu 24.04. If that fails, I omit both AppImages from 0.1.0. I require real installed launch evidence on Ubuntu 24.04 x64 and arm64. RPM build, inspection and a Fedora container install qualify the RPM artifact for 0.1.0; native Fedora desktop launch remains pending and must be stated in the release notes.
+
+Linux retains the preview limits in [ADR 0013](adr/0013-macos-first-local-optional.md): OpenAI, Anthropic and Local chat without Local token authentication. Google, task writers, formatting and verification remain macOS-only. Windows is unsupported and WSL2 is untested.
+
+## Existing directory package
+
 The local package keeps Electron and the controller's Node runtime separate, as [ADR 0003](adr/0003-typescript-electron-node-controller.md) requires. This is a macOS arm64 directory package. It carries a complete Electron distribution and a pinned Node 24.22.0 binary. The declared binary floor is macOS 13.5. The pinned Node executable requires 13.5; the copied Electron payload requires 13.0. Those load-command values establish a build floor. Runtime compatibility on 13.5 remains unqualified. Developer ID signing, notarization and a general installer remain later distribution work.
 
 This staging path is a local maintainer workflow. It expects the existing checked dependency installation, installed Electron payload and repository-local Node binary under `internal/tools/node-v24.22.0-darwin-arm64/`. A delivered package carries those runtime files. Trying it needs local Git and an existing configured Git identity for branch acceptance.

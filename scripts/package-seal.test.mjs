@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { copyFileSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { copyFileSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
@@ -26,6 +27,8 @@ test('a staged app resource seal rejects changed resources', {
   );
   const resource = join(bundle, 'Contents/Resources/value.txt');
   writeFileSync(resource, 'original');
+  const nested = join(bundle, 'Contents/Resources/node');
+  copyFileSync('/usr/bin/true', nested);
   const verify = () =>
     spawnSync('/usr/bin/codesign', ['--verify', '--deep', '--strict', bundle], {
       timeout: 30000,
@@ -39,6 +42,16 @@ test('a staged app resource seal rejects changed resources', {
     notarized: false,
   });
   assert.equal(verify().status, 0);
+  const identity = spawnSync('/usr/bin/codesign', ['--display', '--verbose=2', bundle], {
+    encoding: 'utf8',
+  });
+  assert.equal(identity.status, 0);
+  assert.match(identity.stderr, /Identifier=org.example.package-seal/);
+  const finalHash = createHash('sha256').update(readFileSync(nested)).digest('hex');
+  writeFileSync(resource, finalHash);
+  sealElectronBundle(bundle, undefined, { nested: false });
+  assert.equal(verify().status, 0);
+  assert.equal(createHash('sha256').update(readFileSync(nested)).digest('hex'), finalHash);
   writeFileSync(resource, 'changed');
   assert.notEqual(verify().status, 0);
 });
@@ -53,7 +66,8 @@ test('staging refuses a failed or unfinished seal or verification', () => {
       let calls = 0;
       assert.throws(
         () =>
-          sealElectronBundle('/staged/Electron.app', () => {
+          sealElectronBundle('/staged/CrewKite.app', (_executable, args) => {
+            if (calls === 0) assert.ok(!args.some((arg) => arg.includes('identifier')));
             return calls++ === failedStep ? result : { status: 0 };
           }),
         /resource seal/,

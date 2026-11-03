@@ -1535,6 +1535,7 @@ export const DesktopNoticeSchema = z.discriminatedUnion('kind', [
 export type DesktopNotice = z.infer<typeof DesktopNoticeSchema>;
 export const RuntimeManifestSchema = z.strictObject({
   version: z.literal(1),
+  layout: z.literal('installed').optional(),
   node: z.strictObject({
     version: z.literal('24.22.0'),
     platform: z.enum(['darwin', 'linux']),

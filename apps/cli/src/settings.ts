@@ -12,7 +12,9 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
+import { prepareInstalledState, resolveInstalledState } from '@crewkite/client/node';
 import { type CliSettings, CliSettingsSchema } from '@crewkite/contracts';
+import { assertSchemaCompatibility } from '../../controller/src/store/schema-compatibility.ts';
 
 // The CLI's own settings live in cli.json in the CrewKite home. A file that is missing, too large
 // or fails the schema leaves the defaults in force, and the CLI says which. A save never writes a
@@ -24,7 +26,20 @@ const MAX_SETTINGS_BYTES = 65_536;
 export const defaultSettings = (): CliSettings => CliSettingsSchema.parse({});
 
 export function crewkiteHome(flag?: string): string {
-  return resolve(flag ?? process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite'));
+  const home = resolve(flag ?? process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite'));
+  prepareHome(home);
+  return home;
+}
+
+function prepareHome(home: string) {
+  const payload = process.env.CREWKITE_INSTALLED_APP;
+  const installed = payload ? resolveInstalledState() : undefined;
+  if (installed && home !== installed.home)
+    throw new Error(
+      'The installed CLI uses its selected workspace. Set both home and profile paths to select isolated state.',
+    );
+  assertSchemaCompatibility(join(home, 'state.sqlite'));
+  if (installed) prepareInstalledState(installed, payload);
 }
 
 export type LoadedSettings = { settings: CliSettings; problem: string | null };
@@ -61,6 +76,7 @@ export function loadSettings(home: string): LoadedSettings {
 
 /** Writes the whole file through a temporary file and a rename, private to its owner. */
 export function saveSettings(home: string, next: CliSettings): CliSettings {
+  prepareHome(home);
   const settings = CliSettingsSchema.parse(next);
   const temporary = join(home, `.${SETTINGS_FILE}.${randomUUID()}`);
   const file = openSync(
