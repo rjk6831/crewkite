@@ -296,6 +296,9 @@ export function buildLinuxPackages(
   }
   const root = join(work, 'root');
   packageCopy(stage, join(root, 'opt/crewkite'));
+  // The helper reached the package tree without its set-user-ID bit on the CI runner. Set it on
+  // the tree the packages are built from; dpkg-deb and rpmbuild write that mode, owned by root.
+  chmodSync(join(root, 'opt/crewkite/chrome-sandbox'), 0o4755);
   mkdirSync(join(root, 'usr/bin'), { recursive: true });
   writeFileSync(
     join(root, 'usr/bin/crewkite'),
