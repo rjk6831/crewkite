@@ -19,7 +19,7 @@ jobs:
   package:
     name: linux package (${{ matrix.arch }})
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 15
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
