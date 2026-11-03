@@ -33,7 +33,11 @@ const answering = fixture.replace(
 );
 
 // The quota read's timers run when the test says, so a 20 s deadline and the retries cost nothing.
-async function startReadFixture(t: Parameters<typeof setup>[0], silentReads: number) {
+async function startReadFixture(
+  t: Parameters<typeof setup>[0],
+  silentReads: number,
+  silentAt: (read: number) => boolean = () => false,
+) {
   mkdirSync(resolve('internal'), { recursive: true });
   const person = mkdtempSync(join(resolve('internal'), 'usage-account-'));
   const home = join(person, 'home');
@@ -53,7 +57,7 @@ async function startReadFixture(t: Parameters<typeof setup>[0], silentReads: num
     openAiUsageSpawn: (executable, args, options) => {
       const phase = args.at(-1) === 'list' ? 'features' : 'prepare';
       // A client that never answers its app-server stands in for one starved at launch.
-      const silent = phase === 'prepare' && reads.length < silentReads;
+      const silent = phase === 'prepare' && (reads.length < silentReads || silentAt(reads.length));
       const child = spawn(
         executable,
         silent ? ['-e', 'setInterval(() => {}, 1 << 30)'] : ['-e', answering, 'success', phase],
@@ -138,4 +142,52 @@ test('a start read that runs out of time reads again and fills the gauge', async
   assert.equal(windows[0].remaining?.value, 75);
   assert.equal(context.reads.length, 2);
   assert.equal(context.pending().includes(30000), false, 'a read that worked stops the retries');
+});
+
+// The rail's "read X ago" comes from the last reading. A failed timed read records its attempt and
+// keeps that time, and the next timed read still waits 90 s after the failed attempt.
+test('a timed OpenAI quota read waits 90 seconds and a failed one keeps the last reading time', async (t) => {
+  const context = await startReadFixture(t, 0, (read) => read === 2);
+  const { controller, clock } = context;
+  controller.store.transaction(() => controller.store.markConnectedOnce('openai'));
+  await controller.refreshOpenAiUsageWithRetry('start');
+  assert.equal(context.reads.length, 1);
+  const rows = [
+    { advance: 89_999, reads: 1 },
+    { advance: 1, reads: 2 },
+  ];
+  for (const row of rows) {
+    clock.advance(row.advance);
+    await controller.refreshOpenAiUsageWithRetry('interval');
+    assert.equal(context.reads.length, row.reads, `interval at +${row.advance}`);
+  }
+  const observedAt = controller.openAiUsageState()?.lastObservedAt;
+  assert.equal(observedAt, clock.now());
+  const reader = controller
+    .snapshot()
+    .routes.find((route) => route.displayName === 'OpenAI usage reader');
+  const windowTimes = () =>
+    controller.store
+      .list<Observation>('window')
+      .filter((value) => value.routeId === reader?.id)
+      .map((value) => value.observedAt);
+  assert.deepEqual(windowTimes(), [observedAt]);
+
+  // The third read never answers and runs out of its 20 s deadline.
+  await context.nextLaunch();
+  clock.advance(90_000);
+  const failing = controller.refreshOpenAiUsageWithRetry('interval');
+  await context.nextLaunch();
+  context.fire((ms) => ms > 10000 && ms <= 20000);
+  clock.advance(20_000);
+  await failing;
+  const failed = controller.openAiUsageState();
+  assert.equal(failed?.reason, 'deadline');
+  assert.notEqual(failed?.attemptedAt, observedAt, 'the failed attempt has its own time');
+  assert.equal(failed?.lastObservedAt, observedAt, 'the last reading keeps its time');
+  assert.deepEqual(windowTimes(), [observedAt]);
+  assert.equal(context.pending().includes(5000), false, 'a timed read never retries');
+  clock.advance(69_999);
+  await controller.refreshOpenAiUsageWithRetry('interval');
+  assert.equal(context.reads.length, 3, 'a failed attempt holds the next timed read');
 });

@@ -6,6 +6,7 @@ import {
   ChevronLeft,
   ChevronRight,
   Folder,
+  FolderPlus,
   Info,
   Moon,
   PanelLeftClose,
@@ -25,6 +26,7 @@ import { Dialog, short, titleCase } from './components.tsx';
 import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
+import { openingThread, parseLastThread } from './last-thread.ts';
 import { useLocalReconnect } from './local-setup.tsx';
 import { Onboarding } from './onboarding/onboarding.tsx';
 import { useOnboarding } from './onboarding/use-onboarding.ts';
@@ -60,6 +62,8 @@ function writePreference(key: string, value: string) {
     localStorage.setItem(key, value);
   } catch {}
 }
+
+const LAST_THREAD_KEY = 'crewkite-last-thread-v1';
 
 // Light, Dark or System. System follows the operating system and is the default. The key is new
 // because the old one held a theme the app wrote on first launch, not a choice.
@@ -532,13 +536,23 @@ export function App() {
     const first = projects[0];
     if (first && !taskPages[first.id]) void workspace.loadTasks(first.id);
   }, [projects, taskPages, workspace.loadTasks]);
+  // Read once. After the first thread opens, an empty selection falls back to the first thread.
+  const lastThread = useRef(parseLastThread(readPreference(LAST_THREAD_KEY)));
   useEffect(() => {
     if (selected) return;
-    const first = Object.values(taskPages)
-      .flatMap((page) => page.tasks)
-      .find(({ id }) => !removed.has(id));
-    if (first) setSelected(first.id);
-  }, [selected, taskPages, removed]);
+    const opening = openingThread({
+      last: lastThread.current,
+      projectIds: projects.map(({ id }) => id),
+      pages: taskPages,
+      removed,
+      unreadable: workspace.navigationStale,
+    });
+    if (opening.kind === 'load') void workspace.loadTasks(opening.projectId);
+    else if (opening.kind === 'select') {
+      lastThread.current = null;
+      setSelected(opening.taskId);
+    }
+  }, [selected, projects, taskPages, removed, workspace.navigationStale, workspace.loadTasks]);
   const [themeMode, setThemeMode] = useState<ThemeMode>(readThemeMode);
   const systemTheme = useSystemTheme();
   const theme = themeMode === 'system' ? systemTheme : themeMode;
@@ -560,6 +574,14 @@ export function App() {
   const fresh =
     !task && newThread === null && firstSend?.task.id === selected ? firstSend.task : null;
   const shown = task ?? fresh;
+  const openTaskId = task?.id;
+  useEffect(() => {
+    if (openTaskId && selectedProjectId)
+      writePreference(
+        LAST_THREAD_KEY,
+        JSON.stringify({ projectId: selectedProjectId, taskId: openTaskId }),
+      );
+  }, [openTaskId, selectedProjectId]);
   useEffect(() => {
     if (selectedProjectId && !taskPages[selectedProjectId])
       void workspace.loadTasks(selectedProjectId);
@@ -796,18 +818,21 @@ export function App() {
         )}
         {/* The list stays mounted while the rail shows, so it keeps its scroll position. */}
         <div className="nav-scroll" hidden={collapsed}>
-          <div className="nav-label">PROJECTS</div>
-          {workspace.canPickProject && (
-            <button
-              type="button"
-              className="add-task"
-              disabled={workspace.pending || connection !== 'connected'}
-              onClick={() => void addProject()}
-            >
-              <Folder size={14} />
-              Add project
-            </button>
-          )}
+          <div className="nav-label">
+            PROJECTS
+            {workspace.canPickProject && (
+              <button
+                type="button"
+                className="icon-button"
+                aria-label="Add project"
+                title="Add project"
+                disabled={workspace.pending || connection !== 'connected'}
+                onClick={() => void addProject()}
+              >
+                <FolderPlus size={15} aria-hidden="true" />
+              </button>
+            )}
+          </div>
           {projects.map((project) => (
             <div key={project.id} className="project-group">
               <div

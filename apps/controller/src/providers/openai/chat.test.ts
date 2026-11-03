@@ -103,6 +103,7 @@ import type { ChatTurnRequest } from '../../chat/adapter.ts';
 import { turnNotesBlock } from '../../chat/prompt.ts';
 import { ThreadToolsBroker } from '../../chat/thread-tools/broker.ts';
 import { fixtureReader } from '../../chat/thread-tools/fixture.ts';
+import { startTimingLog } from '../../diagnostics/timing.ts';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { findClient } from '../client-versions.ts';
@@ -221,6 +222,12 @@ const scripts = {
     { id: 0, method: 'item/permissions/requestApproval', params: { ...ids(), itemId: 'command-1', cwd: here(''), reason: 'Needs the network.', permissions: { network: { enabled: true } }, startedAtMs: 1 } },
   ],
   'new-request': () => [{ id: 0, method: 'item/fixture/requestSomething', params: ids() }],
+  // A write inside the copy that the read-only profile's sandbox declines.
+  'sandbox-declined': () => [
+    ['item/started', { ...ids(), item: { ...command, command: 'touch notes.txt', cwd: here('') } }],
+    ['item/completed', { ...ids(), item: { ...command, command: 'touch notes.txt', cwd: here(''), status: 'declined' } }],
+    done(),
+  ],
   'usage-warning': () => [
     ['warning', { message: 'You have used 80% of your usage limit.' }],
     ['warning', { message: 'A setting in config.toml is deprecated.' }],
@@ -1418,6 +1425,63 @@ test('a read-only turn stops when a command names a path outside the scratch cop
   assert.ok(run.frames().some((frame) => frame.method === 'turn/interrupt'));
   // The command never shows as a tool call.
   assert.ok(!run.events.some((event) => event.type === 'tool.started'));
+});
+
+test('a read-only turn logs its profile and each refusal by kind, with no command text or path', async () => {
+  const logHome = mkdtempSync(join(root, 'log-'));
+  const stop = startTimingLog(logHome);
+  const lines = () => {
+    const path = join(logHome, 'controller.log');
+    if (!existsSync(path)) return [];
+    return readFileSync(path, 'utf8')
+      .split('\n')
+      .flatMap((line) => (/ openai read /.test(line) ? [line.slice(line.indexOf(' ') + 1)] : []));
+  };
+  const confirmed = 'openai read profile crewkite-read confirmed';
+  const fallback = 'openai read profile fallback';
+  const rows = [
+    { scenario: 'reply', readOnly: false, detail: {}, lines: [] },
+    { scenario: 'reply', readOnly: true, detail: {}, lines: [confirmed] },
+    { scenario: 'reply', readOnly: true, detail: { profile: ':read-only' }, lines: [fallback] },
+    {
+      scenario: 'wide-ask',
+      readOnly: true,
+      detail: { profile: null, command: '/bin/zsh -lc "cat /etc/passwd"' },
+      // The peer then reports a command it ran from /scratch, outside the copy, which stops the turn.
+      lines: [fallback, 'openai read denied command', 'openai read denied outside-path'],
+    },
+    {
+      scenario: 'outside-read',
+      readOnly: true,
+      detail: {},
+      lines: [confirmed, 'openai read denied outside-path'],
+    },
+    {
+      scenario: 'more-access',
+      readOnly: true,
+      detail: {},
+      lines: [confirmed, 'openai read denied permissions'],
+    },
+    {
+      scenario: 'sandbox-declined',
+      readOnly: true,
+      detail: {},
+      lines: [confirmed, 'openai read denied sandbox'],
+    },
+  ];
+  try {
+    for (const row of rows) {
+      const before = lines().length;
+      await turn(row.scenario, { readOnly: row.readOnly, detail: row.detail }).settled();
+      assert.deepEqual(lines().slice(before), row.lines, row.scenario);
+    }
+  } finally {
+    stop();
+  }
+  assert.doesNotMatch(
+    readFileSync(join(logHome, 'controller.log'), 'utf8'),
+    /passwd|\.codex|raykraft|notes\.txt|scratch/,
+  );
 });
 
 test('a client that fails before its turn runs leaves its error output and last frames in the failure', async () => {

@@ -19,6 +19,7 @@ import {
   googleConnectButton,
   googleConnectError,
   googleSetupProgress,
+  googleStepHeading,
   pollGoogleSetupStatus,
   runGoogleSetupFlow,
   startingGoogleStage,
@@ -44,7 +45,7 @@ function GoogleProgress({
   return (
     <div className="gs-progress">
       <p className="gs-progress-head" role="status">
-        {position}: {label}
+        {googleStepHeading(progress.step)}
       </p>
       <div
         className="gs-progress-track"
@@ -133,17 +134,6 @@ const retryReasonText: Record<string, string> = {
   'connection-lost': 'the connection to the controller dropped',
 };
 
-// Why the coding setup is not ready, from the Google profile, in plain words.
-const profileText: Record<string, string> = {
-  'client-unavailable': 'The official client is not installed.',
-  'client-build-mismatch': 'The installed client does not match the reviewed build.',
-  'unsupported-platform': 'Google coding setup needs a Mac with Apple silicon.',
-  'native-home-unavailable': 'The client cannot read your home folder from this controller.',
-  'auth-method-mismatch': 'The client does not offer personal Google sign-in.',
-  'authentication-required': 'Google sign-in has not finished.',
-  'qualification-pending': 'Setup is complete. The route still needs qualification.',
-};
-
 /** True when a command result is the install's own outcome, which the install line shows. */
 function installOutcome(result: CommandResult | undefined) {
   return (
@@ -164,12 +154,15 @@ const stageLabels: Record<GoogleSetupStage, string> = {
 export function GoogleSetup({
   snapshot,
   workspace,
+  onConnecting,
 }: {
   snapshot: Pick<
     Snapshot,
     'googleAcpSetup' | 'googleAcpInstall' | 'nativeProfiles' | 'usageReaders'
   >;
   workspace: Workspace;
+  /** The step this card's Connect is on, and null once it ends, so the card head can follow. */
+  onConnecting?: (stage: GoogleSetupStage | null) => void;
 }) {
   const setup = snapshot.googleAcpSetup;
   const installation = snapshot.googleAcpInstall;
@@ -178,6 +171,7 @@ export function GoogleSetup({
   );
   const reader = snapshot.usageReaders.find((value) => value.family === 'google');
   const [requested, setRequested] = useState<GoogleSetupStage | null>(null);
+  useEffect(() => onConnecting?.(requested), [onConnecting, requested]);
   const [message, setMessage] = useState<string | null>(null);
   const [pollTimedOut, setPollTimedOut] = useState(false);
   // A follow that could not read the status three times in a row stays off until the card opens again.
@@ -195,7 +189,6 @@ export function GoogleSetup({
   // A step whose ownership is unknown runs nothing this card can follow. It waits for Clear.
   const active = !!setup?.operationId && setup.state !== 'unknown';
   const installing = !!installation?.operationId && installation.state !== 'unknown';
-  const installed = installation?.state === 'installed' || !!setup?.client;
   const installUnknown = installation?.state === 'unknown';
   const unknown = setup?.state === 'unknown' || installUnknown;
   const needsRepair = unknown || setup?.state === 'blocked' || installation?.state === 'blocked';
@@ -318,8 +311,9 @@ export function GoogleSetup({
               : undefined;
         setMessage(
           known ??
+            result.result?.next ??
             (reason
-              ? [reason, result.result?.next].filter(Boolean).join(' ')
+              ? googleConnectError(null)
               : 'Setup stopped before the next step could be confirmed. Review status before retrying.'),
         );
       }
@@ -400,14 +394,6 @@ export function GoogleSetup({
     cancelling: cancelBusy,
     label: primaryLabel,
   });
-  const profileReason =
-    profile && !profile.available && 'reason' in profile
-      ? profile.reason === 'acp-capability-missing'
-        ? setup?.proofId
-          ? 'The client did not report the model choices or review mode CrewKite needs.'
-          : 'The client is installed and has not finished initializing.'
-        : profileText[profile.reason]
-      : undefined;
   const googleAccount =
     setup?.auth.status === 'authenticated'
       ? 'Signed in'
@@ -530,9 +516,6 @@ export function GoogleSetup({
       )}
       {!working && installation?.reason && (
         <p className="muted small">{refusalText[installation.reason] ?? installation.next}</p>
-      )}
-      {installed && !codingReady && !working && !message && profileReason && (
-        <p className="muted small">{profileReason}</p>
       )}
       {/* The model list is known once discovery ends. Until then the line would only say unknown. */}
       {!working && profile?.configOptions && (

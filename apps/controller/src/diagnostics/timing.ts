@@ -18,6 +18,14 @@ export function logTiming(line: string): void {
   sink?.(`timing ${line}`);
 }
 
+/**
+ * One plain line for a step a person checks by hand, such as a provider reconnect. The caller
+ * writes only fixed words, codes and numbers: no command text, no path and no account name.
+ */
+export function logEvent(line: string): void {
+  sink?.(line);
+}
+
 /** Runs work and logs how long it took, including the wait for a returned promise. */
 export function timed<T>(label: string, work: () => T): T {
   const started = performance.now();

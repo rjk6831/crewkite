@@ -268,6 +268,8 @@ export function PermissionCard({
       setBusy(null);
     }
   }
+  // An ask the turn ended on has nothing left to decide, so it folds to its question.
+  const lapsed = block.choice === null && ended;
   return (
     <section
       className={`th-card th-permission${block.choice !== null || ended ? ' is-resolved' : ''}`}
@@ -277,15 +279,15 @@ export function PermissionCard({
         <ShieldQuestion size={15} aria-hidden="true" />
         <p>{block.question}</p>
       </div>
-      {block.detail && <pre>{block.detail}</pre>}
-      {block.reason && <p className="th-muted">{block.reason}</p>}
+      {block.detail && !lapsed && <pre>{block.detail}</pre>}
+      {block.reason && !lapsed && <p className="th-muted">{block.reason}</p>}
       {block.choice !== null ? (
         <p className="th-resolved">
           <Check size={13} aria-hidden="true" />
           {chosen ? chosen.label : block.choice}
         </p>
-      ) : ended ? (
-        <p className="th-muted">This request ended with the turn.</p>
+      ) : lapsed ? (
+        <p className="th-muted">Not answered, the turn ended.</p>
       ) : (
         <div className="th-permission-options">
           {block.options.map((option) => (

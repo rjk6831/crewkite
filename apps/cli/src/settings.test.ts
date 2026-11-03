@@ -107,7 +107,7 @@ test('cli.json is checked with the desktop schemas, saved privately and read by 
     permissionPolicy: 'allow-edits',
     familyModels: { local: 'fixture-local' },
     crewPresets: {
-      Pair: { reviewer: { family: 'local', model: 'fixture-local', effort: 'default' } },
+      Tandem: { reviewer: { family: 'local', model: 'fixture-local', effort: 'default' } },
     },
   };
   current = saveSettings(home, current);
@@ -133,8 +133,8 @@ test('cli.json is checked with the desktop schemas, saved privately and read by 
     defaultModel: 'other',
   };
   assert.equal(familyModel(local, store), 'fixture-local');
-  const pair = readCrewPresets(store).find((preset) => preset.name === 'Pair');
-  assert.deepEqual(pair?.members.find((member) => member.role === 'reviewer')?.selection, {
+  const tandem = readCrewPresets(store).find((preset) => preset.name === 'Tandem');
+  assert.deepEqual(tandem?.members.find((member) => member.role === 'reviewer')?.selection, {
     family: 'local',
     model: 'fixture-local',
     effort: 'default',

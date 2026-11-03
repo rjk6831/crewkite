@@ -44,6 +44,7 @@ import {
   RetryChatTurnPayloadSchema,
   RunChatPlanPayloadSchema,
   SendChatMessagePayloadSchema,
+  SetCreditSpendingPayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
@@ -2571,6 +2572,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('SetDefaultCrew', SetDefaultCrewPayloadSchema),
   mutate('ImportSavedCrews', ImportSavedCrewsPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
+  mutate('SetCreditSpending', SetCreditSpendingPayloadSchema),
   mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
   mutate('OpenChatPullRequest', OpenChatPullRequestPayloadSchema),

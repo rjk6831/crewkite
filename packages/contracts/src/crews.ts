@@ -8,8 +8,13 @@ import { AllowSubagentsSchema } from './subagents.ts';
 // the controller checks that crew again then.
 
 /** The built-in presets, in the order every client lists them. */
-export const CREW_PRESET_NAMES = ['Solo', 'Pair', 'Full crew'] as const;
+export const CREW_PRESET_NAMES = ['Solo', 'Tandem', 'Full crew'] as const;
 export type CrewPresetName = (typeof CREW_PRESET_NAMES)[number];
+/** Tandem was named Pair before 0.1.0. A default or a pin saved then still names Pair. */
+const renamedPresets = new Map<string, CrewPresetName>([['Pair', 'Tandem']]);
+export const currentPresetName = (name: string): string => renamedPresets.get(name) ?? name;
+export const currentCrewChoice = (id: string): string =>
+  id.startsWith('preset:') ? `preset:${currentPresetName(id.slice('preset:'.length))}` : id;
 /** The most crews the person can save. */
 export const SAVED_CREWS_MAX = 24;
 
@@ -17,7 +22,8 @@ export const SavedCrewIdSchema = z.string().regex(/^[a-z0-9-]{1,40}$/);
 /** A crew a thread can start from: `preset:<name>` or `saved:<id>`. */
 export const CrewChoiceIdSchema = z
   .string()
-  .regex(/^(?:preset:(?:Solo|Pair|Full crew)|saved:[a-z0-9-]{1,40})$/);
+  .transform(currentCrewChoice)
+  .pipe(z.string().regex(/^(?:preset:(?:Solo|Tandem|Full crew)|saved:[a-z0-9-]{1,40})$/));
 export type CrewChoiceId = z.infer<typeof CrewChoiceIdSchema>;
 /** The crew new threads start with until the person picks another. */
 export const BUILT_IN_DEFAULT_CREW = 'preset:Solo';

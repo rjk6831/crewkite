@@ -650,6 +650,22 @@ export const ProviderUsageDraftSchema = z.object({
     .min(1)
     .max(32),
 });
+/**
+ * One OpenAI credit reading. `resetsAt` is when the reached limit lifts, so a reading from before
+ * that time stops counting as exhausted.
+ */
+export const OpenAiCreditReadingSchema = z.strictObject({
+  state: z.enum(['available', 'unlimited', 'none']),
+  balance: z
+    .string()
+    .max(128)
+    .regex(/^-?\d+(?:\.\d+)?$/)
+    .nullable(),
+  limitReached: z.boolean(),
+  resetsAt: TimestampSchema.nullable(),
+  observedAt: TimestampSchema,
+});
+export type OpenAiCreditReading = z.infer<typeof OpenAiCreditReadingSchema>;
 export const OpenAiUsageReadSchema = z.strictObject({
   id: CommandIdSchema,
   state: z.enum(['intent', 'owned', 'quiescent', 'unknown']),
@@ -660,6 +676,8 @@ export const OpenAiUsageReadSchema = z.strictObject({
   lastRequest: z.string().min(1).max(200).nullable().optional(),
   lastObservedAt: TimestampSchema.nullable().optional(),
   commandId: CommandIdSchema.optional(),
+  /** The credit state the last published read reported. It stays until a later read replaces it. */
+  credits: OpenAiCreditReadingSchema.nullable().optional(),
 });
 /**
  * The last chat model read. A group stays listed until it exits or a later check finds it gone,

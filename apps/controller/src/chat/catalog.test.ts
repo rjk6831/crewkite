@@ -1,7 +1,11 @@
 import assert from 'node:assert/strict';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
-import { AnthropicNativeProfileSchema, LocalSetupSchema } from '@crewkite/contracts';
+import {
+  AnthropicNativeProfileSchema,
+  allowanceExhausted,
+  LocalSetupSchema,
+} from '@crewkite/contracts';
 import { resolveAnthropicNativeProfile } from '../providers/anthropic/profile.ts';
 import { LOCAL_TEXT_TYPES } from '../providers/local/chat.ts';
 import { buildChatCatalog, type ChatCatalogInput } from './catalog.ts';
@@ -339,4 +343,60 @@ test('a cloud family whose client is ready stays unconnected until the person pr
   assert.equal(after?.reason, null);
   assert.equal(after?.needsConnect, false);
   assert.equal(after?.defaultModel, 'model-live');
+});
+
+test('credits reach the catalog per family, and a reached limit counts until its reset', () => {
+  const nowMs = Date.parse('2026-11-03T12:00:00.000Z');
+  const observedAt = '2026-11-03T11:00:00.000Z';
+  const read = (resetsAt: string | null, windowPercent: number) =>
+    buildChatCatalog({
+      profiles: [],
+      openAiModels: null,
+      local: localSetup(false),
+      connectedOnce: [...everyFamily],
+      windows: [
+        {
+          family: 'anthropic',
+          observation: {
+            windowId: 'five-hour',
+            remaining: { value: windowPercent, unit: 'percent' },
+            resetsAt: null,
+            observedAt,
+          },
+        },
+      ],
+      credits: {
+        openai: { state: 'available', balance: '12.50', limitReached: true, resetsAt, observedAt },
+        anthropic: { extraUsage: true, observedAt },
+      },
+      creditSpending: { anthropic: true },
+      nowMs,
+    }).families;
+  const [openai, anthropic, google, local] = read('2026-11-03T13:00:00.000Z', 0);
+  assert.deepEqual(openai.credits, {
+    state: 'available',
+    balance: '12.50',
+    limitReached: true,
+    observedAt,
+  });
+  assert.equal(openai.creditSpending, false);
+  assert.equal(allowanceExhausted(openai), true);
+  assert.deepEqual(anthropic.credits, {
+    state: 'extra-usage-on',
+    balance: null,
+    limitReached: false,
+    observedAt,
+  });
+  assert.equal(anthropic.creditSpending, true);
+  // Anthropic reports no reached limit of its own. Its window at zero is what exhausts it.
+  assert.equal(allowanceExhausted(anthropic), true);
+  assert.equal(allowanceExhausted(read(null, 40)[1]), false);
+  // Google and Local report no credit state and carry no switch.
+  for (const entry of [google, local]) {
+    assert.equal(entry.credits, undefined, entry.family);
+    assert.equal(entry.creditSpending, undefined, entry.family);
+  }
+  // Past the reset, the reached limit no longer counts. With no reset time it stands.
+  assert.equal(read('2026-11-03T11:30:00.000Z', 0)[0].credits?.limitReached, false);
+  assert.equal(read(null, 0)[0].credits?.limitReached, true);
 });

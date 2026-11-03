@@ -109,16 +109,19 @@ test('saved crews keep their order, unique names and the limit', (t) => {
 });
 
 // Claim: one crew is the default for new threads. Only a preset or a saved crew can be the default,
-// and deleting the default saved crew hands the default back to Solo.
+// deleting the default saved crew hands the default back to Solo, and a default saved as Pair, the
+// earlier name of Tandem, reads as Tandem.
 test('the default crew names a preset or a saved crew and falls back to Solo', (t) => {
-  const { crews } = opened(t);
+  const { store, crews } = opened(t);
+  store.db.prepare("UPDATE crew_settings SET default_crew='preset:Pair' WHERE id=1").run();
+  assert.equal(crews.read().defaultCrew, 'preset:Tandem');
   crews.save(crew('crew-a', 'Review heavy'));
   assert.equal(crews.setDefault('saved:crew-a').defaultCrew, 'saved:crew-a');
   assert.equal(
     refusal(() => crews.setDefault('saved:crew-z')),
     'crew-choice-unknown',
   );
-  assert.equal(crews.setDefault('preset:Pair').defaultCrew, 'preset:Pair');
+  assert.equal(crews.setDefault('preset:Tandem').defaultCrew, 'preset:Tandem');
   crews.setDefault('saved:crew-a');
   assert.equal(crews.delete('crew-a').defaultCrew, 'preset:Solo');
   assert.equal(
@@ -137,7 +140,7 @@ test('crews from the desktop storage are imported once', (t) => {
     [
       crew('crew-a', 'Same id'),
       crew('crew-b', 'MINE'),
-      crew('crew-c', 'Pair'),
+      crew('crew-c', 'Tandem'),
       crew('crew-d', 'Kept', { flightMode: 'glide' }),
     ],
     'saved:crew-d',
@@ -148,7 +151,7 @@ test('crews from the desktop storage are imported once', (t) => {
   );
   assert.equal(read.defaultCrew, 'saved:crew-d');
   assert.equal(read.imported, true);
-  const again = crews.importOnce([crew('crew-e', 'Later')], 'preset:Pair');
+  const again = crews.importOnce([crew('crew-e', 'Later')], 'preset:Tandem');
   assert.deepEqual(again, read);
   // A default that names a crew that did not come along keeps the controller's own.
   const fresh = opened(t).crews;

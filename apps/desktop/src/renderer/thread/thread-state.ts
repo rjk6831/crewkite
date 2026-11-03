@@ -19,6 +19,7 @@ import {
   blankTurn,
   isStop,
   replyLabel,
+  settle,
   type TurnIdentity,
   type TurnStatus,
   type TurnView,
@@ -287,9 +288,7 @@ export function reduceThread(state: ThreadState, action: ThreadAction): ThreadSt
       // The cursors stay, and the record takes no more stream events.
       const folded = { ...foldEvents(events), id: action.turnId };
       const meta = state.turnMeta[action.turnId];
-      const view = folded.ended
-        ? folded
-        : { ...folded, ended: true, status: meta ? metaStatus(meta.state) : ('done' as const) };
+      const view = folded.ended ? folded : settle(folded, meta ? metaStatus(meta.state) : 'done');
       const record: TurnRecord = {
         events,
         cursors: existing?.cursors ?? new Set<string>(),
@@ -422,7 +421,15 @@ export function threadItems(state: ThreadState): ThreadItem[] {
     const record = state.turns[id];
     const meta = state.turnMeta[id];
     const reply = replies.get(id);
-    const base = record?.view ?? blankTurn(id);
+    const stopped = isStop(meta?.failure);
+    // The stored turn can say it ended while its events never brought the end, such as after a
+    // stop. Then nothing in it may still look like it runs or waits for an answer.
+    const over = !record?.view.ended && meta !== undefined && settledStates.has(meta.state);
+    const base = record
+      ? over
+        ? settle(record.view, stopped ? 'stopped' : metaStatus(meta.state))
+        : record.view
+      : blankTurn(id);
     // The effort the client reported on the stored reply beats the one the thread asked for.
     const reported = reply?.author.kind === 'assistant' ? reply.author.effort : undefined;
     const found: TurnIdentity | null =
@@ -439,7 +446,6 @@ export function threadItems(state: ThreadState): ThreadItem[] {
           : null);
     // The live event names no slice. The stored turn does, once the thread read brings it.
     const identity = found && meta?.slice !== undefined ? { ...found, slice: meta.slice } : found;
-    const stopped = isStop(meta?.failure);
     const status: TurnStatus = stopped
       ? 'stopped'
       : record

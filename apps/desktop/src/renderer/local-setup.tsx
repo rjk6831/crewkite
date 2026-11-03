@@ -21,6 +21,7 @@ import {
   REOBSERVE_MS,
   selectionConfirmed,
   selectionLost,
+  settledLine,
   statusLine,
   WAITING_LINE,
   WITHOUT_TOKEN,
@@ -418,7 +419,7 @@ export function LocalSetup({
           Local models
         </ExternalLink>
       </p>
-      <p className="notice" role="status">
+      <p className={settledLine(status) ? 'muted small' : 'notice'} role="status">
         {status}
       </p>
       {notices.stamp && (
@@ -427,7 +428,7 @@ export function LocalSetup({
         </p>
       )}
       {notices.withoutToken && (
-        <p className="notice" role="status">
+        <p className="muted small" role="status">
           {WITHOUT_TOKEN}
         </p>
       )}

@@ -428,6 +428,49 @@ export const GOOGLE_PROGRESS_STEPS: readonly { id: GoogleProgressStep; label: st
   { id: 'authenticate', label: 'Sign in with Google' },
   { id: 'discover', label: 'Discover models' },
 ];
+/** The step a connect is on, as the card heads its progress: `Step 3 of 5: Initialize`. */
+export function googleStepHeading(step: GoogleProgressStep): string {
+  const index = GOOGLE_PROGRESS_STEPS.findIndex(({ id }) => id === step);
+  return `Step ${index + 1} of ${GOOGLE_PROGRESS_STEPS.length}: ${GOOGLE_PROGRESS_STEPS[index]?.label}`;
+}
+
+// Why Google is not connected yet, in plain words. The catalog reports a code from the Google
+// profile, or one of its own before the first Connect.
+const reasonLines: Record<string, string> = {
+  'connect-required': 'Set up on this device. Connect it to use Google in threads.',
+  'not-configured': 'Google is not set up yet.',
+  'client-unavailable': 'The official client is not installed.',
+  'client-build-mismatch': 'The installed client does not match the reviewed build.',
+  'unsupported-platform': 'Google coding setup needs a Mac with Apple silicon.',
+  'native-home-unavailable': 'The client cannot read your home folder from this controller.',
+  'auth-method-mismatch': 'The client does not offer personal Google sign-in.',
+  'authentication-required': 'Google sign-in has not finished.',
+  'qualification-pending': 'Setup is complete. The route still needs qualification.',
+};
+
+/**
+ * The line beside the Google card's name while Google is not connected. A running connect shows
+ * the step it is on, because the profile reports a missing capability until initialize and
+ * discovery have run, and that is no problem while they run. `requested` is the step this card's
+ * Connect asked for, null when no Connect runs. Undefined when there is no reason to word.
+ */
+export function googleReasonLine(
+  reason: string | null | undefined,
+  state: GoogleState,
+  requested: GoogleSetupStage | null,
+): string | undefined {
+  if (!reason) return undefined;
+  const progress = googleSetupProgress(state, requested);
+  if (progress) return googleStepHeading(progress.step);
+  if (reason === 'acp-capability-missing') {
+    const stuck = ['blocked', 'unknown'].includes(state.googleAcpSetup?.state ?? '');
+    return stuck
+      ? 'Google setup did not finish. Press Try again.'
+      : 'The official client is installed. Press Connect Google to finish setup.';
+  }
+  return reasonLines[reason] ?? 'Google setup has not finished.';
+}
+
 // Shares of the whole bar. The download takes most of a first connect.
 const weights: Record<GoogleProgressStep, number> = {
   download: 50,

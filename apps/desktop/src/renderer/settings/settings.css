@@ -290,3 +290,15 @@
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
+
+/* The note beside a credit switch that is on. It informs, so it takes the accent tint. */
+.st-credit-note {
+  margin: 0;
+  padding: 6px 10px;
+  border-left: 2px solid var(--accent);
+  border-radius: 4px;
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.5;
+}

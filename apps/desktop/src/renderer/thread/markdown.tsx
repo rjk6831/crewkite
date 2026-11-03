@@ -5,7 +5,8 @@ import { highlight } from './highlight.ts';
 import { type Block, type InlineNode, parseInline, parseMarkdown } from './markdown-parse.ts';
 
 // Everything reaches the page as React text, so model output can never inject markup. A link is
-// clickable only when it is http or https. Anything else shows as text with its address.
+// clickable only when it is http or https. A link to a local file shows the file and line as code.
+// Anything else shows as text with its address.
 
 function Nodes({ nodes }: { nodes: InlineNode[] }) {
   return nodes.map((node, index) => {
@@ -27,6 +28,8 @@ function Nodes({ nodes }: { nodes: InlineNode[] }) {
             <Nodes nodes={node.children} />
           </em>
         );
+      case 'file':
+        return <code key={key}>{node.text}</code>;
       case 'link':
         return (
           <ExternalLink key={key} href={node.href}>

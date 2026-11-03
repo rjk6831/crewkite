@@ -66,6 +66,7 @@ import {
   SavedPromptsSchema,
   SearchChatHistoryPayloadSchema,
   SendChatMessagePayloadSchema,
+  SetCreditSpendingPayloadSchema,
   SetDefaultCrewPayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
@@ -186,6 +187,12 @@ export const readCatalog = (source: ThreadSource, taskId?: string): Promise<Chat
 // A read can take 20 seconds and its refusal names the next step, so the result comes back as is.
 export const refreshModels = (source: ThreadSource) =>
   dispatch(source, 'RefreshChatModels', RefreshChatModelsPayloadSchema.parse({ family: 'openai' }));
+
+export const setCreditSpending = (
+  source: ThreadSource,
+  family: 'openai' | 'anthropic',
+  allowed: boolean,
+) => run(source, 'SetCreditSpending', SetCreditSpendingPayloadSchema.parse({ family, allowed }));
 
 /** Ranked files and folders of the thread's scratch copy for the text after an at sign. */
 export const completeMention = (

@@ -43,6 +43,7 @@ import {
   type ConversationEntry,
   ConversationEntrySchema,
   canonicalJson,
+  creditsPaused,
   type Event,
   MAX_CHAT_ENTRY_BYTES,
   MAX_CHAT_TURN_EVENTS_BYTES,
@@ -2351,6 +2352,12 @@ export class ChatService {
       ...(end.groups.length ? { ownershipUnknown: true } : {}),
     });
     if (end.stopReason === 'limit') this.appendLimitLine(task, turn, end.failure);
+    if (end.state === 'done' && this.spentCredits(turn))
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: turn.id },
+        text: `${familyName[turn.selection.family]} used credits to finish this turn. Credit spending is off, so the next turn moves to another provider.`,
+      });
     // Stop, Send now, the plan, a restart and the client all end a turn as stopped. The line says
     // which one, so a stop the person did not ask for never reads like one they did.
     if (end.stop)
@@ -2374,6 +2381,26 @@ export class ChatService {
         author: { kind: 'system', turnId: turn.id },
         text: fitText(`${end.failure.message} ${end.failure.nextAction}`, 16_384),
       });
+  }
+
+  /**
+   * A turn that finished past its included allowance with credits on the account spent them. The
+   * gate only runs before a turn, so with the switch off the turn ends and the next one moves.
+   */
+  private spentCredits(turn: ChatTurn): boolean {
+    try {
+      const entry = this.deps
+        .catalog(turn.taskId)
+        .families.find((value) => value.family === turn.selection.family);
+      const state = entry?.credits?.state;
+      return (
+        !!entry &&
+        creditsPaused(entry, turn.selection.model) &&
+        (state === 'available' || state === 'unlimited' || state === 'extra-usage-on')
+      );
+    } catch {
+      return false;
+    }
   }
 
   private appendLimitLine(task: Task, turn: ChatTurn, failure: ChatFailure | null) {
@@ -3016,6 +3043,29 @@ export class ChatService {
     effects: Effects,
   ) {
     const { selection, role, messageId, base, slice } = input;
+    // The person turned credit spending off and the included allowance is used up. The turn
+    // starts on the next family, the way a limit stop moves on, and a side question gets
+    // the line. A plan slice keeps its lane, and its own limit failure hands it on.
+    if (slice === undefined && this.creditsPausedOn(task.id, selection)) {
+      const next = role === 'ask' ? null : this.nextFamily(task.id, selection.family);
+      if (!next) {
+        this.appendEntry(task, {
+          kind: 'chat-system',
+          author: { kind: 'system', turnId: null },
+          text: `${familyName[selection.family]} is out of included allowance and credit spending is off. Turn it on in Settings or pick another provider.`,
+        });
+        return;
+      }
+      if (writesScratch(role))
+        this.setHandoff(task.id, { from: selection.family, reason: 'limit' });
+      this.appendEntry(task, {
+        kind: 'chat-system',
+        author: { kind: 'system', turnId: null },
+        text: `Continued on ${familyName[next.family]} from ${familyName[selection.family]}. Reason: ${handoffReason('limit')}.`,
+      });
+      this.openTurn(task, this.thread(task.id), { ...input, selection: next }, effects);
+      return;
+    }
     // A reviewer or advisor borrows another model. The thread keeps its own choice and any switch
     // still waiting for the next answer.
     const own = writesScratch(role) && slice === undefined;
@@ -3111,9 +3161,21 @@ export class ChatService {
     return row ? ChatTurnSchema.parse(JSON.parse(row.body as string)).selection.family : null;
   }
 
+  /** Whether a turn on this selection would spend credits the person turned off. Local never pauses. */
+  private creditsPausedOn(taskId: string, selection: ChatModelSelection): boolean {
+    try {
+      const entry = this.deps
+        .catalog(taskId)
+        .families.find((value) => value.family === selection.family);
+      return !!entry && creditsPaused(entry, selection.model);
+    } catch {
+      return false;
+    }
+  }
+
   /**
    * The first family in the shared ranking with an adapter and a usable default model. The
-   * family that stopped and any family at zero never qualify.
+   * family that stopped, any family at zero and any family whose credits are paused never qualify.
    */
   private nextFamily(taskId: string, stopped: ChatFamily): ChatModelSelection | null {
     const ranked = rankFamilies(
@@ -3127,7 +3189,7 @@ export class ChatService {
       if (!this.deps.adapters.has(entry.family)) continue;
       if (entry.family === 'google' && !this.deps.googleTermsAcknowledged()) continue;
       const model = entry.defaultModel ?? entry.models[0]?.model;
-      if (!model) continue;
+      if (!model || creditsPaused(entry, model)) continue;
       const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
       const selection = this.deps.resolveSelection(taskId, {
         family: entry.family,
