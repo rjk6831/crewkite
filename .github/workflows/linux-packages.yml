@@ -48,6 +48,19 @@ jobs:
           printf '%s  %s\n' "$INPUTS_SHA256" "$RUNNER_TEMP/linux-inputs.tar" | sha256sum --check
           python3 -c 'import sys, tarfile; tarfile.open(sys.argv[1]).extractall("internal/tools", filter="data")' "$RUNNER_TEMP/linux-inputs.tar"
           test -f "internal/tools/linux-${{ matrix.arch }}.json"
+      # The input archive pins the Node archive digest. The archive comes from the Node project
+      # and is refused unless it matches that pin. Staging checks the binary pin as well.
+      - name: Fetch the pinned Node runtime
+        run: |
+          set -euo pipefail
+          name="node-v24.22.0-linux-${{ matrix.arch }}"
+          want=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["nodeArchiveSha256"])' "internal/tools/linux-${{ matrix.arch }}.json")
+          [[ "$want" =~ ^[a-f0-9]{64}$ ]]
+          if [ ! -f "internal/tools/$name.tar.xz" ]; then
+            curl --fail --location --proto '=https' --tlsv1.2 "https://nodejs.org/dist/v24.22.0/$name.tar.xz" -o "internal/tools/$name.tar.xz"
+          fi
+          printf '%s  %s\n' "$want" "internal/tools/$name.tar.xz" | sha256sum --check
+          if [ ! -d "internal/tools/$name" ]; then tar -xJf "internal/tools/$name.tar.xz" -C internal/tools; fi
           test -f scripts/package-linux-smoke.mjs || { echo 'Native renderer, sandbox and Fedora install qualification runner is required.' >&2; exit 1; }
       - name: Install package tools
         run: |
