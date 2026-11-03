@@ -370,10 +370,12 @@ export function inspectLinuxPackages({ deb, rpm, arch, version }, execute = exec
     throw new Error('The RPM package identity differs from its target.');
   const scripts = execute('rpm', ['-qp', '--scripts', rpm], options).trim();
   if (scripts) throw new Error('The RPM unexpectedly contains installation scripts.');
+  // The file lists name every payload file, several megabytes for the full desktop runtime.
+  const listing = { ...options, maxBuffer: 64 * 1024 * 1024 };
   return {
-    debContents: execute('dpkg-deb', ['--contents', deb], options),
+    debContents: execute('dpkg-deb', ['--contents', deb], listing),
     debDepends: execute('dpkg-deb', ['--field', deb, 'Depends'], options),
-    rpmContents: execute('rpm', ['-qpl', rpm], options),
+    rpmContents: execute('rpm', ['-qpl', rpm], listing),
     rpmRequires: execute('rpm', ['-qpR', rpm], options),
     qualification: 'metadata-only',
   };
