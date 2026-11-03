@@ -1,6 +1,14 @@
 # Releases
 
-This page keeps the ledger for each prerelease: the checks it passed, its checksums and what it left unqualified.
+This page keeps the ledger for each release: the checks it passed, its checksums and what it left unqualified.
+
+## Version 0.1.0 distribution in preparation
+
+The installed release is in preparation. Its fixed state layout follows [Proposed ADR 0041](adr/0041-installed-distribution.md). No signed DMG, browser first-open result or installed Linux launch is qualified by this entry. Final source, artifact checksums and the observed release checks belong here when they exist.
+
+Version 0.1.0 starts fresh installed state. Directory-preview import and installed rollback qualification wait for 0.1.1. AppImages ship only if both architectures pass normal sandboxed launch on Ubuntu 24.04. RPM qualification requires build inspection and Fedora container installation; native Fedora desktop launch remains pending. [Distribution](distribution.md#installed-distribution-in-progress) records the required evidence.
+
+## Earlier prereleases
 
 [D2b UAT 05](https://github.com/rjk6831/crewkite/releases/tag/d2b-uat-05) is the current prerelease. It adds OpenAI Project model and effort selection before planning. Its [required CI](https://github.com/rjk6831/crewkite/actions/runs/39617852147) passed 146 Node claims and one desktop journey.
 

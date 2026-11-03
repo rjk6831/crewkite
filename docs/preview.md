@@ -1,8 +1,42 @@
 # Trying the preview
 
-This guide takes about two minutes once the app is open. You need a local Git repository with at least one commit and a signed-in client for one provider.
+You need a local Git repository with at least one commit and a client for one provider. Connect it from its card; OpenAI uses CrewKite's own sign-in flow. The installed release is in preparation, and its launch checks remain pending.
 
-## Verify the download
+## Installed packages
+
+These steps apply when a release publishes the matching installed asset. Check the release receipt for its source revision and the installation checks that actually passed. A directory ZIP uses the legacy instructions below.
+
+Download one package and `SHA256SUMS` from the same [release](https://github.com/rjk6831/crewkite/releases). Compute the package's SHA-256 and compare it with the line bearing its exact name. The checksum file also lists packages for other platforms; a check of the whole file needs every listed asset.
+
+For the macOS arm64 DMG:
+
+```sh
+shasum -a 256 CrewKite-macOS-arm64.dmg
+```
+
+After its checksum matches, open the DMG, drag CrewKite to Applications and open it there. A signed release needs its recorded Gatekeeper and notarization results. A damaged-app message or a requirement to remove quarantine is a failed installed-launch check, and needs a report with the release identity.
+
+The bundled CLI talks to the desktop's controller. Keep the desktop open and run:
+
+```sh
+/Applications/CrewKite.app/Contents/Resources/bin/crewkite --version
+/Applications/CrewKite.app/Contents/Resources/bin/crewkite thread list --json
+```
+
+On Linux, use `sha256sum` on the selected package and compare its line in `SHA256SUMS`. Install the architecture that matches the computer:
+
+| Computer | Ubuntu DEB | Fedora RPM |
+|----------|------------|------------|
+| x64 | `crewkite_amd64.deb` | `crewkite.x86_64.rpm` |
+| arm64 | `crewkite_arm64.deb` | `crewkite.aarch64.rpm` |
+
+For example, on Ubuntu x64 run `sudo apt install ./crewkite_amd64.deb`; on Fedora x64 run `sudo dnf install ./crewkite.x86_64.rpm`. Open CrewKite from the desktop's application menu. The release needs actual non-root sandboxed launch on both Ubuntu architectures. Fedora container installation establishes package installation only; native Fedora desktop launch remains pending.
+
+AppImages are optional and ship only as a pair. If the release includes them, choose the matching architecture, verify its checksum, make that file executable and open it as your normal account. No release step disables the Chromium sandbox.
+
+Installed data lives outside the application under the [platform state root](distribution.md#installed-distribution-in-progress). Version 0.1.0 starts fresh installed state. Keep an existing directory preview intact; its state import and rollback qualification are deferred to 0.1.1.
+
+## Verify a legacy directory download
 
 Download the macOS arm64 ZIP and `SHA256SUMS` from the same published [release](https://github.com/rjk6831/crewkite/releases). Read its release receipt for the exact source revision, tested macOS version, signing status and provider qualification.
 
@@ -14,7 +48,7 @@ shasum -a 256 -c SHA256SUMS
 
 Extract the archive after the checksum passes. Keep its folder together. If macOS blocks opening it, retain the exact message with the candidate identity in your report. The [distribution notes](distribution.md) distinguish directory-package testing from signing and installation checks.
 
-## Open the candidate
+## Open a legacy directory candidate
 
 The preview has an ad-hoc resource seal. It has no verified Developer ID identity and is not notarized by Apple. Check the release receipt for the exact candidate's first-launch evidence.
 
@@ -38,6 +72,8 @@ I record the exact source revision, verification and provider qualification in t
 On Linux x64 and arm64, this preview runs the OpenAI, Anthropic and Local families from source. Follow the Install steps in the [README](../README.md#install) and start the desktop with `pnpm desktop`, or use the CLI. Google is not available on Linux yet. Packaged installers come later, so the download steps above apply to macOS only. The shortcuts use Ctrl in place of Command, and the Remember the token on this device option for a Local token is hidden when the system has no keychain that encrypts it. Windows is not supported. WSL2 is untested, so I cannot say whether the Linux preview runs there. [ADR 0013](adr/0013-macos-first-local-optional.md) records the platform order.
 
 ## Walkthrough
+
+Each provider needs one explicit Connect on this device. After connection, later launches reconnect it with no click using its saved sign-in or endpoint. A fresh install waits for Connect before sign-in, model and quota reads. Local reports when the model runtime is down and reconnects when it returns. Client discovery and version probes remain separate from provider connection.
 
 1. Connect a provider. Open Settings in the left rail. Each provider has a card with its sign-in or connection state, the models it offers and the allowance it has left. Connect one provider there. Local is on the rail from the first launch. With no endpoint saved its row reads "Set up" and opens the Local card. Press Connect in the card or in the left rail. It connects in place with the saved host, port and mode, and asks for a token only when the runtime needs one that CrewKite does not hold. A runtime with auth off on 127.0.0.1 connects with no token, whichever mode is saved. After a token was used, "Remember the token on this device" keeps it so the next launch needs no prompt. [Local models](local-models.md#connect) has the rules. Before a connection the card shows its last reading, marked "Last seen 2 h ago. Not connected.", with the controls off. [Provider routes](providers.md) lists what each provider needs first. Until one is connected, New thread shows a card that names the four providers and opens each one's Settings card, and Send stays off. Google's third-party access FAQ (see [Google and your account](providers.md#google-and-your-account)) says third-party access through its coding client login violates its terms, CrewKite has no exception, and using the Google route is your own choice and risk. The Google card shows this and keeps Connect off until you tick a box that also says Roots No Limits LLC is not liable for Google's actions against your account. One press of Connect Google then runs every step: it downloads and checks the official client, starts it, opens the Google sign-in in your browser and reads your models, with a progress bar that names the step. A step that stalls or times out runs again by itself. If Connect stops, Try again continues from the step that stopped, and one Connect gives up after 20 minutes. Until Google is connected, CrewKite reads no Google quota, and the left rail shows Google with Connect and no bars.
 2. Add a project. Choose Add project in the left rail and select the root of a Git repository.
@@ -96,7 +132,11 @@ The keys above are the macOS keys. In the Linux preview the same shortcuts use C
 
 ## Uninstall
 
-CrewKite keeps its data in four places. Quit the app with Command-Q first, so the controller stops.
+Quit the app first, so the controller stops. Removing an installed application leaves workspace data intact. Remove its data only when its projects, threads, unaccepted edits and saved settings are no longer needed.
+
+An installed build keeps `home`, `profile` and its managed provider directory under the platform root in the [distribution notes](distribution.md#installed-distribution-in-progress). Deleting that root also removes CrewKite's own OpenAI sign-in and client history. It does not remove the person's separate provider client installation or history. Accepted branches stay in the project repository.
+
+The legacy directory preview and source paths are:
 
 1. The app. A preview package is the folder you extracted, so move that folder to the Trash. A source checkout is the folder you cloned.
 2. The controller data folder. It holds the database, the thread records, the scratch copies and the attached files. A package keeps it at `state/home` inside the package folder, so step 1 already removed it. `pnpm desktop` and the CLI use `.crewkite` in your home folder, or the folder named by `CREWKITE_HOME`.
@@ -108,7 +148,7 @@ CrewKite keeps its data in four places. Quit the app with Command-Q first, so th
 git for-each-ref --format='delete %(refname)' refs/crewkite/threads/ | git update-ref --stdin
 ```
 
-Run it once in each project you added. It touches no branch, no working tree and no HEAD. The branches you accepted stay in your repository, and `git for-each-ref refs/crewkite/threads/` prints nothing once the refs are gone. A provider client stays signed in until you sign it out in that client.
+Run it once in each project you added. It touches no branch, no working tree and no HEAD. The branches you accepted stay in your repository, and `git for-each-ref refs/crewkite/threads/` prints nothing once the refs are gone. A separate provider client's own sign-in stays with that client. Sign out from CrewKite's OpenAI card before removing its managed data if that sign-in should end.
 
 ## Send a short record
 
