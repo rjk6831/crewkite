@@ -38,6 +38,7 @@ import { readableType, SubagentTracker } from '../../chat/subagents.ts';
 import type { ThreadToolsServer } from '../../chat/thread-tools/broker.ts';
 import { turnTools } from '../../chat/thread-tools/turn.ts';
 import { frameTrace } from '../../chat/trace.ts';
+import { logEvent } from '../../diagnostics/timing.ts';
 import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { fileDigestSync } from '../file-digest.ts';
@@ -981,7 +982,7 @@ class OpenAiChatTurn {
   private observe(reply: z.infer<typeof threadReply>, profile: boolean) {
     if (!profile || this.wideSandbox) return;
     if (reply.activePermissionProfile?.id === READ_PROFILE && reply.sandbox?.type === 'readOnly')
-      return;
+      return logEvent(`openai read profile ${READ_PROFILE} confirmed`);
     this.widen(
       `opened the thread under ${reply.activePermissionProfile?.id ? `the ${clip(reply.activePermissionProfile.id, 60)} profile` : 'no named profile'}`,
     );
@@ -989,6 +990,7 @@ class OpenAiChatTurn {
 
   private widen(why: string) {
     this.wideSandbox = true;
+    logEvent('openai read profile fallback');
     this.notice(
       'warning',
       `${this.codexName} ${why}, so this read-only turn reads through the plain read-only sandbox and CrewKite checks each command first.`,
@@ -1209,6 +1211,7 @@ class OpenAiChatTurn {
         kind === 'command' &&
         !network &&
         scratchCommand(call, this.request.scratch.directory);
+      if (!inside) this.readDenied(network ? 'network' : kind);
       return this.answer(answerId, inside ? 'allow-once' : 'deny', 'read-only');
     }
     // Network access reaches past the scratch copy, and no policy or grant covers a host, so the
@@ -1253,7 +1256,28 @@ class OpenAiChatTurn {
       detail: clip(detail, 16_384),
       options: OPTIONS.filter((option) => option.kind !== 'allow-thread'),
     });
-    if (this.request.readOnly) this.answer(answerId, 'deny', 'read-only');
+    if (this.request.readOnly) {
+      this.readDenied('permissions');
+      this.answer(answerId, 'deny', 'read-only');
+    }
+  }
+
+  /**
+   * One controller.log line for each command or request a read-only turn refused, by kind only.
+   * The command text and its paths stay out of the log.
+   */
+  private readDenied(
+    kind:
+      | 'command'
+      | 'edit'
+      | 'other'
+      | 'network'
+      | 'permissions'
+      | 'outside-path'
+      | 'unconfirmed'
+      | 'sandbox',
+  ) {
+    if (this.request.readOnly) logEvent(`openai read denied ${kind}`);
   }
 
   /** `by` names an answer the adapter gave on its own. CrewKite's own answers leave it out. */
@@ -1415,6 +1439,7 @@ class OpenAiChatTurn {
       const outside = this.request.readOnly ? outsidePaths(input, directory) : [];
       const unproven = this.wideSandbox && !outside.length && !scratchCommand(input, directory);
       if (outside.length || unproven) {
+        this.readDenied(outside.length ? 'outside-path' : 'unconfirmed');
         this.interrupt();
         this.fail(
           chatFailure({
@@ -1594,6 +1619,8 @@ class OpenAiChatTurn {
     this.started(raw);
     if (AGENT_ITEM.test(head.type)) this.agentWork(head.id, raw, true);
     const value = toolEnd.safeParse(raw).data;
+    // On a read-only turn the client's sandbox declines what the profile does not allow.
+    if (value?.status === 'declined') this.readDenied('sandbox');
     const status =
       value?.status === 'declined'
         ? 'denied'

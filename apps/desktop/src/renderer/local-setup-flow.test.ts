@@ -12,6 +12,7 @@ import {
   lowMemory,
   selectionConfirmed,
   selectionLost,
+  settledLine,
   statusLine,
   WAITING_LINE,
   WITHOUT_TOKEN,
@@ -470,6 +471,23 @@ test('a background model read is followed past ten seconds and stops at its dead
     await followDiscovery({ read: async () => running, wait: async () => {}, active: () => false }),
     false,
   );
+});
+
+// Claim: a line that says Local is connected and eligible reads as quiet status, and a line that
+// asks for an action keeps the notice style.
+test('a connected status line reads as quiet status and a problem keeps the notice style', () => {
+  const line = (reason: NonNullable<LocalSetup['reason']>) =>
+    statusLine({
+      setup: { reason },
+      message: null,
+      lost: null,
+      confirmed: false,
+      quiet: false,
+      held: null,
+    });
+  assert.equal(settledLine(line('qualification-pending')), true);
+  assert.equal(settledLine(line('connection-unavailable')), false);
+  assert.equal(settledLine(line('model-unloaded')), false);
 });
 
 test('the Local card shows only the notices that describe the current state', () => {

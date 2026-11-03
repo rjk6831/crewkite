@@ -7,9 +7,11 @@ import type {
 import { type ReactNode, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import type { Workspace } from '../source.ts';
+import { setCreditSpending } from '../thread/commands.ts';
 import { FamilyMark } from '../thread/family-mark.tsx';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import type { UsageGaugeCard } from '../usage-presentation.ts';
+import '../thread/subagents.css';
 import { ClientRecord } from './client-status.tsx';
 import { readFamilyDefaults, writeFamilyDefault } from './preferences.ts';
 import type { ProviderActions } from './provider-actions.ts';
@@ -133,11 +135,14 @@ export function Allowance({
   cards,
   now,
   none,
+  credit = null,
 }: {
   label: string;
   cards: readonly UsageCard[];
   now: number;
   none: string;
+  /** What the rail bar says once the included allowance is used up. */
+  credit?: string | null;
 }) {
   return (
     <section className="st-block" aria-label={`${label} allowance`}>
@@ -149,7 +154,77 @@ export function Allowance({
       ) : (
         <p className="st-note">{none}</p>
       )}
+      {credit && <p role="status">{credit}</p>}
     </section>
+  );
+}
+
+const creditNotes = {
+  openai:
+    "Credits also need to be turned on in OpenAI's own settings. CrewKite can't override it there.",
+  anthropic:
+    "Extra usage also needs to be turned on in your Anthropic account settings. CrewKite can't override it there.",
+};
+
+/**
+ * The Allow credit spending switch. The controller holds it, so the card shows what the catalog
+ * says and changes it only through the command.
+ */
+export function CreditSwitch({
+  family,
+  entry,
+  workspace,
+}: {
+  family: 'openai' | 'anthropic';
+  entry: CatalogEntry | undefined;
+  workspace: Workspace;
+}) {
+  const id = useId();
+  const [allowed, setAllowed] = useState(entry?.creditSpending === true);
+  const [saving, setSaving] = useState(false);
+  const [failure, setFailure] = useState<string | null>(null);
+  useEffect(() => setAllowed(entry?.creditSpending === true), [entry?.creditSpending]);
+  const source = workspace.source;
+  const live = workspace.connection === 'connected' && !workspace.preview;
+  async function change(next: boolean) {
+    if (!source) return;
+    setSaving(true);
+    setFailure(null);
+    try {
+      await setCreditSpending(source, family, next);
+      setAllowed(next);
+    } catch (error) {
+      setFailure(error instanceof Error ? error.message : 'The switch could not be saved.');
+    } finally {
+      setSaving(false);
+    }
+  }
+  return (
+    <div className="st-field">
+      <label className="sa-switch" htmlFor={id}>
+        <input
+          id={id}
+          type="checkbox"
+          role="switch"
+          checked={allowed}
+          aria-checked={allowed}
+          aria-describedby={`${id}-note`}
+          disabled={!source || !live || saving}
+          onChange={(event) => void change(event.target.checked)}
+        />
+        <span>Allow credit spending</span>
+      </label>
+      {allowed ? (
+        <p id={`${id}-note`} className="st-credit-note">
+          {creditNotes[family]}
+        </p>
+      ) : (
+        <small id={`${id}-note`} className="st-hint">
+          When the included allowance runs out, CrewKite hands work to another provider.
+        </small>
+      )}
+      {failure && <p role="status">{failure}</p>}
+    </div>
   );
 }
 
@@ -157,6 +232,7 @@ export function ProviderCard({
   family,
   entry,
   detail,
+  reasonLine,
   main,
   side,
   models,
@@ -167,6 +243,8 @@ export function ProviderCard({
   entry: CatalogEntry | undefined;
   /** One line under the name, such as the sign-in the client reports. */
   detail?: string;
+  /** The line for the catalog's reason, for a card that words its own reasons. */
+  reasonLine?: string;
   main: ReactNode;
   side: ReactNode;
   /** Shown under the model list, such as a way to read it again. */
@@ -206,7 +284,9 @@ export function ProviderCard({
           {!entry ? 'Unknown' : entry.connected ? 'Connected' : 'Not connected'}
         </span>
         <span className="st-detail">
-          {entry && !entry.connected && entry.reason ? reasonText(entry.reason) : detail}
+          {entry && !entry.connected && entry.reason
+            ? (reasonLine ?? reasonText(entry.reason))
+            : detail}
         </span>
       </header>
       {found && (

@@ -512,3 +512,61 @@ test('an Anthropic read that worked leaves no status line, and a failed one says
     /^Last refresh failed\. .*Check the Anthropic sign-in/,
   );
 });
+
+test('an exhausted family shows its credit state in the same bar, and nothing changes before', () => {
+  type Entry = ChatCatalogRead['families'][number];
+  const observedAt = new Date(nowMs - 60_000).toISOString();
+  const entry = (
+    family: Entry['family'],
+    percent: number,
+    credits: Entry['credits'],
+    creditSpending: boolean | undefined,
+  ): Entry => ({
+    family,
+    connected: true,
+    reason: null,
+    models: [],
+    defaultModel: null,
+    remaining: [{ windowId: 'weekly', label: 'weekly', percent, resetsAt: null, observedAt }],
+    readAt: observedAt,
+    accepts: null,
+    credits,
+    ...(creditSpending === undefined ? {} : { creditSpending }),
+  });
+  const credits = (
+    state: NonNullable<Entry['credits']>['state'],
+    balance: string | null = null,
+  ) => ({
+    state,
+    balance,
+    limitReached: false,
+    observedAt,
+  });
+  const cases: [string, Entry, string][] = [
+    ['before exhaustion', entry('openai', 30, credits('available', '7'), true), '30% left'],
+    [
+      'balance as reported',
+      entry('openai', 0, credits('available', '7.25'), true),
+      'Credits 7.25 left',
+    ],
+    ['unlimited', entry('openai', 0, credits('unlimited'), true), 'Credits unlimited'],
+    ['no credits', entry('openai', 0, credits('none'), false), 'No credits'],
+    ['switch off', entry('openai', 0, credits('available', '7'), false), 'Credits paused'],
+    [
+      'the provider says its limit is reached',
+      entry('openai', 40, { ...credits('available', '3'), limitReached: true }, true),
+      'Credits 3 left',
+    ],
+    ['extra usage on', entry('anthropic', 0, credits('extra-usage-on'), true), 'Extra usage on'],
+    [
+      'anthropic switch off',
+      entry('anthropic', 0, credits('extra-usage-on'), false),
+      'Credits paused',
+    ],
+    ['google has no switch', entry('google', 0, null, undefined), '0% left'],
+  ];
+  for (const [claim, value, text] of cases) {
+    const [row] = railFamilies({ families: [value] }, nowMs);
+    assert.deepEqual(row.bars, [{ text, percent: value.remaining[0].percent }], claim);
+  }
+});

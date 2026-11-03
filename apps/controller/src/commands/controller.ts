@@ -55,6 +55,7 @@ import { chatScratchDirectory } from '../chat/scratch-folder.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
+import { ConnectLog } from '../diagnostics/connect-log.ts';
 import { readDiagnostics } from '../diagnostics/read.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
 import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
@@ -92,6 +93,7 @@ import { connectLocalModel } from '../providers/local/chat-connect.ts';
 import type { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
 import type { LocalInputHelper, startLocalSecretInput } from '../providers/local/secure-input.ts';
 import { openAiChatAdapter } from '../providers/openai/chat.ts';
+import { openAiCreditReading } from '../providers/openai/discovery.ts';
 import {
   modelReadFailure,
   type OpenAiModelCatalogObservation,
@@ -132,6 +134,7 @@ import {
   migrations,
   type NativeReviewRuntime,
   type NativeRuntime,
+  type OpenAiCreditReading,
   type PreparedVerification,
 } from './schemas.ts';
 import {
@@ -287,6 +290,8 @@ export class Controller {
   };
   /** The Google setup steps the controller starts on its own at launch. */
   googleAcpPreparation?: Promise<void>;
+  /** One controller.log line per provider connect, at launch and on the card's Connect. */
+  readonly connectLog = new ConnectLog();
   acpStart?: {
     key: string;
     hash: string;
@@ -381,7 +386,13 @@ export class Controller {
     }
     // Google setup is three client runs and can take a minute. Recovery above has settled any
     // interrupted step, so the runs that need no click start here.
-    this.googleAcpPreparation = this.prepareGoogleAcp().catch(() => {});
+    if (this.store.hasConnectedOnce('google')) this.connectLog.begin('google', 'auto');
+    this.googleAcpPreparation = this.prepareGoogleAcp()
+      .catch(() => {})
+      .then(() => this.settleGoogleConnect());
+    // Local reconnects its saved endpoint from the desktop at launch.
+    if (this.store.hasConnectedOnce('local') && this.localControl().endpoint)
+      this.connectLog.begin('local', 'auto');
   }
 
   private taskOperationRuntime?: TaskOperations;
@@ -539,6 +550,9 @@ export class Controller {
   // next turn on each family reports again.
   private googlePrompt: GooglePromptCapabilities | null = null;
   private localVision: { modelKey: string; vision: boolean } | null = null;
+  // What the OpenAI client said about credits during the last chat turn. The quota read keeps its
+  // own copy on disk, and the newer of the two counts.
+  private openAiTurnCredits: OpenAiCreditReading | null = null;
 
   // The Anthropic client's picker rows, read in the background. A read that fails leaves the last
   // rows in place, or none, and the catalog then lists the model IDs this home ran turns on.
@@ -610,6 +624,11 @@ export class Controller {
         this.store.hasConnectedOnce(family),
       ),
       localVision: this.localVision,
+      credits: { openai: this.openAiCredits(), anthropic: this.anthropicCredits() },
+      creditSpending: {
+        openai: this.store.creditSpending('openai'),
+        anthropic: this.store.creditSpending('anthropic'),
+      },
       windows: [
         ...this.store.list<Observation>('window').map((observation) => ({
           family: this.store.get<Route>('route', observation.routeId)?.family,
@@ -620,6 +639,29 @@ export class Controller {
       turns: this.store.db,
       nowMs: Date.parse(this.now()),
     });
+  }
+
+  private openAiCredits(): OpenAiCreditReading | null {
+    let read: OpenAiCreditReading | null = null;
+    try {
+      read = this.openAiUsageState()?.credits ?? null;
+    } catch {
+      // A damaged read record reads as no credit reading.
+    }
+    const turn = this.openAiTurnCredits;
+    if (!read || !turn) return read ?? turn;
+    return Date.parse(turn.observedAt) > Date.parse(read.observedAt) ? turn : read;
+  }
+
+  private anthropicCredits(): { extraUsage: boolean; observedAt: string } | null {
+    try {
+      const reading = this.anthropicUsage().status().reading;
+      return reading?.extraUsage
+        ? { extraUsage: reading.extraUsage.is_enabled, observedAt: reading.receivedAt }
+        : null;
+    } catch {
+      return null;
+    }
   }
 
   /**
@@ -925,6 +967,10 @@ export class Controller {
         environment: request.environment,
       }),
       spawn: this.options.nativeSpawn as Parameters<typeof openAiChatAdapter>[0]['spawn'],
+      onUsage: (usage) => {
+        const reading = openAiCreditReading(usage);
+        if (reading) this.openAiTurnCredits = { ...reading, observedAt: this.now() };
+      },
       threadTools,
     });
     const anthropic = anthropicChatAdapter({
@@ -1071,18 +1117,31 @@ export class Controller {
     ) {
       // A setup step the person pressed connects Google on this device. The launch-time steps
       // run from then on.
-      if ('consent' in command.payload && command.payload.consent === 'explicit')
+      if ('consent' in command.payload && command.payload.consent === 'explicit') {
         this.connectedNow('google');
-      return this.executeAcpSetup(command as AcpSetupCommand, principal);
+        this.connectLog.begin('google', 'manual');
+      }
+      const setup = this.executeAcpSetup(command as AcpSetupCommand, principal);
+      void setup.then((result) => this.settleGoogleConnect(result)).catch(() => {});
+      return setup;
     }
     if (command.command === 'StartRun' && this.isPreparedAcp(command.payload.runId))
       return this.executeAcpStart(command, principal);
     if (command.command === 'InstallGoogleAcp' || command.command === 'StopGoogleAcpInstall') {
-      if (command.command === 'InstallGoogleAcp') this.connectedNow('google');
-      return this.executeGoogleInstall(command, principal);
+      if (command.command === 'InstallGoogleAcp') {
+        this.connectedNow('google');
+        this.connectLog.begin('google', 'manual');
+      }
+      const install = this.executeGoogleInstall(command, principal);
+      void install.then((result) => this.settleGoogleConnect(result)).catch(() => {});
+      return install;
     }
-    if (command.command === 'CheckNativeConnection')
-      return this.checkNativeConnection(command, principal);
+    if (command.command === 'CheckNativeConnection') {
+      this.connectLog.begin('anthropic', 'manual');
+      const check = this.checkNativeConnection(command, principal);
+      void check.then((result) => this.settleAnthropicConnect(result)).catch(() => {});
+      return check;
+    }
     if (command.command === 'SignInOpenAi') return this.signInOpenAi(command);
     if (command.command === 'SignOutOpenAi') return this.signOutOpenAi(command);
     if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
@@ -1478,6 +1537,8 @@ export class Controller {
     // Saved crews belong to no task. The controller checks names, the limit and the default when
     // it applies the command, and a replayed key answers from its receipt.
     if (crewsMutations.includes(command.command)) return;
+    // The credit switch belongs to no task. A replayed key answers from its receipt.
+    if (command.command === 'SetCreditSpending') return;
     if (
       [
         'SendChatMessage',
@@ -1751,6 +1812,18 @@ export class Controller {
       case 'EditProjectNote':
       case 'RemoveProjectNote':
         return notesCommand(this.projectNotes(), command);
+      case 'SetCreditSpending': {
+        const { family, allowed } = command.payload;
+        this.store.setCreditSpending(family, allowed);
+        // The picker, the rail and Settings read the catalog again on this event.
+        const models = this.chatCatalog().families.find((entry) => entry.family === family);
+        this.event('chat.catalog', null, 0, {
+          family,
+          models: Math.min(models?.models.length ?? 0, 64),
+          reason: null,
+        });
+        return { outcome: 'applied' };
+      }
       case 'ReadSavedCrews':
       case 'SaveCrew':
       case 'DeleteCrew':

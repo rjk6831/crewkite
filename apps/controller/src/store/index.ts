@@ -525,6 +525,32 @@ export class Store {
       );
   }
 
+  /** The Allow credit spending switch. A row means on, so a home that never set it reads off. */
+  creditSpending(family: 'openai' | 'anthropic'): boolean {
+    return !!this.db
+      .prepare('SELECT 1 FROM receipts WHERE command_key=?')
+      .get(`credit-spending:${family}`);
+  }
+
+  setCreditSpending(family: 'openai' | 'anthropic', allowed: boolean) {
+    if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
+    const key = `credit-spending:${family}`;
+    if (!allowed) {
+      this.db.prepare('DELETE FROM receipts WHERE command_key=?').run(key);
+      return;
+    }
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO receipts(command_key,request_hash,principal,result) VALUES (?,?,?,?)',
+      )
+      .run(
+        key,
+        createHash('sha256').update(key).digest('hex'),
+        'local-owner',
+        canonicalJson({ outcome: 'applied' }),
+      );
+  }
+
   append(event: Omit<Event, 'cursor'>): Event {
     if (!this.transactionEvents) throw new Error('Events require a transaction.');
     const insert = this.db.prepare('INSERT INTO events(event_id,task_id,body) VALUES (?,?,?)');

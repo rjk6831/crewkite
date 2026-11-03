@@ -311,6 +311,7 @@ export async function installBridge(
         'DeleteCrew',
         'SetDefaultCrew',
         'ImportSavedCrews',
+        'SetCreditSpending',
         'RefreshChatModels',
         'ReadChatBranchStatus',
         'PushChatBranch',

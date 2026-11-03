@@ -411,7 +411,7 @@ test('an unreadable version is read again after a backoff, at once when the file
   }
 });
 
-test('the version read is bounded, kills its whole process group and passes a minimal environment', () => {
+test('the version read is bounded, kills its whole process group and passes a minimal environment with a private Codex home', () => {
   const { root, bin, store, client, link } = scratch();
   try {
     const pids = join(root, 'pids');
@@ -434,7 +434,7 @@ test('the version read is bounded, kills its whole process group and passes a mi
     const script = join(store, 'codex-env');
     writeFileSync(
       script,
-      `#!${process.execPath}\nrequire('node:fs').writeFileSync(${JSON.stringify(seen)}, JSON.stringify(Object.keys(process.env).sort()));\nconsole.log('0.170.2');\n`,
+      `#!${process.execPath}\nconst fs = require('node:fs');\nconst home = process.env.CODEX_HOME;\nfs.writeFileSync(${JSON.stringify(seen)}, JSON.stringify({ names: Object.keys(process.env).sort(), home, mode: fs.statSync(home).mode & 0o777, entries: fs.readdirSync(home) }));\nconsole.log('0.170.2');\n`,
     );
     chmodSync(script, 0o755);
     link(script);
@@ -450,11 +450,22 @@ test('the version read is bounded, kills its whole process group and passes a mi
     } finally {
       delete process.env.CREWKITE_FIXTURE_SECRET;
     }
+    const report = JSON.parse(readFileSync(seen, 'utf8')) as {
+      names: string[];
+      home: string;
+      mode: number;
+      entries: string[];
+    };
     // macOS adds __CF_USER_TEXT_ENCODING to every process it starts; CrewKite does not pass it.
-    const passed = (JSON.parse(readFileSync(seen, 'utf8')) as string[]).filter(
-      (name) => !name.startsWith('__CF_'),
-    );
-    assert.deepEqual(passed, ['HOME', 'LANG', 'NO_COLOR', 'PATH']);
+    const passed = report.names.filter((name) => !name.startsWith('__CF_'));
+    assert.deepEqual(passed, ['CODEX_HOME', 'HOME', 'LANG', 'NO_COLOR', 'PATH']);
+    // The person's ~/.codex is never the client's home: the read gets an empty private folder
+    // outside the home folder, gone once the read ends.
+    const personal = join(userInfo().homedir, '.codex');
+    assert.ok(report.home !== personal && !report.home.startsWith(`${personal}/`), report.home);
+    assert.equal(report.mode, 0o700);
+    assert.deepEqual(report.entries, []);
+    assert.equal(existsSync(report.home), false, 'the private folder is removed after the read');
 
     // A file that changes while its version runs keeps no version.
     link(client('codex-changing', `echo '# touched' >> "$0"\necho '0.170.2'`));

@@ -28,6 +28,12 @@ export const setupReasons: Record<NonNullable<LocalSetup['reason']>, string> = {
   'qualification-pending': 'Connected. The loaded model is eligible for chat.',
 };
 
+/**
+ * A status line that says the connection works. It reads as plain status text, so the notice
+ * style stays for something the person has to act on.
+ */
+export const settledLine = (line: string) => line === setupReasons['qualification-pending'];
+
 /** How often an open Settings page or model picker reads the runtime again. */
 export const REOBSERVE_MS = 15_000;
 

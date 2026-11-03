@@ -19,7 +19,7 @@ I require the original cancelled response, closed streams and absent owned group
 
 The quota read is on by default when the pinned client is present. There is no opt-in.
 
-The quota reader shares a durable gate with setup and task admission. Controller startup attempts one read. An authenticated client connection or admission can request a needed refresh. While a client remains authenticated, the controller checks every ten seconds and permits an interval attempt at least 270 seconds after the prior attempt. Startup and connection attempts keep a sixty-second cooldown. Failed reads count toward both limits, and active or unknown Google ownership refuses another read. Fresh exhausted quota refuses an admission refresh. Admission rechecks every bucket, reserve and current authority. Account matching remains user-attested; context tokens supply no account allowance.
+The quota reader shares a durable gate with setup and task admission. Controller startup attempts one read. An authenticated client connection or admission can request a needed refresh. While a client remains authenticated, the controller checks every ten seconds and permits an interval attempt at least 90 seconds after the prior attempt. Startup and connection attempts keep a sixty-second cooldown. Failed reads count toward both limits, and active or unknown Google ownership refuses another read. Fresh exhausted quota refuses an admission refresh. Admission rechecks every bucket, reserve and current authority. Account matching remains user-attested; context tokens supply no account allowance.
 
 ## Why
 

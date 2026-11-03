@@ -2,6 +2,7 @@ import type { DatabaseSync } from 'node:sqlite';
 import {
   type ChatCatalogRead,
   ChatCatalogReadSchema,
+  type ChatCredits,
   type ChatEffort,
   ChatEffortSchema,
   type ChatFamily,
@@ -10,6 +11,7 @@ import {
   type LocalSetup,
   type Observation,
 } from '@crewkite/contracts';
+import type { OpenAiCreditReading } from '../commands/schemas.ts';
 import { anthropicChatAccepts } from '../providers/anthropic/chat.ts';
 import type { AnthropicLiveModel } from '../providers/anthropic/models.ts';
 import type { GooglePromptCapabilities } from '../providers/google/chat.ts';
@@ -60,6 +62,16 @@ export type ChatCatalogInput = {
    * no route. Only the fields the gauge needs, so a reading without a route can join.
    */
   windows: readonly { family: ChatFamily | undefined; observation: CatalogObservation }[];
+  /**
+   * The newest credit reading per family. OpenAI's carries a balance and the time its reached
+   * limit lifts. Anthropic's says only whether extra usage is on.
+   */
+  credits?: {
+    openai?: OpenAiCreditReading | null;
+    anthropic?: { extraUsage: boolean; observedAt: string } | null;
+  };
+  /** The person's Allow credit spending switch per family. Off when left out. */
+  creditSpending?: Partial<Record<'openai' | 'anthropic', boolean>>;
   /** The database that holds the chat turns, for each family's last turn stats. Null stats without it. */
   turns?: Pick<DatabaseSync, 'prepare'>;
   nowMs: number;
@@ -128,6 +140,7 @@ function openai(input: ChatCatalogInput): Entry {
   return {
     ...entry(input, 'openai', !!ready, reason, models, fallback),
     ...(client ? { client } : {}),
+    ...credits(input, 'openai'),
     accepts: modalities
       ? [
           ...(modalities.includes('image') ? ['image/*'] : []),
@@ -175,6 +188,7 @@ function anthropic(input: ChatCatalogInput): Entry {
         models[0]?.model,
     ),
     ...(client ? { client } : {}),
+    ...credits(input, 'anthropic'),
     // The client's input protocol fixes these types for every model, so they hold wherever the
     // client is installed.
     accepts: present ? [...anthropicChatAccepts] : null,
@@ -281,6 +295,40 @@ function entry(
     needsConnect: awaiting || (!connected && windows.some((window) => window.percent !== null)),
     lastTurnStats: lastTurnStats(input, family),
     accepts: null,
+  };
+}
+
+function credits(
+  input: ChatCatalogInput,
+  family: 'openai' | 'anthropic',
+): { credits: ChatCredits | null; creditSpending: boolean } {
+  const creditSpending = input.creditSpending?.[family] === true;
+  if (family === 'anthropic') {
+    const reading = input.credits?.anthropic;
+    return {
+      credits: reading
+        ? {
+            state: reading.extraUsage ? 'extra-usage-on' : 'extra-usage-off',
+            balance: null,
+            limitReached: false,
+            observedAt: reading.observedAt,
+          }
+        : null,
+      creditSpending,
+    };
+  }
+  const reading = input.credits?.openai;
+  if (!reading) return { credits: null, creditSpending };
+  // A reached limit lifts at its reset. Without a reset time the reading stands until the next.
+  const lifted = reading.resetsAt !== null && Date.parse(reading.resetsAt) <= input.nowMs;
+  return {
+    credits: {
+      state: reading.state,
+      balance: reading.balance,
+      limitReached: reading.limitReached && !lifted,
+      observedAt: reading.observedAt,
+    },
+    creditSpending,
   };
 }
 

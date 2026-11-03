@@ -34,7 +34,7 @@ const latestTurn = 'usage-turn:anthropic';
 const maximumRecordBytes = 256 * 1024;
 // The gauge reads on its own this often while the controller runs, so the rail stays near current
 // between turns. A minute is the floor, the same as the read cooldown.
-const periodicReadMs = 600_000;
+const periodicReadMs = 300_000;
 const minimumRecheckMs = 60_000;
 const recordSchema = z.strictObject({
   operationId: CommandIdSchema,
@@ -91,7 +91,7 @@ export class AnthropicUsageRefresh {
   }
 
   /**
-   * Arms the next periodic read for ten minutes after the last attempt, or a minute from now when
+   * Arms the next periodic read for five minutes after the last attempt, or a minute from now when
    * that has passed. A read after a turn moves the next one back, so the two never stack.
    */
   private armPeriodic() {
@@ -127,7 +127,7 @@ export class AnthropicUsageRefresh {
         // its time-ordered suffix. Upgrade: pass the controller's ID helper in the options.
         void this.refreshWhenDue(`cmd_${this.options.artifactId().slice(4)}`);
     } catch {}
-    // The read above saved its attempt time before it returned, so the next one lands ten
+    // The read above saved its attempt time before it returned, so the next one lands five
     // minutes after it.
     this.armPeriodic();
   }
@@ -557,7 +557,7 @@ export class AnthropicUsageRefresh {
 
   /**
    * The gauge reads on its own when the controller starts, after each chat turn settles, since a
-   * turn spent some allowance, and every ten minutes while no Anthropic turn runs. It reads only
+   * turn spent some allowance, and every five minutes while no Anthropic turn runs. It reads only
    * when the client resolves, the last read is more than a minute old and no other read runs.
    * Anything else skips it without a receipt.
    */

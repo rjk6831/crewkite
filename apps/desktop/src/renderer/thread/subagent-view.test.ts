@@ -243,11 +243,11 @@ test('a preset keeps what the person set for each role across a save and passes 
     getItem: (key: string) => values.get(key) ?? null,
     setItem: (key: string, value: string) => void values.set(key, value),
   };
-  const [, pair] = readCrewPresets(store);
-  assert(pair.members.every((member) => member.allowSubagents === undefined));
+  const [, tandem] = readCrewPresets(store);
+  assert(tandem.members.every((member) => member.allowSubagents === undefined));
   writeCrewPresets(
     readCrewPresets(store).map((preset) =>
-      preset.name === 'Pair'
+      preset.name === 'Tandem'
         ? {
             ...preset,
             members: preset.members.map((member) =>

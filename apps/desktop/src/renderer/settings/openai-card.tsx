@@ -4,8 +4,9 @@ import { useEffect, useState } from 'react';
 import type { Workspace } from '../source.ts';
 import { refreshModels } from '../thread/commands.ts';
 import { usageCards } from '../thread/usage-cards.ts';
+import { creditText } from '../usage-presentation.ts';
 import { ClientStatus, QuotaRefresh } from './client-status.tsx';
-import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
+import { Allowance, type CardProps, CreditSwitch, ProviderCard } from './provider-card.tsx';
 import { ConnectLine } from './providers/connect.tsx';
 import { connectedOnce } from './providers/connect-copy.ts';
 
@@ -43,16 +44,20 @@ export function OpenAiCard({
         </ClientStatus>
       }
       side={
-        <Allowance
-          label="OpenAI"
-          cards={cards}
-          now={now}
-          none={
-            connectedOnce(header, 'openai')
-              ? 'No usage has been read. Refresh quota to read it.'
-              : 'Connect OpenAI to read its usage.'
-          }
-        />
+        <>
+          <Allowance
+            label="OpenAI"
+            cards={cards}
+            now={now}
+            none={
+              connectedOnce(header, 'openai')
+                ? 'No usage has been read. Refresh quota to read it.'
+                : 'Connect OpenAI to read its usage.'
+            }
+            credit={entry ? creditText(entry, entry.defaultModel) : null}
+          />
+          <CreditSwitch family="openai" entry={entry} workspace={workspace} />
+        </>
       }
       models={entry?.connected && <ModelRefresh workspace={workspace} modelRead={modelRead} />}
     />

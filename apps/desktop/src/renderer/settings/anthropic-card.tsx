@@ -1,9 +1,9 @@
 import { RefreshCw } from 'lucide-react';
 import { formatLocalTime } from '../format-time.ts';
 import { usageCards } from '../thread/usage-cards.ts';
-import { anthropicReadReason } from '../usage-presentation.ts';
+import { anthropicReadReason, creditText } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
-import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
+import { Allowance, type CardProps, CreditSwitch, ProviderCard } from './provider-card.tsx';
 import { ConnectLine } from './providers/connect.tsx';
 
 const signInText = (state: string | undefined) =>
@@ -103,7 +103,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
                 </button>
               )}
           </div>
-          <p className="st-note">Usage is read again every ten minutes while Anthropic is idle.</p>
+          <p className="st-note">Usage is read again every five minutes while Anthropic is idle.</p>
           {failure && <p role="status">{failure}</p>}
           {detail && reader?.readReason && reader.readReason !== 'reported' && (
             <>
@@ -122,12 +122,16 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
         </ClientStatus>
       }
       side={
-        <Allowance
-          label="Anthropic"
-          cards={cards}
-          now={now}
-          none="No usage has been read. Refresh quota to read it."
-        />
+        <>
+          <Allowance
+            label="Anthropic"
+            cards={cards}
+            now={now}
+            none="No usage has been read. Refresh quota to read it."
+            credit={entry ? creditText(entry, entry.defaultModel) : null}
+          />
+          <CreditSwitch family="anthropic" entry={entry} workspace={workspace} />
+        </>
       }
     />
   );

@@ -623,7 +623,7 @@ function CrewTab({
       },
     });
   }
-  // A crew replaces the whole crew, so Solo or Pair is the way back from Full crew. A saved crew
+  // A crew replaces the whole crew, so Solo or Tandem is the way back from Full crew. A saved crew
   // brings its own flight mode. A mode the person picked before the thread had a crew travels in
   // the same call.
   function start(id: string, flightMode?: ChatFlightMode) {
@@ -758,7 +758,7 @@ function CrewTab({
       <p className="th-muted">
         {crew
           ? mode.title
-          : 'Balanced and Glide run with a crew. Picking one here starts the Solo crew, the builder alone, and Pair or Full crew above add the other roles.'}
+          : 'Balanced and Glide run with a crew. Picking one here starts the Solo crew, the builder alone, and Tandem or Full crew above add the other roles.'}
       </p>
       {/* The same setting as Permissions on the Thread tab, so mode and policy read in one place. */}
       <label>

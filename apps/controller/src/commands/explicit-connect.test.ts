@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
-import { mkdirSync, mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { test } from 'node:test';
+import { startTimingLog } from '../diagnostics/timing.ts';
 import {
   type NativeProfileResolution,
   unavailableNativeProfile,
@@ -28,7 +29,7 @@ const profile = {
 const answering = fixture.replace(
   '  let result = replies[message.method];',
   `  let result = message.method === 'account/rateLimits/read'
-    ? { rateLimits: {}, rateLimitsByLimitId: { ordinary: { primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1792231983 } } } }
+    ? { rateLimits: {}, rateLimitsByLimitId: { ordinary: { primary: { usedPercent: 25, windowDurationMins: 300, resetsAt: 1792231983 }, credits: { hasCredits: true, unlimited: false, balance: '3' } } } }
     : replies[message.method];`,
 );
 
@@ -99,6 +100,14 @@ test('a provider connected once reconnects at every later launch with no command
   assert.ok(context.started.includes('usage app-server'), 'the quota read ran at launch');
   assert.ok(context.started.includes('models app-server'), 'the model read ran at launch');
   assert.equal(controller.openAiUsageState()?.state, 'quiescent');
+  // The credit state the read reported is kept with it, for the rail and the credit gate.
+  assert.deepEqual(
+    [
+      controller.openAiUsageState()?.credits?.state,
+      controller.openAiUsageState()?.credits?.balance,
+    ],
+    ['available', '3'],
+  );
   assert.deepEqual(controller.workspaceState().providerConnections?.connectedOnce, ['openai']);
   // Sign-out ends it, so the launch after it asks again.
   const signedOut = await controller.execute(
@@ -107,4 +116,21 @@ test('a provider connected once reconnects at every later launch with no command
   );
   assert.equal(signedOut.outcome, 'applied');
   assert.equal(controller.store.hasConnectedOnce('openai'), false);
+});
+
+test('a launch reconnect writes one connect line with its time, for the provider connected once only', async (t) => {
+  const context = await launchFixture(t);
+  const { controller } = context;
+  const stop = startTimingLog(controller.home);
+  t.after(stop);
+  const lines = () =>
+    readFileSync(join(controller.home, 'controller.log'), 'utf8')
+      .split('\n')
+      .flatMap((line) => (/ connect /.test(line) ? [line.slice(line.indexOf(' ') + 1)] : []));
+  controller.store.transaction(() => controller.store.markConnectedOnce('openai'));
+  await context.launch();
+  assert.deepEqual(
+    lines().map((line) => line.replace(/ms=\d+$/, 'ms=n')),
+    ['connect openai auto ok ms=n'],
+  );
 });

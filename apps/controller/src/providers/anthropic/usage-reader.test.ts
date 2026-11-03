@@ -1053,9 +1053,9 @@ test('a client update inside the range re-binds the quota reader and reads go on
   const second = f.status()?.trust?.scopeHash;
   assert.notEqual(second, first);
   assert.equal(f.status()?.readingScopeHash, second);
-  // The ten-minute read runs on the new build.
+  // The five-minute read runs on the new build.
   const launches = f.launches();
-  f.clock.advance(600_000);
+  f.clock.advance(300_000);
   await f.periodicRead();
   assert.equal(f.launches(), launches + 1);
   assert.equal(f.status()?.readState, 'quiescent');
@@ -1072,9 +1072,9 @@ test('a quota read that started no process ends quiescent and the next read runs
   assert.equal(f.status()?.readState, 'quiescent');
   assert.equal(f.status()?.operationId, null);
   assert.equal(f.controller.anthropicUsage().blocker(), undefined);
-  // The next build arrives, and the ten-minute read binds to it.
+  // The next build arrives, and the five-minute read binds to it.
   f.install('2.1.316');
-  f.clock.advance(600_000);
+  f.clock.advance(300_000);
   await f.periodicRead();
   assert.equal(f.status()?.readState, 'quiescent');
   assert.equal(f.status()?.readReason, 'reported');
@@ -1084,7 +1084,7 @@ test('a quota read that started no process ends quiescent and the next read runs
   assert.equal((await f.refresh()).outcome, 'applied');
 });
 
-test('the gauge reads every ten minutes while no Anthropic turn runs', async (t) => {
+test('the gauge reads every five minutes while no Anthropic turn runs', async (t) => {
   const f = refreshFixture(t);
   // The reader's own timers stay under a minute. The periodic read is the one at a minute or more.
   const periodic = () => f.timers.filter((timer) => timer.milliseconds >= 60_000);
@@ -1105,10 +1105,10 @@ test('the gauge reads every ten minutes while no Anthropic turn runs', async (t)
     .run(taskId);
   const rows: { claim: string; advance: number; turn: string | null; calls: number }[] = [
     { claim: 'the first timer reads when nothing was read yet', advance: 0, turn: null, calls: 1 },
-    { claim: 'a timer before ten minutes reads nothing', advance: 59_000, turn: null, calls: 1 },
+    { claim: 'a timer before five minutes reads nothing', advance: 59_000, turn: null, calls: 1 },
     {
       claim: 'a running Anthropic turn holds the read',
-      advance: 541_000,
+      advance: 241_000,
       turn: 'running',
       calls: 1,
     },
@@ -1120,9 +1120,9 @@ test('the gauge reads every ten minutes while no Anthropic turn runs', async (t)
     await read();
     assert.equal(f.calls(), row.calls, row.claim);
   }
-  // Each timer lands ten minutes after the last attempt, and a missed one checks again a minute on.
+  // Each timer lands five minutes after the last attempt, and a missed one checks again a minute on.
   assert.deepEqual(
     periodic().map((timer) => timer.milliseconds),
-    [600_000, 600_000, 541_000, 60_000, 600_000],
+    [300_000, 300_000, 241_000, 60_000, 300_000],
   );
 });

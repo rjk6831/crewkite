@@ -5,9 +5,11 @@ import {
   classifyGoogleFailure,
   GOOGLE_CONNECT_LIMIT_MS,
   GOOGLE_READ_TRIES,
+  type GoogleSetupStage,
   googleClientStatus,
   googleConnectButton,
   googleConnectError,
+  googleReasonLine,
   googleSetupProgress,
   nextGoogleStage,
   pollGoogleSetupStatus,
@@ -936,4 +938,54 @@ test('the unconfirmed outcome line shows only after a step ended in an unknown s
     googleConnectError({ googleAcpInstall: null, googleAcpSetup: setup(2, 'unknown') }),
     unconfirmed,
   );
+});
+
+// Claim: the Google card never shows a reason code. While a Connect initializes or discovers, the
+// missing capability it reports reads as the step; after Connect it reads as one sentence.
+test('the Google card words every reason and shows the step while Connect runs', () => {
+  const proofId = 'art_01K7M1N2P3Q4R5S6T7V8W9X0YZ';
+  const installed = (value: NonNullable<GoogleState['googleAcpSetup']>): GoogleState => ({
+    googleAcpInstall: null,
+    googleAcpSetup: value,
+  });
+  const rows: [string, string, GoogleState, GoogleSetupStage | null, string | undefined][] = [
+    [
+      'between install and initialize',
+      'acp-capability-missing',
+      installed(setup(1, 'uninitialized', { client })),
+      'initialize',
+      'Step 3 of 5: Initialize',
+    ],
+    [
+      'discovery the controller runs',
+      'acp-capability-missing',
+      installed(setup(3, 'discovering', { client, proofId, operationId: 'cmd_1' })),
+      null,
+      'Step 5 of 5: Discover models',
+    ],
+    [
+      'a Connect that stopped blocked',
+      'acp-capability-missing',
+      installed(setup(4, 'blocked', { client, proofId, reason: 'acp-capability-missing' })),
+      null,
+      'Google setup did not finish. Press Try again.',
+    ],
+    [
+      'installed and never connected',
+      'acp-capability-missing',
+      installed(setup(1, 'uninitialized', { client })),
+      null,
+      'The official client is installed. Press Connect Google to finish setup.',
+    ],
+    [
+      'a code the card has no words for',
+      'some-new-code',
+      installed(setup(0, 'uninitialized')),
+      null,
+      'Google setup has not finished.',
+    ],
+    ['connected', '', installed(setup(6, 'ready', { client, proofId })), null, undefined],
+  ];
+  for (const [name, reason, state, requested, want] of rows)
+    assert.equal(googleReasonLine(reason, state, requested), want, name);
 });

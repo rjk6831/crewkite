@@ -4714,3 +4714,245 @@ test('a Local slice that cannot fit goes to the crew builder in balanced and gli
     assert.equal(readFileSync(join(scratch, 'a.txt'), 'utf8'), 'taxed\n', flightMode);
   }
 });
+
+/** A catalog entry with a credit reading and the Allow credit spending switch. */
+function creditEntry(
+  family: ChatFamily,
+  percent: number,
+  creditSpending: boolean | undefined,
+  observedAt: string,
+): ChatCatalogRead['families'][number] {
+  return {
+    ...familyEntry(family, percent, null, observedAt),
+    ...(creditSpending === undefined
+      ? {}
+      : {
+          creditSpending,
+          credits: { state: 'available', balance: '5', limitReached: false, observedAt },
+        }),
+  };
+}
+
+function creditAdapters() {
+  const reply = (family: ChatFamily) =>
+    createScriptedChatAdapter({
+      family,
+      turns: [[{ kind: 'text', itemId: 'r', chunks: [`${family} answered.`] }]],
+    });
+  return new Map((['openai', 'anthropic', 'google', 'local'] as const).map((f) => [f, reply(f)]));
+}
+
+test('an exhausted family with credit spending off hands the turn on before it starts', {
+  timeout: 30000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const paused =
+    'OpenAI is out of included allowance and credit spending is off. Turn it on in Settings or pick another provider.';
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const cases = [
+    {
+      claim: 'a single thread moves to the next family with allowance',
+      families: [creditEntry('openai', 0, false, now), creditEntry('google', 50, undefined, now)],
+      send: pick('openai'),
+      turns: ['google'],
+      line: 'Continued on Google from OpenAI. Reason: usage limit reached.',
+    },
+    {
+      claim: 'the switch on lets the turn start there',
+      families: [creditEntry('openai', 0, true, now), creditEntry('google', 50, undefined, now)],
+      send: pick('openai'),
+      turns: ['openai'],
+      line: 'Fix the rounding.',
+    },
+    {
+      claim: 'Local is never gated',
+      families: [
+        creditEntry('local', 0, undefined, now),
+        creditEntry('google', 50, undefined, now),
+      ],
+      send: pick('local'),
+      turns: ['local'],
+      line: 'Fix the rounding.',
+    },
+    {
+      claim: 'with no taker the turn does not start',
+      families: [creditEntry('openai', 0, false, now), creditEntry('google', 0, undefined, now)],
+      send: pick('openai'),
+      turns: [],
+      line: paused,
+    },
+    {
+      claim: 'a side question gets the line and never moves the thread',
+      families: [creditEntry('openai', 0, false, now), creditEntry('google', 50, undefined, now)],
+      ask: true,
+      turns: [],
+      line: paused,
+    },
+  ];
+  for (const row of cases) {
+    const thread = standalone(t, {
+      adapters: creditAdapters(),
+      catalog: () => ({ families: row.families }),
+    });
+    const { store, service, taskId } = thread;
+    const done = turnReaches(thread, 'done');
+    if ('ask' in row)
+      act(store, (effects) =>
+        service.ask({ taskId, family: 'openai', model: 'openai-model', question: 'Why?' }, effects),
+      );
+    else thread.send('Fix the rounding.', row.send);
+    if (row.turns.length) await done;
+    const read = thread.read();
+    assert.deepEqual(
+      read.turns.map((turn) => turn.selection.family),
+      row.turns,
+      row.claim,
+    );
+    const lines = read.messages.map((message) => message.text);
+    assert.equal(lines.at(row.turns.length ? -2 : -1), row.line, row.claim);
+    if (row.turns.length) assert.equal(read.thread.selection?.family, row.turns[0], row.claim);
+    else assert.equal(read.thread.activeTurnId, null, row.claim);
+  }
+});
+
+test('a crew step on a family whose credits are paused runs on the next family', {
+  timeout: 30000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep[] => [{ kind: 'text', itemId: 'r', chunks: [text] }];
+  const adapters = new Map([
+    ['openai', createScriptedChatAdapter({ family: 'openai', turns: [reply('Built.')] })],
+    ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: [] })],
+    [
+      'google',
+      createScriptedChatAdapter({
+        family: 'google',
+        turns: [reply('Clean.\nFindings: 0'), reply('It holds.')],
+      }),
+    ],
+  ] as const);
+  const families = [
+    creditEntry('openai', 10, false, now),
+    creditEntry('anthropic', 0, false, now),
+    creditEntry('google', 50, undefined, now),
+  ];
+  const thread = standalone(t, { adapters, catalog: () => ({ families }) });
+  const { store, service, taskId } = thread;
+  const crew: ChatCrew = {
+    name: 'Full crew',
+    members: [
+      { role: 'builder', selection: pick('openai') },
+      { role: 'reviewer', selection: pick('anthropic') },
+      { role: 'challenger', selection: pick('google') },
+    ],
+  };
+  store.transaction(() => service.configure({ taskId, crew, flightMode: 'glide' }));
+  const ended = next(
+    thread,
+    (event) =>
+      event.type === 'conversation.entry' &&
+      /^Crew (finished|stopped)/.test((event.payload as { text: string }).text),
+  );
+  thread.send('Fix the rounding.', pick('openai'));
+  await ended;
+  const read = thread.read();
+  assert.deepEqual(
+    read.turns.map((turn) => [turn.role, turn.selection.family]),
+    [
+      ['assistant', 'openai'],
+      ['reviewer', 'google'],
+      ['challenger', 'google'],
+    ],
+  );
+  assert.ok(
+    read.messages.some(
+      (message) =>
+        message.text === 'Continued on Google from Anthropic. Reason: usage limit reached.',
+    ),
+  );
+  assert.equal(adapters.get('anthropic')?.requests.length, 0);
+  // The step borrowed a model. The thread keeps its own pick.
+  assert.equal(read.thread.selection?.family, 'openai');
+});
+
+test('a turn that spent credits with the switch off finishes, says so, and the next turn moves', {
+  timeout: 30000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const families = [
+    creditEntry('openai', 40, false, now),
+    creditEntry('google', 50, undefined, now),
+  ];
+  const adapters = creditAdapters();
+  const openai = adapters.get('openai');
+  assert.ok(openai);
+  // The allowance runs out while the turn runs, and the provider keeps going on credits.
+  adapters.set('openai', {
+    ...openai,
+    startTurn(request, emit) {
+      families[0] = creditEntry('openai', 0, false, now);
+      return openai.startTurn(request, emit);
+    },
+  });
+  const thread = standalone(t, { adapters, catalog: () => ({ families }) });
+  const first = turnReaches(thread, 'done');
+  thread.send('Fix the rounding.');
+  await first;
+  assert.deepEqual(
+    thread
+      .read()
+      .messages.slice(-2)
+      .map((message) => message.text),
+    [
+      'openai answered.',
+      'OpenAI used credits to finish this turn. Credit spending is off, so the next turn moves to another provider.',
+    ],
+  );
+  const second = turnReaches(thread, 'done');
+  thread.send('Then the totals.');
+  await second;
+  assert.deepEqual(
+    thread.read().turns.map((turn) => [turn.state, turn.selection.family]),
+    [
+      ['done', 'openai'],
+      ['done', 'google'],
+    ],
+  );
+});
+
+test('the credit spending switch is off by default and round trips through its command', {
+  timeout: 30000,
+}, async (t) => {
+  const { controller, command } = await chat(t, []);
+  const catalog = async () =>
+    (
+      (await controller.execute(command('ReadChatCatalog', {}), 'local-owner'))
+        .data as ChatCatalogRead
+    ).families.map((entry) => [entry.family, entry.creditSpending]);
+  const set = (family: string, allowed: boolean) =>
+    controller.execute(command('SetCreditSpending', { family, allowed }, 0), 'local-owner');
+  assert.deepEqual(await catalog(), [
+    ['openai', false],
+    ['anthropic', false],
+    ['google', undefined],
+    ['local', undefined],
+  ]);
+  assert.equal((await set('openai', true)).outcome, 'applied');
+  assert.deepEqual((await catalog()).slice(0, 2), [
+    ['openai', true],
+    ['anthropic', false],
+  ]);
+  assert.equal((await set('openai', false)).outcome, 'applied');
+  assert.deepEqual((await catalog())[0], ['openai', false]);
+  // Google reports no credit state, so it has no switch to set.
+  assert.notEqual((await set('google', true)).outcome, 'applied');
+});
