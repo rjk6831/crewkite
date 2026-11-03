@@ -389,7 +389,8 @@ export class Controller {
     if (this.store.hasConnectedOnce('google')) this.connectLog.begin('google', 'auto');
     this.googleAcpPreparation = this.prepareGoogleAcp()
       .catch(() => {})
-      .then(() => this.settleGoogleConnect());
+      .then(() => this.settleGoogleConnect())
+      .catch(() => {});
     // Local reconnects its saved endpoint from the desktop at launch.
     if (this.store.hasConnectedOnce('local') && this.localControl().endpoint)
       this.connectLog.begin('local', 'auto');

@@ -895,7 +895,8 @@ export class ProviderCommands {
    * ready failed; on the card's Connect only a refused step fails, since the steps run one by one.
    */
   settleGoogleConnect(this: Controller, result?: CommandResult) {
-    if (!this.connectLog.mode('google')) return;
+    // A launch preparation can end after close, when the store is gone.
+    if (this.closed || !this.connectLog.mode('google')) return;
     const setup = this.store.googleAcpSetup();
     if (setup.state === 'ready') return this.connectLog.ok('google');
     if (!result)
