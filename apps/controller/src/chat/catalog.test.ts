@@ -7,6 +7,8 @@ import { LOCAL_TEXT_TYPES } from '../providers/local/chat.ts';
 import { buildChatCatalog, type ChatCatalogInput } from './catalog.ts';
 
 const text = [...LOCAL_TEXT_TYPES];
+// Families connected in CrewKite, so these cases test what each client reports.
+const everyFamily = ['openai', 'anthropic', 'google', 'local'] as const;
 const observation = {
   version: 1,
   runtime: { connectorId: 'local-sdk-v1', version: 'fixture-version', build: 1 },
@@ -111,6 +113,7 @@ test('the catalog reports the file types each client said it takes, and null bef
       profiles: [],
       openAiModels: null,
       windows: [],
+      connectedOnce: everyFamily,
       nowMs: Date.parse('2026-10-25T12:00:00.000Z'),
       ...(input as Pick<ChatCatalogInput, 'local'>),
     });
@@ -165,6 +168,7 @@ test('the catalog reports the file types each client said it takes, and null bef
       profiles: [],
       openAiModels: null,
       windows: [],
+      connectedOnce: everyFamily,
       nowMs: Date.parse('2026-10-25T12:00:00.000Z'),
       ...(input as Pick<ChatCatalogInput, 'local'>),
     });
@@ -208,6 +212,7 @@ test('a writer profile build mismatch no longer disconnects chat when the chat c
       openAiModels: null,
       local: localSetup(false),
       windows: [],
+      connectedOnce: everyFamily,
       nowMs: Date.parse('2026-10-31T12:00:00.000Z'),
     }).families.find((entry) => entry.family === 'anthropic');
   for (const [label, clients, connected, reason, message] of [
@@ -253,6 +258,7 @@ test('Anthropic lists the client rows, then model IDs this home finished turns o
       anthropicModels: rows,
       local: localSetup(false),
       windows: [],
+      connectedOnce: everyFamily,
       ...(turns ? { turns } : {}),
       nowMs: Date.parse('2026-10-31T12:00:00.000Z'),
     }).families.find((entry) => entry.family === 'anthropic');
@@ -307,4 +313,30 @@ test('Anthropic lists the client rows, then model IDs this home finished turns o
     ['model-a', ['low', 'medium', 'high'], 'medium'],
     ['model-b', ['default'], 'default'],
   ]);
+});
+
+test('a cloud family whose client is ready stays unconnected until the person presses Connect', () => {
+  const writer = AnthropicNativeProfileSchema.parse(resolveAnthropicNativeProfile({}).facts);
+  const read = (connectedOnce: ChatCatalogInput['connectedOnce']) =>
+    buildChatCatalog({
+      profiles: [
+        AnthropicNativeProfileSchema.parse({ ...writer, available: true, reason: 'available' }),
+      ],
+      openAiModels: null,
+      anthropicModels: [{ value: 'default', model: 'model-live', label: 'Live', efforts: [] }],
+      local: localSetup(false),
+      windows: [],
+      connectedOnce,
+      nowMs: Date.parse('2026-11-03T12:00:00.000Z'),
+    }).families.find((entry) => entry.family === 'anthropic');
+  const before = read([]);
+  assert.equal(before?.connected, false);
+  assert.equal(before?.reason, 'connect-required');
+  assert.equal(before?.needsConnect, true);
+  assert.equal(before?.defaultModel, null);
+  const after = read(['anthropic']);
+  assert.equal(after?.connected, true);
+  assert.equal(after?.reason, null);
+  assert.equal(after?.needsConnect, false);
+  assert.equal(after?.defaultModel, 'model-live');
 });

@@ -188,7 +188,7 @@ A failed or unavailable native profile keeps its own refusal or unknown ownershi
 
 ### Connecting installed clients
 
-Each provider connects once per device, by a click, and nothing connects on its own at first launch. The controller keeps a connected-once record per provider and does no provider work at launch for a provider without one: no quota read, no model read, no sign-in check and no Google setup step. Finding a client on disk and reading its version still run, because the cards show what is installed.
+Each provider connects once per device, by a click, and nothing connects on its own at first launch. The controller keeps a connected-once record per provider and does no provider work at launch for a provider without one: no quota read, no model read, no sign-in check and no Google setup step. Finding a client on disk and reading its version still run, because the cards show what is installed. An installed client that is signed in elsewhere is still not connected in CrewKite. Until I press Connect, the welcome, the left rail and the model picker show that provider as not connected with Connect, and no thread can start on it.
 
 - Anthropic: the card names the Claude Code build it found. Connect runs the sign-in check, and a signed-in client connects. Anthropic keeps the client's own home and sign-in.
 - OpenAI: Connect signs CrewKite's own Codex home in, as the OpenAI section describes.

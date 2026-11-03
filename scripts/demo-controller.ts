@@ -150,6 +150,11 @@ export async function startDemoController(
           : 'complete',
   });
   try {
+    // The scripted family stands for a provider the person already connected on this device.
+    if (options.chatScript)
+      runtime.controller.store.transaction(() =>
+        runtime.controller.store.markConnectedOnce('anthropic'),
+      );
     const source = join(directory, 'demo-shop');
     if (!existsSync(source)) createSyntheticRepository(source);
     const result = await runtime.controller.execute(

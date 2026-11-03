@@ -66,6 +66,8 @@ export async function startScriptedController(
       ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns }) as never],
     ]),
   });
+  // The person connected the scripted family on this device, so the catalog offers it.
+  controller.store.transaction(() => controller.store.markConnectedOnce('anthropic'));
   chmodSync(home, 0o700);
   const server = await serve(controller);
   let closing: Promise<void> | undefined;
