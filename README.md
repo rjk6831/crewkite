@@ -41,6 +41,8 @@ From source:
 
 To try a published build without the source, follow the [preview guide](docs/preview.md). Connect each provider once from its card. OpenAI signs in through CrewKite's own client home; the person's existing client sign-in stays separate. Later launches reconnect providers that were connected before.
 
+Check for Updates… sits under About in the CrewKite menu on macOS and in Help on Linux. CrewKite also checks once a day after launch and offers a newer release's download page. Updating is a manual download in 0.1.x.
+
 OpenAI compatibility follows its protocol checks and replies; version 0.133.0 introduced the named read profile. Anthropic accepts builds from 2.1.259 within its tested major, and the Google quota reader accepts builds from 1.4.0 within its tested major. Settings shows the found version and its checked-build date. [Provider routes](docs/providers.md#client-versions) lists tested builds, update commands and setup.
 
 ## Platforms
