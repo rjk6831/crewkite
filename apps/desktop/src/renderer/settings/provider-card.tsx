@@ -270,18 +270,31 @@ export function ProviderCard({
   }
   const titleId = useId();
   const card = useRef<HTMLElement>(null);
+  // A family this computer cannot run keeps its card, greyed, with the one line that says why.
+  const unavailable = entry?.reason === 'unsupported-platform';
   useEffect(() => {
     if (pendingCard !== family) return;
     pendingCard = null;
     card.current?.scrollIntoView({ block: 'start' });
   }, [family]);
   return (
-    <section ref={card} id={`st-card-${family}`} className="st-card" aria-labelledby={titleId}>
+    <section
+      ref={card}
+      id={`st-card-${family}`}
+      className={unavailable ? 'st-card is-unavailable' : 'st-card'}
+      aria-labelledby={titleId}
+    >
       <header className="st-card-head">
         <FamilyMark family={family} />
         <h2 id={titleId}>{familyName(family)}</h2>
         <span className={entry?.connected ? 'st-pill is-on' : 'st-pill'}>
-          {!entry ? 'Unknown' : entry.connected ? 'Connected' : 'Not connected'}
+          {!entry
+            ? 'Unknown'
+            : unavailable
+              ? 'Not on Linux'
+              : entry.connected
+                ? 'Connected'
+                : 'Not connected'}
         </span>
         <span className="st-detail">
           {entry && !entry.connected && entry.reason
@@ -289,7 +302,7 @@ export function ProviderCard({
             : detail}
         </span>
       </header>
-      {found && (
+      {!unavailable && found && (
         <div className={found.accepted ? 'st-client' : 'st-client is-refused'}>
           <p role="status">{found.message}</p>
           {onCheck && (
@@ -306,15 +319,17 @@ export function ProviderCard({
           <ClientRecord status={found} capabilities={family !== 'openai'} />
         </div>
       )}
-      <div className="st-body">
-        <div className="st-col">{main}</div>
-        <div className="st-col">
-          <Models family={family} entry={entry}>
-            {models}
-          </Models>
-          {side}
+      {!unavailable && (
+        <div className="st-body">
+          <div className="st-col">{main}</div>
+          <div className="st-col">
+            <Models family={family} entry={entry}>
+              {models}
+            </Models>
+            {side}
+          </div>
         </div>
-      </div>
+      )}
     </section>
   );
 }

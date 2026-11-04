@@ -217,7 +217,7 @@ function ResizeHandle({
   );
 }
 
-const refreshFamilies = ['openai', 'anthropic', 'google'] as const;
+const refreshFamilies = ['google', 'openai', 'anthropic'] as const;
 
 function UsageTab({
   source,

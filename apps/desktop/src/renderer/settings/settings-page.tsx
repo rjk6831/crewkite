@@ -102,9 +102,9 @@ export function SettingsPage({
           threadId={threadId}
         />
         <CrewsCard catalog={catalog} projects={workspace.projects} />
+        <GoogleCard {...card} entry={entry('google')} />
         <OpenAiCard {...card} entry={entry('openai')} modelRead={modelRead} />
         <AnthropicCard {...card} entry={entry('anthropic')} />
-        <GoogleCard {...card} entry={entry('google')} />
         <LocalCard {...card} entry={entry('local')} />
         <McpCard />
         <ExtensionsCard source={workspace.source} />

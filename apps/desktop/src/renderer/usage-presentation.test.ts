@@ -146,9 +146,9 @@ test('native clients remain visible before any usage route exists', () => {
   assert.deepEqual(
     clients.map(({ family, profiles, reader }) => [family, profiles.length, reader]),
     [
+      ['google', 1, null],
       ['openai', 1, null],
       ['anthropic', 2, null],
-      ['google', 1, null],
       ['local', 0, null],
     ],
   );
@@ -414,6 +414,17 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
       expect: { bars: [], needsConnect: true },
     },
     {
+      claim: 'Google on Linux keeps its row, greyed, with no bars and no Connect',
+      entry: entry('google', [window('pool-daily', 'pool-daily', 99, 600)], {
+        connected: false,
+        reason: 'unsupported-platform',
+        models: [],
+        defaultModel: null,
+        readAt: at(-125),
+      }),
+      expect: { bars: [], needsConnect: false, unavailable: true },
+    },
+    {
       claim: 'Local has no bars, reads No limits and carries the hardware line',
       entry: entry('local', [], { lastTurnStats: stats, readAt: null }),
       expect: {
@@ -458,6 +469,18 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
     for (const [key, value] of Object.entries(expect))
       assert.deepEqual(view[key as keyof typeof view], value, `${claim}: ${key}`);
   }
+  // The rail reads Google, OpenAI, Anthropic, Local whatever order the catalog sends (ADR 0053).
+  assert.deepEqual(
+    railFamilies(
+      {
+        families: (['openai', 'anthropic', 'google', 'local'] as const).map((family) =>
+          entry(family, []),
+        ),
+      },
+      nowMs,
+    ).map(({ family }) => family),
+    ['google', 'openai', 'anthropic', 'local'],
+  );
   // An unconnected family that has read no usage keeps its row with Connect and no bar, so the
   // rail shows one gauge per provider. Local also stays when the catalog has no entry for it.
   const unread = entry('google', [], { connected: false });

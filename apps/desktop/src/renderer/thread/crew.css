@@ -188,12 +188,3 @@
   align-items: center;
   gap: 8px;
 }
-.st-project-crew {
-  grid-template-columns: minmax(84px, 180px) auto;
-  justify-content: start;
-}
-.st-project-crew label {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
