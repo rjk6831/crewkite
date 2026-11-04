@@ -452,6 +452,12 @@ export const LocalSetupSchema = z
      * `authMode`. Missing until a connect has probed.
      */
     connectedWithoutToken: z.boolean().optional(),
+    /**
+     * True when the last probe on this connection found the runtime answering with no token. It
+     * outlives a failed connect while the runtime is down, so Local reconnects with no click
+     * when the runtime returns.
+     */
+    reconnectsWithoutToken: z.boolean().optional(),
     operation: LocalOperationSchema.nullable(),
     generation: z.enum(['idle', 'active', 'unknown']),
     observation: LocalModelObservationSchema.nullable(),
@@ -2599,7 +2605,11 @@ export const CommandSchema = z.discriminatedUnion('command', [
   ),
   mutate('RefreshLocalModels', z.strictObject({ consent: z.literal('explicit') })),
   mutate('SelectLocalModel', LocalModelSelectionSchema),
-  mutate('BeginLocalConnectionInput', z.strictObject({ consent: z.literal('explicit') })),
+  mutate(
+    'BeginLocalConnectionInput',
+    // An unattended connect, as when Local reconnects on its own, never opens the token window.
+    z.strictObject({ consent: z.literal('explicit'), unattended: z.literal(true).optional() }),
+  ),
   mutate('CancelLocalConnectionInput', z.strictObject({ operationId: CommandIdSchema })),
   mutate('DisconnectLocal', empty),
   // The remembered token travels on these two and no other path. They carry no expected

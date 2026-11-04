@@ -1,7 +1,7 @@
 import type { ChatFamily, WorkspaceState } from '@crewkite/contracts';
 import { useEffect, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
-import { connectInPlace, WITHOUT_TOKEN } from '../local-setup-flow.ts';
+import { connectInPlace, RAIL_TOAST_MS, railConnectLine } from '../local-setup-flow.ts';
 import { familyModel, onFamilyDefaults } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
 import { useCatalog } from '../settings/use-catalog.ts';
@@ -39,7 +39,16 @@ export function RailUsage({
       stop();
     };
   }, []);
-  const [localNote, setLocalNote] = useState<string | null>(null);
+  // A Local connect from the rail says how it went in a short toast over the rail, never in a
+  // row, so the rail keeps its height. The detail stays on the Local card in Settings.
+  const [toast, setToast] = useState<string | null>(null);
+  const toastTimer = useRef(0);
+  useEffect(() => () => window.clearTimeout(toastTimer.current), []);
+  const say = (text: string) => {
+    window.clearTimeout(toastTimer.current);
+    setToast(text);
+    toastTimer.current = window.setTimeout(() => setToast(null), RAIL_TOAST_MS);
+  };
   const [connecting, setConnecting] = useState(false);
   const attempt = useRef(0);
   const rows = railFamilies(catalog, now, {
@@ -62,7 +71,8 @@ export function RailUsage({
     attempt.current += 1;
     const mine = attempt.current;
     setConnecting(true);
-    setLocalNote('Connecting');
+    window.clearTimeout(toastTimer.current);
+    setToast(null);
     try {
       const result = await connectInPlace({
         setup,
@@ -72,19 +82,10 @@ export function RailUsage({
         active: () => attempt.current === mine,
       });
       if (result.kind === 'stopped') return;
-      if (result.kind === 'settings') {
-        setLocalNote(null);
-        settings('local');
-      } else
-        setLocalNote(
-          result.kind === 'connected'
-            ? result.withoutToken
-              ? WITHOUT_TOKEN
-              : 'Connected'
-            : result.message,
-        );
+      if (result.kind === 'settings') settings('local');
+      else say(railConnectLine(result));
     } catch {
-      setLocalNote('Local could not be reached. Open Settings to connect.');
+      say(railConnectLine(null));
     } finally {
       setConnecting(false);
     }
@@ -93,6 +94,9 @@ export function RailUsage({
     family === 'local' ? void connectLocal() : settings(family);
   return (
     <section className="rail-usage" aria-label="Provider allowance">
+      <div className="rail-toast" role="status" aria-live="polite" hidden={!toast}>
+        {toast}
+      </div>
       {rows.map((row) => (
         <div
           key={row.family}
@@ -148,11 +152,6 @@ export function RailUsage({
               {row.read && <span>{row.read}</span>}
             </span>
           )}
-          {row.family === 'local' && localNote && (
-            <span className="rail-usage-reset" role="status">
-              {localNote}
-            </span>
-          )}
           {row.setUp &&
             (onOpenSettings ? (
               <button
@@ -173,7 +172,7 @@ export function RailUsage({
                 disabled={row.family === 'local' && connecting}
                 onClick={() => connect(row.family)}
               >
-                Connect
+                {row.family === 'local' && connecting ? 'Connecting…' : 'Connect'}
               </button>
             ) : (
               <span className="rail-usage-reset">Connect in Settings</span>

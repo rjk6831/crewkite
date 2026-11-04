@@ -548,6 +548,11 @@ const LocalControlFields = z.strictObject({
   // false when it wanted one. It never changes `authMode`. Missing until a connect has probed.
   connectedWithoutToken: z.boolean().optional(),
   connectionFailed: z.boolean().default(false),
+  // The connection revision at which the probe last found the runtime answering with no token.
+  // Unlike `connectedWithoutToken`, a connect that fails while the runtime is down keeps it, so
+  // Local can reconnect on its own when the runtime returns. A new revision (endpoint or mode
+  // change, Disconnect) leaves it behind, and a probe that meets a token request clears it.
+  openProbeRevision: RevisionSchema.nullable().default(null),
   revision: RevisionSchema,
   connectionRevision: RevisionSchema,
   endpoint: LocalEndpointSchema.nullable(),

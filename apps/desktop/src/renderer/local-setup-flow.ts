@@ -226,6 +226,7 @@ export async function connectInPlace({
   wait,
   active,
   attempts = 20,
+  unattended = false,
 }: {
   setup: LocalSetup;
   command: (input: DesktopCommand) => Promise<CommandResult>;
@@ -233,13 +234,15 @@ export async function connectInPlace({
   wait: () => Promise<void>;
   active: () => boolean;
   attempts?: number;
+  /** No person pressed Connect, so a runtime that wants a token gets no token window. */
+  unattended?: boolean;
 }): Promise<RailConnectResult> {
   if (!setup.endpoint) return { kind: 'settings', why: 'unconfigured' };
   if (!setup.connected) {
     const started = await command({
       command: 'BeginLocalConnectionInput',
       expectedRevision: setup.revision,
-      payload: { consent: 'explicit' },
+      payload: { consent: 'explicit', ...(unattended ? { unattended: true as const } : {}) },
     });
     if (!active()) return { kind: 'stopped' };
     if (!applied(started))
@@ -479,6 +482,19 @@ export async function observeOpenConnection(
   );
 }
 
+/** How long the rail's connect toast stays up before it clears on its own. */
+export const RAIL_TOAST_MS = 4_000;
+
+/**
+ * The rail's short word on a Local connect. The rail keeps one line per provider, so the reason
+ * and the token detail stay on the Local card in Settings.
+ */
+export function railConnectLine(result: RailConnectResult | null): string {
+  return result?.kind === 'connected'
+    ? 'Local connected.'
+    : 'Local did not connect. Settings has the details.';
+}
+
 /** How often a launch reconnect tries again while the runtime is not running. */
 export const LAUNCH_RETRY_MS = 5_000;
 
@@ -486,8 +502,9 @@ export const LAUNCH_RETRY_MS = 5_000;
  * Whether Local reconnects now, at launch or after the runtime comes back. Only a device that
  * connected Local once reconnects, with the saved endpoint. With the runtime's auth on, only a
  * remembered token reconnects, so no token window opens on its own. With auth off the endpoint
- * alone is enough: a saved none mode, or a saved token mode whose last connect found the runtime
- * answering with no token.
+ * alone is enough: a saved none mode, or a saved token mode whose last probe on this connection
+ * found the runtime answering with no token. A connect that failed while the runtime was down
+ * keeps that answer.
  */
 export function launchReconnect(
   setup: LocalSetup | null | undefined,
@@ -496,5 +513,5 @@ export function launchReconnect(
 ): boolean {
   if (!connectedOnce || !setup?.endpoint || setup.connected) return false;
   if (setup.operation || setup.generation !== 'idle') return false;
-  return setup.authMode === 'none' || setup.connectedWithoutToken === true || tokenRemembered;
+  return setup.authMode === 'none' || setup.reconnectsWithoutToken === true || tokenRemembered;
 }

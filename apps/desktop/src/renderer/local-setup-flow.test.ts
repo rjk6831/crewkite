@@ -11,6 +11,8 @@ import {
   launchReconnect,
   localNotices,
   lowMemory,
+  RAIL_TOAST_MS,
+  railConnectLine,
   selectionConfirmed,
   selectionLost,
   settledLine,
@@ -588,7 +590,14 @@ test('Local connect waits out a model read the controller is running and then co
 test('a runtime that answered with no token reconnects with token mode saved', () => {
   const down = setup({ operation: null, reason: 'connection-required' });
   const cases: [string, Partial<LocalSetup>, boolean, boolean][] = [
-    ['token mode, last connect needed no token', { connectedWithoutToken: true }, false, true],
+    ['token mode, last probe needed no token', { reconnectsWithoutToken: true }, false, true],
+    // A failed connect while the runtime was down clears the connection mark, not the probe's.
+    [
+      'token mode, runtime went down after a no-token connect',
+      { connectedWithoutToken: undefined, reconnectsWithoutToken: true },
+      false,
+      true,
+    ],
     [
       'token mode, last connect wanted a token, none kept',
       { connectedWithoutToken: false },
@@ -598,10 +607,20 @@ test('a runtime that answered with no token reconnects with token mode saved', (
     ['token mode, never probed, none kept', {}, false, false],
     ['token mode, token kept', { connectedWithoutToken: false }, true, true],
     ['none mode', { authMode: 'none' }, false, true],
-    ['already connected', { connectedWithoutToken: true, connected: true }, false, false],
-    ['no endpoint', { connectedWithoutToken: true, endpoint: null }, false, false],
+    ['already connected', { reconnectsWithoutToken: true, connected: true }, false, false],
+    ['no endpoint', { reconnectsWithoutToken: true, endpoint: null }, false, false],
   ];
   for (const [label, change, remembered, want] of cases)
     assert.equal(launchReconnect({ ...down, ...change }, true, remembered), want, label);
-  assert.equal(launchReconnect({ ...down, connectedWithoutToken: true }, false, false), false);
+  assert.equal(launchReconnect({ ...down, reconnectsWithoutToken: true }, false, false), false);
+});
+
+// Claim: the rail says how a Local connect went in one short line that clears itself, and leaves
+// the reason and token detail to the Local card.
+test('the rail connect line is short and the toast clears in a few seconds', () => {
+  assert.equal(railConnectLine({ kind: 'connected', withoutToken: true }), 'Local connected.');
+  assert.equal(railConnectLine({ kind: 'connected', withoutToken: false }), 'Local connected.');
+  for (const result of [{ kind: 'blocked', message: 'A long controller reason.' } as const, null])
+    assert.equal(railConnectLine(result), 'Local did not connect. Settings has the details.');
+  assert.ok(RAIL_TOAST_MS >= 3_000 && RAIL_TOAST_MS <= 5_000);
 });
