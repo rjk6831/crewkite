@@ -8,6 +8,7 @@ import { installOnboarding } from './onboarding-ipc.ts';
 import { OnboardingStore } from './onboarding-store.ts';
 import { DesktopController, prepareStateDirectory, resolveRuntime } from './runtime.ts';
 import { rendererURL, secureSession, secureWindow } from './security.ts';
+import { installUpdateChecks } from './updates.ts';
 import { BoundsStore, clampBounds, MINIMUM_SIZE } from './window-bounds.ts';
 
 let ownedController: DesktopController | null = null;
@@ -46,13 +47,37 @@ async function start() {
     app.on('window-all-closed', () => app.quit());
     await app.whenReady();
     app.setAboutPanelOptions({ applicationName: 'CrewKite', applicationVersion: CREWKITE_VERSION });
+    // Check for Updates sits under About on macOS and in Help on Linux, where people look for it.
+    let checkForUpdates = () => {};
+    const updatesItem = { label: 'Check for Updates…', click: () => checkForUpdates() };
     Menu.setApplicationMenu(
       Menu.buildFromTemplate([
-        ...(process.platform === 'darwin' ? [{ role: 'appMenu' as const, label: 'CrewKite' }] : []),
+        ...(process.platform === 'darwin'
+          ? [
+              {
+                label: 'CrewKite',
+                submenu: [
+                  { role: 'about' as const },
+                  updatesItem,
+                  { type: 'separator' as const },
+                  { role: 'services' as const },
+                  { type: 'separator' as const },
+                  { role: 'hide' as const },
+                  { role: 'hideOthers' as const },
+                  { role: 'unhide' as const },
+                  { type: 'separator' as const },
+                  { role: 'quit' as const },
+                ],
+              },
+            ]
+          : []),
         { role: 'fileMenu' },
         { role: 'editMenu' },
         { role: 'viewMenu' },
         { role: 'windowMenu' },
+        ...(process.platform === 'darwin'
+          ? []
+          : [{ role: 'help' as const, submenu: [updatesItem, { role: 'about' as const }] }]),
       ]),
     );
     secureSession(session.defaultSession, join(app.getAppPath(), 'out/renderer'));
@@ -99,6 +124,7 @@ async function start() {
     await installBridge(window, controller);
     installThreadAttention(window);
     installOnboarding(window, new OnboardingStore(paths.profile));
+    checkForUpdates = installUpdateChecks(window, paths.profile).check;
     if (closing || window.isDestroyed()) return;
     await window.loadURL(rendererURL);
     window.show();

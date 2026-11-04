@@ -8,6 +8,7 @@ import {
   DISCOVERY_FOLLOW_MS,
   followDiscovery,
   lastSeen,
+  launchReconnect,
   localNotices,
   lowMemory,
   selectionConfirmed,
@@ -580,4 +581,27 @@ test('Local connect waits out a model read the controller is running and then co
     command: async () => ({ outcome: 'blocked', reason: 'local-operation-active' }),
   });
   assert.equal(refused.kind, 'blocked');
+});
+
+// Claim: Local reconnects on its own after the runtime restarts when its last connect needed no
+// token, even with token mode saved, and still never reconnects into a token prompt.
+test('a runtime that answered with no token reconnects with token mode saved', () => {
+  const down = setup({ operation: null, reason: 'connection-required' });
+  const cases: [string, Partial<LocalSetup>, boolean, boolean][] = [
+    ['token mode, last connect needed no token', { connectedWithoutToken: true }, false, true],
+    [
+      'token mode, last connect wanted a token, none kept',
+      { connectedWithoutToken: false },
+      false,
+      false,
+    ],
+    ['token mode, never probed, none kept', {}, false, false],
+    ['token mode, token kept', { connectedWithoutToken: false }, true, true],
+    ['none mode', { authMode: 'none' }, false, true],
+    ['already connected', { connectedWithoutToken: true, connected: true }, false, false],
+    ['no endpoint', { connectedWithoutToken: true, endpoint: null }, false, false],
+  ];
+  for (const [label, change, remembered, want] of cases)
+    assert.equal(launchReconnect({ ...down, ...change }, true, remembered), want, label);
+  assert.equal(launchReconnect({ ...down, connectedWithoutToken: true }, false, false), false);
 });
