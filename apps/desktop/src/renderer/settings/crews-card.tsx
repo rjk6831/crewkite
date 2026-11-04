@@ -309,6 +309,9 @@ export function CrewsCard({
   const [presets, setPresets] = useState<CrewPreset[]>(() => readCrewPresets());
   const [editing, setEditing] = useState<SavedCrew | 'new' | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
+  // One project at a time, so the row stays one line however many projects there are.
+  const [projectId, setProjectId] = useState<string | null>(null);
+  const project = projects.find((value) => value.id === projectId) ?? projects[0];
   // The controller keeps saved crews and the default. A change it refuses leaves the list as it
   // was and says why.
   async function change(work: () => Promise<void>): Promise<boolean> {
@@ -377,25 +380,35 @@ export function CrewsCard({
             {problem}
           </p>
         )}
-        {projects.length > 0 && (
+        {project && (
           <div className="st-row">
             <span className="st-field">
               <span className="st-name">Project crews</span>
               <small className="st-hint">New threads in a project start with its crew.</small>
             </span>
-            <div className="st-controls st-crew">
-              {projects.map((project) => (
-                <div key={project.id} className="st-crew-role st-project-crew">
-                  <label htmlFor={`settings-project-crew-${project.id}`}>{project.name}</label>
-                  <CrewSelect
-                    id={`settings-project-crew-${project.id}`}
-                    value={projectCrews[project.id] ?? 'default'}
-                    extra={{ value: 'default', label: `Default (${defaultName})` }}
-                    choices={choices}
-                    onChange={(id) => writeProjectCrew(project.id, id === 'default' ? null : id)}
-                  />
-                </div>
-              ))}
+            <div className="st-controls">
+              <select
+                aria-label="Project"
+                value={project.id}
+                onChange={(event) => setProjectId(event.target.value)}
+              >
+                {projects.map((value) => {
+                  const own = projectCrews[value.id];
+                  const name = own && choices.find((choice) => choice.id === own)?.name;
+                  return (
+                    <option key={value.id} value={value.id}>
+                      {name ? `${value.name} (${name})` : value.name}
+                    </option>
+                  );
+                })}
+              </select>
+              <CrewSelect
+                label={`Crew for ${project.name}`}
+                value={projectCrews[project.id] ?? 'default'}
+                extra={{ value: 'default', label: `Default (${defaultName})` }}
+                choices={choices}
+                onChange={(id) => writeProjectCrew(project.id, id === 'default' ? null : id)}
+              />
             </div>
           </div>
         )}

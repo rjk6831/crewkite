@@ -49,6 +49,8 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0049](0049-provider-setup-sends-again-without-receipt-replay.md) | Provider setup sends again without receipt replay | Proposed |
 | [0050](0050-a-side-question-runs-beside-the-active-turn.md) | A side question runs beside the active turn | Proposed |
 | [0051](0051-own-openai-client-home-and-explicit-connect.md) | The OpenAI client runs in a home of its own, and every provider connects explicitly | Proposed |
+| [0052](0052-credit-spending-is-a-per-provider-switch-that-defaults-off.md) | Credit spending is a per-provider switch that defaults off | Proposed |
+| [0053](0053-providers-read-in-goal-order.md) | Providers read in GOAL order | Proposed |
 
 ## Writing a new record
 

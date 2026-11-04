@@ -1,5 +1,10 @@
 /* Settings page and the rail allowance strip. Colors come from the tokens in style.css. */
 
+:root {
+  /* Every select in a settings row is this wide, so the selects in one card line up. */
+  --st-select-width: 260px;
+}
+
 .settings-page {
   flex: 1;
   min-height: 0;
@@ -197,6 +202,9 @@
 .st-rows {
   display: grid;
 }
+.st-card.is-unavailable {
+  opacity: 0.55;
+}
 .st-row {
   display: grid;
   grid-template-columns: minmax(200px, 340px) minmax(0, 1fr);
@@ -232,11 +240,11 @@
   gap: 8px;
 }
 .st-controls select {
-  width: auto;
-  min-width: 220px;
+  width: var(--st-select-width);
   max-width: 100%;
 }
 .st-controls select.effort-select {
+  width: auto;
   min-width: 120px;
 }
 .st-segment {

@@ -100,6 +100,20 @@ function readingReserve(
   };
 }
 
+/**
+ * The order a person sees the providers in, everywhere: Google, OpenAI, Anthropic, Local (ADR 0053).
+ * It follows the kite's panels from the top left, counter clockwise. Stored data keeps its own
+ * order; only what is drawn follows this one.
+ */
+export const FAMILY_DISPLAY_ORDER = ['google', 'openai', 'anthropic', 'local'] as const;
+
+/** Sorts anything with a family into the display order. */
+export function inDisplayOrder<T extends { family: ChatFamily }>(values: readonly T[]): T[] {
+  return [...values].sort(
+    (a, b) => FAMILY_DISPLAY_ORDER.indexOf(a.family) - FAMILY_DISPLAY_ORDER.indexOf(b.family),
+  );
+}
+
 export function nativeUsageClients(
   snapshot: Pick<Snapshot, 'usageReaders'> & {
     nativeProfiles: readonly Pick<
@@ -108,7 +122,7 @@ export function nativeUsageClients(
     >[];
   },
 ) {
-  return (['openai', 'anthropic', 'google', 'local'] as const).map((family) => ({
+  return FAMILY_DISPLAY_ORDER.map((family) => ({
     family,
     label: familyLabels[family],
     profiles: snapshot.nativeProfiles.filter((profile) => profile.family === family),
@@ -482,6 +496,8 @@ export type RailFamily = {
   needsConnect: boolean;
   /** Local with no endpoint saved. The row reads "Set up" and opens the Local card. */
   setUp: boolean;
+  /** This computer cannot run the family. The row stays, greyed, and says so. */
+  unavailable: boolean;
   read: string | null;
   /** The hardware and model line for Local, with every unknown part left out. */
   detail: string | null;
@@ -530,11 +546,16 @@ export function railFamilies(
   if (!catalog) return [];
   const modelFor = options.modelFor ?? ((entry) => entry.defaultModel);
   // Local is on the rail whatever its state, so a machine that never set it up can start there.
-  const entries = catalog.families.some(({ family }) => family === 'local')
-    ? catalog.families
-    : [...catalog.families, localPlaceholder];
+  const entries = inDisplayOrder(
+    catalog.families.some(({ family }) => family === 'local')
+      ? catalog.families
+      : [...catalog.families, localPlaceholder],
+  );
   return entries.map((entry) => {
     const model = modelFor(entry);
+    // A family this computer cannot run keeps its row, greyed, so every computer shows the same
+    // four rows in the same order. Today that is Google on Linux.
+    const unavailable = entry.reason === 'unsupported-platform';
     const setUp =
       entry.family === 'local' &&
       !entry.connected &&
@@ -560,7 +581,7 @@ export function railFamilies(
       !entry.connected &&
       (entry.family === 'google' || !entry.remaining.some((window) => window.percent !== null));
     const bars: RailBar[] =
-      unlimited || setUp || unread
+      unlimited || setUp || unread || unavailable
         ? []
         : credit
           ? [{ text: credit, percent: tightest.percent }]
@@ -583,7 +604,8 @@ export function railFamilies(
       unlimited,
       resetsIn: until !== null && until > 0 ? until : null,
       resetPassed: until !== null && until <= 0,
-      needsConnect: !entry.connected && !setUp,
+      needsConnect: !entry.connected && !setUp && !unavailable,
+      unavailable,
       setUp,
       read: readAgo(entry.readAt, nowMs, true),
       detail:

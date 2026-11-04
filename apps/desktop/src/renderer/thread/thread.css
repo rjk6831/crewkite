@@ -1435,6 +1435,9 @@
   gap: 2px;
   font-size: 11px;
 }
+.rail-usage-row.is-unavailable {
+  opacity: 0.55;
+}
 .rail-usage-row:focus-visible {
   outline: 2px solid var(--accent);
   outline-offset: 4px;

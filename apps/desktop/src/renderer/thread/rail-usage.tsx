@@ -100,7 +100,13 @@ export function RailUsage({
       {rows.map((row) => (
         <div
           key={row.family}
-          className={row.needsConnect ? 'rail-usage-row is-waiting' : 'rail-usage-row'}
+          className={
+            row.unavailable
+              ? 'rail-usage-row is-unavailable'
+              : row.needsConnect
+                ? 'rail-usage-row is-waiting'
+                : 'rail-usage-row'
+          }
           // A native title shows late and never on keyboard focus. The detail card shows on both.
           tabIndex={row.detail ? 0 : undefined}
         >
@@ -114,7 +120,12 @@ export function RailUsage({
             {familyName(row.family)}
             {row.detail && <span className="th-sr">. {row.detail}</span>}
           </span>
-          {row.unlimited ? (
+          {row.unavailable ? (
+            <span className="rail-usage-meter">
+              <span className="rail-usage-bar" aria-hidden="true" />
+              <span className="rail-usage-value is-unknown">Not on Linux</span>
+            </span>
+          ) : row.unlimited ? (
             <span className="rail-usage-meter">
               <span className="rail-usage-unlimited" aria-hidden="true">
                 <span>∞</span>

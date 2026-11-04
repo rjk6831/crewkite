@@ -1,7 +1,6 @@
 import {
   type ChatAttachment,
   type ChatCatalogRead,
-  ChatFamilySchema,
   type ChatThread,
   type LocalSetup,
   type Task,
@@ -24,6 +23,7 @@ import {
 } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
 import type { DesktopCommand } from '../source.ts';
+import { FAMILY_DISPLAY_ORDER } from '../usage-presentation.ts';
 import { configureThread, importAttachment, sendMessage, type ThreadSource } from './commands.ts';
 import { Composer, type ComposerHandle, type SendInput } from './composer.tsx';
 import { EmptyThread } from './empty-thread.tsx';
@@ -44,7 +44,7 @@ function FirstRun({ onOpenSettings }: { onOpenSettings?: () => void }) {
         {onOpenSettings ? 'Pick one to open its card in Settings.' : 'Connect one in Settings.'}
       </p>
       <ul className="th-first-run-list" aria-label="Providers">
-        {ChatFamilySchema.options.map((family) => (
+        {FAMILY_DISPLAY_ORDER.map((family) => (
           <li key={family}>
             {onOpenSettings ? (
               <button

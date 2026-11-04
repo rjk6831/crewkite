@@ -2,7 +2,6 @@ import {
   type ChatCatalogChange,
   type ChatCatalogRead,
   type ChatFamily,
-  ChatFamilySchema,
   ProjectSchema,
   type WorkspaceState,
 } from '@crewkite/contracts';
@@ -21,7 +20,7 @@ import { useClock } from '../settings/use-catalog.ts';
 import '../settings/settings.css';
 import type { Workspace } from '../source.ts';
 import { FamilyMark } from '../thread/family-mark.tsx';
-import { projectUsagePresentation } from '../usage-presentation.ts';
+import { FAMILY_DISPLAY_ORDER, projectUsagePresentation } from '../usage-presentation.ts';
 import {
   ONBOARDING_STEPS,
   type OnboardingStep,
@@ -153,12 +152,12 @@ function ProviderStep({
   return (
     <>
       <p className="onb-lead">
-        CrewKite runs threads on OpenAI, Anthropic, Google or Local models. Connect one to continue.
+        CrewKite runs threads on Google, OpenAI, Anthropic or Local models. Connect one to continue.
         CrewKite adds no plan requirement, so each family works on the plan its provider allows.
         Each setup below is the one Settings has.
       </p>
       <ul className="onb-families" aria-label="Providers">
-        {ChatFamilySchema.options.map((family) => (
+        {FAMILY_DISPLAY_ORDER.map((family) => (
           <FamilyRow
             key={family}
             family={family}
