@@ -26,6 +26,15 @@ test('the scratch copy prefix comes off the paths a reply quotes', () => {
       `Attached ${home}/chat/tsk_01ABC/files/a1/shot.png`,
       `Attached ${home}/chat/tsk_01ABC/files/a1/shot.png`,
     ],
+    // The installed app keeps its home under Application Support, a folder name with a space.
+    [
+      'Fixed in /Users/me/Library/Application Support/CrewKite/chat/tsk_01ABC/demo-shop/src/cart.js:4.',
+      'Fixed in src/cart.js:4.',
+    ],
+    [
+      'Compare /tmp/a and then /Users/me/Library/Application Support/CrewKite/chat/tsk_01ABC/scratch/a.js',
+      'Compare /tmp/a and then a.js',
+    ],
     ['src/money.js stays as it is.', 'src/money.js stays as it is.'],
     ['/etc/chat/notes stays too.', '/etc/chat/notes stays too.'],
   ];

@@ -1,4 +1,5 @@
 import { externalLink } from '../../shared/external-link.ts';
+import { projectRelative } from './scratch-paths.ts';
 
 // A Markdown subset for assistant text: headings, paragraphs, nested bullet and numbered lists,
 // block quotes, fenced code, tables, horizontal rules, inline code, bold, italic and links. The
@@ -274,12 +275,17 @@ function trimAddress(address: string): string {
 const filePath =
   /^((?:[A-Za-z]:[\\/])?(?!\/\/)[^:#?<>\n]+?)(?::(\d+)(?::(\d+))?|#L(\d+)(?:C\d+)?(?:-L?\d+)?)?$/;
 const hostPath = /^(?:[A-Za-z]:[\\/]|~\/|\/)/;
+// A file name has an extension or a folder in it.
+const namesFile = /[\\/]|\.[A-Za-z0-9]+$/;
 
 function fileText(label: string, url: string): string | null {
   const found = filePath.exec(url);
   if (!found || !/[/\\.]/.test(found[1])) return null;
-  const [, , line, column, anchor] = found;
+  const [, path, line, column, anchor] = found;
   let text = label.replace(/^`(.+)`$/, '$1');
+  // A label such as "Line 4" names no file, so the file comes from the link: from the project
+  // root inside a scratch copy, else by its name alone when the path is on the host.
+  if (!namesFile.test(text.replace(/:\d+(?::\d+)?$/, ''))) text = projectRelative(path);
   // A label that is itself a host path would show what the link hides, so only the name stays.
   if (hostPath.test(text)) text = text.split(/[\\/]/).filter(Boolean).pop() ?? text;
   const at = line ?? anchor;
