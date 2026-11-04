@@ -1486,11 +1486,14 @@
 /* A bar and its figure on one line. Two lines when the family reports five-hour and weekly. */
 .rail-usage-meter {
   display: grid;
-  grid-template-columns: 1fr 5.5em;
+  grid-template-columns: minmax(0, 1fr) minmax(5.5em, auto);
   align-items: center;
   gap: 8px;
 }
 .rail-usage-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
   color: var(--text);
   font-variant-numeric: tabular-nums;
   text-align: right;

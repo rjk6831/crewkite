@@ -579,12 +579,23 @@ const LocalControlFields = z.strictObject({
     .refine((operation) => operation.binding.version === (operation.kind === 'input' ? 2 : 1))
     .nullable(),
 });
-// Saved setups from before the probe kept its answer in `noneConnected`.
+// Saved setups from before the probe kept its answer in `noneConnected`. Setups saved before
+// `openProbeRevision` existed, or saved by a launch that read one of those, hold only
+// `connectedWithoutToken`. Only a probe that found the runtime open on the current connection
+// sets it to true; every new revision and every connect clears it first. So it carries the same
+// proof for this revision, and the first failed read must not lose it.
 export const LocalControlSchema = z.preprocess((value) => {
-  if (!value || typeof value !== 'object' || !('noneConnected' in value)) return value;
-  const { noneConnected, ...rest } = value as Record<string, unknown>;
-  return noneConnected === true && !('connectedWithoutToken' in rest)
-    ? { ...rest, connectedWithoutToken: true }
+  if (!value || typeof value !== 'object') return value;
+  let rest = value as Record<string, unknown>;
+  if ('noneConnected' in rest) {
+    const { noneConnected, ...others } = rest;
+    rest =
+      noneConnected === true && !('connectedWithoutToken' in others)
+        ? { ...others, connectedWithoutToken: true }
+        : others;
+  }
+  return rest.connectedWithoutToken === true && rest.openProbeRevision == null
+    ? { ...rest, openProbeRevision: rest.connectionRevision }
     : rest;
 }, LocalControlFields);
 export type LocalControl = z.infer<typeof LocalControlSchema>;
