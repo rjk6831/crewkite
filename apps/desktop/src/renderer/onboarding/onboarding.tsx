@@ -61,15 +61,19 @@ function FamilyRow({
   // Google sign-in follows the install in the same click, and unmounting the card ended that.
   const [opened, setOpened] = useState(false);
   const panel = useId();
-  const state = ready
-    ? 'Ready'
-    : needsAcknowledgement
-      ? 'Needs acknowledgement'
-      : entry
-        ? 'Not connected'
-        : 'Unknown';
+  // A family this computer cannot run keeps its row, greyed, with nothing to set up (ADR 0053).
+  const unavailable = entry?.reason === 'unsupported-platform';
+  const state = unavailable
+    ? 'Not on Linux'
+    : ready
+      ? 'Ready'
+      : needsAcknowledgement
+        ? 'Needs acknowledgement'
+        : entry
+          ? 'Not connected'
+          : 'Unknown';
   return (
-    <li className="onb-family">
+    <li className={unavailable ? 'onb-family is-unavailable' : 'onb-family'}>
       <div className="onb-family-head">
         <FamilyMark family={family} />
         <div className="onb-family-text">
@@ -77,24 +81,26 @@ function FamilyRow({
           <span className="onb-family-note">{familyNotes[family]}</span>
         </div>
         <span className={ready ? 'st-pill is-on' : 'st-pill'}>{state}</span>
-        <button
-          type="button"
-          className="button secondary"
-          aria-expanded={open}
-          aria-controls={panel}
-          aria-label={`${open ? 'Hide' : ready ? 'Review' : 'Set up'} ${familyName(family)}`}
-          onClick={() => {
-            setOpen(!open);
-            setOpened(true);
-          }}
-        >
-          {open ? (
-            <ChevronDown size={14} aria-hidden="true" />
-          ) : (
-            <ChevronRight size={14} aria-hidden="true" />
-          )}
-          {open ? 'Hide' : ready ? 'Review' : 'Set up'}
-        </button>
+        {!unavailable && (
+          <button
+            type="button"
+            className="button secondary"
+            aria-expanded={open}
+            aria-controls={panel}
+            aria-label={`${open ? 'Hide' : ready ? 'Review' : 'Set up'} ${familyName(family)}`}
+            onClick={() => {
+              setOpen(!open);
+              setOpened(true);
+            }}
+          >
+            {open ? (
+              <ChevronDown size={14} aria-hidden="true" />
+            ) : (
+              <ChevronRight size={14} aria-hidden="true" />
+            )}
+            {open ? 'Hide' : ready ? 'Review' : 'Set up'}
+          </button>
+        )}
       </div>
       {/* The panel holds the same card Settings shows, so every setup rule and gate stays in it. */}
       <div id={panel} className="onb-family-card" hidden={!open}>

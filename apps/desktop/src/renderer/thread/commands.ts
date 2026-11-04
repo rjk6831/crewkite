@@ -72,6 +72,7 @@ import {
   StopChatTurnPayloadSchema,
 } from '@crewkite/contracts';
 import type { DesktopCommand, DesktopSource } from '../source.ts';
+import { inDisplayOrder } from '../usage-presentation.ts';
 import { THREAD_PAGE_SIZE } from './thread-state.ts';
 
 // The chat commands are listed in CommandSchema. The cast stays in this one file so the thread
@@ -175,14 +176,20 @@ export const readAnalytics = (
     'ReadChatAnalytics',
     ReadChatAnalyticsPayloadSchema.parse(input),
     ChatAnalyticsReadSchema,
-  );
-export const readCatalog = (source: ThreadSource, taskId?: string): Promise<ChatCatalogRead> =>
-  read(
+  ).then((analytics) => ({ ...analytics, families: inDisplayOrder(analytics.families) }));
+// Every list drawn from the catalog, such as the model picker, reads in the display order.
+export const readCatalog = async (
+  source: ThreadSource,
+  taskId?: string,
+): Promise<ChatCatalogRead> => {
+  const catalog = await read(
     source,
     'ReadChatCatalog',
     ReadChatCatalogPayloadSchema.parse({ taskId }),
     ChatCatalogReadSchema,
   );
+  return { ...catalog, families: inDisplayOrder(catalog.families) };
+};
 
 // A read can take 20 seconds and its refusal names the next step, so the result comes back as is.
 export const refreshModels = (source: ThreadSource) =>

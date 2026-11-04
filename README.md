@@ -5,7 +5,7 @@
   <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="109">
 </picture>
 
-CrewKite is a local workspace for the coding agents you already pay for. It runs the OpenAI, Anthropic and Google clients, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
+CrewKite is a local workspace for the coding agents you already pay for. It runs the Google, OpenAI and Anthropic clients, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
@@ -23,7 +23,7 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 ## Status
 
-CrewKite is a prerelease, version 0.1.0. I ran all four families, OpenAI, Anthropic, Google and Local, live through development. The release build gets a final check on macOS before it ships.
+CrewKite is a prerelease, version 0.1.0. I ran all four families, Google, OpenAI, Anthropic and Local, live through development. The release build gets a final check on macOS before it ships.
 
 <!-- Release screenshot pending the installed-build launch checks. -->
 

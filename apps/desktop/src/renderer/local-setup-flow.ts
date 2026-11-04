@@ -239,12 +239,28 @@ export async function connectInPlace({
 }): Promise<RailConnectResult> {
   if (!setup.endpoint) return { kind: 'settings', why: 'unconfigured' };
   if (!setup.connected) {
-    const started = await command({
-      command: 'BeginLocalConnectionInput',
-      expectedRevision: setup.revision,
-      payload: { consent: 'explicit', ...(unattended ? { unattended: true as const } : {}) },
-    });
+    const begin = (revision: number) =>
+      command({
+        command: 'BeginLocalConnectionInput',
+        expectedRevision: revision,
+        payload: { consent: 'explicit', ...(unattended ? { unattended: true as const } : {}) },
+      });
+    let started = await begin(setup.revision);
     if (!active()) return { kind: 'stopped' };
+    // A press can land while the launch reconnect is already probing, or just after it moved the
+    // setup on. The press then follows that connect, or sends again on the current revision, so
+    // it reports how the connect ends.
+    const busy = (result: CommandResult) =>
+      result.outcome === 'stale-revision' ||
+      (result.outcome === 'blocked' && result.reason === 'local-operation-active');
+    if (!applied(started) && busy(started)) {
+      const now = await read();
+      if (!active() || !now) return { kind: 'stopped' };
+      if (!now.operation && !now.connected) {
+        started = await begin(now.revision);
+        if (!active()) return { kind: 'stopped' };
+      } else started = { outcome: 'applied', revision: now.revision };
+    }
     if (!applied(started))
       return {
         kind: 'blocked',
