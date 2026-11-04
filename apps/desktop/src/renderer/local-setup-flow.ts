@@ -483,9 +483,11 @@ export async function observeOpenConnection(
 export const LAUNCH_RETRY_MS = 5_000;
 
 /**
- * Whether a launch reconnects Local now. Only a device that connected Local once reconnects, with
- * the saved endpoint. With the runtime's auth on, only a remembered token reconnects, so no token
- * window opens at launch. With auth off the endpoint alone is enough.
+ * Whether Local reconnects now, at launch or after the runtime comes back. Only a device that
+ * connected Local once reconnects, with the saved endpoint. With the runtime's auth on, only a
+ * remembered token reconnects, so no token window opens on its own. With auth off the endpoint
+ * alone is enough: a saved none mode, or a saved token mode whose last connect found the runtime
+ * answering with no token.
  */
 export function launchReconnect(
   setup: LocalSetup | null | undefined,
@@ -494,5 +496,5 @@ export function launchReconnect(
 ): boolean {
   if (!connectedOnce || !setup?.endpoint || setup.connected) return false;
   if (setup.operation || setup.generation !== 'idle') return false;
-  return setup.authMode === 'none' || tokenRemembered;
+  return setup.authMode === 'none' || setup.connectedWithoutToken === true || tokenRemembered;
 }
