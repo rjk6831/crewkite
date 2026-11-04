@@ -102,6 +102,9 @@
   border-radius: 8px;
   background: var(--surface-raised);
 }
+.onb-family.is-unavailable {
+  opacity: 0.55;
+}
 .onb-family-head {
   display: flex;
   align-items: center;

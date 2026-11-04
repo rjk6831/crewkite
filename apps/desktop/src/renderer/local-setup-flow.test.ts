@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { LocalEndpointSchema, type LocalSetup } from '@crewkite/contracts';
+import { type CommandResult, LocalEndpointSchema, type LocalSetup } from '@crewkite/contracts';
 import {
   connectInPlace,
   connectLocalFlow,
@@ -372,6 +372,50 @@ test('Local connect stops its command chain when component ownership changes', a
   });
   assert.equal(
     (await rail([setup({ operation: null, reason: 'connection-unavailable' })], idle)).result.kind,
+    'blocked',
+  );
+  // A press while the launch reconnect is probing follows that connect to its end, and a press
+  // on a setup that just moved on sends again on the current revision.
+  const answering = async (reads: LocalSetup[], start: LocalSetup, answers: CommandResult[]) => {
+    const sent: string[] = [];
+    const result = await connectInPlace({
+      setup: start,
+      command: async (input) => {
+        sent.push(`${input.command}@${'expectedRevision' in input ? input.expectedRevision : ''}`);
+        return answers.shift() ?? { outcome: 'applied', revision: 9 };
+      },
+      read: async () => reads.shift(),
+      wait: async () => {},
+      active: () => true,
+    });
+    return { result, sent };
+  };
+  const autoProbing = { ...probing, revision: 4 };
+  assert.deepEqual(
+    await answering([autoProbing, autoProbing, up, withModels], idle, [
+      { outcome: 'blocked', reason: 'local-operation-active' },
+    ]),
+    {
+      result: { kind: 'connected', withoutToken: true },
+      sent: [`BeginLocalConnectionInput@${idle.revision}`, `RefreshLocalModels@${up.revision}`],
+    },
+  );
+  const movedOn = { ...idle, revision: 7 };
+  assert.deepEqual(
+    await answering([movedOn, up, withModels], idle, [{ outcome: 'stale-revision', revision: 7 }]),
+    {
+      result: { kind: 'connected', withoutToken: true },
+      sent: [
+        `BeginLocalConnectionInput@${idle.revision}`,
+        'BeginLocalConnectionInput@7',
+        `RefreshLocalModels@${up.revision}`,
+      ],
+    },
+  );
+  // Any other refusal still ends the press with its line.
+  assert.equal(
+    (await answering([], idle, [{ outcome: 'blocked', reason: 'local-not-configured' }])).result
+      .kind,
     'blocked',
   );
   assert.match(WITHOUT_TOKEN, /^Connected without a token./);

@@ -1,6 +1,6 @@
 # Provider routes
 
-CrewKite reaches each provider through that provider's own client, signed in on your machine with your own subscription. The chat thread runs one adapter per family: OpenAI, Anthropic, Google and Local. This page names the transport of each, what you have to set up first and how far I have run it live. The file and repository writers that came before the chat thread keep their dated qualification notes under [Writers](#writers).
+CrewKite reaches each provider through that provider's own client, signed in on your machine with your own subscription. The chat thread runs one adapter per family: Google, OpenAI, Anthropic and Local. This page names the transport of each, what you have to set up first and how far I have run it live. The file and repository writers that came before the chat thread keep their dated qualification notes under [Writers](#writers).
 
 ## Plans per family
 
