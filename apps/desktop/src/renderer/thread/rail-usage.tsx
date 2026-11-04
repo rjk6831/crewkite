@@ -134,6 +134,7 @@ export function RailUsage({
                   className={
                     bar.percent === null ? 'rail-usage-value is-unknown' : 'rail-usage-value'
                   }
+                  title={bar.text}
                 >
                   {bar.text}
                 </span>
