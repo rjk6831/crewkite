@@ -731,6 +731,7 @@ export function useLocalReconnect(workspace: Workspace) {
       read: async () => (await refresh()).localSetup,
       wait: () => new Promise((resolve) => window.setTimeout(resolve, 500)),
       active: () => mounted.current,
+      unattended: true,
     })
       .catch(() => null)
       .then((result) => {

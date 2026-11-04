@@ -71,6 +71,25 @@ const GOOGLE_DIAGNOSTIC_OPERATIONS = 50;
 // The connection revision at which a no-authentication connect met a runtime that wants a token.
 // Memory only: the next connect probes again.
 const tokenAsked = new WeakMap<object, number>();
+// Connects started with no person at the window, by operation ID, per controller. Memory only:
+// the operation is launched by the same controller that accepted it.
+const unattendedConnects = new WeakMap<object, Set<string>>();
+const unattended = (controller: object) => {
+  const ids = unattendedConnects.get(controller) ?? new Set<string>();
+  unattendedConnects.set(controller, ids);
+  return ids;
+};
+
+/**
+ * Whether a connect's probe answer opens the token window. Only a person at the window gets one,
+ * and only when the runtime asked for a token this computer can take and none was supplied.
+ */
+export function opensTokenWindow(
+  found: string,
+  options: { supplied: boolean; unattended: boolean; refused: boolean },
+): boolean {
+  return found === 'token-required' && !options.supplied && !options.unattended && !options.refused;
+}
 const profileReads = new WeakMap<object, { profiles?: NativeProfileResolution[] }>();
 
 export class ProviderCommands {
@@ -1095,6 +1114,9 @@ export class ProviderCommands {
       ...(control.connectedWithoutToken === undefined
         ? {}
         : { connectedWithoutToken: control.connectedWithoutToken }),
+      ...(control.openProbeRevision === control.connectionRevision
+        ? { reconnectsWithoutToken: true }
+        : {}),
       operation: control.operation
         ? {
             kind: control.operation.kind,
@@ -1250,7 +1272,7 @@ export class ProviderCommands {
     // Connect on the saved endpoint before the launch reconnect connects counts as auto.
     if (command.command === 'ConfigureLocal') this.connectLog.begin('local', 'manual');
     if (command.command === 'BeginLocalConnectionInput' && !this.connectLog.mode('local'))
-      this.connectLog.begin('local', 'manual');
+      this.connectLog.begin('local', command.payload.unattended ? 'auto' : 'manual');
     if (command.command === 'ConfigureLocal') {
       const authMode = command.payload.authMode ?? 'token';
       const refusal = authMode === 'token' ? this.localTokenRefusal() : null;
@@ -1363,7 +1385,12 @@ export class ProviderCommands {
         clientQuiescent: false,
       },
     });
-    effects.push(() => this.launchLocalOperation(binding.operationId));
+    const quiet = command.command === 'BeginLocalConnectionInput' && !!command.payload.unattended;
+    // Recorded once the command has committed, so a rolled back command leaves nothing behind.
+    effects.push(() => {
+      if (quiet) unattended(this).add(binding.operationId);
+      this.launchLocalOperation(binding.operationId);
+    });
     return applied();
   }
 
@@ -1391,10 +1418,11 @@ export class ProviderCommands {
   }
 
   launchLocalOperation(this: Controller, operationId: string) {
-    if (this.closed) return;
-    const initial = this.localControl();
-    const operation = initial.operation;
-    if (!operation || operation.binding.operationId !== operationId) return;
+    const operation = this.closed ? null : this.localControl().operation;
+    if (!operation || operation.binding.operationId !== operationId) {
+      unattended(this).delete(operationId);
+      return;
+    }
     const completion = Promise.withResolvers<void>();
     const runtime: LocalOperationRuntime = {
       operationId,
@@ -1572,6 +1600,7 @@ export class ProviderCommands {
           });
         } catch {}
       } finally {
+        unattended(this).delete(operationId);
         if (this.localOperation === runtime) this.localOperation = undefined;
         completion.resolve();
       }
@@ -1657,13 +1686,30 @@ export class ProviderCommands {
           return found;
         })().then((found) => {
           const open = found === 'open';
+          const quiet = unattended(this).has(operationId);
           tokenAsked.delete(this);
           const supplied =
             this.localSecret?.supplied && this.localSecretMatches(this.localControl());
+          // The runtime wants a token now, so the earlier no-token answer no longer holds.
+          if (found === 'token-required' && !this.closed)
+            try {
+              this.store.transaction(() => {
+                const current = this.localControl();
+                if (
+                  current.connectionRevision === control.connectionRevision &&
+                  current.openProbeRevision !== null
+                )
+                  this.saveLocal({ ...current, openProbeRevision: null }, false);
+              });
+            } catch {}
           if (
             found === 'token-required' &&
+            !opensTokenWindow(found, {
+              supplied: !!supplied,
+              unattended: quiet,
+              refused: !!this.localTokenRefusal(),
+            }) &&
             !supplied &&
-            this.localTokenRefusal() &&
             !runtime.stopped &&
             !this.closed
           ) {
@@ -1717,6 +1763,7 @@ export class ProviderCommands {
             this.saveLocal({
               ...current,
               connectedWithoutToken: true,
+              openProbeRevision: current.connectionRevision,
               connectionFailed: false,
               observationStale: !!current.observation,
               selection: null,

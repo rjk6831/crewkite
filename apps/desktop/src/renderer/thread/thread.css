@@ -1390,12 +1390,44 @@
 
 /* Left rail allowance summary */
 .rail-usage {
+  position: relative;
   display: grid;
   gap: 7px;
   margin: 0 -12px;
   padding: 8px 14px;
   border-top: 1px solid var(--border);
   flex-shrink: 0;
+}
+/* A connect result floats over the rail for a few seconds, so no row grows or wraps. */
+.rail-toast {
+  position: absolute;
+  bottom: calc(100% + 6px);
+  left: 14px;
+  right: 14px;
+  z-index: 30;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--surface-raised);
+  color: var(--text);
+  font-size: 11px;
+  line-height: 1.45;
+  box-shadow: 0 6px 18px rgb(0 0 0 / 0.28);
+  animation: rail-toast-in 160ms ease-out;
+}
+.rail-toast[hidden] {
+  display: none;
+}
+@keyframes rail-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .rail-toast {
+    animation: none;
+  }
 }
 .rail-usage-row {
   position: relative;
