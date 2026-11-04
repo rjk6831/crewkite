@@ -76,6 +76,7 @@ After 0.1.0, in rough order. [docs/roadmap.md](docs/roadmap.md) has the detail.
 
 - Named builders. A crew roster where each builder has its own provider, model and effort, with a live view of who works on which slice and the subagents each one starts.
 - An API key route for each provider. It gives the full model list for Anthropic and a Google route inside Google's terms.
+- Grok (xAI) as the other choice for the G row. Grok's own coding client speaks the same protocol as the Google route and signs in with your xAI subscription, so it would bring a fourth subscription family to Linux and to people who skip the Google route. It ships after I review xAI's terms and qualify Grok on macOS and Linux.
 - Windows, once the port above is done.
 - Google on Linux, plus Linux task writers, formatting and verification, alongside packaged Linux installers.
 - Large repository work off the controller's main thread, and per-hunk review for large files.

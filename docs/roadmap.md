@@ -78,6 +78,7 @@ The README lists these in rough order. Each gets its own ADR or amendment before
 
 - Named builders: a crew roster with a provider, model and effort per builder, a live view of slice ownership, and each builder's subagents
 - An API key route per provider, with the full Anthropic model list and a Google route inside Google's terms
+- A choice of provider for the G row: Google, or Grok (xAI) through its own coding client over the same Agent Client Protocol the Google route uses. It signs in with the person's xAI subscription, and the controller removes any xAI API key from the client's environment, so turns draw on the plan and never on per-token billing. It ships after a dated review of xAI's terms, a qualification run on macOS and Linux, and its own ADR. The GOAL display order stays as ADR 0053 sets it
 - The Windows port
 - Google, task writers, formatting and verification on Linux, with packaged installers
 - Large repository copy, comparison and acceptance off the controller's main thread; per-hunk review for large files through git's own diff
