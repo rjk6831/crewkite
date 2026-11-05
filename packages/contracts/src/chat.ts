@@ -1256,6 +1256,24 @@ export function creditsPaused(
   return entry.creditSpending === false && allowanceExhausted(entry, model);
 }
 
+/**
+ * The family is out of included allowance, the person allowed credit spending for it, and the
+ * provider reports credits it can spend: a balance, unlimited credits or extra usage turned on.
+ * Such a family can still take work, after every family with allowance left. The turn itself
+ * passes the provider's own credit and spend checks when it starts (ADR 0052).
+ */
+export function creditsCarry(
+  entry: Pick<ChatCatalogEntry, 'remaining' | 'credits' | 'creditSpending'>,
+  model: string | null = null,
+): boolean {
+  const state = entry.credits?.state;
+  return (
+    entry.creditSpending === true &&
+    allowanceExhausted(entry, model) &&
+    (state === 'available' || state === 'unlimited' || state === 'extra-usage-on')
+  );
+}
+
 export function tightestAllowance(
   entry: Pick<ChatCatalogEntry, 'remaining'>,
   model: string | null = null,
@@ -1295,33 +1313,40 @@ export function rankFamilies(
   // reset time spreads over an infinite span and ranks after every timed window.
   const rate = (allowance: { percent: number; resetsAt: string | null }) =>
     allowance.percent / Math.max((reset(allowance.resetsAt) - now) / 3_600_000, 0.25);
-  return families
-    .filter((entry) => entry.connected && !exclude.includes(entry.family))
-    .filter((entry) => score(entry).percent !== 0)
-    .sort((left, right) => {
-      if (mode === 'local-first' && (left.family === 'local') !== (right.family === 'local'))
-        return left.family === 'local' ? -1 : 1;
-      const a = score(left);
-      const b = score(right);
-      // A family with no reading sorts last in every mode. It may be out already.
-      if (a.percent === null && b.percent !== null) return 1;
-      if (b.percent === null && a.percent !== null) return -1;
-      if (
-        a.percent !== null &&
-        b.percent !== null &&
-        (mode === 'even-spend' || mode === 'local-first')
-      ) {
-        const pace =
-          rate({ percent: b.percent, resetsAt: b.resetsAt }) -
-          rate({ percent: a.percent, resetsAt: a.resetsAt });
-        if (pace !== 0) return pace;
-      }
-      // Allowance that resets soonest is lost soonest, so resets-first spends it while it lasts.
-      // A window with no reset time counts as the farthest away.
-      if (mode === 'resets-first' && reset(a.resetsAt) !== reset(b.resetsAt))
+  return (
+    families
+      .filter((entry) => entry.connected && !exclude.includes(entry.family))
+      // A family at zero drops out, unless credits the person allowed can carry it (ADR 0052). It
+      // ranks after every family with allowance left, since its score is zero.
+      .filter((entry) => score(entry).percent !== 0 || creditsCarry(entry, modelFor(entry)))
+      .sort((left, right) => {
+        if (mode === 'local-first' && (left.family === 'local') !== (right.family === 'local'))
+          return left.family === 'local' ? -1 : 1;
+        const a = score(left);
+        const b = score(right);
+        // Credits come after every included allowance, in every mode, so a family left only with
+        // credits is the last choice even when its window resets soonest.
+        if ((a.percent === 0) !== (b.percent === 0)) return a.percent === 0 ? 1 : -1;
+        // A family with no reading sorts last in every mode. It may be out already.
+        if (a.percent === null && b.percent !== null) return 1;
+        if (b.percent === null && a.percent !== null) return -1;
+        if (
+          a.percent !== null &&
+          b.percent !== null &&
+          (mode === 'even-spend' || mode === 'local-first')
+        ) {
+          const pace =
+            rate({ percent: b.percent, resetsAt: b.resetsAt }) -
+            rate({ percent: a.percent, resetsAt: a.resetsAt });
+          if (pace !== 0) return pace;
+        }
+        // Allowance that resets soonest is lost soonest, so resets-first spends it while it lasts.
+        // A window with no reset time counts as the farthest away.
+        if (mode === 'resets-first' && reset(a.resetsAt) !== reset(b.resetsAt))
+          return reset(a.resetsAt) - reset(b.resetsAt);
+        if (a.percent !== null && b.percent !== null && a.percent !== b.percent)
+          return b.percent - a.percent;
         return reset(a.resetsAt) - reset(b.resetsAt);
-      if (a.percent !== null && b.percent !== null && a.percent !== b.percent)
-        return b.percent - a.percent;
-      return reset(a.resetsAt) - reset(b.resetsAt);
-    });
+      })
+  );
 }

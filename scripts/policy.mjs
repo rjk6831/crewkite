@@ -89,7 +89,9 @@ export function checkCommit(message) {
       `subject "${subject}" must be <type>(<scope>)?: <summary> with type in ${TYPES.join(', ')}`,
     );
   if (/:[ ]+[A-Z]/.test(subject)) errors.push('summary must start with lower case');
-  if (subject.length > 72) errors.push('subject is longer than 72 characters');
+  // A squash merge adds " (#N)" to the subject, so the limit counts the subject without it.
+  if (subject.replace(/ \(#\d+\)$/, '').length > 72)
+    errors.push('subject is longer than 72 characters');
   if (/\.\s*$/.test(subject)) errors.push('subject ends with a period');
   if (lines.length > 1 && lines[1].trim() !== '')
     errors.push('leave a blank line after the subject');

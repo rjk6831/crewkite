@@ -38,6 +38,10 @@ test('commit messages use conventional subjects and carry no authoring marks', (
   assert.ok(checkCommit('Add router', tool).length);
   assert.ok(checkCommit('feat: add router.', tool).length);
   assert.ok(checkCommit(`feat: ${'x'.repeat(80)}`, tool).length);
+  // GitHub's squash suffix does not count toward the subject limit.
+  const long = `feat: ${'x'.repeat(66)}`;
+  assert.deepEqual(checkCommit(valid.replace(/^.*$/m, `${long} (#144)`)), []);
+  assert.ok(checkCommit(valid.replace(/^.*$/m, `${long}x (#144)`)).length);
   assert.ok(checkCommit('feat: add router\nno blank line', tool).length);
   assert.ok(
     checkCommit('feat: add router\n\nCo-authored-by: Acme-Agent <bot@example.com>', tool).length,

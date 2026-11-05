@@ -3940,3 +3940,55 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
   for (const [claim, schema, input, accepted] of rows)
     assert.equal(schema.safeParse(input).success, accepted, claim);
 });
+
+// Claim: a family left only with credits the person allowed ranks after every family with
+// allowance in every mode, and drops out without the permission or without usable credits.
+test('credits keep a family in the ranking only last, and only with permission and usable credits', () => {
+  const now = Date.parse('2026-11-05T00:00:00.000Z');
+  const at = (hours: number) => new Date(now + hours * 3_600_000).toISOString();
+  const family = (name: 'openai' | 'google', percent: number, resetHours: number) => ({
+    family: name,
+    connected: true,
+    reason: null,
+    models: [
+      {
+        model: `${name}-m`,
+        label: name,
+        efforts: ['default' as const],
+        defaultEffort: 'default' as const,
+      },
+    ],
+    defaultModel: `${name}-m`,
+    remaining: [
+      { windowId: 'weekly', label: 'weekly', percent, resetsAt: at(resetHours), observedAt: at(0) },
+    ],
+    accepts: null,
+  });
+  const credited = (state: 'available' | 'none', allowed: boolean) => ({
+    ...family('openai', 0, 1),
+    creditSpending: allowed,
+    credits: { state, balance: '5', limitReached: false, observedAt: at(0) },
+  });
+  const google = family('google', 40, 100);
+  for (const mode of ['most-left', 'resets-first', 'even-spend', 'local-first'] as const) {
+    assert.deepEqual(
+      rankFamilies([credited('available', true), google], [], undefined, mode, now).map(
+        (e) => e.family,
+      ),
+      ['google', 'openai'],
+      mode,
+    );
+    assert.deepEqual(
+      rankFamilies([credited('available', false), google], [], undefined, mode, now).map(
+        (e) => e.family,
+      ),
+      ['google'],
+      mode,
+    );
+    assert.deepEqual(
+      rankFamilies([credited('none', true), google], [], undefined, mode, now).map((e) => e.family),
+      ['google'],
+      mode,
+    );
+  }
+});
