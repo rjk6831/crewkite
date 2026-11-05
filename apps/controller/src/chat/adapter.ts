@@ -24,6 +24,11 @@ export type ChatTurnRequest = Readonly<{
   taskId: string;
   role: ChatRole;
   selection: ChatModelSelection;
+  /**
+   * The person turned Allow credit spending on for this family in Settings. An adapter may then
+   * run past the included allowance on credits the provider reports usable, and on nothing else.
+   */
+  creditSpending?: boolean;
   /** The user's text for this turn. A handoff packet is prepended by the controller. */
   prompt: string;
   /**

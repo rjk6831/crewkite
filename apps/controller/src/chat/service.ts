@@ -1944,11 +1944,15 @@ export class ChatService {
           plan: planning && thread.plan ? planSummary(thread.plan) : null,
         })
       : (caught?.prompt ?? prompt);
+    const entry = this.deps
+      .catalog(task.id)
+      .families.find((value) => value.family === turn.selection.family);
     return {
       turnId: turn.id,
       taskId: task.id,
       role: turn.role,
       selection: turn.selection,
+      ...(entry?.creditSpending === true ? { creditSpending: true } : {}),
       prompt: turnNotes ? `${turnNotes}\n\n${body}` : body,
       files,
       threadTools,

@@ -132,7 +132,7 @@ test('Settings and the CLI name the found version and the state in plain words',
       true,
       'Codex 0.170.2 found. Checked with 0.163.0 on 2 Nov 2026; this build is newer than the last checked build.',
     ],
-    [at('openai', '0.163.0'), true, 'Codex 0.163.0 found. Checked with 0.163.0 on 2 Nov 2026.'],
+    [at('openai', '0.163.0'), true, 'Codex 0.163.0 found, checked on 2 Nov 2026.'],
     [
       at('openai', '1.0.0'),
       true,
@@ -157,7 +157,7 @@ test('Settings and the CLI name the found version and the state in plain words',
     [
       at('anthropic', '2.1.316 (Claude Code)'),
       true,
-      'Claude Code 2.1.316 found. Checked with 2.1.316 on 3 Nov 2026.',
+      'Claude Code 2.1.316 found, checked on 3 Nov 2026.',
     ],
     [
       at('anthropic', '2.1.340 (Claude Code)'),

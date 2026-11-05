@@ -1215,7 +1215,7 @@ function About({ onClose, preview }: { onClose: () => void; preview: boolean }) 
           <span>Created by Raymond J. Kraft</span>
         </div>
         <p>
-          CrewKite runs coding threads against Anthropic, OpenAI, Google and Local models. Each
+          CrewKite runs coding threads against Google, OpenAI, Anthropic and Local models. Each
           thread works in a scratch copy of your project, and edits reach your repository only when
           you accept them from the Changes tab.
         </p>

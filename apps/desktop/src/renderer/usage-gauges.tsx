@@ -61,6 +61,8 @@ export type UsageGaugesProps = {
   cards: readonly UsageCard[];
   nowMs: number;
   label?: string;
+  /** A control in a card's header, such as its provider's Refresh. */
+  action?: (card: UsageCard) => ReactNode;
 };
 
 /** A span as "4 h 56 min", or "4 h 56 m" when `short` is set for narrow places such as the rail. */
@@ -211,7 +213,7 @@ function details(reading: UsageReading, view: ReturnType<typeof describe>) {
   if (view.known && view.remaining && view.remaining.value >= 10_000)
     rows.push(['Remaining', `${exact.format(view.remaining.value)} ${view.remaining.unit}`]);
   if (reading.note) rows.push(['Note', reading.note]);
-  if (reading.windowId) rows.push(['Window', <code key="window">{reading.windowId}</code>]);
+  if (reading.windowId) rows.push(['Limit ID', <code key="window">{reading.windowId}</code>]);
   if (reading.source) rows.push(['Source', sourceText[reading.source]]);
   if (reading.confidence) rows.push(['Confidence', confidenceText[reading.confidence]]);
   if (view.observedAt !== null && !Number.isNaN(view.observedAt))
@@ -588,7 +590,7 @@ function UsageMeter({ reading, nowMs }: { reading: UsageReading; nowMs: number }
   );
 }
 
-function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
+function Card({ card, nowMs, action }: { card: UsageCard; nowMs: number; action?: ReactNode }) {
   const titleId = `usage-card-${useId().replace(/[^a-zA-Z0-9]/g, '')}`;
   const auxiliary = card.auxiliary ?? [];
   const featured = card.featured ?? null;
@@ -617,6 +619,7 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
             ))}
           </ul>
         )}
+        {action && <div className="usage-gauges-card-action">{action}</div>}
       </header>
       {card.notice && (
         <p className="usage-gauges-notice">
@@ -737,11 +740,11 @@ function Card({ card, nowMs }: { card: UsageCard; nowMs: number }) {
   );
 }
 
-export function UsageGauges({ cards, nowMs, label = 'Provider usage' }: UsageGaugesProps) {
+export function UsageGauges({ cards, nowMs, label = 'Provider usage', action }: UsageGaugesProps) {
   return (
     <section className="usage-gauges" aria-label={label}>
       {cards.map((card) => (
-        <Card key={card.id} card={card} nowMs={nowMs} />
+        <Card key={card.id} card={card} nowMs={nowMs} action={action?.(card)} />
       ))}
     </section>
   );

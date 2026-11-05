@@ -301,7 +301,7 @@ const bucket = z
       rateLimitReachedType: rateLimitReachedType ?? null,
     }),
   );
-const limits = z
+export const OpenAiLimitsSchema = z
   .object({
     ordinaryUsageAllowed: z
       .boolean()
@@ -321,6 +321,27 @@ const limits = z
     ...limits,
     availableResetCount: rateLimitResetCredits?.availableCount ?? null,
   }));
+
+/**
+ * Whether the account's existing credits may carry work past the included allowance: the codex
+ * bucket reports credits available or unlimited, no spend control is reached, and no limit other
+ * than the plain rate limit stops it. It says nothing about the person's own permission.
+ */
+export function existingCreditsUsable(value: z.output<typeof OpenAiLimitsSchema>): boolean {
+  const creditBucket = value.rateLimitsByLimitId
+    ? value.rateLimitsByLimitId.codex
+    : value.rateLimits.limitId === 'codex'
+      ? value.rateLimits
+      : null;
+  return (
+    !!creditBucket &&
+    (creditBucket.limitId === null || creditBucket.limitId === 'codex') &&
+    (creditBucket.credits === 'available' || creditBucket.credits === 'unlimited') &&
+    creditBucket.spendControlReached !== true &&
+    (creditBucket.rateLimitReachedType === null ||
+      creditBucket.rateLimitReachedType === 'rate_limit_reached')
+  );
+}
 
 export type OpenAiUsageWindow = Omit<Observation, 'routeId' | 'observedAt'>;
 export type OpenAiCredits = Readonly<{
@@ -620,7 +641,7 @@ const requirements = z
 export type DiscoveryMetadata = {
   platform: z.output<typeof platform>;
   account: z.output<typeof account>;
-  limits: z.output<typeof limits>;
+  limits: z.output<typeof OpenAiLimitsSchema>;
   models: z.output<typeof models>['data'];
   configuration?: z.output<typeof configuration>;
   requirements?: z.output<typeof requirements>;
@@ -841,7 +862,7 @@ export class OpenAiDiscovery {
           case 2:
             // Usage reads first, so an over-limit window still shows when admission refuses it.
             this.reportUsage('account/rateLimits/read', value.result);
-            this.limits = limits.parse(value.result);
+            this.limits = OpenAiLimitsSchema.parse(value.result);
             break;
           case 3: {
             const page = models.parse(value.result);

@@ -43,6 +43,8 @@ import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { fileDigestSync } from '../file-digest.ts';
 import {
+  existingCreditsUsable,
+  OpenAiLimitsSchema,
   type OpenAiUsageHook,
   type OpenAiUsageWindow,
   openAiUsageReporter,
@@ -754,16 +756,25 @@ class OpenAiChatTurn {
           // Usage is advisory, so a failed read does not stop the turn.
           if ('result' in reply) {
             this.rateLimits('account/rateLimits/read', reply.result);
-            if (limitsReply.safeParse(reply.result).data?.ordinaryUsageAllowed === false)
-              return this.fail(
-                chatFailure({
-                  stage: 'session',
-                  kind: 'usage-limit',
-                  method: 'account/rateLimits/read',
-                  message: 'The ChatGPT plan has no included Codex usage left.',
-                  resetsAt: this.resetsAt(),
-                }),
-              );
+            // Past the included allowance the turn runs only on existing credits, and only when
+            // the person allowed credit spending and the provider reports the credits usable,
+            // the same rule the writer and reviewer follow.
+            if (limitsReply.safeParse(reply.result).data?.ordinaryUsageAllowed === false) {
+              const read = OpenAiLimitsSchema.safeParse(reply.result);
+              const usable = read.success && existingCreditsUsable(read.data);
+              if (!this.request.creditSpending || !usable)
+                return this.fail(
+                  chatFailure({
+                    stage: 'session',
+                    kind: 'usage-limit',
+                    method: 'account/rateLimits/read',
+                    message: this.request.creditSpending
+                      ? 'The ChatGPT plan has no included Codex usage left, and the account reports no credits CrewKite may use.'
+                      : 'The ChatGPT plan has no included Codex usage left.',
+                    resetsAt: this.resetsAt(),
+                  }),
+                );
+            }
           }
           this.readConfig();
         });
