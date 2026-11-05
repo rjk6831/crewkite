@@ -525,6 +525,44 @@ export class Store {
       );
   }
 
+  /**
+   * The person's default model for a family, from Settings, or null when they left it to the
+   * client. It is a row in receipts, as the credit switch is, with the choice as its next line.
+   */
+  familyModel(family: string): { family: string; model: string; effort: string } | null {
+    const row = this.db
+      .prepare('SELECT result FROM receipts WHERE command_key=?')
+      .get(`family-model:${family}`) as { result: string } | undefined;
+    if (!row) return null;
+    try {
+      const next = CommandResultSchema.parse(JSON.parse(row.result)).next;
+      const value = next ? JSON.parse(next) : null;
+      return value && value.family === family && typeof value.model === 'string' ? value : null;
+    } catch {
+      return null;
+    }
+  }
+
+  setFamilyModel(family: string, selection: { model: string; effort: string } | null) {
+    if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
+    const key = `family-model:${family}`;
+    this.db.prepare('DELETE FROM receipts WHERE command_key=?').run(key);
+    if (!selection) return;
+    this.db
+      .prepare('INSERT INTO receipts(command_key,request_hash,principal,result) VALUES (?,?,?,?)')
+      .run(
+        key,
+        createHash('sha256').update(key).digest('hex'),
+        'local-owner',
+        canonicalJson(
+          CommandResultSchema.parse({
+            outcome: 'applied',
+            next: JSON.stringify({ family, model: selection.model, effort: selection.effort }),
+          }),
+        ),
+      );
+  }
+
   /** The Allow credit spending switch. A row means on, so a home that never set it reads off. */
   creditSpending(family: 'openai' | 'anthropic'): boolean {
     return !!this.db

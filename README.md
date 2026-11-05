@@ -23,7 +23,7 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 ## Status
 
-CrewKite is a prerelease, version 0.1.0. I ran all four families, Google, OpenAI, Anthropic and Local, live through development. The release build gets a final check on macOS before it ships.
+CrewKite 0.1.0 is its first public release. I ran all four families, Google, OpenAI, Anthropic and Local, live through development. The release build gets a final check on macOS before it ships.
 
 <!-- Release screenshot pending the installed-build launch checks. -->
 

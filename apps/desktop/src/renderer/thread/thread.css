@@ -1486,10 +1486,13 @@
   height: 14px;
   font-size: 8.5px;
 }
-/* A bar and its figure on one line. Two lines when the family reports five-hour and weekly. */
+/* A bar and its figure on one line. Two lines when the family reports five-hour and weekly. The
+   figure column has one fixed width, wide enough for "Credits paused" and "Connecting…", so every
+   bar ends at the same place and no state change moves one. A longer figure ends in an ellipsis
+   with its full text as a title. */
 .rail-usage-meter {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(5.5em, auto);
+  grid-template-columns: minmax(0, 1fr) 7.5em;
   align-items: center;
   gap: 8px;
 }
@@ -1561,6 +1564,11 @@
   text-decoration: underline;
   text-underline-offset: 2px;
   cursor: pointer;
+}
+/* Local's Connect in the figure column, right aligned like the figure it stands in for. */
+.rail-usage-meter .rail-usage-connect {
+  justify-self: end;
+  text-align: right;
 }
 .rail-usage-connect:focus-visible {
   outline: 2px solid var(--accent);

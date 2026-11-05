@@ -1067,6 +1067,16 @@ export const ChatCreditsSchema = z.strictObject({
 });
 export type ChatCredits = z.infer<typeof ChatCreditsSchema>;
 export const CreditFamilySchema = z.enum(['openai', 'anthropic']);
+/**
+ * The person's default model for one family, from Settings. Work that moves to the family on its
+ * own, such as an automatic handoff, starts on it. Null hands the choice back to the client.
+ */
+export const SetFamilyModelPayloadSchema = z
+  .strictObject({
+    family: ChatFamilySchema,
+    selection: ChatModelSelectionSchema.nullable(),
+  })
+  .refine((payload) => !payload.selection || payload.selection.family === payload.family);
 export const SetCreditSpendingPayloadSchema = z.strictObject({
   family: CreditFamilySchema,
   allowed: z.boolean(),

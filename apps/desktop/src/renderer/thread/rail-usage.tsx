@@ -130,7 +130,20 @@ export function RailUsage({
               <span className="rail-usage-unlimited" aria-hidden="true">
                 <span>∞</span>
               </span>
-              <span className="rail-usage-value">No limits</span>
+              {/* Local's Connect sits where "No limits" goes, so the row keeps one height before
+                  and after it connects and the rail never moves. */}
+              {row.family === 'local' && row.needsConnect && onOpenSettings ? (
+                <button
+                  type="button"
+                  className="rail-usage-connect rail-usage-value"
+                  disabled={connecting}
+                  onClick={() => connect('local')}
+                >
+                  {connecting ? 'Connecting…' : 'Connect'}
+                </button>
+              ) : (
+                <span className="rail-usage-value">No limits</span>
+              )}
             </span>
           ) : (
             row.bars.map((bar) => (
@@ -177,6 +190,7 @@ export function RailUsage({
               <span className="rail-usage-reset">Set up in Settings</span>
             ))}
           {row.needsConnect &&
+            !(row.family === 'local' && row.unlimited && onOpenSettings) &&
             (onOpenSettings ? (
               <button
                 type="button"

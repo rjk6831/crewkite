@@ -173,6 +173,8 @@ export type ChatServiceDeps = {
   resolveEnvironment: (family: ChatFamily) => NodeJS.ProcessEnv;
   /** True when the person acknowledged the current Google terms text (ADR 0002). */
   googleTermsAcknowledged: () => boolean;
+  /** The person's default model for a family from Settings, or null. */
+  familyModel?: (family: ChatFamily) => { model: string; effort?: string } | null;
   projectPath: (projectId: string) => string | undefined;
   /** The project's notes, oldest first. Every turn carries them. Absent means no notes. */
   projectNotes?: (projectId: string) => readonly string[];
@@ -1326,6 +1328,8 @@ export class ChatService {
         this.crewStep(task, thread, chain, effects, undefined, brief),
       findings: (review) => statedFindings(review),
       reviewBrief: CREW_REVIEW,
+      creditsPaused: (taskId, selection) => this.creditsPausedOn(taskId, selection),
+      nextFamily: (taskId, from) => this.nextFamily(taskId, from),
       familyBusy: (family) =>
         !!this.deps.store.db
           .prepare(
@@ -3174,8 +3178,10 @@ export class ChatService {
   }
 
   /**
-   * The first family in the shared ranking with an adapter and a usable default model. The
-   * family that stopped, any family at zero and any family whose credits are paused never qualify.
+   * The first family in the shared ranking with an adapter and a usable model. The model is the
+   * one this thread last ran on that family, else the person's default for it in Settings, else
+   * the client's own default. The family that stopped, any family at zero and any family whose
+   * credits are paused never qualify.
    */
   private nextFamily(taskId: string, stopped: ChatFamily): ChatModelSelection | null {
     const ranked = rankFamilies(
@@ -3188,9 +3194,24 @@ export class ChatService {
     for (const entry of ranked) {
       if (!this.deps.adapters.has(entry.family)) continue;
       if (entry.family === 'google' && !this.deps.googleTermsAcknowledged()) continue;
-      const model = entry.defaultModel ?? entry.models[0]?.model;
+      const listed = (model: string | undefined) =>
+        model && entry.models.some((value) => value.model === model) ? model : undefined;
+      const used = [...this.turns(taskId)]
+        .reverse()
+        .find((turn) => turn.selection.family === entry.family && listed(turn.selection.model));
+      const chosen = this.deps.familyModel?.(entry.family) ?? null;
+      const model =
+        listed(used?.selection.model) ??
+        listed(chosen?.model) ??
+        entry.defaultModel ??
+        entry.models[0]?.model;
       if (!model || creditsPaused(entry, model)) continue;
-      const effort = entry.models.find((value) => value.model === model)?.defaultEffort;
+      const effort =
+        model === used?.selection.model
+          ? used.selection.effort
+          : model === chosen?.model && chosen.effort
+            ? chosen.effort
+            : entry.models.find((value) => value.model === model)?.defaultEffort;
       const selection = this.deps.resolveSelection(taskId, {
         family: entry.family,
         model,

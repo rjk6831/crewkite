@@ -11,6 +11,7 @@ import {
   ChatCatalogReadSchema,
   type ChatChangesRead,
   ChatChangesReadSchema,
+  type ChatFamily,
   type ChatInstructionsRead,
   ChatInstructionsReadSchema,
   type ChatMentionsRead,
@@ -68,6 +69,7 @@ import {
   SendChatMessagePayloadSchema,
   SetCreditSpendingPayloadSchema,
   SetDefaultCrewPayloadSchema,
+  SetFamilyModelPayloadSchema,
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from '@crewkite/contracts';
@@ -200,6 +202,17 @@ export const setCreditSpending = (
   family: 'openai' | 'anthropic',
   allowed: boolean,
 ) => run(source, 'SetCreditSpending', SetCreditSpendingPayloadSchema.parse({ family, allowed }));
+
+/** Tells the controller the person's default model for one family. Null leaves it to the client. */
+export const setFamilyModel = (source: ThreadSource, family: ChatFamily, model: string | null) =>
+  run(
+    source,
+    'SetFamilyModel',
+    SetFamilyModelPayloadSchema.parse({
+      family,
+      selection: model ? { family, model, effort: 'default' } : null,
+    }),
+  );
 
 /** Ranked files and folders of the thread's scratch copy for the text after an at sign. */
 export const completeMention = (
