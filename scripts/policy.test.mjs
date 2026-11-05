@@ -42,6 +42,12 @@ test('commit messages use conventional subjects and carry no authoring marks', (
   assert.ok(
     checkCommit('feat: add router\n\nCo-authored-by: Acme-Agent <bot@example.com>', tool).length,
   );
+  // A product name in the body is fine; a link back to an agent session is not.
+  assert.deepEqual(
+    checkCommit(valid.replace('the configured reserve.', 'the configured reserve on Acme-Agent.')),
+    [],
+  );
+  assert.ok(checkCommit(`${valid}\nhttps://claude.ai/code/session_01ABC`).length);
 });
 
 test('tool instruction files, dot folders and internal/ never enter the tree', () => {
@@ -79,14 +85,17 @@ test('prose rules flag dashes, framing and bold lead-ins outside code fences', (
   assert.equal(checkProse('a.ts', '// use files rather than a server').length, 0);
 });
 
-test('agent names are allowed only under providers/', () => {
-  assert.equal(
-    checkProvenance('apps/controller/src/router.ts', '// tuned with acme-agent', tool).length,
-    1,
-  );
+test('product names may appear anywhere, attribution lines and agent session links may not', () => {
+  assert.deepEqual(checkProvenance('README.md', 'CrewKite runs acme-agent as a thread.'), []);
   assert.deepEqual(
-    checkProvenance('apps/controller/src/providers/acme.ts', "bin: 'acme-agent'", tool),
+    checkProvenance('apps/controller/src/router.ts', '// tuned with acme-agent'),
     [],
   );
-  assert.deepEqual(checkProvenance('docs/providers.md', 'acme-agent route', tool), []);
+  assert.equal(
+    checkProvenance('docs/a.md', 'Co-authored-by: Acme-Agent <bot@example.com>').length,
+    1,
+  );
+  assert.equal(checkProvenance('docs/a.md', 'Generated with Acme-Agent').length, 1);
+  assert.equal(checkProvenance('docs/a.md', 'See https://claude.ai/code/session_01ABC').length, 1);
+  assert.deepEqual(checkProvenance('scripts/policy.mjs', 'claude-session'), []);
 });
