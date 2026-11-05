@@ -34,8 +34,11 @@ assert.match(
 const packages = join(root, 'internal/packages/d0', `${values.id}-installers`);
 const deb = join(packages, `crewkite_${target.deb}.deb`);
 const rpm = join(packages, `crewkite.${target.rpm}.rpm`);
-const run = (command, args) =>
-  execFileSync(command, args, { encoding: 'utf8', timeout: 120000, maxBuffer: 4 * 1024 * 1024 });
+// The Fedora container installs a few hundred packages from public mirrors before it checks
+// anything, and a slow mirror takes minutes. That one step gets a longer limit; nothing it checks
+// is relaxed.
+const run = (command, args, timeout = 120000) =>
+  execFileSync(command, args, { encoding: 'utf8', timeout, maxBuffer: 4 * 1024 * 1024 });
 const hashes = Object.fromEntries(
   [deb, rpm].map((path) => [path, createHash('sha256').update(readFileSync(path)).digest('hex')]),
 );
@@ -255,21 +258,25 @@ case "$(runuser -u smoke -- env HOME=/home/smoke /usr/bin/crewkite --help)" in
   *) echo 'Installed CLI help failed' >&2; exit 1 ;;
 esac
 `;
-const container = run('docker', [
-  'run',
-  '--rm',
-  '--network=bridge',
-  '--mount',
-  `type=bind,src=${rpm},dst=/tmp/crewkite.rpm,readonly`,
-  inputs.fedoraImage,
-  'sh',
-  '-ec',
-  fedoraScript,
-  '--',
-  target.rpm,
-  values.arch,
-  hashes[rpm],
-  runtimeProbe,
-  payloadProbe,
-]);
+const container = run(
+  'docker',
+  [
+    'run',
+    '--rm',
+    '--network=bridge',
+    '--mount',
+    `type=bind,src=${rpm},dst=/tmp/crewkite.rpm,readonly`,
+    inputs.fedoraImage,
+    'sh',
+    '-ec',
+    fedoraScript,
+    '--',
+    target.rpm,
+    values.arch,
+    hashes[rpm],
+    runtimeProbe,
+    payloadProbe,
+  ],
+  600000,
+);
 writeFileSync(join(output, 'fedora-install.txt'), container);

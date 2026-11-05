@@ -482,6 +482,7 @@ export class Controller {
       adapters: this.options.chatAdapters ?? this.defaultChatAdapters(),
       resolveEnvironment: (family) => this.chatEnvironment(family),
       googleTermsAcknowledged: () => googleTermsCurrent(this.store.googleAcpSetup().googleTerms),
+      familyModel: (family) => this.store.familyModel(family),
       projectPath: (projectId) => this.projectPath(projectId),
       projectNotes: (projectId) => this.projectNotes().texts(projectId),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
@@ -1540,6 +1541,8 @@ export class Controller {
     if (crewsMutations.includes(command.command)) return;
     // The credit switch belongs to no task. A replayed key answers from its receipt.
     if (command.command === 'SetCreditSpending') return;
+    // So does the default model per family.
+    if (command.command === 'SetFamilyModel') return;
     if (
       [
         'SendChatMessage',
@@ -1813,6 +1816,11 @@ export class Controller {
       case 'EditProjectNote':
       case 'RemoveProjectNote':
         return notesCommand(this.projectNotes(), command);
+      case 'SetFamilyModel': {
+        const { family, selection } = command.payload;
+        this.store.setFamilyModel(family, selection);
+        return { outcome: 'applied' };
+      }
       case 'SetCreditSpending': {
         const { family, allowed } = command.payload;
         this.store.setCreditSpending(family, allowed);

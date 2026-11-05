@@ -41,13 +41,16 @@ import { selectedOption } from './palette/select.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { RailSearch } from './rail-search.tsx';
 import { loadCrews } from './settings/crew-store.ts';
+import { onFamilyDefaults, readFamilyDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
 import { useWorkspace, type Workspace } from './source.ts';
+import { setFamilyModel } from './thread/commands.ts';
 import { adjacentThread, isMacPlatform, searchHint, shortcutFor } from './thread/composer-rules.ts';
 import type { HistoryFind } from './thread/history-reveal.ts';
 import { NewThread } from './thread/new-thread.tsx';
 import { RailUsage } from './thread/rail-usage.tsx';
 import { type FirstSend, OpeningThread, ThreadView } from './thread/thread-view.tsx';
+import { FAMILY_DISPLAY_ORDER } from './usage-presentation.ts';
 
 // Local preferences only. Storage can be full or blocked, and the app keeps working with defaults.
 function readPreference(key: string) {
@@ -531,6 +534,19 @@ export function App() {
   useEffect(() => {
     if (connection === 'connected' && workspace.source)
       void loadCrews(workspace.source).catch(() => {});
+  }, [connection, workspace.source]);
+  // The default model per family lives in this window. The controller gets a copy at connect and
+  // after each change, so work that moves to a family on its own starts on the person's choice.
+  useEffect(() => {
+    const source = workspace.source;
+    if (connection !== 'connected' || !source) return;
+    const sync = () => {
+      const defaults = readFamilyDefaults();
+      for (const family of FAMILY_DISPLAY_ORDER)
+        void setFamilyModel(source, family, defaults[family] ?? null).catch(() => {});
+    };
+    sync();
+    return onFamilyDefaults(sync);
   }, [connection, workspace.source]);
   useEffect(() => {
     const first = projects[0];
@@ -1229,8 +1245,7 @@ function About({ onClose, preview }: { onClose: () => void; preview: boolean }) 
           ))}
         </div>
         <div className="about-license">
-          <span>Roots No Limits LLC</span>
-          <span>Apache License 2.0 · Copyright 2026 Raymond J. Kraft</span>
+          <span>Apache License 2.0 · © 2026 Roots No Limits LLC</span>
         </div>
       </div>
     </Dialog>

@@ -4956,3 +4956,188 @@ test('the credit spending switch is off by default and round trips through its c
   // Google reports no credit state, so it has no switch to set.
   assert.notEqual((await set('google', true)).outcome, 'applied');
 });
+
+// Claim: work that moves to a family on its own starts on the model this thread last ran there,
+// else on the person's Settings default for that family, else on the client's own default. A
+// Settings choice the family no longer lists falls back to the client's default.
+test('an automatic handoff starts on the thread or Settings model, never silently on the client default', {
+  timeout: 30000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const google = {
+    ...creditEntry('google', 50, undefined, now),
+    models: [
+      {
+        model: 'google-model',
+        label: 'Flash',
+        efforts: ['default', 'high'],
+        defaultEffort: 'default',
+      },
+      {
+        model: 'google-argon',
+        label: 'Argon',
+        efforts: ['default', 'high'],
+        defaultEffort: 'high',
+      },
+    ],
+  } as ChatCatalogRead['families'][number];
+  const cases = [
+    {
+      claim: 'the Settings choice wins over the client default',
+      chosen: 'google-argon',
+      model: 'google-argon',
+      effort: 'high',
+    },
+    {
+      claim: 'with no choice the client default runs',
+      chosen: null,
+      model: 'google-model',
+      effort: 'default',
+    },
+    {
+      claim: 'a choice the family dropped falls back',
+      chosen: 'google-gone',
+      model: 'google-model',
+      effort: 'default',
+    },
+  ];
+  for (const row of cases) {
+    const thread = standalone(t, {
+      adapters: creditAdapters(),
+      catalog: () => ({ families: [creditEntry('openai', 0, false, now), google] }),
+      familyModel: (family) => (family === 'google' && row.chosen ? { model: row.chosen } : null),
+    });
+    const done = turnReaches(thread, 'done');
+    thread.send('Fix the rounding.', {
+      family: 'openai',
+      model: 'openai-model',
+      effort: 'default',
+    });
+    await done;
+    const [turn] = thread.read().turns;
+    assert.deepEqual(
+      [turn?.selection.family, turn?.selection.model, turn?.selection.effort],
+      ['google', row.model, row.effort],
+      row.claim,
+    );
+  }
+  // The model this thread last ran on Google beats the Settings choice.
+  const thread = standalone(t, {
+    adapters: creditAdapters(),
+    catalog: () => ({ families: [creditEntry('openai', 0, false, now), google] }),
+    familyModel: () => ({ model: 'google-argon' }),
+  });
+  const first = turnReaches(thread, 'done');
+  thread.send('Look first.', { family: 'google', model: 'google-model', effort: 'high' });
+  await first;
+  const second = turnReaches(thread, 'done');
+  thread.send('Fix the rounding.', { family: 'openai', model: 'openai-model', effort: 'default' });
+  await second;
+  const last = thread.read().turns.at(-1);
+  assert.deepEqual(
+    [last?.selection.family, last?.selection.model, last?.selection.effort],
+    ['google', 'google-model', 'high'],
+    'the thread keeps its own Google model',
+  );
+});
+
+// Claim: a plan slice passes the credit switch the way a single turn does. A slice whose family is
+// out of included allowance with credits off moves to the family a handoff picks, and that family
+// never gets a request it would pay for.
+test('a plan slice on a family whose credits are paused runs on the next family', {
+  timeout: 60000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep => ({ kind: 'text', itemId: 'r', chunks: [text] });
+  const plan = {
+    planId: 'p1',
+    goal: 'Add tax to the order total.',
+    slices: [
+      {
+        id: 1,
+        title: 'Apply tax',
+        brief: 'Use TAX_RATE in orderTotal.',
+        files: [],
+        depends: [],
+        difficulty: 'hard',
+        readOnly: false,
+      },
+    ],
+  };
+  const write: ChatScriptStep = {
+    kind: 'tool',
+    callId: 'w',
+    toolKind: 'edit',
+    title: 'Write a.txt',
+    write: { path: 'a.txt', content: 'taxed\n' },
+  };
+  const adapters = new Map<ChatFamily, ChatAdapter>([
+    [
+      'openai',
+      createScriptedChatAdapter({
+        family: 'openai',
+        turns: [[reply(`\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``)]],
+      }),
+    ],
+    ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: [] })],
+    ['google', createScriptedChatAdapter({ family: 'google', turns: [[write]] })],
+  ]);
+  // Anthropic has allowance when the plan is made and runs out before the slice starts.
+  const families = [
+    creditEntry('openai', 40, false, now),
+    creditEntry('anthropic', 50, false, now),
+    creditEntry('google', 50, undefined, now),
+  ];
+  const thread = standalone(t, { adapters, catalog: () => ({ families }) });
+  const { store, service, taskId } = thread;
+  const crew: ChatCrew = {
+    name: 'Plan crew',
+    members: [
+      { role: 'builder', selection: pick('openai') },
+      // The fixer takes the hard slice, and its family has no allowance left.
+      { role: 'fixer', selection: pick('anthropic') },
+      { role: 'orchestrator', selection: pick('openai') },
+    ],
+  };
+  store.transaction(() => service.configure({ taskId, crew, flightMode: 'balanced' }));
+  const proposed = next(
+    thread,
+    (event) =>
+      event.type === 'chat.thread' && (event.payload as ChatThread).plan?.phase === 'proposed',
+  );
+  const free = settles(thread);
+  const ended = next(
+    thread,
+    (event) =>
+      event.type === 'conversation.entry' &&
+      /^(Crew finished|Plan stopped|Plan paused)/.test((event.payload as { text: string }).text),
+  );
+  thread.send('Add tax.', pick('openai'));
+  await proposed;
+  await free;
+  assert.equal(thread.read().thread.plan?.slices[0]?.assignment?.family, 'anthropic');
+  families[1] = creditEntry('anthropic', 0, false, now);
+  assert.equal(
+    act(store, (effects) => service.runPlan({ taskId, planId: 'p1' }, effects)).outcome,
+    'applied',
+  );
+  await ended;
+  const read = thread.read();
+  const anthropic = adapters.get('anthropic') as ReturnType<typeof createScriptedChatAdapter>;
+  assert.equal(anthropic.requests.length, 0, 'no paid request');
+  assert.deepEqual(
+    read.turns.filter((turn) => turn.slice === 1).map((turn) => turn.selection.family),
+    ['google'],
+  );
+  assert.ok(
+    read.messages.some(
+      (message) =>
+        message.text === 'Slice 1 continued on Google from Anthropic. Reason: usage limit reached.',
+    ),
+  );
+});

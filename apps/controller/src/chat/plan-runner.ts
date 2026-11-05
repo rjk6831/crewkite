@@ -103,6 +103,13 @@ export type PlanHost = {
   reviewBrief: string;
   /** Whether a turn on this family is open in any thread, this one included. */
   familyBusy: (family: ChatFamily) => boolean;
+  /**
+   * The family is out of included allowance and its credit switch is off, so a turn there would
+   * spend credits the person did not allow. Absent means never.
+   */
+  creditsPaused?: (taskId: string, selection: ChatModelSelection) => boolean;
+  /** Where an automatic handoff would move work off `from`, or null. */
+  nextFamily?: (taskId: string, from: ChatFamily) => ChatModelSelection | null;
   /** Ask the running turn to stop. Its settle finishes the rest. */
   stopActive: (taskId: string, effects: Effects) => void;
   /**
@@ -676,9 +683,28 @@ export class PlanRunner {
     task: Task,
     thread: ChatThread,
     slice: Slice,
-    selection: ChatModelSelection,
+    chosen: ChatModelSelection,
     effects: Effects,
   ): ChatThread {
+    // Every step of a slice, the build, review, fix and resolve, passes the credit switch the
+    // way a single turn does. It moves to the family a handoff would pick, or the plan pauses.
+    let selection = chosen;
+    if (this.host.creditsPaused?.(task.id, selection)) {
+      const next = this.host.nextFamily?.(task.id, selection.family);
+      if (!next || this.host.familyBusy(next.family)) {
+        this.halt(task, `slice ${slice.id} needs credits that are off`);
+        this.host.line(
+          task,
+          `Plan paused: ${familyName[selection.family]} is out of included allowance and credit spending is off. Turn it on in Settings or run the slice from the plan card later.`,
+        );
+        return this.host.thread(task.id);
+      }
+      this.host.line(
+        task,
+        `Slice ${slice.id} continued on ${familyName[next.family]} from ${familyName[selection.family]}. Reason: usage limit reached.`,
+      );
+      selection = next;
+    }
     const plan = thread.plan as ChatPlanState;
     const lane = slice.lane as Lane;
     const id = slice.id;
