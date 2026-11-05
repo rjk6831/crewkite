@@ -15,6 +15,7 @@ import { z } from 'zod';
 import {
   authorityNotice,
   type DiscoveryMetadata,
+  existingCreditsUsable,
   OpenAiDiscovery,
   type OpenAiUsageHook,
 } from './discovery.ts';
@@ -297,20 +298,10 @@ function choiceFailure(metadata: DiscoveryMetadata, plan: StructuredSession) {
 /** Writer and reviewer admission use the same fresh account and allowance facts. */
 export function nativeTaskAdmitted(metadata: DiscoveryMetadata, plan: StructuredSession) {
   const limits = metadata.limits;
-  const creditBucket = limits.rateLimitsByLimitId
-    ? limits.rateLimitsByLimitId.codex
-    : limits.rateLimits.limitId === 'codex'
-      ? limits.rateLimits
-      : null;
   const existingCreditsAllowed =
     plan.creditPolicy === 'existing-credits' &&
     limits.ordinaryUsageAllowed === false &&
-    creditBucket &&
-    (creditBucket.limitId === null || creditBucket.limitId === 'codex') &&
-    (creditBucket.credits === 'available' || creditBucket.credits === 'unlimited') &&
-    creditBucket.spendControlReached !== true &&
-    (creditBucket.rateLimitReachedType === null ||
-      creditBucket.rateLimitReachedType === 'rate_limit_reached');
+    existingCreditsUsable(limits);
   return (
     (limits.ordinaryUsageAllowed === true || !!existingCreditsAllowed) &&
     choiceFailure(metadata, plan) === null

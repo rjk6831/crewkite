@@ -262,6 +262,7 @@ input.on('line', (line) => {
   // A hung client never answers the interrupt.
   if (value.method === 'turn/interrupt' && given.silent) return;
   let result = replies[value.method];
+  if (value.method === 'account/rateLimits/read' && given.limits) result = given.limits;
   // Fields CrewKite does not read change shape between client builds.
   // A thread opened with a permission profile names it and a read-only sandbox, as 0.163 does.
   // given.profile stands in for a build that answers with another profile, or none.
@@ -352,7 +353,11 @@ function turn(
       mcp?: Record<string, unknown>;
       /** A client that no longer has the thread, so thread/resume answers with an error. */
       lostThread?: boolean;
+      /** The account/rateLimits/read result in place of the default. */
+      limits?: Record<string, unknown>;
     };
+    /** The person allowed credit spending for OpenAI. */
+    creditSpending?: boolean;
     /** The message, when a test needs more than the default. */
     prompt?: string;
     threadTools?: OpenAiChatDeps['threadTools'];
@@ -435,6 +440,7 @@ function turn(
     ...(options.resumable !== undefined ? { resumable: options.resumable } : {}),
     ...(options.title !== undefined ? { title: options.title } : {}),
     ...(options.allowanceLeft !== undefined ? { allowanceLeft: options.allowanceLeft } : {}),
+    ...(options.creditSpending ? { creditSpending: true } : {}),
   };
   const handle = adapter.startTurn(request, (event) => {
     events.push(event);
@@ -1572,4 +1578,71 @@ test('the client starts with Git held to the scratch copy', async () => {
     run.launchEnvironment().GIT_CEILING_DIRECTORIES,
     realpathSync.native(dirname(run.scratch)),
   );
+});
+
+// Claim: past the included allowance a turn runs only on existing credits, and only when the
+// person allowed credit spending and the provider reports the credits usable with no spend
+// control reached. Anything else ends the turn as a limit before it starts.
+test('a used-up plan runs on credits only when the switch is on and the provider reports them usable', async () => {
+  const bucket = (
+    credits: Record<string, unknown> | null,
+    extra: Record<string, unknown> = {},
+  ) => ({
+    ordinaryUsageAllowed: false,
+    rateLimits: {
+      limitId: 'codex',
+      primary: { usedPercent: 100, windowDurationMins: 300, resetsAt: 1793000000 },
+      secondary: null,
+      credits,
+      ...extra,
+    },
+  });
+  const available = { hasCredits: true, unlimited: false, balance: '5' };
+  const rows = [
+    { claim: 'switch off', limits: bucket(available), on: false, stop: 'limit', credits: false },
+    {
+      claim: 'switch on, credits usable',
+      limits: bucket(available),
+      on: true,
+      stop: 'done',
+      credits: false,
+    },
+    {
+      claim: 'switch on, no credits',
+      limits: bucket({ hasCredits: false, unlimited: false, balance: '0' }),
+      on: true,
+      stop: 'limit',
+      credits: true,
+    },
+    {
+      claim: 'switch on, spend control reached',
+      limits: bucket(available, { spendControlReached: true }),
+      on: true,
+      stop: 'limit',
+      credits: true,
+    },
+    {
+      claim: 'switch on, credits unknown',
+      limits: bucket(null),
+      on: true,
+      stop: 'limit',
+      credits: true,
+    },
+  ];
+  for (const row of rows) {
+    const run = turn('stream', { detail: { limits: row.limits }, creditSpending: row.on });
+    const { stopReason, failure } = await run.settled();
+    assert.equal(stopReason, row.stop, row.claim);
+    if (row.stop === 'limit') {
+      assert.equal(failure?.kind, 'usage-limit', row.claim);
+      assert.equal(failure?.method, 'account/rateLimits/read', row.claim);
+      assert.equal(
+        failure?.message,
+        row.credits
+          ? 'The ChatGPT plan has no included Codex usage left, and the account reports no credits CrewKite may use.'
+          : 'The ChatGPT plan has no included Codex usage left.',
+        row.claim,
+      );
+    }
+  }
 });

@@ -195,8 +195,9 @@ export function clientVersionStatus(
   const message = (() => {
     if (information && checked !== null)
       switch (state) {
+        // The found build is the checked build, so the line names it once.
         case 'tested':
-          return `${row.name} ${version} found. ${checked}.`;
+          return `${row.name} ${version} found, checked on ${'checkedOn' in row ? row.checkedOn : ''}.`;
         case 'supported':
           return `${row.name} ${version} found. ${checked}; builds from ${row.minimum} on are supported.`;
         case 'newer':
@@ -207,7 +208,9 @@ export function clientVersionStatus(
       }
     switch (state) {
       case 'tested':
-        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}.`;
+        return 'checkedOn' in row
+          ? `${row.name} ${version} found, checked on ${row.checkedOn}.`
+          : `${row.name} ${version} found, the tested build.`;
       case 'newer':
         return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}; a newer build runs while its flags and replies match what CrewKite sends.`;
       case 'supported':

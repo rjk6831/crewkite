@@ -815,3 +815,45 @@
     border-color: Canvas;
   }
 }
+
+/* A small control in a card's header, such as Refresh, kept to the right of the title. */
+.usage-gauges-card-action {
+  margin-left: auto;
+}
+.usage-refresh {
+  display: inline-grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.usage-refresh:hover:not(:disabled) {
+  background: var(--surface-hover);
+  color: var(--text);
+}
+.usage-refresh:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.usage-refresh:disabled {
+  cursor: default;
+  opacity: 0.5;
+}
+.usage-refresh .is-spinning {
+  animation: usage-refresh-spin 1s linear infinite;
+}
+@keyframes usage-refresh-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+@media (prefers-reduced-motion: reduce) {
+  .usage-refresh .is-spinning {
+    animation: none;
+  }
+}

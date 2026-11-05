@@ -48,7 +48,7 @@ import {
 } from '../settings/preferences.ts';
 import { useProviderActions } from '../settings/provider-actions.ts';
 import { useCatalog } from '../settings/use-catalog.ts';
-import { UsageGauges } from '../usage-gauges.tsx';
+import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
 import { ChecksSettings } from './checks-card.tsx';
@@ -233,52 +233,59 @@ function UsageTab({
   // the reader events they cause, so the gauges below update without a reload here.
   const actions = useProviderActions({ metadataCommand: (input) => source.command(input) });
   if (!header) return <p className="th-muted">Usage is not available yet.</p>;
-  const cards = usageCards(projectUsagePresentation(header, null, now), header);
-  const refresh = refreshFamilies.flatMap((family) => {
+  const scopes = projectUsagePresentation(header, null, now);
+  const cards = usageCards(scopes, header);
+  const familyOf = new Map(scopes.map((scope) => [scope.id, scope.family]));
+  // Each provider's Refresh sits in its own card's header, as a small icon button.
+  const refresh = (card: UsageCard) => {
+    const found = familyOf.get(card.id);
+    const family = refreshFamilies.find((value) => value === found);
+    if (!family) return null;
     const { label, reader, cooldownSeconds } = clientFor(header, family, now);
-    if (!reader) return [];
+    if (!reader) return null;
     const reading = reader.readState === 'intent' || reader.readState === 'owned';
-    return [
-      <li key={family} className="th-usage-refresh-row">
-        <span>{label}</span>
-        <button
-          type="button"
-          className="th-button"
-          aria-label={`Refresh ${label} usage`}
-          disabled={
-            preview ||
-            !reader.available ||
-            actions.busy[family] ||
-            reading ||
-            reader.readState === 'unknown' ||
-            cooldownSeconds > 0
-          }
-          title={cooldownSeconds > 0 ? `Refresh available in ${cooldownSeconds}s.` : undefined}
-          onClick={() =>
-            void (family === 'anthropic'
-              ? actions.refreshAnthropic()
-              : actions.observeUsage(family))
-          }
-        >
-          <RefreshCw size={13} aria-hidden="true" /> {reading ? 'Reading' : 'Refresh'}
-        </button>
-        {actions.messages[family] && <small role="status">{actions.messages[family]}</small>}
-      </li>,
-    ];
-  });
+    const message = actions.messages[family];
+    return (
+      <button
+        type="button"
+        className="usage-refresh"
+        aria-label={reading ? `Reading ${label} usage` : `Refresh ${label} usage`}
+        disabled={
+          preview ||
+          !reader.available ||
+          actions.busy[family] ||
+          reading ||
+          reader.readState === 'unknown' ||
+          cooldownSeconds > 0
+        }
+        title={
+          message ??
+          (cooldownSeconds > 0 ? `Refresh available in ${cooldownSeconds}s.` : 'Refresh usage')
+        }
+        onClick={() =>
+          void (family === 'anthropic' ? actions.refreshAnthropic() : actions.observeUsage(family))
+        }
+      >
+        <RefreshCw size={13} aria-hidden="true" className={reading ? 'is-spinning' : undefined} />
+      </button>
+    );
+  };
+  const notes = refreshFamilies.flatMap((family) =>
+    actions.messages[family] ? [actions.messages[family]] : [],
+  );
   return (
     <>
-      {refresh.length > 0 && (
-        <ul className="th-usage-refresh" aria-label="Refresh usage">
-          {refresh}
-        </ul>
-      )}
+      {notes.map((note) => (
+        <p key={note} className="th-muted" role="status">
+          {note}
+        </p>
+      ))}
       {cards.length === 0 ? (
         <p className="th-muted">
           No provider usage has been read yet. Connect a provider in Settings.
         </p>
       ) : (
-        <UsageGauges cards={cards} nowMs={now} />
+        <UsageGauges cards={cards} nowMs={now} action={refresh} />
       )}
     </>
   );

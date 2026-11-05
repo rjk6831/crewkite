@@ -65,8 +65,12 @@ const PROSE_ALL = [
 
 const TEXT = /\.(md|mdx|ts|tsx|js|mjs|cjs|json|ya?ml|css|html|sh|sql|txt)$|(^|\/)[^.]+$/;
 const SKIP = /(^|\/)(pnpm-lock\.yaml|LICENSE|NOTICE)$/;
-// Agent and model product names may appear only where the product integrates with them.
-const PROVIDER_PATH = /(^|\/)providers(\/|\.md$)/;
+// Attribution a tool adds to its own work: a co-author or generated-by line, or a link back to an
+// agent session. Product names alone are fine anywhere (ADR 0015, amended 2026-11-05). The policy
+// files hold these patterns and the tests that exercise them.
+const ATTRIBUTION =
+  /^\s*(?:co-authored-by:|generated (?:with|by)\b|authored by:)|claude-session|claude\.ai\/code\/session|chatgpt\.com\/codex\/tasks/im;
+const POLICY_PATH = /^scripts\/policy(\.test)?\.mjs$/;
 
 export function checkBranch(name, pattern) {
   const errors = BRANCH.test(name)
@@ -76,7 +80,7 @@ export function checkBranch(name, pattern) {
   return errors;
 }
 
-export function checkCommit(message, pattern) {
+export function checkCommit(message) {
   const lines = message.split('\n').filter((line) => !line.startsWith('#'));
   const subject = lines[0] ?? '';
   const errors = [];
@@ -97,12 +101,10 @@ export function checkCommit(message, pattern) {
   if (body.length < 20) errors.push('body must explain why the change is needed');
   if (!/^Signed-off-by: [^<>\n]+ <[^<>\s]+@[^<>\s]+>$/im.test(message))
     errors.push('DCO sign-off is required');
-  if (/^(?:co-authored-by:|generated (?:with|by)\b|authored by:)/im.test(message))
-    errors.push('authoring trailers are not allowed');
+  if (ATTRIBUTION.test(message))
+    errors.push('authoring trailers and agent session links are not allowed');
   for (const [rule, why] of PROSE_ALL)
     if (rule.test(message)) errors.push(`commit message: ${why}`);
-  if (pattern?.test(message))
-    errors.push('commit message names an agent or carries an authoring trailer');
   return errors;
 }
 
@@ -134,12 +136,12 @@ export function checkProse(path, text) {
   return errors;
 }
 
-export function checkProvenance(path, text, pattern) {
-  if (!pattern || PROVIDER_PATH.test(path)) return [];
+export function checkProvenance(path, text) {
+  if (POLICY_PATH.test(path)) return [];
   return text
     .split('\n')
     .flatMap((line, i) =>
-      pattern.test(line) ? [`${path}:${i + 1}: names an agent outside providers/`] : [],
+      ATTRIBUTION.test(line) ? [`${path}:${i + 1}: authoring trailer or agent session link`] : [],
     );
 }
 
@@ -156,12 +158,12 @@ const git = (...args) =>
   execFileSync('git', args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
 const lines = (out) => out.split('\n').filter(Boolean);
 
-function scanFiles(paths, pattern) {
+function scanFiles(paths) {
   return paths
     .filter((path) => TEXT.test(path) && !SKIP.test(path) && existsSync(path))
     .flatMap((path) => {
       const text = readFileSync(path, 'utf8');
-      return [...checkProse(path, text), ...checkProvenance(path, text, pattern)];
+      return [...checkProse(path, text), ...checkProvenance(path, text)];
     });
 }
 
@@ -171,28 +173,24 @@ function run([command, arg]) {
     case 'branch':
       return checkBranch(arg ?? git('branch', '--show-current').trim(), pattern);
     case 'commit':
-      return checkCommit(readFileSync(arg, 'utf8'), pattern);
+      return checkCommit(readFileSync(arg, 'utf8'));
     case 'commits': {
       const shas = arg
         ? lines(git('rev-list', '--no-merges', arg))
         : [git('rev-parse', 'HEAD').trim()];
       return shas.flatMap((sha) =>
-        checkCommit(git('log', '-1', '--format=%B', sha).trim(), pattern).map(
+        checkCommit(git('log', '-1', '--format=%B', sha).trim()).map(
           (e) => `${sha.slice(0, 8)}: ${e}`,
         ),
       );
     }
     case 'staged': {
       const staged = lines(git('diff', '--cached', '--name-only', '--diff-filter=ACR'));
-      return [...checkTree(staged), ...scanFiles(staged, pattern)];
+      return [...checkTree(staged), ...scanFiles(staged)];
     }
     case 'all': {
-      if (!pattern && process.env.CI)
-        return ['PROVENANCE_PATTERN is not set; the provenance check fails closed in CI'];
-      if (!pattern)
-        console.warn('policy: provenance pattern not found locally; skipping that check');
       const tracked = lines(git('ls-files'));
-      return [...checkTree(tracked), ...scanFiles(tracked, pattern)];
+      return [...checkTree(tracked), ...scanFiles(tracked)];
     }
     default:
       return [`unknown command "${command}"`];

@@ -5,7 +5,7 @@
   <img src="apps/desktop/src/renderer/assets/crewkite-wordmark.png" alt="CrewKite" width="320" height="109">
 </picture>
 
-CrewKite is a local workspace for the coding agents you already pay for. It runs the Google, OpenAI and Anthropic clients, and a local model, as threads on your own computer. A thread can move from one provider to another and keep its messages and its edited files.
+CrewKite is a local workspace for the coding agents you already pay for. It runs Google, OpenAI, Anthropic and Local models through their own clients (Antigravity CLI, Codex, Claude Code and LM Studio) as threads on your own computer, each signed in with your own plan. A thread can move from one provider to another and keep its messages and its edited files.
 
 CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
@@ -76,6 +76,7 @@ After 0.1.0, in rough order. [docs/roadmap.md](docs/roadmap.md) has the detail.
 
 - Named builders. A crew roster where each builder has its own provider, model and effort, with a live view of who works on which slice and the subagents each one starts.
 - An API key route for each provider. It gives the full model list for Anthropic and a Google route inside Google's terms.
+- GitHub checks in the thread: a pull request's CI results and logs, re-running failed jobs, and squash merging with your own message, each through your own GitHub sign-in and an explicit click.
 - Grok (xAI) as the other choice for the G row. Grok's own coding client speaks the same protocol as the Google route and signs in with your xAI subscription, so it would bring a fourth subscription family to Linux and to people who skip the Google route. It ships after I review xAI's terms and qualify Grok on macOS and Linux.
 - Windows, once the port above is done.
 - Google on Linux, plus Linux task writers, formatting and verification, alongside packaged Linux installers.

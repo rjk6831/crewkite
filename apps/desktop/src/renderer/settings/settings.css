@@ -127,18 +127,26 @@
   color: var(--text-dim);
   font-size: 11px;
 }
+/* The client line: one sentence with the build and its check date, and Check again beside it.
+   The self-test and capabilities sit under both at full width, so a long capability list never
+   squeezes the sentence. */
 .st-client {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 12px;
+  gap: 8px 12px;
   margin: -8px 0 16px;
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.5;
 }
 .st-client p {
-  flex: 1;
-  overflow-wrap: anywhere;
+  min-width: 0;
+  overflow-wrap: break-word;
+}
+.st-client > small,
+.st-client > .facts-grid {
+  grid-column: 1 / -1;
 }
 .st-client.is-refused p {
   color: var(--text);
@@ -288,10 +296,20 @@
   color: var(--text-dim);
 }
 
+/* A crew role on one line in Settings: its name, its model select and the subagent switch beside
+   it. The name column fits the longest role, so every select starts at the same place, and the
+   row wraps only when the window is too narrow for all three. */
+.st-crew .st-crew-role {
+  grid-template-columns: 112px minmax(0, 1fr);
+}
 .st-crew-pick {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  align-items: center;
+  gap: 8px 16px;
+}
+.st-crew-pick .sa-switch-row {
+  flex-basis: auto;
 }
 
 .st-note-text {

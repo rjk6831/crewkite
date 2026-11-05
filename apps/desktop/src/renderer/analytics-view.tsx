@@ -1,13 +1,9 @@
-import {
-  allowanceText,
-  countText,
-  type DesktopSource,
-  tokensText,
-  wallText,
-} from '@crewkite/client';
+import { countText, type DesktopSource, tokensText, wallText } from '@crewkite/client';
 import type { ChatAnalyticsRead, ReadChatAnalyticsPayload } from '@crewkite/contracts';
 import { useEffect, useState } from 'react';
+import { familyName } from './components.tsx';
 import { readAnalytics, type ThreadSource } from './thread/commands.ts';
+import { windowLabel } from './usage-presentation.ts';
 import './analytics.css';
 
 // Usage numbers for one thread or one project, as plain figures and small tables. The controller
@@ -101,6 +97,7 @@ export function AnalyticsView({
 }
 
 function Numbers({ read }: { read: ChatAnalyticsRead }) {
+  const [shown, setShown] = useState(TURN_ROWS);
   if (read.turns === 0)
     return (
       <p className="th-muted">
@@ -129,7 +126,9 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
         ] as [string, string][])
       : []),
   ];
-  const turns = read.turnRows.slice(-TURN_ROWS);
+  // The newest turns first come in pages of 20, so a long thread stays a short list until the
+  // person asks for more. The CSV file holds every listed turn.
+  const turns = read.turnRows.slice(-shown);
   return (
     <>
       <dl className="an-totals">
@@ -145,21 +144,21 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
           <caption>By family</caption>
           <thead>
             <tr>
-              <th scope="col">Family</th>
+              <th scope="col">Provider</th>
               <th scope="col">Turns</th>
-              <th scope="col">Wall time</th>
-              <th scope="col">Tokens in</th>
-              <th scope="col">Tokens out</th>
+              <th scope="col">Time</th>
+              <th scope="col">Tokens in / out</th>
             </tr>
           </thead>
           <tbody>
             {read.families.map((family) => (
               <tr key={family.family}>
-                <th scope="row">{family.family}</th>
+                <th scope="row">{familyName(family.family)}</th>
                 <td>{family.turns}</td>
                 <td>{wallText(family.wallMs)}</td>
-                <td>{tokensText(family.tokensIn, family.tokensInTurns, family.turns)}</td>
-                <td>{tokensText(family.tokensOut, family.tokensOutTurns, family.turns)}</td>
+                <td>
+                  {`${tokensText(family.tokensIn, family.tokensInTurns, family.turns)} / ${tokensText(family.tokensOut, family.tokensOutTurns, family.turns)}`}
+                </td>
               </tr>
             ))}
           </tbody>
@@ -167,16 +166,38 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
       </div>
       {read.families.some((family) => family.allowance.length > 0) && (
         <>
-          <h3 className="an-heading">Allowance used</h3>
-          <ul className="an-list">
-            {read.families.flatMap((family) =>
-              family.allowance.map((entry) => (
-                <li key={`${family.family}/${entry.windowId}`}>
-                  {family.family}, {allowanceText(entry)}
-                </li>
-              )),
-            )}
-          </ul>
+          <div className="an-scroll">
+            <table className="an-table">
+              <caption>Allowance used</caption>
+              <thead>
+                <tr>
+                  <th scope="col">Window</th>
+                  <th scope="col">Used</th>
+                  <th scope="col">Turns measured</th>
+                </tr>
+              </thead>
+              {read.families
+                .filter((family) => family.allowance.length > 0)
+                .map((family) => (
+                  <tbody key={family.family}>
+                    <tr className="an-group">
+                      <th scope="rowgroup" colSpan={3}>
+                        {familyName(family.family)}
+                      </th>
+                    </tr>
+                    {family.allowance.map((entry) => (
+                      <tr key={entry.windowId}>
+                        <th scope="row">{windowLabel(entry.windowId)}</th>
+                        <td>
+                          {entry.consumed === null ? 'Unknown' : `${entry.consumed} ${entry.unit}`}
+                        </td>
+                        <td>{`${entry.measuredTurns} of ${entry.measuredTurns + entry.unmeasuredTurns}`}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                ))}
+            </table>
+          </div>
           {read.families.some((family) => family.windowsOmitted > 0) && (
             <p className="th-muted">
               Some windows are not listed. The most recently read come first.
@@ -188,9 +209,9 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
             </p>
           )}
           <p className="th-muted">
-            A turn is charged only when gauge readings within 15 minutes before and after it show
-            the drop and no other chat turn of the project overlapped. Task runs, other projects and
-            use outside CrewKite between the readings are not checked, and they count too.
+            Each turn is measured from the gauge readings just before and after it. A turn shows
+            Unknown when it overlapped another or no reading was close enough. Anything else that
+            used the plan in between counts toward it.
           </p>
         </>
       )}
@@ -235,12 +256,11 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
             <caption>Newest turns</caption>
             <thead>
               <tr>
-                <th scope="col">Sequence</th>
+                <th scope="col">#</th>
                 <th scope="col">Role</th>
-                <th scope="col">Family</th>
-                <th scope="col">Wall time</th>
-                <th scope="col">Tokens in</th>
-                <th scope="col">Tokens out</th>
+                <th scope="col">Provider</th>
+                <th scope="col">Time</th>
+                <th scope="col">Tokens in / out</th>
               </tr>
             </thead>
             <tbody>
@@ -248,19 +268,27 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
                 <tr key={turn.id}>
                   <td>{turn.sequence}</td>
                   <td>{turn.role}</td>
-                  <td>{turn.family}</td>
+                  <td>{familyName(turn.family)}</td>
                   <td>{wallText(turn.wallMs)}</td>
-                  <td>{countText(turn.tokensIn)}</td>
-                  <td>{countText(turn.tokensOut)}</td>
+                  <td>{`${countText(turn.tokensIn)} / ${countText(turn.tokensOut)}`}</td>
                 </tr>
               ))}
             </tbody>
           </table>
           {read.turnRows.length > turns.length && (
-            <p className="th-muted">
-              {read.turnRows.length - turns.length} earlier turns are not shown here. The CSV file
-              holds all {read.turnRows.length} listed turns.
-            </p>
+            <div className="an-more">
+              <button
+                type="button"
+                className="button secondary"
+                onClick={() => setShown((value) => value + TURN_ROWS)}
+              >
+                Show {Math.min(TURN_ROWS, read.turnRows.length - turns.length)} more
+              </button>
+              <span className="th-muted">
+                {read.turnRows.length - turns.length} earlier of {read.turnRows.length}. The CSV
+                file holds all of them.
+              </span>
+            </div>
           )}
           {read.turnRowsOmitted > 0 && (
             <p className="th-muted">

@@ -85,6 +85,11 @@ The README lists these in rough order. Each gets its own ADR or amendment before
 - Project notes fetched on demand; routing that weighs context size beside allowance
 - Published bench results per family
 
+Planned for 0.2.0:
+
+- Design-system enforcement. Shared components for the repeated parts of the app (card header, client line, fact grid, table, select row) that take only design tokens, so a card cannot drift from the others. A screenshot check renders every provider card, the rail and the inspector tabs in both themes, at the normal and the minimum window, with data shaped like real client records. It runs locally and in the release session before a build is signed, not on every pull request, so it costs no Actions minutes per change
+- GitHub in the thread, through the person's own GitHub sign-in. CrewKite already pushes a branch, opens a pull request and reads branch status. Next it shows a pull request's checks and their logs, re-runs failed jobs, and squash merges with the person's title, description and sign-off. The controller runs each step in its own code (ADR 0002), never a model; a merge needs an explicit click and first shows exactly what lands on the base branch. Issues, labels, branch protection and releases stay out of 0.2.0
+
 ## How I will judge it
 
 I measure usable results, my active minutes, elapsed time including waits, and the context I had to rebuild by hand. I record abandoned work and every time I chose another tool. If CrewKite keeps adding overhead, I fix the specific friction first, then narrow scope. Adding providers or features is not the default answer.

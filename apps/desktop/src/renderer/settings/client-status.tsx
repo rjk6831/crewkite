@@ -154,14 +154,13 @@ export function ClientRecord({
   /** A family that reports no list leaves the line out. */
   capabilities?: boolean;
 }) {
-  if (!status.checkedOn && !status.probe && !status.capabilities?.length) return null;
+  // The card's own line already names the build found and the build and date it was checked
+  // with, so the record keeps only what that line does not say.
+  if (!status.probe && !(capabilities && status.capabilities?.length)) return null;
+  const probe = status.probe?.replace(/^Self-test of [^:]+:\s*/, '');
   return (
     <div className="facts-grid compact">
-      {status.version && <Fact label="Found" value={status.version} />}
-      {status.checkedOn && (
-        <Fact label="Last checked" value={`${status.tested} on ${status.checkedOn}`} />
-      )}
-      {status.probe && <Fact label="Self-test" value={status.probe} />}
+      {probe && <Fact label="Self-test" value={probe.charAt(0).toUpperCase() + probe.slice(1)} />}
       {capabilities && (
         <Fact
           label="Capabilities"
