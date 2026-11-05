@@ -556,3 +556,60 @@ test('a slice replays only its own changes, and a blocked slice writes nothing u
       else writeFileSync(join(threadScratch, path), text);
   });
 });
+
+// Claim: a crew model out of included allowance still takes its slices when the person allowed
+// credit spending for its family and the provider reports credits it can spend. Without that
+// permission, or without usable credits, the slice moves on as before. Credits never outrank a
+// family with allowance left, whatever the mode.
+test('a crew model at zero allowance keeps its slices when credits it may spend carry it', () => {
+  const sol = { family: 'openai' as const, model: 'openai-model', effort: 'high' as const };
+  const argon = { family: 'google' as const, model: 'google-model', effort: 'default' as const };
+  const credited = (state: string, allowed: boolean | undefined) => ({
+    ...entry('openai', 0, 120),
+    ...(allowed === undefined ? {} : { creditSpending: allowed }),
+    credits: {
+      state: state as 'available',
+      balance: '9730',
+      limitReached: false,
+      observedAt: hours(0),
+    },
+  });
+  const plan: ChatPlan = {
+    planId: 'p1',
+    goal: 'Harden the helpers.',
+    slices: [slice(1, 'easy'), slice(2, 'medium'), slice(3, 'hard')],
+  };
+  const assign = (openai: ChatCatalogEntry, mode: PlanInputs['mode'] = 'most-left') =>
+    assignPlan(plan, {
+      families: [openai, entry('google', 50, 1)],
+      mode,
+      now: NOW,
+      builder: sol,
+      fixer: argon,
+      autoHandoff: true,
+      excluded: [],
+      localContext: null,
+      localSliceFits: fits,
+      files: {},
+    }).rows.map((row) => row.assignment?.family ?? null);
+  // Credits on and usable: the builder keeps the easy and medium slices, the fixer the hard one.
+  assert.deepEqual(assign(credited('available', true)), ['openai', 'openai', 'google']);
+  assert.deepEqual(assign(credited('unlimited', true)), ['openai', 'openai', 'google']);
+  assert.deepEqual(assign(credited('available', true), 'resets-first'), [
+    'openai',
+    'openai',
+    'google',
+  ]);
+  // Credits off, never set, none or unknown: every slice goes to the family with allowance.
+  for (const [state, allowed] of [
+    ['available', false],
+    ['available', undefined],
+    ['none', true],
+    ['unknown', true],
+  ] as const)
+    assert.deepEqual(
+      assign(credited(state, allowed)),
+      ['google', 'google', 'google'],
+      `${state} ${allowed}`,
+    );
+});
