@@ -151,10 +151,39 @@ const windowWords = new Map([
 // A per-model window, such as weekly-fable, names the model first: "Fable, weekly".
 const modelWindow = /^(weekly|five-hour)-([a-z][a-z0-9.-]*)$/;
 
-/** The name a usage window shows, from its reader's window ID. */
-export function windowLabel(windowId: string): string {
+// A window whose ID is a limit bucket and a slot, such as main:primary, is named by its length.
+const bucketWindow = /^([a-z0-9_.-]+):(primary|secondary)$/i;
+
+/** A window length in words: Weekly, Five-hour, or its hours or days. */
+function periodName(seconds: number): string {
+  if (seconds === 604_800) return 'Weekly';
+  if (seconds === 18_000) return 'Five-hour';
+  if (seconds % 86_400 === 0) return `${seconds / 86_400} d`;
+  if (seconds % 3_600 === 0) return `${seconds / 3_600} h`;
+  return `${Math.round(seconds / 60)} min`;
+}
+
+/**
+ * The name a usage window shows, from its reader's window ID and, when the reader reported it,
+ * the window's length in seconds. A bucket and slot ID never shows raw.
+ */
+export function windowLabel(windowId: string, periodSeconds?: number): string {
   const known = windowNames.get(windowId);
   if (known) return known;
+  const bucket = bucketWindow.exec(windowId);
+  if (bucket) {
+    const length =
+      periodSeconds !== undefined
+        ? periodName(periodSeconds)
+        : bucket[2].toLowerCase() === 'primary'
+          ? 'Main window'
+          : 'Second window';
+    // The plan's own bucket has no suffix. A model's bucket adds its name after an underscore.
+    const model = bucket[1].split('_').slice(1).join(' ');
+    return model === ''
+      ? length
+      : `${model[0].toUpperCase()}${model.slice(1)}, ${length.toLowerCase()}`;
+  }
   const model = modelWindow.exec(windowId.toLowerCase());
   if (model) {
     const name = model[2].replace(/-/g, ' ');
@@ -255,7 +284,7 @@ export function projectUsagePresentation(
       return {
         id: `${id}:${observation.windowId}:${occurrence}`,
         windowId: observation.windowId,
-        label: windowLabel(observation.windowId),
+        label: windowLabel(observation.windowId, observation.semantics?.periodSeconds),
         remaining: observation.remaining,
         resetsAt: observation.resetsAt,
         observedAt: observation.observedAt,
@@ -340,6 +369,20 @@ export function anthropicReadReason(reason: string, clientVersion: string): stri
 
 const primaryWindows = ['weekly', 'five-hour'];
 
+/** The Anthropic card is built from its reader, not from a route, so it carries its own ID. */
+export const ANTHROPIC_USAGE_CARD_ID = 'native-quota:anthropic';
+
+/**
+ * The provider a usage card belongs to, so its header can carry that provider's refresh. Route
+ * cards map through their scopes; the Anthropic card is its reader's own.
+ */
+export function usageCardFamily(
+  cardId: string,
+  scopeFamilies: ReadonlyMap<string, ChatFamily>,
+): ChatFamily | undefined {
+  return cardId === ANTHROPIC_USAGE_CARD_ID ? 'anthropic' : scopeFamilies.get(cardId);
+}
+
 /** The controller turned the report's used percent into what remains. */
 export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): UsageCard | null {
   const reader = snapshot.usageReaders.find((value) => value.id === 'anthropic-usage-v1');
@@ -370,7 +413,7 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
   );
   const featured = models.length === 1 ? models[0] : null;
   return {
-    id: 'native-quota:anthropic',
+    id: ANTHROPIC_USAGE_CARD_ID,
     title: 'Anthropic subscription',
     // A report read under another sign-in says so. A current one needs no tag.
     tags: matching ? [] : ['May be from an earlier sign-in'],

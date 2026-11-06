@@ -49,7 +49,7 @@ import {
 import { useProviderActions } from '../settings/provider-actions.ts';
 import { useCatalog } from '../settings/use-catalog.ts';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
-import { projectUsagePresentation } from '../usage-presentation.ts';
+import { projectUsagePresentation, usageCardFamily } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
 import { ChecksSettings } from './checks-card.tsx';
 import { configureThread, type ThreadSource } from './commands.ts';
@@ -238,7 +238,7 @@ function UsageTab({
   const familyOf = new Map(scopes.map((scope) => [scope.id, scope.family]));
   // Each provider's Refresh sits in its own card's header, as a small icon button.
   const refresh = (card: UsageCard) => {
-    const found = familyOf.get(card.id);
+    const found = usageCardFamily(card.id, familyOf);
     const family = refreshFamilies.find((value) => value === found);
     if (!family) return null;
     const { label, reader, cooldownSeconds } = clientFor(header, family, now);

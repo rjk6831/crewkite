@@ -143,30 +143,40 @@ export function QuotaRefresh({
 }
 
 /**
- * What the build found reports about itself: the build the last protocol check passed against and
- * its date, the connect-time self-test and the capability list from the client's own handshake.
+ * What the build found reports about itself: the connect-time self-test and the capability list
+ * from the client's own handshake. Both lines always show, so every client card reads the same; a
+ * client that has not reported yet, or never lists capabilities, says so.
  */
 export function ClientRecord({
   status,
-  capabilities = true,
+  family,
 }: {
   status: ClientVersionStatus;
-  /** A family that reports no list leaves the line out. */
-  capabilities?: boolean;
+  family: 'openai' | 'anthropic' | 'google' | 'local';
 }) {
-  // The card's own line already names the build found and the build and date it was checked
-  // with, so the record keeps only what that line does not say.
-  if (!status.probe && !(capabilities && status.capabilities?.length)) return null;
+  // The local runtime is not a coding client; its card shows the record only when it reported one.
+  if (family === 'local' && !status.probe && !status.capabilities?.length) return null;
   const probe = status.probe?.replace(/^Self-test of [^:]+:\s*/, '');
   return (
     <div className="facts-grid compact">
-      {probe && <Fact label="Self-test" value={probe.charAt(0).toUpperCase() + probe.slice(1)} />}
-      {capabilities && (
-        <Fact
-          label="Capabilities"
-          value={status.capabilities?.length ? status.capabilities.join(', ') : 'Not reported yet'}
-        />
-      )}
+      <Fact
+        label="Self-test"
+        value={
+          probe
+            ? probe.charAt(0).toUpperCase() + probe.slice(1)
+            : 'Runs on the first turn after Connect'
+        }
+      />
+      <Fact
+        label="Capabilities"
+        value={
+          status.capabilities?.length
+            ? status.capabilities.join(', ')
+            : family === 'openai'
+              ? 'Not reported by this client'
+              : 'Not reported yet'
+        }
+      />
     </div>
   );
 }

@@ -41,6 +41,7 @@ type Reading = {
   unit: AnalyticsAllowance['unit'];
   resetsAt: string | null;
   at: number;
+  periodSeconds?: number;
 };
 type Span = { id: string; start: number; end: number | null };
 type Loaded = { task: Task; thread: ChatThread; turns: ChatTurn[] };
@@ -134,6 +135,9 @@ function loadGauge(
           unit: parsed.data.remaining.unit,
           resetsAt: parsed.data.resetsAt,
           at: Date.parse(parsed.data.observedAt),
+          ...(parsed.data.semantics?.periodSeconds
+            ? { periodSeconds: parsed.data.semantics.periodSeconds }
+            : {}),
         });
         continue;
       }
@@ -308,9 +312,11 @@ function readThread(store: Store, { task, thread, turns }: Loaded, gauge: Gauge)
         const unit = windowUnit(gauge, family, windowId);
         if (!unit) return [];
         const measured = values.filter((value) => value !== null);
+        const period = gauge.windows.get(family)?.get(windowId)?.at(-1)?.periodSeconds;
         return [
           {
             windowId,
+            ...(period ? { periodSeconds: period } : {}),
             unit,
             consumed: sum(values),
             measuredTurns: measured.length,

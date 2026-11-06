@@ -316,7 +316,7 @@ export function ProviderCard({
             </button>
           )}
           {checkedAt && !checking && <small className="st-hint">Checked at {checkedAt}.</small>}
-          <ClientRecord status={found} capabilities={family !== 'openai'} />
+          <ClientRecord status={found} family={family} />
         </div>
       )}
       {!unavailable && (

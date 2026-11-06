@@ -18,7 +18,8 @@ import type { Store } from './index.ts';
 /**
  * The rail state of a thread comes from its newest turn. A failed turn stays failed until another
  * turn starts. The turn index makes this one lookup per summary, and the turn row is durable, so
- * the state survives a restart. The desktop folds chat.turn events with the same rule in
+ * the state survives a restart. A thread with an open turn shows it, waiting before running, even
+ * when a newer side question has ended. The desktop folds chat.turn events with the same rule in
  * turnActivity, apps/desktop/src/renderer/rail-activity.ts; change both together.
  */
 function chatActivity(state: ChatTurnState | null): ChatThreadActivity {
@@ -157,7 +158,8 @@ export function taskPage(store: Store, input: TaskPageRequest, now = () => perfo
       json_extract(t.body,'$.state') AS state,json_extract(t.body,'$.waitingReason') AS waitingReason,
       json_extract(t.body,'$.runId') AS runId,json_extract(t.body,'$.next') AS next,
       (SELECT json_extract(c.body,'$.state') FROM chat_turns c WHERE c.task_id=t.id
-      ORDER BY c.sequence DESC LIMIT 1) AS turnState
+      ORDER BY CASE json_extract(c.body,'$.state') WHEN 'waiting-permission' THEN 0
+        WHEN 'running' THEN 1 WHEN 'queued' THEN 1 ELSE 2 END, c.sequence DESC LIMIT 1) AS turnState
       ${pattern ? ",json_extract(t.body,'$.outcome') AS outcome,json_extract(t.body,'$.criteria') AS criteria,json_extract(p.body,'$.name') AS projectName" : ''}
       FROM entities t ${pattern ? "LEFT JOIN entities p ON p.kind='project' AND p.id=json_extract(t.body,'$.projectId')" : ''}
       WHERE t.kind='task' AND t.id>? ${projectId ? "AND json_extract(t.body,'$.projectId')=?" : ''}

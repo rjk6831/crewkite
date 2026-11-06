@@ -187,7 +187,7 @@ function Numbers({ read }: { read: ChatAnalyticsRead }) {
                     </tr>
                     {family.allowance.map((entry) => (
                       <tr key={entry.windowId}>
-                        <th scope="row">{windowLabel(entry.windowId)}</th>
+                        <th scope="row">{windowLabel(entry.windowId, entry.periodSeconds)}</th>
                         <td>
                           {entry.consumed === null ? 'Unknown' : `${entry.consumed} ${entry.unit}`}
                         </td>

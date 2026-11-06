@@ -296,20 +296,43 @@
   color: var(--text-dim);
 }
 
-/* A crew role on one line in Settings: its name, its model select and the subagent switch beside
-   it. The name column fits the longest role, so every select starts at the same place, and the
-   row wraps only when the window is too narrow for all three. */
+/* A preset role is one line at every window size: name, select and Allow subagents. The name
+   column fits the longest role, so every select starts at the same place, and the model and effort
+   selects share one select's width, so every switch does too. Near the smallest window the selects
+   give up width and the switch keeps its words. */
 .st-crew .st-crew-role {
-  grid-template-columns: 112px minmax(0, 1fr);
+  flex: 1 1 100%;
+  grid-template-columns: 100px minmax(0, 1fr);
+}
+/* Near the smallest window the descriptions give up width so a preset role's model name fits. */
+@media (max-width: 1180px) {
+  .st-row {
+    grid-template-columns: minmax(180px, 250px) minmax(0, 1fr);
+  }
 }
 .st-crew-pick {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 8px 16px;
+  gap: 8px;
+  min-width: 0;
+}
+.st-crew-pick select {
+  flex: 0 1 var(--st-select-width);
+  width: auto;
+  min-width: 0;
+}
+.st-crew-pick select:has(+ select.effort-select) {
+  flex-basis: calc(var(--st-select-width) - 128px);
+}
+.st-crew-pick select.effort-select {
+  flex: 0 0 120px;
+  min-width: 0;
 }
 .st-crew-pick .sa-switch-row {
-  flex-basis: auto;
+  flex: 0 0 auto;
+  flex-wrap: nowrap;
+  margin-left: 8px;
+  white-space: nowrap;
 }
 
 .st-note-text {

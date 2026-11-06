@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  foldActivity,
+  type LiveActivity,
   type NoticeMemory,
   type NoticeView,
   type RailEvent,
@@ -144,4 +146,31 @@ test('a finished or failed reply, a waiting permission and a crew end post a not
     }).notices,
     [],
   );
+});
+
+// Claim: the rail shows a thread running while any of its turns is open, even after a newer side
+// question beside the builder has ended; it falls back to the newest turn once none is open.
+test('a builder keeps the thread running after the side question beside it ends', () => {
+  let cursor = 0;
+  const turn = (sequence: number, state: string) => {
+    cursor += 1;
+    return {
+      type: 'chat.turn',
+      cursor: String(cursor),
+      taskId: 'tsk_1',
+      payload: { taskId: 'tsk_1', sequence, state },
+    };
+  };
+  let live: LiveActivity = new Map();
+  const shown = () => live.get('tsk_1')?.activity;
+  live = foldActivity(live, turn(1, 'running'));
+  live = foldActivity(live, turn(2, 'running'));
+  live = foldActivity(live, turn(2, 'done'));
+  assert.equal(shown(), 'running');
+  live = foldActivity(live, turn(1, 'waiting-permission'));
+  assert.equal(shown(), 'waiting');
+  live = foldActivity(live, turn(1, 'stopped'));
+  assert.equal(shown(), 'idle');
+  live = foldActivity(live, turn(3, 'failed'));
+  assert.equal(shown(), 'failed');
 });

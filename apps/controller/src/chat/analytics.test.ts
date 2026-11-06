@@ -141,6 +141,8 @@ function fixture(t: { after: (run: () => void) => void }) {
     routeId: id('rte', 1),
     windowId,
     kind: 'rolling',
+    // The reader's window length travels to the table, so it can name the window plainly.
+    semantics: { scope: 'provider', periodSeconds: 604_800 },
     remaining: { value, unit: 'percent' },
     resetsAt,
     observedAt: at(clock),
@@ -317,6 +319,7 @@ test('thread analytics count what the rows hold and leave unreported values unkn
       allowance: [
         {
           windowId: 'primary',
+          periodSeconds: 604_800,
           unit: 'percent',
           consumed: 2.5,
           measuredTurns: 2,

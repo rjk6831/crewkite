@@ -23,7 +23,15 @@ export const activityLabel: Record<ChatThreadActivity, string> = {
   failed: 'Last reply failed',
 };
 
-type Live = { sequence: number; cursor: bigint; activity: ChatThreadActivity };
+type Live = {
+  sequence: number;
+  cursor: bigint;
+  activity: ChatThreadActivity;
+  /** The newest turn's own state. */
+  last: ChatThreadActivity;
+  /** The thread's turns still open, by sequence: a side question can end while a builder runs. */
+  open: ReadonlyMap<number, ChatThreadActivity>;
+};
 export type LiveActivity = ReadonlyMap<string, Live>;
 
 const record = (value: unknown): Record<string, unknown> | null =>
@@ -32,21 +40,34 @@ const record = (value: unknown): Record<string, unknown> | null =>
     : null;
 
 /**
- * A chat.turn event moves the dot without another page read. An update to an older turn, such as
- * a process check settling, never overrides a newer one.
+ * A chat.turn event moves the dot without another page read.
  */
 export function foldActivity(live: LiveActivity, event: RailEvent): LiveActivity {
   if (event.type !== 'chat.turn') return live;
   const turn = record(event.payload);
   if (!turn || typeof turn.taskId !== 'string' || typeof turn.sequence !== 'number') return live;
-  const state = turn.state as ChatTurnState;
   const known = live.get(turn.taskId);
-  if (known && known.sequence > turn.sequence) return live;
+  const activity = turnActivity(turn.state as ChatTurnState);
+  const open = new Map(known?.open ?? []);
+  if (activity === 'running' || activity === 'waiting') open.set(turn.sequence, activity);
+  else open.delete(turn.sequence);
+  // The newest turn names the thread's state, unless a turn is still open: a builder keeps the
+  // thread running after a side question beside it has ended. An update to an older turn, such as
+  // a process check settling, changes only whether that turn is open.
+  const older = !!known && known.sequence > turn.sequence;
+  const last = older ? known.last : activity;
+  const states = [...open.values()];
   const next = new Map(live);
   next.set(turn.taskId, {
-    sequence: turn.sequence,
+    sequence: older ? known.sequence : turn.sequence,
     cursor: BigInt(event.cursor),
-    activity: turnActivity(state),
+    activity: states.includes('waiting')
+      ? 'waiting'
+      : states.includes('running')
+        ? 'running'
+        : last,
+    last,
+    open,
   });
   return next;
 }

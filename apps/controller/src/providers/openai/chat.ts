@@ -41,6 +41,7 @@ import { frameTrace } from '../../chat/trace.ts';
 import { logEvent } from '../../diagnostics/timing.ts';
 import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
+import { recordClient } from '../client-record.ts';
 import { fileDigestSync } from '../file-digest.ts';
 import {
   existingCreditsUsable,
@@ -992,8 +993,13 @@ class OpenAiChatTurn {
    */
   private observe(reply: z.infer<typeof threadReply>, profile: boolean) {
     if (!profile || this.wideSandbox) return;
-    if (reply.activePermissionProfile?.id === READ_PROFILE && reply.sandbox?.type === 'readOnly')
+    if (reply.activePermissionProfile?.id === READ_PROFILE && reply.sandbox?.type === 'readOnly') {
+      // Settings shows the result as the client's self-test.
+      recordClient('openai', {
+        probe: 'Self-test of the read-only profile: confirmed on the last read-only turn.',
+      });
       return logEvent(`openai read profile ${READ_PROFILE} confirmed`);
+    }
     this.widen(
       `opened the thread under ${reply.activePermissionProfile?.id ? `the ${clip(reply.activePermissionProfile.id, 60)} profile` : 'no named profile'}`,
     );
@@ -1001,6 +1007,10 @@ class OpenAiChatTurn {
 
   private widen(why: string) {
     this.wideSandbox = true;
+    recordClient('openai', {
+      probe:
+        'Self-test of the read-only profile: not confirmed, so read-only turns ask before each command.',
+    });
     logEvent('openai read profile fallback');
     this.notice(
       'warning',
