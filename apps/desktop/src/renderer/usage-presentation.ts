@@ -616,6 +616,23 @@ export function railFamilies(
     );
     const tightest = tightestAllowance(entry, model);
     const credit = creditText(entry, model);
+    // A plan with no five-hour window but a weekly window for one model, such as Anthropic Ultra
+    // since 6 November 2026, keeps two lines: the provider's weekly window and that model's. The
+    // model window that limits the family's model comes first, else the one with the least left.
+    const fiveHour = entry.remaining.some((window) => window.label.toLowerCase() === 'five-hour');
+    const weekly = entry.remaining.find(
+      (window) => window.windowId === 'weekly' && window.percent !== null,
+    );
+    const scoped = entry.remaining.filter(
+      (window) =>
+        window.windowId.startsWith('weekly-') &&
+        window.label.toLowerCase() === 'weekly' &&
+        window.percent !== null,
+    );
+    const modelWindow =
+      scoped.find((window) => applies.includes(window)) ??
+      [...scoped].sort((left, right) => (left.percent ?? 0) - (right.percent ?? 0))[0];
+    const pair = !fiveHour && !both && weekly && modelWindow ? [weekly, modelWindow] : null;
     // A provider that is not connected and has read nothing keeps its row with Connect, so the
     // rail shows one gauge per provider. It has no bar to draw yet. Google reads its quota only
     // once it is connected, so until then its row is Connect alone, whatever an older read left.
@@ -633,13 +650,20 @@ export function railFamilies(
                 const { percent } = period(label);
                 return { text: `${barNames[label]} ${percentText(percent)}`, percent };
               })
-            : [
-                {
-                  text:
-                    tightest.percent === null ? 'unknown' : `${percentText(tightest.percent)} left`,
-                  percent: tightest.percent,
-                },
-              ];
+            : pair
+              ? pair.map((window, index) => ({
+                  text: `${index === 0 ? barNames.weekly : (windowLabel(window.windowId).split(',')[0] ?? window.windowId)} ${percentText(window.percent)}`,
+                  percent: window.percent,
+                }))
+              : [
+                  {
+                    text:
+                      tightest.percent === null
+                        ? 'unknown'
+                        : `${percentText(tightest.percent)} left`,
+                    percent: tightest.percent,
+                  },
+                ];
     const until = tightest.resetsAt ? Date.parse(tightest.resetsAt) - nowMs : null;
     return {
       family: entry.family,

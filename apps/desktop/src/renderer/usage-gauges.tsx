@@ -635,7 +635,16 @@ function Card({ card, nowMs, action }: { card: UsageCard; nowMs: number; action?
           data-featured={featured ? 'true' : undefined}
         >
           {left && <UsageGauge reading={left} nowMs={nowMs} cluster />}
-          {featured && <UsageGauge reading={featured} nowMs={nowMs} size="featured" cluster />}
+          {/* With one side dial the raised centre has nothing to sit between, so the model dial
+              takes the same size beside it and the two read as a pair. */}
+          {featured && (
+            <UsageGauge
+              reading={featured}
+              nowMs={nowMs}
+              size={card.primary.length === 1 ? 'primary' : 'featured'}
+              cluster
+            />
+          )}
           {right && <UsageGauge reading={right} nowMs={nowMs} cluster />}
           {third && <UsageGauge reading={third} nowMs={nowMs} cluster />}
         </div>
