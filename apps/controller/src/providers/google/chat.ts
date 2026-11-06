@@ -1265,6 +1265,7 @@ export function googleChatAdapter(deps: {
             );
           recordClient('google', {
             capabilities: capabilityNames(handshake.agentCapabilities),
+            probe: 'Self-test of the handshake: protocol 1 accepted on the last connect.',
             kept: {
               initialize: {
                 agentCapabilities: handshake.agentCapabilities ?? null,

@@ -36,6 +36,8 @@ const allowanceUnit = z.enum(['percent', 'tokens', 'requests', 'credits', 'minut
  */
 export const AnalyticsAllowanceSchema = z.strictObject({
   windowId: z.string().min(1).max(200),
+  /** The window's length when its reader reported one, so the table can name it plainly. */
+  periodSeconds: z.number().int().positive().optional(),
   unit: allowanceUnit,
   consumed: z.number().finite().nonnegative().nullable(),
   measuredTurns: count,

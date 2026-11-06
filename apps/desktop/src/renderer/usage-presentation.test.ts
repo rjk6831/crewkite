@@ -18,6 +18,7 @@ import {
   nativeUsageClients,
   projectUsagePresentation,
   railFamilies,
+  usageCardFamily,
   windowLabel,
 } from './usage-presentation.ts';
 
@@ -528,6 +529,18 @@ test('usage windows show plain names, and an unknown ID reads as words', () => {
   for (const [id, name] of rows) assert.equal(windowLabel(id), name, id);
 });
 
+// Claim: a limit bucket and slot ID never shows raw; its length names it when the reader gave it.
+test('a bucket window reads by its length, never as its raw ID', () => {
+  assert.equal(windowLabel('plan:primary', 604_800), 'Weekly');
+  assert.equal(windowLabel('plan:primary', 18_000), 'Five-hour');
+  assert.equal(windowLabel('plan:secondary', 86_400), '1 d');
+  assert.equal(windowLabel('plan:primary'), 'Main window');
+  assert.equal(windowLabel('plan:secondary'), 'Second window');
+  assert.equal(windowLabel('plan_spark:primary', 604_800), 'Spark, weekly');
+  for (const id of ['plan:primary', 'plan_spark:secondary'])
+    assert.ok(!windowLabel(id).includes(':'), id);
+});
+
 test('an Anthropic read that worked leaves no status line, and a failed one says what to do', () => {
   assert.equal(anthropicReadReason('reported', '2.4.0'), null);
   assert.match(
@@ -592,4 +605,12 @@ test('an exhausted family shows its credit state in the same bar, and nothing ch
     const [row] = railFamilies({ families: [value] }, nowMs);
     assert.deepEqual(row.bars, [{ text, percent: value.remaining[0].percent }], claim);
   }
+});
+
+// Claim: the Anthropic usage card has a provider, so its header carries Anthropic's refresh.
+test('every usage card maps to its provider, the Anthropic card included', () => {
+  const scopes = new Map([['route:openai', 'openai' as const]]);
+  assert.equal(usageCardFamily('native-quota:anthropic', scopes), 'anthropic');
+  assert.equal(usageCardFamily('route:openai', scopes), 'openai');
+  assert.equal(usageCardFamily('route:unknown', scopes), undefined);
 });

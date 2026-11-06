@@ -28,6 +28,7 @@ import {
   checkOwner,
   spawnCheckChild as spawn,
 } from '../../../controller/src/host/check-ownership.ts';
+import { controllerPath } from './controller-path.ts';
 
 export { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 
@@ -254,7 +255,7 @@ export class DesktopController {
         cwd: this.paths.root,
         env: {
           ...checkEnvironment(),
-          PATH: process.env.PATH,
+          PATH: controllerPath(process.env.PATH, process.platform),
           HOME: process.env.HOME,
           TMPDIR: process.env.TMPDIR,
           CODEX_HOME: process.env.CODEX_HOME,

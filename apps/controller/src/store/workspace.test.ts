@@ -155,6 +155,13 @@ test('the rail state of each thread comes from its newest turn and survives a re
     ['a failed last turn shows failed', ['done', 'failed'], 'failed'],
     ['a turn that finished after a failure clears it', ['failed', 'done'], 'idle'],
     ['a stopped last turn is idle', ['stopped'], 'idle'],
+    // A side question beside a running builder ends first. The builder still runs.
+    ['a builder still running after a newer side question ended', ['running', 'done'], 'running'],
+    [
+      'a permission request outranks a newer running turn',
+      ['waiting-permission', 'running'],
+      'waiting',
+    ],
   ];
   store.transaction(() => {
     store.put('project', projectId, 0, { id: projectId, name: 'Rail', revision: 0 });
