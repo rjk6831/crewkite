@@ -1,6 +1,6 @@
 # Trying the preview
 
-You need a local Git repository with at least one commit and a client for one provider. Connect it from its card; OpenAI uses CrewKite's own sign-in flow. The installed release is in preparation, and its launch checks remain pending.
+You need a local Git repository with at least one commit and a client for one provider. Connect it from its card; OpenAI uses CrewKite's own sign-in flow.
 
 ## Installed packages
 
