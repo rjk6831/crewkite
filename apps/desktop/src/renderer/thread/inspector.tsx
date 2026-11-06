@@ -52,12 +52,13 @@ import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation, usageCardFamily } from '../usage-presentation.ts';
 import { ChangesPanel } from './changes-panel.tsx';
 import { ChecksSettings } from './checks-card.tsx';
-import { configureThread, type ThreadSource } from './commands.ts';
+import { configureThread, runTests, type ThreadSource } from './commands.ts';
 import { FamilyMark } from './family-mark.tsx';
 import { modelLine } from './message-list.tsx';
 import type { ThreadSettings } from './thread-state.ts';
 import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
+import { Select } from '../select.tsx';
 import { useModelLabel } from './model-labels.ts';
 import { InfoMark, RoleInfo } from './role-info.tsx';
 import { SubagentSwitch } from './subagent-switch.tsx';
@@ -463,7 +464,7 @@ function ThreadTab({
         <span className="role-name">
           Permissions <InfoMark {...permissionInfo[thread?.permissionPolicy ?? 'ask']} />
         </span>
-        <select
+        <Select
           value={thread?.permissionPolicy ?? 'ask'}
           disabled={!thread}
           onChange={(event) =>
@@ -475,7 +476,7 @@ function ThreadTab({
               {policy.label}
             </option>
           ))}
-        </select>
+        </Select>
       </label>
       <p className="th-muted">
         {
@@ -493,7 +494,7 @@ function ThreadTab({
         {/* The limit offer and the picker rank by the mode too, so it stays open with the box off. */}
         <label>
           Handoff mode
-          <select
+          <Select
             value={mode.id}
             title={mode.title}
             disabled={!thread}
@@ -506,7 +507,7 @@ function ThreadTab({
                 {item.label}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
       </div>
       {!draft && (
@@ -749,7 +750,7 @@ function CrewTab({
         <span className="role-name">
           Flight mode <InfoMark {...flightModeInfo[mode.id]} />
         </span>
-        <select
+        <Select
           value={mode.id}
           title={mode.title}
           disabled={!thread}
@@ -760,7 +761,7 @@ function CrewTab({
               {item.label}
             </option>
           ))}
-        </select>
+        </Select>
       </label>
       <p className="th-muted">
         {crew
@@ -772,7 +773,7 @@ function CrewTab({
         <span className="role-name">
           Permissions <InfoMark {...permissionInfo[thread?.permissionPolicy ?? 'ask']} />
         </span>
-        <select
+        <Select
           value={thread?.permissionPolicy ?? 'ask'}
           disabled={!thread}
           onChange={(event) =>
@@ -784,7 +785,7 @@ function CrewTab({
               {policy.label}
             </option>
           ))}
-        </select>
+        </Select>
       </label>
       <p className="th-muted">
         {
@@ -803,6 +804,9 @@ function CrewTab({
       ) : (
         <ChecksSettings
           thread={thread}
+          onRunTests={
+            thread ? () => runTests(source, { taskId: thread.taskId }).then(() => {}) : undefined
+          }
           onEdit={(checks) =>
             thread
               ? configureThread(source, { taskId: thread.taskId, checks }).then(() => {})

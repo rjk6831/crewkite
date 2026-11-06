@@ -5141,3 +5141,115 @@ test('a plan slice on a family whose credits are paused runs on the next family'
     ),
   );
 });
+
+// Claim: Run tests runs the project's test command in the scratch copy with no model turn, asks
+// first unless the thread allows the command, keeps the run with the thread's checks with its
+// real exit status and output, writes one result line, and refuses a second start while the first
+// runs. The Tests switch stays as it was.
+test('run tests runs the test command alone and keeps its real result', {
+  timeout: 60000,
+}, async (t) => {
+  const thread = standalone(t, {
+    adapters: new Map([
+      ['openai', createScriptedChatAdapter({ family: 'openai', turns: [textReply('Built.')] })],
+    ]),
+  });
+  const { store, service, taskId } = thread;
+  const done = turnReaches(thread, 'done');
+  thread.send('Build it.');
+  const built = await done;
+  const scratch = chatScratchDirectory(dirname(thread.root), taskId);
+  writeFileSync(
+    join(scratch, 'package.json'),
+    JSON.stringify({ name: 'fixture', private: true, scripts: { test: 'node gate.mjs' } }),
+  );
+  writeFileSync(
+    join(scratch, 'gate.mjs'),
+    "import { existsSync } from 'node:fs';\nif (existsSync('ok')) { console.log('8 of 8 passed'); process.exit(0); }\nconsole.log('1 of 8 passed');\nprocess.exitCode = 1;\n",
+  );
+  store.transaction(() => service.configure({ taskId, checks: { refresh: true } }));
+  const tests = thread.read().thread.checks?.items.filter((item) => item.kind === 'test') ?? [];
+  assert.equal(tests.length, 1, 'the package.json test script is the test check');
+  assert.equal(tests[0]?.enabled, false, 'the Tests switch starts off');
+  const turns = thread.read().turns.length;
+  const line = (pattern: RegExp) =>
+    next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        pattern.test((event.payload as { text?: string }).text ?? ''),
+    );
+
+  // The thread asks each time, so the first run waits for the person's answer.
+  const failedLine = line(/^Tests failed: /);
+  assert.equal(act(store, (fx) => service.runTests({ taskId }, fx)).outcome, 'applied');
+  const ask = thread.read().thread.checks?.ask;
+  assert.equal(ask?.trigger, 'manual');
+  assert.deepEqual(
+    ask?.commands.map((command) => command.label),
+    tests.map((item) => item.label),
+  );
+  assert.equal(
+    act(store, (fx) => service.runTests({ taskId }, fx)).reason,
+    'checks-running',
+    'a second start waits while the question is open',
+  );
+  act(store, (fx) =>
+    service.resolvePermission(
+      { taskId, turnId: built.id, requestId: ask?.requestId ?? '', choice: 'allow-thread' },
+      fx,
+    ),
+  );
+  const failed = await failedLine;
+  assert.match(
+    (failed.payload as { text: string }).text,
+    /\(exit 1\)\. The output is under Checks\.$/,
+  );
+  const firstRun = thread.read().thread.checks?.runs.at(-1);
+  assert.deepEqual(
+    [firstRun?.trigger, firstRun?.status, firstRun?.exitCode],
+    ['manual', 'failed', 1],
+  );
+  assert.match(firstRun?.tail ?? '', /1 of 8 passed/);
+
+  // Allowed for the thread now: the next run starts at once and passes.
+  writeFileSync(join(scratch, 'ok'), '');
+  const passedLine = line(/^Tests passed: /);
+  assert.equal(act(store, (fx) => service.runTests({ taskId }, fx)).outcome, 'applied');
+  assert.equal(thread.read().thread.checks?.ask, null, 'no question the second time');
+  assert.equal(
+    act(store, (fx) => service.runTests({ taskId }, fx)).reason,
+    'checks-running',
+    'no duplicate start',
+  );
+  const passed = await passedLine;
+  assert.match((passed.payload as { text: string }).text, /\(exit 0\)\.$/);
+  const secondRun = thread.read().thread.checks?.runs.at(-1);
+  assert.deepEqual([secondRun?.status, secondRun?.exitCode], ['passed', 0]);
+  assert.match(secondRun?.tail ?? '', /8 of 8 passed/);
+
+  const after = thread.read();
+  assert.equal(after.turns.length, turns, 'no model turn ran');
+  assert.equal(
+    after.thread.checks?.items.find((item) => item.kind === 'test')?.enabled,
+    false,
+    'the Tests switch is untouched',
+  );
+});
+
+// Claim: Run tests says why it cannot start: no test command, or a turn still running.
+test('run tests explains when it cannot start', { timeout: 30000 }, async (t) => {
+  const thread = standalone(t, {
+    adapters: new Map([
+      ['openai', createScriptedChatAdapter({ family: 'openai', turns: [textReply('Built.')] })],
+    ]),
+  });
+  const { store, service, taskId } = thread;
+  const done = turnReaches(thread, 'done');
+  thread.send('Build it.');
+  await done;
+  store.transaction(() => service.configure({ taskId, checks: { refresh: true } }));
+  const refused = act(store, (fx) => service.runTests({ taskId }, fx));
+  assert.deepEqual([refused.outcome, refused.reason], ['blocked', 'no-test-command']);
+  assert.match(refused.next ?? '', /Add one under Project checks/);
+});

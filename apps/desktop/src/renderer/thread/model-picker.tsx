@@ -11,6 +11,7 @@ import { ArrowRightLeft, Check, ChevronDown, ChevronRight } from 'lucide-react';
 import { type KeyboardEvent, useEffect, useId, useRef, useState } from 'react';
 import { familyName } from '../components.tsx';
 import { REOBSERVE_MS } from '../local-setup-flow.ts';
+import { Select } from '../select.tsx';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import { FamilyMark } from './family-mark.tsx';
@@ -49,7 +50,7 @@ export function EffortSelect({
   onChange: (effort: ChatEffort) => void;
 }) {
   return (
-    <select
+    <Select
       className="effort-select"
       aria-label={label}
       value={value}
@@ -63,7 +64,7 @@ export function EffortSelect({
           {effortLabel(effort)}
         </option>
       ))}
-    </select>
+    </Select>
   );
 }
 

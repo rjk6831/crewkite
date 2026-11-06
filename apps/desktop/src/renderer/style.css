@@ -86,7 +86,7 @@ body {
 }
 button,
 input,
-select,
+.ck-select,
 textarea {
   font: inherit;
 }
@@ -100,7 +100,7 @@ button:disabled {
 button,
 a,
 input,
-select,
+.ck-select,
 textarea,
 summary {
   -webkit-tap-highlight-color: transparent;
@@ -171,7 +171,7 @@ p {
   line-height: 1.65;
 }
 input,
-select,
+.ck-select,
 textarea {
   width: 100%;
   background: var(--background);
@@ -180,8 +180,8 @@ textarea {
   color: var(--text);
   padding: 9px 10px;
 }
-select {
-  padding-right: 24px;
+.ck-select {
+  padding-right: 10px;
 }
 textarea {
   resize: vertical;
@@ -195,7 +195,7 @@ label {
   color: var(--text-muted);
 }
 label input,
-label select,
+label .ck-select,
 label textarea {
   color: var(--text);
 }

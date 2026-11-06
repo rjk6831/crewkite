@@ -118,3 +118,15 @@
   justify-items: start;
   gap: 8px;
 }
+/* Run tests: the button and what it runs, or why it waits. */
+.th-checks-run {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 10px;
+  margin: 4px 0 8px;
+}
+.th-checks-run .th-muted {
+  flex: 1 1 200px;
+  font-size: 11.5px;
+}

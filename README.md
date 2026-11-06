@@ -17,6 +17,7 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 - Split large work across providers. An orchestrator proposes up to 8 slices, the controller assigns each one by allowance and difficulty, and a reviewer, fixer and challenger check the result.
 - Review before anything lands. Each thread works in its own copy of the repository. You read the diff, accept or discard each hunk, and Accept makes a new local branch while your checkout stays as it was.
 - Approve what runs. Commands, edits and tool calls ask first unless your policy allows them, and subagents a provider starts show under the step that started them.
+- Run your tests on demand. Run tests runs the project's test command in the thread's copy and shows the exit status and output, with no model involved and no credits spent.
 - Run a local model beside the cloud ones. An LM Studio model assigned to a crew role takes slices that fit its context, at no cost beyond your hardware.
 - Work on large repositories. A thread's copy has no file count cap and checks free disk space before it starts.
 - Keep your work on your computer. CrewKite has no account, sends no telemetry and hosts nothing. It is Apache 2.0.

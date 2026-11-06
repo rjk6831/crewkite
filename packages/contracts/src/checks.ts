@@ -51,8 +51,11 @@ export const ChatCheckRunSchema = z.strictObject({
   checkId: ChatCheckSchema.shape.id,
   label: ChatCheckSchema.shape.label,
   command: ChatCheckSchema.shape.command,
-  /** What started the run: a fix turn, the last slice of a plan, or a merged copy. */
-  trigger: z.enum(['fix', 'plan', 'combined']),
+  /**
+   * What started the run: a fix turn, the last slice of a plan, a merged copy, or the person's
+   * Run tests.
+   */
+  trigger: z.enum(['fix', 'plan', 'combined', 'manual']),
   status: z.enum(['running', 'passed', 'failed', 'stopped']),
   /** Why a run failed or stopped, in words for the person. */
   reason: z.string().min(1).max(300).nullable(),
@@ -69,7 +72,7 @@ export type ChatCheckRun = z.infer<typeof ChatCheckRunSchema>;
 /** The question the person answers before checks run: the exact commands, and what changed. */
 export const ChatChecksAskSchema = z.strictObject({
   requestId: z.string().regex(/^chkask_[0-9a-f]{32}$/),
-  trigger: z.enum(['fix', 'plan', 'combined']),
+  trigger: z.enum(['fix', 'plan', 'combined', 'manual']),
   commands: z
     .array(z.strictObject({ label: z.string().max(80), resolved: z.string().max(500) }))
     .max(16),

@@ -1,0 +1,89 @@
+/* CrewKite's dropdown. The closed control takes the native select's box from style.css, so a form
+   keeps its size when it moves to it. The open list follows the model picker's menu: raised
+   surface, strong border, the app shadow and the accent check. */
+.ck-select {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  text-align: left;
+  cursor: pointer;
+}
+.ck-select:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.ck-select-value {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* A native select's text box is about 1.385 times its font size; the same here keeps every closed
+   control the height it had. The element in the selector outranks the app's inherited 1.5. */
+button.ck-select,
+button.ck-select .ck-select-value {
+  line-height: 1.385;
+}
+.ck-select-chevron {
+  flex-shrink: 0;
+  color: var(--text-dim);
+}
+.ck-select[aria-expanded="true"] .ck-select-chevron {
+  transform: rotate(180deg);
+}
+.ck-select-list {
+  position: fixed;
+  z-index: 1000;
+  box-sizing: border-box;
+  padding: 4px;
+  overflow-y: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: 10px;
+  background: var(--surface-raised);
+  box-shadow: var(--shadow);
+  color: var(--text);
+  font-size: 12.5px;
+}
+.ck-select-group {
+  margin: 6px 0 2px;
+  padding: 0 10px;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+}
+.ck-select-group:first-child {
+  margin-top: 2px;
+}
+.ck-select-option {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 10px;
+  border-radius: 7px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.ck-select-option.in-group {
+  padding-left: 16px;
+}
+.ck-select-option > span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ck-select-option.is-active {
+  background: var(--surface-hover);
+}
+.ck-select-option[aria-selected="true"] {
+  font-weight: 500;
+}
+.ck-select-option[aria-selected="true"] svg {
+  color: var(--accent);
+}
+.ck-select-option[aria-disabled="true"] {
+  color: var(--text-dim);
+  cursor: default;
+}

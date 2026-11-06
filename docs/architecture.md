@@ -79,7 +79,7 @@ A finished slice replays onto the thread's copy in plan order. The comparison us
 
 The controller finds check commands in `package.json` scripts, `pyproject.toml` tool tables and pytest dependencies, a `pytest.ini`, Makefile `test`, `lint` and `typecheck` targets, a `Cargo.toml` and a `go.mod`. Each one starts off. A command the person adds is accepted only as a program that runs in the scratch copy. Shells, wrappers such as `env`, inline code flags and paths outside the copy are refused.
 
-A run needs the thread's permission for commands. The approval covers those commands and the script text behind them, so a changed script asks again. Checks run as local processes with the person's permissions, and nothing contains them. Balanced and Glide run the enabled checks after each fix and after the last slice of a plan. The full output goes to the artifact store, and the thread shows a redacted tail of the last 1,000 characters.
+A run needs the thread's permission for commands. The approval covers those commands and the script text behind them, so a changed script asks again. Checks run as local processes with the person's permissions, and nothing contains them. Balanced and Glide run the enabled checks after each fix and after the last slice of a plan. Run tests runs the thread's test command on its own, whether its switch is on or off, in the thread's copy and with no model turn. It waits while a turn, a crew step, a plan or another check run is open, asks the same question unless the thread already allows that command, and writes one line with the command and its exit status. The full output goes to the artifact store, and the thread shows a redacted tail of the last 1,000 characters.
 
 ## Task conversation
 

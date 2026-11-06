@@ -137,11 +137,30 @@ export function ChecksCard({
  * controller reads the project files and runs the enabled checks in the scratch copy; it asks the
  * thread's command permission first.
  */
+/**
+ * Why Run tests cannot start now, or null when it can. The controller checks the same things; this
+ * only says so before the click.
+ */
+export function runTestsBlocker(thread: ChatThread | null): string | null {
+  if (!thread?.checks) return 'Project checks are read after the first message.';
+  if (!thread.checks.items.some((item) => item.kind === 'test'))
+    return 'No test command was found. Add one below, or read the project files again.';
+  if (thread.checks.ask) return 'Answer the open question about the checks first.';
+  if (thread.checks.runs.some((run) => run.status === 'running'))
+    return 'The project checks are running.';
+  if (thread.activeTurnId || thread.crewChain || thread.plan?.phase === 'running')
+    return 'Run tests when the current turn or crew step has finished.';
+  return null;
+}
+
 export function ChecksSettings({
   thread,
   onEdit,
+  onRunTests,
 }: {
   thread: ChatThread | null;
+  /** Run the test command now, outside any crew step. */
+  onRunTests?: () => Promise<void>;
   onEdit: (edit: {
     refresh?: true;
     switch?: { id: string; enabled: boolean };
@@ -162,6 +181,9 @@ export function ChecksSettings({
   }, [unread, taskId]);
   const allowed =
     thread?.permissionPolicy === 'allow-all' || !!thread?.permissionGrants?.includes('command');
+  const tests = items.filter((item) => item.kind === 'test');
+  const blocker = runTestsBlocker(thread);
+  const [starting, setStarting] = useState(false);
   async function act(edit: Parameters<typeof onEdit>[0]) {
     setError(null);
     try {
@@ -220,6 +242,28 @@ export function ChecksSettings({
             </li>
           ))}
         </ul>
+      )}
+      {onRunTests && (
+        <div className="th-checks-run">
+          <button
+            type="button"
+            className="th-pill th-outline"
+            disabled={!!blocker || starting}
+            onClick={() => {
+              setStarting(true);
+              setError(null);
+              onRunTests()
+                .catch((cause: unknown) => setError(failure(cause)))
+                .finally(() => setStarting(false));
+            }}
+          >
+            Run tests
+          </button>
+          <span className="th-muted">
+            {blocker ??
+              `Runs ${tests.map((item) => item.resolved).join(', ')} in this thread's scratch copy now. No model runs. The result shows under Checks.`}
+          </span>
+        </div>
       )}
       <form
         className="th-checks-add"

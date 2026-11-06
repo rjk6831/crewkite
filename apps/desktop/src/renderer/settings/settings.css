@@ -247,11 +247,11 @@
   flex-wrap: wrap;
   gap: 8px;
 }
-.st-controls select {
+.st-controls .ck-select {
   width: var(--st-select-width);
   max-width: 100%;
 }
-.st-controls select.effort-select {
+.st-controls .ck-select.effort-select {
   width: auto;
   min-width: 120px;
 }
@@ -316,15 +316,15 @@
   gap: 8px;
   min-width: 0;
 }
-.st-crew-pick select {
+.st-crew-pick .ck-select {
   flex: 0 1 var(--st-select-width);
   width: auto;
   min-width: 0;
 }
-.st-crew-pick select:has(+ select.effort-select) {
+.st-crew-pick .ck-select:has(+ .ck-select.effort-select) {
   flex-basis: calc(var(--st-select-width) - 128px);
 }
-.st-crew-pick select.effort-select {
+.st-crew-pick .ck-select.effort-select {
   flex: 0 0 120px;
   min-width: 0;
 }

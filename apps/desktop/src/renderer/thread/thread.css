@@ -84,7 +84,7 @@
   gap: 6px;
   color: var(--text-dim);
 }
-.th-project-select select {
+.th-project-select .ck-select {
   width: auto;
   padding: 3px 22px 3px 6px;
   border-color: transparent;
@@ -961,7 +961,7 @@
   align-items: center;
   gap: 2px;
 }
-.th-effort select {
+.th-effort .ck-select {
   width: auto;
   height: 30px;
   padding: 0 6px 0 8px;
@@ -971,7 +971,7 @@
   color: var(--text-muted);
   font-size: 12px;
 }
-.th-effort select:hover {
+.th-effort .ck-select:hover {
   background-color: var(--surface-hover);
 }
 .th-menu {
@@ -1090,7 +1090,7 @@
   gap: 6px;
 }
 .th-attach-row .th-picker > .th-pill,
-.th-attach-row .th-effort select {
+.th-attach-row .th-effort .ck-select {
   height: 32px;
   border: 1px solid var(--border-strong);
   border-radius: 8px;
@@ -1108,10 +1108,10 @@
 }
 .th-attach-row .th-picker > .th-pill:hover,
 .th-attach-row .th-picker > .th-pill[aria-expanded="true"],
-.th-attach-row .th-effort select:hover {
+.th-attach-row .th-effort .ck-select:hover {
   background-color: var(--surface-hover);
 }
-.th-attach-row .th-effort select {
+.th-attach-row .th-effort .ck-select {
   padding: 0 8px;
   color: var(--text-muted);
 }
@@ -1294,7 +1294,7 @@
 .th-toggle input {
   width: auto;
 }
-.th-facts select:disabled {
+.th-facts .ck-select:disabled {
   opacity: 0.55;
 }
 .th-session {

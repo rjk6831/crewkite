@@ -3,6 +3,7 @@ import type { ChatCatalogRead, ChatModelSelection } from '@crewkite/contracts';
 import { useState } from 'react';
 import { familyName } from '../components.tsx';
 import { runExport } from '../diagnostics.tsx';
+import { Select } from '../select.tsx';
 import { effortLevels, shownEffort } from '../thread/model-groups.ts';
 import { EffortSelect } from '../thread/model-picker.tsx';
 import { InfoMark } from '../thread/role-info.tsx';
@@ -51,7 +52,7 @@ function ModelSelect({
   );
   const families = [...new Set(choices.map(({ entry }) => entry))];
   return (
-    <select
+    <Select
       id={id}
       aria-label={label}
       value={listed >= 0 ? String(listed) : value ? saved_ : auto}
@@ -88,7 +89,7 @@ function ModelSelect({
           )}
         </optgroup>
       ))}
-    </select>
+    </Select>
   );
 }
 
@@ -197,7 +198,7 @@ export function GeneralCard({
             </small>
           </label>
           <div className="st-controls">
-            <select
+            <Select
               id="settings-permissions"
               value={saved.permissionPolicy}
               onChange={(event) =>
@@ -213,7 +214,7 @@ export function GeneralCard({
                   {policy.label}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
         </div>
         <div className="st-row">
@@ -225,7 +226,7 @@ export function GeneralCard({
             </small>
           </label>
           <div className="st-controls">
-            <select
+            <Select
               id="settings-handoff"
               value={saved.handoffMode}
               title={mode.title}
@@ -242,7 +243,7 @@ export function GeneralCard({
                   {item.label}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
         </div>
         <div className="st-row">

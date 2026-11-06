@@ -12,6 +12,7 @@ import { FamilyMark } from '../thread/family-mark.tsx';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import type { UsageGaugeCard } from '../usage-presentation.ts';
 import '../thread/subagents.css';
+import { Select } from '../select.tsx';
 import { ClientRecord } from './client-status.tsx';
 import { readFamilyDefaults, writeFamilyDefault } from './preferences.ts';
 import type { ProviderActions } from './provider-actions.ts';
@@ -79,7 +80,7 @@ function Models({
             after a limit. The rail and the picker show its allowance.
           </small>
           <div className="st-controls">
-            <select
+            <Select
               id={selectId}
               aria-describedby={hintId}
               value={listed ? chosen : ''}
@@ -96,7 +97,7 @@ function Models({
                   {model.label}
                 </option>
               ))}
-            </select>
+            </Select>
           </div>
         </div>
       )}

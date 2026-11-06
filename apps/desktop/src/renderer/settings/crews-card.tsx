@@ -42,6 +42,7 @@ import {
   writeProjectCrew,
 } from './preferences.ts';
 import '../thread/crew.css';
+import { Select } from '../select.tsx';
 
 const presetId = (name: string) => name.toLowerCase().replace(/\s+/g, '-');
 // The fixer and the orchestrator are the builder's model unless the person pins another.
@@ -100,7 +101,7 @@ export function CrewSelect({
   const saved = choices.filter((choice) => choice.id.startsWith('saved:'));
   const known = choices.some((choice) => choice.id === value) || extra?.value === value;
   return (
-    <select
+    <Select
       id={id}
       aria-label={label}
       value={known ? value : ''}
@@ -130,7 +131,7 @@ export function CrewSelect({
           ))}
         </optgroup>
       )}
-    </select>
+    </Select>
   );
 }
 
@@ -265,7 +266,7 @@ export function CrewDialog({
             <span className="role-name st-name">
               Flight mode <InfoMark {...flightModeInfo[flightMode]} />
             </span>
-            <select
+            <Select
               id={`${idBase}-mode`}
               value={flightMode}
               title={mode.title}
@@ -276,7 +277,7 @@ export function CrewDialog({
                   {item.label}
                 </option>
               ))}
-            </select>
+            </Select>
             <small className="st-hint">{mode.title}</small>
           </label>
         </div>
@@ -387,7 +388,7 @@ export function CrewsCard({
               <small className="st-hint">New threads in a project start with its crew.</small>
             </span>
             <div className="st-controls">
-              <select
+              <Select
                 aria-label="Project"
                 value={project.id}
                 onChange={(event) => setProjectId(event.target.value)}
@@ -401,7 +402,7 @@ export function CrewsCard({
                     </option>
                   );
                 })}
-              </select>
+              </Select>
               <CrewSelect
                 label={`Crew for ${project.name}`}
                 value={projectCrews[project.id] ?? 'default'}

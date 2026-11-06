@@ -28,6 +28,7 @@ import {
   SUGGESTED_FIRST_MESSAGE,
 } from './flow.ts';
 import './onboarding.css';
+import { Select } from '../select.tsx';
 
 const stepNames: Record<OnboardingStep, string> = {
   provider: 'Provider',
@@ -277,7 +278,7 @@ function ProjectStep({
       {projects.length > 0 && (
         <div className="onb-field">
           <label htmlFor={select}>Project</label>
-          <select
+          <Select
             id={select}
             value={projectId ?? projects[0].id}
             onChange={(event) => onProject(event.target.value)}
@@ -287,7 +288,7 @@ function ProjectStep({
                 {project.name}
               </option>
             ))}
-          </select>
+          </Select>
         </div>
       )}
       <div className="onb-actions">

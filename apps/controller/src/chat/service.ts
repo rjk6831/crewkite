@@ -2608,6 +2608,85 @@ export class ChatService {
       this.stopCrew(task, this.thread(task.id), chain, `the ${step} could not start`, started.next);
   }
 
+  /**
+   * Run the thread's test command now, outside any crew step: the person's Run tests. It asks the
+   * same question a crew run asks unless the thread already allows the command, runs in the
+   * scratch copy, keeps the run with the thread's checks, writes one line with the result and
+   * starts no turn. A turn, a plan step, a crew chain or another check run makes it wait.
+   */
+  runTests(payload: Payload<'RunChatTests'>, effects: Effects): CommandResult {
+    const task = this.task(payload.taskId);
+    if (!task) return blocked('task-not-found');
+    const thread = this.thread(task.id);
+    if (thread.activeTurnId || this.plans.holds(thread) || thread.crewChain)
+      return blocked('thread-busy', 'Run tests when the current turn or crew step has finished.');
+    if (this.checksBusy(task.id))
+      return blocked('checks-running', 'The project checks are already running.');
+    const tests = (thread.checks?.items ?? []).filter((item) => item.kind === 'test');
+    if (!tests.length)
+      return blocked(
+        'no-test-command',
+        'No test command was found. Add one under Project checks, or read the project files again.',
+      );
+    const assessed = this.checks.assess(task, thread, undefined, tests);
+    const go = (fx: Effects, approve: boolean) =>
+      fx.push(() => {
+        if (approve) this.checks.approve(task.id, assessed.set);
+        const entry = this.checks.reserve(task.id);
+        this.checks.run(task.id, 'manual', undefined, entry, tests).then(
+          (result) => this.testsDone(task.id, result),
+          () => this.testsDone(task.id, null),
+        );
+      });
+    if (!this.checksNeedAsk(thread, assessed)) {
+      go(effects, false);
+      return { outcome: 'applied' };
+    }
+    this.raiseCheckAsk(task, thread, 'manual', assessed, (answer, fx) => {
+      if (answer === 'allow' || answer === 'allow-thread') go(fx, answer === 'allow-thread');
+      else
+        fx.push(() =>
+          this.testsDone(task.id, {
+            outcome: answer === 'stop' ? 'stopped' : 'denied',
+            runs: [],
+            brief: null,
+          }),
+        );
+    });
+    return { outcome: 'applied' };
+  }
+
+  /** One line with the result of Run tests. The run itself is already with the thread's checks. */
+  private testsDone(taskId: string, result: ChecksOutcome | null) {
+    try {
+      this.deps.store.transaction(() => {
+        const task = this.task(taskId);
+        if (!task || this.closed) return;
+        const run = result?.runs.at(-1);
+        const exit = run?.exitCode ?? null;
+        const text = !result
+          ? 'The tests could not run.'
+          : result.outcome === 'passed'
+            ? `Tests passed: ${run?.command ?? 'the test command'}${exit === null ? '' : ` (exit ${exit})`}.`
+            : result.outcome === 'failed'
+              ? `Tests failed: ${run?.command ?? 'the test command'}${exit === null ? '' : ` (exit ${exit})`}. The output is under Checks.`
+              : result.outcome === 'denied'
+                ? 'The tests did not run. The command was not allowed.'
+                : result.outcome === 'stopped'
+                  ? 'The tests were stopped.'
+                  : 'No test command ran.';
+        this.appendEntry(task, {
+          kind: 'chat-system',
+          author: { kind: 'system', turnId: null },
+          text,
+        });
+      });
+    } catch {
+      // A thread deleted mid-run has nowhere to show the line.
+    }
+    if (!this.closed) this.wakeQueues();
+  }
+
   /** The thread waits on a check question or runs checks, so no turn may start. */
   private checksBusy(taskId: string): boolean {
     return this.checkAsk.has(taskId) || this.checks.running(taskId);
@@ -2640,7 +2719,7 @@ export class ChatService {
   private raiseCheckAsk(
     task: Task,
     thread: ChatThread,
-    trigger: 'fix' | 'plan' | 'combined',
+    trigger: 'fix' | 'plan' | 'combined' | 'manual',
     assessed: ReturnType<ThreadChecks['assess']>,
     settle: (answer: CheckAnswer, effects: Effects) => void,
   ) {
