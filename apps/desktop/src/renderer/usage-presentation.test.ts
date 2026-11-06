@@ -404,6 +404,36 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
       expect: { bars: ['99% left'], needsConnect: true, read: 'read 2 h ago' },
     },
     {
+      claim: 'Anthropic with a five-hour, a weekly and a model window keeps 5 h and week',
+      entry: entry(
+        'anthropic',
+        [
+          window('five-hour', 'five-hour', 60, 120),
+          window('weekly', 'weekly', 81, 9000),
+          window('weekly-fable', 'weekly', 93, 9000),
+        ],
+        { defaultModel: 'claude-opus-5-5' },
+      ),
+      expect: { bars: ['5 h 60%', 'week 81%'] },
+    },
+    {
+      claim:
+        'Anthropic Ultra, a weekly and a model window and no five-hour, shows week and the model',
+      entry: entry(
+        'anthropic',
+        [window('weekly', 'weekly', 81, 9000), window('weekly-fable', 'weekly', 93, 9000)],
+        { defaultModel: 'claude-opus-5-5' },
+      ),
+      expect: { bars: ['week 81%', 'Fable 93%'] },
+    },
+    {
+      claim: 'A weekly window alone keeps one bar',
+      entry: entry('anthropic', [window('weekly', 'weekly', 81, 9000)], {
+        defaultModel: 'claude-opus-5-5',
+      }),
+      expect: { bars: ['81% left'] },
+    },
+    {
       claim: 'Google before Connect shows Connect and no bars, even with an older read',
       entry: entry('google', [window('pool-daily', 'pool-daily', 99, 600)], {
         connected: false,

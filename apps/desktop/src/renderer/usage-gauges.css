@@ -467,11 +467,15 @@
 .usage-gauges-cluster[data-count="1"]:not([data-featured]) {
   grid-template-columns: minmax(0, 1fr);
 }
-.usage-gauges-cluster[data-count="1"][data-featured] {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr);
-}
 .usage-gauges-cluster[data-featured] > .is-primary {
   margin-top: 8cqi;
+}
+/* One side dial and a model dial: an even pair, side by side and level. */
+.usage-gauges-cluster[data-count="1"][data-featured] {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.usage-gauges-cluster[data-count="1"][data-featured] > .is-primary {
+  margin-top: 0;
 }
 .usage-gauge.is-clustered {
   gap: 4px;

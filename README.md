@@ -13,7 +13,7 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 - Use the plans you already pay for. CrewKite runs each provider's own signed-in client, sets no API key and adds no plan of its own.
 - Keep working when a limit hits. A thread moves to another provider mid task with its messages and edited files, by hand or by the handoff rule you pick.
-- See every allowance in one place. The rail shows the five-hour and weekly windows each provider reports, and Local shows no limit.
+- See every allowance in one place. The rail shows the five-hour and weekly windows each provider reports, or the weekly and model windows for a plan with no five-hour limit, and Local shows no limit.
 - Split large work across providers. An orchestrator proposes up to 8 slices, the controller assigns each one by allowance and difficulty, and a reviewer, fixer and challenger check the result.
 - Review before anything lands. Each thread works in its own copy of the repository. You read the diff, accept or discard each hunk, and Accept makes a new local branch while your checkout stays as it was.
 - Approve what runs. Commands, edits and tool calls ask first unless your policy allows them, and subagents a provider starts show under the step that started them.
@@ -63,7 +63,7 @@ CrewKite puts no plan gate of its own. Each family works on whatever plan its pr
 | Family | Account | Plan facts |
 |--------|---------|------------|
 | OpenAI | The OpenAI account its client is signed in with | As of 31 October 2026, OpenAI says its coding client is included in its Free, Go, Plus, Pro, Business, Edu and Enterprise plans. Usage limits depend on the plan, the model and the task. |
-| Anthropic | The Anthropic account its client is signed in with | As of 31 October 2026, Anthropic includes its coding client in its Pro, Max, Team and Enterprise plans and leaves it out of Free. Pro and Max have a five-hour limit and a weekly limit that the Anthropic chat app shares. |
+| Anthropic | The Anthropic account its client is signed in with | As of 31 October 2026, Anthropic includes its coding client in its Pro, Max, Team and Enterprise plans and leaves it out of Free. Pro and Max have a five-hour limit and a weekly limit that the Anthropic chat app shares. On 6 November 2026 Anthropic removed the five-hour limit from Ultra (formerly Max 20x); its weekly limit still applies, and its row shows the weekly window and the model's own weekly window, such as Fable. |
 | Google | Your personal Google account | As of 31 October 2026, Google gives accounts without a paid plan a quota that refreshes weekly. Google AI Pro refreshes every five hours until a weekly limit, and Google AI Ultra has the highest quota. Limits follow available capacity. |
 | Local | LM Studio on this computer | As of 31 October 2026, LM Studio is free to use at home and at work. Speed and context follow your hardware. |
 
