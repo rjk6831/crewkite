@@ -2,6 +2,7 @@ import type { DesktopSource } from '@crewkite/client';
 import type { ProjectPage } from '@crewkite/contracts';
 import { useState } from 'react';
 import { AnalyticsView } from '../analytics-view.tsx';
+import { Select } from '../select.tsx';
 import type { ThreadSource } from '../thread/commands.ts';
 
 /**
@@ -33,7 +34,7 @@ export function ProjectUsageCard({
               <label className="st-name" htmlFor="project-usage-pick">
                 Project
               </label>
-              <select
+              <Select
                 id="project-usage-pick"
                 value={projectId ?? ''}
                 onChange={(event) => setChosen(event.target.value || null)}
@@ -44,7 +45,7 @@ export function ProjectUsageCard({
                     {project.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             </div>
           </div>
         )}

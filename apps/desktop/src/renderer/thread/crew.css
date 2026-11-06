@@ -38,11 +38,11 @@
   gap: 6px;
   min-width: 0;
 }
-.th-crew-pick select {
+.th-crew-pick .ck-select {
   flex: 1 1 140px;
   min-width: 0;
 }
-.th-crew-pick select.effort-select {
+.th-crew-pick .ck-select.effort-select {
   flex: 0 1 auto;
 }
 .th-crew-model {
@@ -121,7 +121,7 @@
   gap: 6px;
 }
 .crew-dialog-field input,
-.crew-dialog-field select {
+.crew-dialog-field .ck-select {
   max-width: 360px;
 }
 .crew-dialog-problem {

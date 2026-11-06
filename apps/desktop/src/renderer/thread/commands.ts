@@ -58,6 +58,7 @@ import {
   RenameChatThreadPayloadSchema,
   ResolveChatPermissionPayloadSchema,
   RetryChatTurnPayloadSchema,
+  RunChatTestsPayloadSchema,
   SaveChatPromptPayloadSchema,
   SaveCrewPayloadSchema,
   type SavedCrew,
@@ -357,6 +358,9 @@ export const steerMessage = (
   source: ThreadSource,
   input: Input<typeof SteerChatMessagePayloadSchema>,
 ) => run(source, 'SteerChatMessage', SteerChatMessagePayloadSchema.parse(input));
+/** Run the thread's test command in its scratch copy now. No model runs. */
+export const runTests = (source: ThreadSource, input: Input<typeof RunChatTestsPayloadSchema>) =>
+  run(source, 'RunChatTests', RunChatTestsPayloadSchema.parse(input));
 export const configureThread = (
   source: ThreadSource,
   input: Input<typeof ConfigureChatThreadPayloadSchema>,

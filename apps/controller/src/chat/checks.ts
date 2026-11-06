@@ -633,16 +633,19 @@ export class ThreadChecks {
     task: Task,
     thread: ChatThread,
     directory?: string,
+    only?: readonly ChatCheck[],
   ): { commands: { label: string; resolved: string }[]; changed: string[]; set: string } {
     const where = directory ?? this.directory(task);
     const home = this.directory(task);
     const commands: { label: string; resolved: string }[] = [];
     const changed: string[] = [];
     const set = createHash('sha256');
-    for (const item of enabledChecks(thread)) {
+    for (const item of only ?? enabledChecks(thread)) {
       const now = describe(item, where);
       commands.push({ label: item.label.slice(0, 80), resolved: now.resolved });
-      if (item.pin !== now.digest) changed.push(item.label.slice(0, 80));
+      // A check that is off has no pin to compare. Run tests on it asks unless the person allowed
+      // this command set for the thread.
+      if (item.pin !== null && item.pin !== now.digest) changed.push(item.label.slice(0, 80));
       // The set an approval covers is read from the thread's own copy, whatever copy runs.
       set.update(`${item.id}\0${item.command}\0${sourceDigest(item, home)}\0`);
     }
@@ -710,12 +713,13 @@ export class ThreadChecks {
     trigger: ChatCheckRun['trigger'],
     directory?: string,
     reserved?: Entry,
+    only?: readonly ChatCheck[],
   ): Promise<ChecksOutcome> {
     const entry = reserved ?? this.reserve(taskId, directory !== undefined);
     try {
       const task = this.host.task(taskId);
       const thread = this.host.thread(taskId);
-      const items = enabledChecks(thread);
+      const items = only ?? enabledChecks(thread);
       if (!task || !items.length) return { outcome: 'none', runs: [], brief: null };
       const finished: Finished[] = [];
       for (const item of items) {

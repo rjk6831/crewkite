@@ -702,6 +702,13 @@ export const StopChatTurnPayloadSchema = z.strictObject({
   taskId: id('tsk'),
   turnId: ChatTurnIdSchema,
 });
+/**
+ * Run the thread's test command in its scratch copy now, outside any crew step. No model runs and
+ * no turn starts; the result joins the thread's checks.
+ */
+export const RunChatTestsPayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+});
 export const ConfigureChatThreadPayloadSchema = z.strictObject({
   taskId: id('tsk'),
   selection: ChatModelSelectionSchema.optional(),

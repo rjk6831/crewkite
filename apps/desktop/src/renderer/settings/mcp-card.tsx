@@ -5,6 +5,7 @@ import type {
   McpState,
 } from '@crewkite/contracts';
 import { useCallback, useEffect, useState } from 'react';
+import { Select } from '../select.tsx';
 
 const lines = (text: string) => text.split('\n').filter((line) => line.length > 0);
 const READ_TOOLS = /[\s,]+/;
@@ -240,7 +241,7 @@ export function McpThreadMenu({
       {state.servers.map((server) => (
         <label key={server.name}>
           {server.name}
-          <select
+          <Select
             value={chosen[server.name] ?? 'off'}
             onChange={(event) => {
               const value = event.target.value;
@@ -258,7 +259,7 @@ export function McpThreadMenu({
                 {label}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
       ))}
       {error && <small role="status">{error}</small>}

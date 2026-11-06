@@ -98,3 +98,9 @@ d3-rc11
 - I made Local setup safe to send again and kept its card clear of uncertain command receipts.
 - I moved large client digests to a worker, checked Google's two files once per connect and ran their signature checks together. Google progress names the file being checked, elapsed time and the retry count.
 - I added descriptions to Flight mode and Permissions and account-free protocol checks for provider client changes.
+
+Release polish
+
+- I replaced every native dropdown in the desktop app with CrewKite's own, with the same values, groups, keys and closed sizes, so none opens a system popup. A source check keeps native selects out.
+- I added Run tests to Project checks. It runs the project's test command in the thread's copy with no model turn, asks first unless the thread allows the command, and keeps the exit status and output with the thread's checks.
+- CLI JSON lines move to version 7, since a check run can now come from Run tests.

@@ -32,6 +32,7 @@ import { Inspector, type InspectorTab } from './inspector.tsx';
 import { defaultSelection } from './model-picker.tsx';
 import type { FirstSend } from './thread-view.tsx';
 import './thread.css';
+import { Select } from '../select.tsx';
 
 const NO_PROVIDER = 'Connect a provider in Settings';
 
@@ -254,13 +255,13 @@ export function NewThread({
             <label className="th-project-select">
               <span className="th-sr">Project</span>
               <Folder size={13} aria-hidden="true" />
-              <select value={projectId} onChange={(event) => onProject(event.target.value)}>
+              <Select value={projectId} onChange={(event) => onProject(event.target.value)}>
                 {projects.map((item) => (
                   <option key={item.id} value={item.id}>
                     {item.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             </label>
           )}
           <button

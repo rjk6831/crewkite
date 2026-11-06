@@ -27,6 +27,7 @@ import {
   WITHOUT_TOKEN,
   waitForLocalReadiness,
 } from './local-setup-flow.ts';
+import { Select } from './select.tsx';
 import { useClock } from './settings/use-catalog.ts';
 import { type DesktopCommand, localResultLine, type Workspace } from './source.ts';
 
@@ -590,7 +591,7 @@ export function LocalSetup({
             <>
               <label>
                 Observed Local model
-                <select
+                <Select
                   value={choiceId ?? ''}
                   disabled={blocked || stale}
                   onChange={(event) => {
@@ -620,7 +621,7 @@ export function LocalSetup({
                         : ''}
                     </option>
                   ))}
-                </select>
+                </Select>
               </label>
               {selectedChoice && (
                 <div className="facts-grid">

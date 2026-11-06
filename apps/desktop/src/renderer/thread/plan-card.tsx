@@ -4,6 +4,7 @@ import { familyName } from '../components.tsx';
 import { FamilyMark } from './family-mark.tsx';
 import { type PlanSliceView, planCard, planOverrides } from './plan-card.ts';
 import './plan-card.css';
+import { Select } from '../select.tsx';
 
 export type PlanHandlers = {
   /** Runs the whole plan, or one slice. `overrides` are the families picked in Balanced. */
@@ -66,7 +67,7 @@ function SliceRow({
       {candidates ? (
         <label className="th-plan-pick">
           <span className="th-sr">Provider for slice {slice.id}</span>
-          <select
+          <Select
             value={pick ?? 0}
             disabled={busy}
             onChange={(event) => onPick(Number(event.target.value))}
@@ -76,7 +77,7 @@ function SliceRow({
                 {familyName(candidate.family)} · {candidate.model}
               </option>
             ))}
-          </select>
+          </Select>
         </label>
       ) : (
         assigned && (

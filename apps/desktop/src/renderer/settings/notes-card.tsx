@@ -5,6 +5,7 @@ import {
   type ProjectNotesRead,
 } from '@crewkite/contracts';
 import { useEffect, useRef, useState } from 'react';
+import { Select } from '../select.tsx';
 import { addNote, editNote, readNotes, removeNote, type ThreadSource } from '../thread/commands.ts';
 
 /**
@@ -96,7 +97,7 @@ export function NotesCard({
               <small className="st-hint">Every thread in the project sends these notes.</small>
             </div>
             <div className="st-controls">
-              <select
+              <Select
                 id="notes-project"
                 value={projectId}
                 onChange={(event) => {
@@ -111,7 +112,7 @@ export function NotesCard({
                     {project.name}
                   </option>
                 ))}
-              </select>
+              </Select>
             </div>
           </div>
           {read?.notes.map((entry) => (

@@ -1549,6 +1549,7 @@ export class Controller {
         'ResolveChatPermission',
         'StopChatTurn',
         'ConfigureChatThread',
+        'RunChatTests',
         'HandoffChatThread',
         'AcceptChatChanges',
         'SteerChatMessage',
@@ -1711,6 +1712,8 @@ export class Controller {
         return this.chat().stopTurn(command.payload, effects);
       case 'ConfigureChatThread':
         return this.chat().configure(command.payload, effects);
+      case 'RunChatTests':
+        return this.chat().runTests(command.payload, effects);
       case 'HandoffChatThread':
         return this.chat().handoff(command.payload, effects);
       case 'SteerChatMessage':
