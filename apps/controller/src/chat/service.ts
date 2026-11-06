@@ -102,7 +102,13 @@ import {
   writeDiscardMark,
   writeThreadBaseRef,
 } from './changes.ts';
-import { type ChecksOutcome, commandsAllowed, enabledChecks, ThreadChecks } from './checks.ts';
+import {
+  type ChecksOutcome,
+  commandsAllowed,
+  enabledChecks,
+  ThreadChecks,
+  testsLine,
+} from './checks.ts';
 import {
   dropStaged,
   FileRefused,
@@ -2662,19 +2668,15 @@ export class ChatService {
       this.deps.store.transaction(() => {
         const task = this.task(taskId);
         if (!task || this.closed) return;
-        const run = result?.runs.at(-1);
-        const exit = run?.exitCode ?? null;
         const text = !result
           ? 'The tests could not run.'
-          : result.outcome === 'passed'
-            ? `Tests passed: ${run?.command ?? 'the test command'}${exit === null ? '' : ` (exit ${exit})`}.`
-            : result.outcome === 'failed'
-              ? `Tests failed: ${run?.command ?? 'the test command'}${exit === null ? '' : ` (exit ${exit})`}. The output is under Checks.`
-              : result.outcome === 'denied'
-                ? 'The tests did not run. The command was not allowed.'
-                : result.outcome === 'stopped'
-                  ? 'The tests were stopped.'
-                  : 'No test command ran.';
+          : result.outcome === 'passed' || result.outcome === 'failed'
+            ? testsLine(result.outcome, result.runs)
+            : result.outcome === 'denied'
+              ? 'The tests did not run. The command was not allowed.'
+              : result.outcome === 'stopped'
+                ? 'The tests were stopped.'
+                : 'No test command ran.';
         this.appendEntry(task, {
           kind: 'chat-system',
           author: { kind: 'system', turnId: null },

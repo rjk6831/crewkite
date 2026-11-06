@@ -427,6 +427,17 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
       expect: { bars: ['week 81%', 'Fable 93%'] },
     },
     {
+      // Part 14, U23: the catalog the controller sends once a weekly-only /usage read retires an
+      // older five-hour frame (usage-reader.test.ts), before and after the same home reopens.
+      claim: 'Anthropic after a weekly-only read shows no 5 h bar from an earlier frame',
+      entry: entry(
+        'anthropic',
+        [window('weekly', 'weekly', 83, 9000), window('weekly-fable', 'weekly', 81, 9000)],
+        { defaultModel: 'claude-opus-5-5' },
+      ),
+      expect: { bars: ['week 83%', 'Fable 81%'] },
+    },
+    {
       claim: 'A weekly window alone keeps one bar',
       entry: entry('anthropic', [window('weekly', 'weekly', 81, 9000)], {
         defaultModel: 'claude-opus-5-5',

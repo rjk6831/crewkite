@@ -1006,3 +1006,27 @@ export class ThreadChecks {
     }
   }
 }
+
+/**
+ * The thread line for Run tests. One command reads as before: its name and exit status. With
+ * several, a failure names the first command that failed, with its own exit status, and how many
+ * of the commands failed, so a later command that passed is never reported as the failure. Each
+ * run, its tail and its full output stay with the thread's checks.
+ */
+export function testsLine(
+  outcome: 'passed' | 'failed',
+  runs: readonly Pick<ChatCheckRun, 'command' | 'status' | 'exitCode'>[],
+): string {
+  const named = (run: (typeof runs)[number] | undefined) =>
+    `${run?.command ?? 'the test command'}${
+      run?.exitCode === null || run?.exitCode === undefined ? '' : ` (exit ${run.exitCode})`
+    }`;
+  if (outcome === 'passed')
+    return runs.length > 1
+      ? `Tests passed: all ${runs.length} commands. The output is under Checks.`
+      : `Tests passed: ${named(runs[0])}.`;
+  const failed = runs.filter((run) => run.status === 'failed');
+  const first = failed[0] ?? runs.at(-1);
+  const count = runs.length > 1 ? `, ${failed.length || 1} of ${runs.length} commands failed` : '';
+  return `Tests failed: ${named(first)}${count}. The output is under Checks.`;
+}

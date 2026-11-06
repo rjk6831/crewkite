@@ -104,3 +104,6 @@ Release polish
 - I replaced every native dropdown in the desktop app with CrewKite's own, with the same values, groups, keys and closed sizes, so none opens a system popup. A source check keeps native selects out.
 - I added Run tests to Project checks. It runs the project's test command in the thread's copy with no model turn, asks first unless the thread allows the command, and keeps the exit status and output with the thread's checks.
 - CLI JSON lines move to version 7, since a check run can now come from Run tests.
+- I drew a dropdown's list inside the dialog that holds it, so the Edit crew lists show above the dialog and reach assistive technology. Escape closes the list and leaves the dialog open.
+- I made a full Anthropic usage read retire a window it no longer reports, so a plan with no five-hour limit shows no five-hour bar from an older turn reading, also after a restart.
+- I made the Run tests line name the command that failed and its exit status when a project has several test commands, with how many of them failed.
