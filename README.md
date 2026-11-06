@@ -24,15 +24,19 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 ## Status
 
-CrewKite 0.1.0 is its first public release. I ran all four families, Google, OpenAI, Anthropic and Local, live through development. The release build gets a final check on macOS before it ships.
-
-<!-- Release screenshot pending the installed-build launch checks. -->
+CrewKite 0.1.0 is its first public release. I ran all four families, Google, OpenAI, Anthropic and Local, live through development.
 
 A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan and assigns each slice to the crew's builder or its fixer for a hard slice. Local takes a slice only when a crew role uses Local and the slice fits its context. Any model can read what another did through read-only thread tools.
 
 ## Install
 
-Installed packages are in preparation. Their signing, first-open and Linux launch checks remain pending. The [distribution notes](docs/distribution.md#installed-distribution-in-progress) describe the fixed state paths and qualification limits. Version 0.1.0 starts fresh installed state; directory-preview import and rollback qualification wait for 0.1.1.
+Download the [latest release](https://github.com/rjk6831/crewkite/releases/latest) and check it against `SHA256SUMS` with `shasum -a 256` on macOS or `sha256sum` on Linux.
+
+- macOS on Apple silicon: [CrewKite-macOS-arm64.dmg](https://github.com/rjk6831/crewkite/releases/latest/download/CrewKite-macOS-arm64.dmg). It is signed with Developer ID and notarized. Open the DMG, drag CrewKite to Applications and open it there.
+- Ubuntu and Debian: [crewkite_amd64.deb](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite_amd64.deb) or [crewkite_arm64.deb](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite_arm64.deb), then `sudo apt install ./crewkite_amd64.deb`.
+- Fedora: [crewkite.x86_64.rpm](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite.x86_64.rpm) or [crewkite.aarch64.rpm](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite.aarch64.rpm), then `sudo dnf install ./crewkite.x86_64.rpm`.
+
+Linux is a preview. The DEB was tested on Ubuntu 24.04 with desktop launch. The RPM was tested on Fedora 45 for install, headless runtime and the CLI. Google is not available on Linux. Windows is not supported yet. The [preview guide](docs/preview.md) covers install, uninstall and where state lives. Version 0.1.0 starts fresh installed state; directory-preview import waits for 0.1.1.
 
 From source:
 
@@ -40,7 +44,7 @@ From source:
 2. Run `pnpm install`, then `pnpm desktop:install` to download the Electron binary.
 3. Run `pnpm demo` to open the desktop on a synthetic project with scripted providers. To use your own clients on Apple silicon, stage a package with `node scripts/package.mjs --id my-build` and open `bin/desktop` in the folder it prints. The script expects the pinned Node binary under `internal/tools` and a committed working tree.
 
-To try a published build without the source, follow the [preview guide](docs/preview.md). Connect each provider once from its card. OpenAI signs in through CrewKite's own client home; the person's existing client sign-in stays separate. Later launches reconnect providers that were connected before.
+Connect each provider once from its card. OpenAI signs in through CrewKite's own client home; the person's existing client sign-in stays separate. Later launches reconnect providers that were connected before.
 
 Check for Updates… sits under About in the CrewKite menu on macOS and in Help on Linux. CrewKite also checks once a day after launch and offers a newer release's download page. Updating is a manual download in 0.1.x.
 
@@ -81,7 +85,7 @@ After 0.1.0, in rough order. [docs/roadmap.md](docs/roadmap.md) has the detail.
 - An API key route for each provider. It gives the full model list for Anthropic and a Google route inside Google's terms.
 - Grok (xAI) as the other choice for the G row. Grok's own coding client speaks the same protocol as the Google route and signs in with your xAI subscription, so it would bring a fourth subscription family to Linux and to people who skip the Google route. It ships after I review xAI's terms and qualify Grok on macOS and Linux.
 - Windows, once the port above is done.
-- Google on Linux, plus Linux task writers, formatting and verification, alongside packaged Linux installers.
+- Google on Linux, plus Linux task writers, formatting and verification.
 - Large repository work off the controller's main thread, and per-hunk review for large files.
 - Project notes fetched when a model needs them, and routing that weighs context size beside allowance.
 - Published bench results: tokens, time and checks passed per family on the same tasks.
