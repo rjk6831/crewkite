@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { addedProblem, commandWords, detectChecks } from './checks.ts';
+import { addedProblem, commandWords, detectChecks, testsLine } from './checks.ts';
 
 // Claim: the controller reads the declared checks from the project files and nothing else. A
 // command is plain words, never a shell line. The table is the whole detection contract.
@@ -181,4 +181,45 @@ test('detection reads package scripts, python tools, pytest, make targets, cargo
     'pytest',
     'tests/',
   ]);
+});
+
+// Claim: the Run tests line names the command that failed with its own exit status, however many
+// test commands ran and in whatever order, and one command reads as it always has.
+test('the run tests line names the failed command, not the last one', () => {
+  const run = (command: string, status: 'passed' | 'failed', exitCode: number | null) => ({
+    command,
+    status,
+    exitCode,
+  });
+  const cases: [Parameters<typeof testsLine>, string][] = [
+    [
+      ['failed', [run('npm run test', 'failed', 1), run('make test', 'passed', 0)]],
+      'Tests failed: npm run test (exit 1), 1 of 2 commands failed. The output is under Checks.',
+    ],
+    [
+      [
+        'failed',
+        [
+          run('npm run test', 'passed', 0),
+          run('make test', 'failed', 2),
+          run('cargo test', 'failed', 101),
+        ],
+      ],
+      'Tests failed: make test (exit 2), 2 of 3 commands failed. The output is under Checks.',
+    ],
+    [
+      ['failed', [run('npm run test', 'failed', 1)]],
+      'Tests failed: npm run test (exit 1). The output is under Checks.',
+    ],
+    [
+      ['failed', [run('npm run test', 'failed', null)]],
+      'Tests failed: npm run test. The output is under Checks.',
+    ],
+    [['passed', [run('npm run test', 'passed', 0)]], 'Tests passed: npm run test (exit 0).'],
+    [
+      ['passed', [run('npm run test', 'passed', 0), run('make test', 'passed', 0)]],
+      'Tests passed: all 2 commands. The output is under Checks.',
+    ],
+  ];
+  for (const [input, line] of cases) assert.equal(testsLine(...input), line);
 });

@@ -34,6 +34,18 @@ type SelectProps = {
   children?: ReactNode;
 };
 
+/**
+ * Where the open list is drawn. A modal dialog sits in the top layer and makes the rest of the
+ * page inert, so a list portaled to the body would be painted under the dialog and left out of
+ * its accessibility tree. Inside an open dialog the list is drawn in that dialog; elsewhere it is
+ * drawn in the body, so no card or scroll box clips it. Its fixed position keeps it on the
+ * control either way, since a dialog sets no containing block for fixed boxes.
+ */
+export function listHost(control: Element | null): Element | null {
+  if (!control) return null;
+  return control.closest('dialog[open]') ?? control.ownerDocument.body;
+}
+
 const GAP = 4;
 const MARGIN = 8;
 const MAX_HEIGHT = 320;
@@ -56,6 +68,7 @@ export function Select({
   const [open, setOpen] = useState(false);
   const [active, setActive] = useState(-1);
   const [place, setPlace] = useState<CSSProperties>({});
+  const [host, setHost] = useState<Element | null>(null);
   const trigger = useRef<HTMLButtonElement>(null);
   const list = useRef<HTMLDivElement>(null);
   const typed = useRef({ text: '', at: 0 });
@@ -117,6 +130,7 @@ export function Select({
     setActive(
       selected >= 0 && !options[selected]?.disabled ? selected : nextEnabled(options, -1, 1),
     );
+    setHost(listHost(trigger.current));
     setOpen(true);
   };
   const close = () => {
@@ -193,6 +207,7 @@ export function Select({
         <ChevronDown size={14} aria-hidden="true" className="ck-select-chevron" />
       </button>
       {open &&
+        host &&
         createPortal(
           <div
             ref={list}
@@ -241,7 +256,7 @@ export function Select({
               );
             })}
           </div>,
-          document.body,
+          host,
         )}
     </>
   );

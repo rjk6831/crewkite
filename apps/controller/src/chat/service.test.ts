@@ -5237,6 +5237,98 @@ test('run tests runs the test command alone and keeps its real result', {
   );
 });
 
+// Claim (Part 14, U22): with several test commands, the thread line names the command that
+// failed and its own exit status, never a later command that passed. Each run keeps its own
+// result and output under Checks, one line is written per run, and the guards still hold.
+test('run tests names the failing command when a later test command passes', {
+  timeout: 60000,
+}, async (t) => {
+  const thread = standalone(t, {
+    adapters: new Map([
+      ['openai', createScriptedChatAdapter({ family: 'openai', turns: [textReply('Built.')] })],
+    ]),
+  });
+  const { store, service, taskId } = thread;
+  const done = turnReaches(thread, 'done');
+  thread.send('Build it.');
+  const built = await done;
+  // The polyglot fixture of the Part 14 repro, file for file.
+  const scratch = chatScratchDirectory(dirname(thread.root), taskId);
+  writeFileSync(
+    join(scratch, 'package.json'),
+    JSON.stringify({
+      name: 'p14-polyglot-fixture',
+      private: true,
+      scripts: { test: 'node gate.mjs' },
+    }),
+  );
+  writeFileSync(
+    join(scratch, 'gate.mjs'),
+    "console.log('synthetic npm failure');\nprocess.exitCode = 1;\n",
+  );
+  writeFileSync(join(scratch, 'Makefile'), 'test:\n\t@echo synthetic make success\n');
+  store.transaction(() => service.configure({ taskId, checks: { refresh: true } }));
+  const tests = thread.read().thread.checks?.items.filter((item) => item.kind === 'test') ?? [];
+  assert.deepEqual(
+    tests.map((item) => [item.command, item.enabled]),
+    [
+      ['npm run test', false],
+      ['make test', false],
+    ],
+  );
+  const turns = thread.read().turns.length;
+  const lines = () =>
+    thread
+      .read()
+      .messages.filter((message) => /^Tests /.test((message as { text?: string }).text ?? ''));
+  const failedLine = next(
+    thread,
+    (event) =>
+      event.type === 'conversation.entry' &&
+      /^Tests failed: /.test((event.payload as { text?: string }).text ?? ''),
+  );
+  assert.equal(act(store, (fx) => service.runTests({ taskId }, fx)).outcome, 'applied');
+  const ask = thread.read().thread.checks?.ask;
+  assert.equal(
+    act(store, (fx) => service.runTests({ taskId }, fx)).reason,
+    'checks-running',
+    'a second start waits while the question is open',
+  );
+  act(store, (fx) =>
+    service.resolvePermission(
+      { taskId, turnId: built.id, requestId: ask?.requestId ?? '', choice: 'allow' },
+      fx,
+    ),
+  );
+  assert.equal(
+    act(store, (fx) => service.runTests({ taskId }, fx)).reason,
+    'checks-running',
+    'a second start waits while the commands run',
+  );
+  assert.equal(
+    (await failedLine.then((event) => event.payload as { text: string })).text,
+    'Tests failed: npm run test (exit 1), 1 of 2 commands failed. The output is under Checks.',
+  );
+  const runs = thread.read().thread.checks?.runs.slice(-2) ?? [];
+  assert.deepEqual(
+    runs.map((run) => [run.command, run.trigger, run.status, run.exitCode]),
+    [
+      ['npm run test', 'manual', 'failed', 1],
+      ['make test', 'manual', 'passed', 0],
+    ],
+  );
+  assert.match(runs[0]?.tail ?? '', /synthetic npm failure/);
+  assert.match(runs[1]?.tail ?? '', /synthetic make success/);
+  assert.equal(lines().length, 1, 'one thread line for the run');
+  const after = thread.read();
+  assert.equal(after.turns.length, turns, 'no model turn ran');
+  assert.deepEqual(
+    after.thread.checks?.items.filter((item) => item.kind === 'test').map((item) => item.enabled),
+    [false, false],
+    'the Tests switches are untouched',
+  );
+});
+
 // Claim: Run tests says why it cannot start: no test command, or a turn still running.
 test('run tests explains when it cannot start', { timeout: 30000 }, async (t) => {
   const thread = standalone(t, {

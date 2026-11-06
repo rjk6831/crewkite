@@ -482,7 +482,7 @@ test('a client installed as a node script reads usage with the person PATH and f
 
 function refreshFixture(
   t: TestContext,
-  mode: 'success' | 'held' | 'unknown' | 'error' | 'large' = 'success',
+  mode: 'success' | 'held' | 'unknown' | 'error' | 'large' | 'weekly-only' = 'success',
   /** The controller's chat client resolver. Without one the pinned profile stands in. */
   chat?: (profile: NativeProfileResolution) => ChatClientResolution,
 ) {
@@ -574,7 +574,11 @@ function refreshFixture(
                         scope: { model: { display_name: '漢'.repeat(128) }, surface: null },
                       })),
                     )
-                  : assistant,
+                  : mode === 'weekly-only'
+                    ? withLimits(
+                        limits.filter((limit: { kind: string }) => limit.kind !== 'session'),
+                      )
+                    : assistant,
                 mode === 'error' ? { ...terminal, is_error: true } : terminal,
               ].map((frame) => ({ ...frame, session_id: selectedSession })),
             );
@@ -727,6 +731,61 @@ test('a usage read needs no consent and survives retries and reopen, and a turn 
     'applied',
   );
   assert.equal(f.calls(), 4);
+});
+
+// Claim (Part 14, U23): a plan that reports no five-hour limit shows no five-hour gauge from an
+// older turn frame, on the rail and the card, before and after the same home reopens. A newer
+// frame that names five-hour, from an account that still has one, shows it again.
+test('a weekly-only usage read retires an older five-hour window and the reopen keeps it gone', async (t) => {
+  const f = refreshFixture(t, 'weekly-only');
+  const turn = (windows: ReturnType<typeof usageWindow>[]) =>
+    f.controller.anthropicUsage().recordTurnReading({
+      source: 'turn-rate-limit',
+      status: 'reported',
+      receivedAt: f.clock.now(),
+      observedAt: null,
+      freshness: 'unknown',
+      windows,
+      extraUsage: null,
+      model: null,
+      modelTurns: 0,
+      qualified: false,
+    });
+  // What the rail reads (the catalog) and what the card reads (the reader's reading).
+  const rail = async () => {
+    const { expectedRevision: _, ...read } = f.command('ReadChatCatalog');
+    const { data } = await f.controller.execute(read, 'local-owner');
+    assert(data?.kind === 'chat-catalog');
+    return data.families
+      .find((entry) => entry.family === 'anthropic')
+      ?.remaining.map(({ windowId, percent }) => [windowId, percent]);
+  };
+  const card = () =>
+    f.status()?.reading?.windows.map(({ windowId, remaining }) => [windowId, remaining.value]);
+  const weekly = [
+    ['weekly', 83],
+    ['weekly-fable', 81],
+  ];
+  // 01:00, the turn frame of the repro: five-hour 37%, resetting at 01:05.
+  turn([usageWindow('five-hour', 37, '2026-10-21T01:05:00.000Z')]);
+  assert.deepEqual(await rail(), [['five-hour', 37]]);
+  // 01:02, a full /usage read with no session window.
+  f.clock.advance(120000);
+  assert.equal((await f.controller.execute(f.command(), 'local-owner')).outcome, 'applied');
+  assert.deepEqual(await rail(), weekly);
+  assert.deepEqual(card(), weekly);
+  // 01:07, after the old five-hour reset, and again after the same home reopens.
+  f.clock.advance(300000);
+  assert.deepEqual(await rail(), weekly);
+  assert.deepEqual(card(), weekly);
+  await f.reopen();
+  assert.deepEqual(await rail(), weekly);
+  assert.deepEqual(card(), weekly);
+  // A newer frame that names five-hour shows it beside the weekly windows it did not name.
+  f.clock.advance(60000);
+  turn([usageWindow('five-hour', 64, '2026-10-21T06:00:00.000Z')]);
+  assert.deepEqual(await rail(), [['five-hour', 64], ...weekly]);
+  assert.deepEqual(card(), [...weekly, ['five-hour', 64]]);
 });
 
 test('an Anthropic quota read runs on any build in range and refuses one outside it with the card line', async (t) => {

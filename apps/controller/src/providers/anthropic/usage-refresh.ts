@@ -621,9 +621,17 @@ export class AnthropicUsageRefresh {
       return [];
     }
     const { native, turn } = parts;
+    // A /usage read reports every window the plan has, so once it is newer than the last turn
+    // frame in the same scope, a window it no longer names is gone: a plan that dropped its
+    // five-hour limit shows no five-hour gauge from the frame before. The card reads the same
+    // way (current()). A turn frame names only some windows, so a newer one retires nothing.
+    const retired =
+      native?.reading.status === 'reported' &&
+      turn?.readingScopeHash === native.readingScopeHash &&
+      Date.parse(native.reading.receivedAt) > Date.parse(turn.reading.receivedAt);
     // Each window keeps the time of the read that produced it, so a per-model percent from a
     // /usage read days ago does not pass as fresh because a turn frame came in today.
-    const sources = [native, turn].filter(
+    const sources = (retired ? [native] : [native, turn]).filter(
       (part): part is Current =>
         part?.reading.status === 'reported' &&
         part.readingScopeHash === (native ?? turn)?.readingScopeHash,
