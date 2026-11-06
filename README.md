@@ -26,6 +26,11 @@ CrewKite by Roots No Limits LLC. Created by Raymond J. Kraft.
 
 CrewKite 0.1.0 is its first public release. I ran all four families, Google, OpenAI, Anthropic and Local, live through development.
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/images/crew-finished-dark.png">
+  <img alt="A CrewKite thread on demo-shop after a crew run: a review that checks each claim against the code, the line Crew finished: 4 slices, 5 reviews, 1 fix, and the change accepted to a branch. The rail shows Google, OpenAI, Anthropic and Local allowances." src="docs/images/crew-finished-light.png">
+</picture>
+
 A crew can work a large request in slices. In the Full crew preset an orchestrator model reads the request and proposes a plan of up to 8 slices. The controller checks the plan and assigns each slice to the crew's builder or its fixer for a hard slice. Local takes a slice only when a crew role uses Local and the slice fits its context. Any model can read what another did through read-only thread tools.
 
 ## Install
