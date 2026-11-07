@@ -11,6 +11,10 @@ const authMethod = z.enum([
 ]);
 const status = z.object({
   authMethod,
+  // Builds that publish these say whether the stored sign-in still works. An expired sign-in keeps
+  // its method, so the method alone cannot prove a subscription session.
+  loggedIn: z.boolean().optional().catch(undefined),
+  loginExpiresAt: z.iso.datetime({ offset: true }).optional().catch(undefined),
   type: z.never().optional(),
   method: z.never().optional(),
   request_id: z.never().optional(),
@@ -52,6 +56,8 @@ export function metadataCommand(kind: z.input<typeof command>) {
 export type AuthMetadata = {
   authMethod: z.output<typeof authMethod>;
   status: 'signed-out' | 'subscription-candidate' | 'unsupported';
+  /** The client still names a subscription sign-in that no longer works. */
+  expired: boolean;
   billing: 'unknown';
   qualified: false;
 };
@@ -61,6 +67,7 @@ export function projectAuthStatus(input: {
   stdout: Uint8Array;
   stderrBytes: number;
   exitCode: number | null;
+  now?: number;
 }): AuthMetadata {
   if (
     input.stdout.byteLength > MAX_STDOUT_BYTES ||
@@ -70,17 +77,24 @@ export function projectAuthStatus(input: {
   )
     throw new DiscoveryError('limit');
   if (input.exitCode !== 0 && input.exitCode !== 1) throw new DiscoveryError('incomplete');
-  let method: AuthMetadata['authMethod'];
+  let parsed: z.output<typeof status>;
   try {
     const text = new TextDecoder('utf-8', { fatal: true }).decode(input.stdout);
-    method = status.parse(JSON.parse(text)).authMethod;
+    parsed = status.parse(JSON.parse(text));
   } catch {
     throw new DiscoveryError('invalid-message');
   }
-  if ((input.exitCode === 1) !== (method === 'none'))
+  const named = parsed.authMethod;
+  const expiresAt = parsed.loginExpiresAt ? Date.parse(parsed.loginExpiresAt) : Number.NaN;
+  const expired =
+    named === 'claude.ai' && (parsed.loggedIn === false || expiresAt <= (input.now ?? Date.now()));
+  // A signed-out client exits 1. An expired one may exit either way.
+  if (!expired && (input.exitCode === 1) !== (named === 'none'))
     throw new DiscoveryError('inconsistent-status');
+  const method = expired ? 'none' : named;
   return {
     authMethod: method,
+    expired,
     status:
       method === 'none'
         ? 'signed-out'
