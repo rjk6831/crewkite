@@ -130,6 +130,10 @@ Skip is on every step and ends the welcome for good. The desktop keeps that flag
 
 The keys above are the macOS keys. In the Linux preview the same shortcuts use Ctrl in place of Command. The window shortcuts wait while a dialog is open. Control N and Control P move the caret in a Mac text box, so on a Mac only Command counts.
 
+## Known issue in 0.1.0
+
+If Claude Code's own sign-in has expired, CrewKite 0.1.0 still shows Anthropic as Ready with its usage unknown, and Anthropic turns stop with "The Anthropic client is not signed in." No credits or API billing are used. Run `claude auth login` in Terminal and choose your Claude subscription account, then click Check Anthropic sign-in on the Anthropic card in Settings. Version 0.1.1 shows the expired sign-in on the card.
+
 ## Uninstall
 
 Quit the app first, so the controller stops. Removing an installed application leaves workspace data intact. Remove its data only when its projects, threads, unaccepted edits and saved settings are no longer needed.
