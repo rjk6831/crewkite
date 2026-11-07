@@ -57,6 +57,8 @@ const clientHash = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c666
 const subscriptionMetadata = z.strictObject({
   authMethod: z.literal('claude.ai'),
   status: z.literal('subscription-candidate'),
+  // Records written before 0.1.1 have no expired field.
+  expired: z.literal(false).optional(),
   billing: z.literal('unknown'),
   qualified: z.literal(false),
 });

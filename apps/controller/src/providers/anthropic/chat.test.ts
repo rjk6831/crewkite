@@ -560,6 +560,30 @@ test('stop ends a running turn as stopped and leaves no process behind', async (
   assert.equal(groupAbsent(turn.handle.groups[0] ?? 0), true);
 });
 
+test('a client that reports an API key stops before its first request, and a subscription sign-in runs', async (t) => {
+  const keyed = run(['read', { out: { ...init(), apiKeySource: 'ANTHROPIC_API_KEY' } }, 'hold']);
+  t.after(keyed.cleanup);
+  const stopped = await keyed.handle.result;
+  assert.equal(stopped.stopReason, 'error');
+  assert.equal(stopped.failure?.kind, 'signed-out');
+  assert.equal(stopped.failure?.method, 'system/init');
+  assert.match(stopped.failure?.message ?? '', /would bill an API key/);
+  assert(!keyed.events.some((event) => event.type === 'turn.started'));
+  const subscribed = run([
+    'read',
+    { out: { ...init(), apiKeySource: 'none' } },
+    { out: done() },
+    { exit: 0 },
+  ]);
+  t.after(subscribed.cleanup);
+  const ran = await subscribed.handle.result;
+  assert.equal(ran.failure, null);
+  assert(subscribed.events.some((event) => event.type === 'turn.started'));
+  const helper = run(['read', { out: { ...init(), apiKeySource: 'apiKeyHelper' } }, 'hold']);
+  t.after(helper.cleanup);
+  assert.equal((await helper.handle.result).failure?.kind, 'signed-out');
+});
+
 test('a client that exits without a result is reported with its last stderr line', async (t) => {
   const turn = run([
     'read',

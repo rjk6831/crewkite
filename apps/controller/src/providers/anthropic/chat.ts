@@ -132,12 +132,17 @@ const frame = z.object({
 });
 // effort is the level the client sends after its own default, caps and model downgrades, and
 // null when it sends none. Builds that do not publish it leave it out.
+// The key sources the client names for an API key: its own settings, a helper, the environment.
+const API_KEY_SOURCE = /^(user|project|org|temporary|apiKeyHelper)$|key/i;
 const init = z.object({
   session_id: sessionId,
   model: z.string().min(1).max(200).optional(),
   effort: ChatSetEffortSchema.nullish().catch(undefined),
   // The names the client lists for feature detection. A list that changed shape drops out.
   capabilities: z.array(z.string().max(80)).max(64).optional().catch(undefined),
+  // Where the client found an API key. A subscription sign-in reports none. Builds that do not
+  // publish it leave it out.
+  apiKeySource: z.string().max(80).optional().catch(undefined),
 });
 const streamEvent = z.object({
   event: z.object({
@@ -996,6 +1001,29 @@ function startTurn(
   const onInit = (value: unknown) => {
     const parsed = init.safeParse(value);
     if (!parsed.success) return unreadable('system/init');
+    // The client reports where it found an API key before its first request, and none for a
+    // subscription sign-in. CrewKite never bills an API key, so a turn that would use one stops here
+    // and the work can move to another provider. A value it does not know goes to the trace.
+    const key = parsed.data.apiKeySource;
+    if (key !== undefined && API_KEY_SOURCE.test(key)) {
+      decide(
+        'error',
+        chatFailure({
+          stage: 'session',
+          kind: 'signed-out',
+          message:
+            'The Anthropic client would bill an API key, so CrewKite stopped the turn before it sent anything.',
+          providerMessage: null,
+          method: 'system/init',
+          nextAction:
+            'Remove the API key from Claude Code settings, run claude auth login with your Claude subscription account, then check the Anthropic sign-in in Settings.',
+        }),
+      );
+      endInput();
+      signal('SIGTERM');
+      return;
+    }
+    if (key !== undefined && key !== 'none') unknown(`system/init apiKeySource ${clip(key, 40)}`);
     session = parsed.data.session_id;
     if (parsed.data.model) model = parsed.data.model;
     if (parsed.data.capabilities?.length && build)

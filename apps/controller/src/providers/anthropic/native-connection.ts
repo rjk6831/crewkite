@@ -252,11 +252,13 @@ export class NativeConnectionChecks {
             ? 'Resolve the native client process before checking again.'
             : metadata?.status === 'subscription-candidate'
               ? 'Native subscription sign-in observed. Billing and task qualification require their own checks.'
-              : metadata?.status === 'signed-out'
-                ? 'Sign in through the native client, then check again.'
-                : observed.reason
-                  ? 'Check the native client and retry the sign-in check.'
-                  : 'Use a native subscription sign-in. This authentication method is unsupported.',
+              : metadata?.expired
+                ? 'The Anthropic sign-in has expired. Run claude auth login in Terminal and choose your Claude subscription account, then check again.'
+                : metadata?.status === 'signed-out'
+                  ? 'Sign in through the native client, then check again.'
+                  : observed.reason
+                    ? 'Check the native client and retry the sign-in check.'
+                    : 'Use a native subscription sign-in. This authentication method is unsupported.',
         };
         record('complete', value);
         result = resultFor(value);

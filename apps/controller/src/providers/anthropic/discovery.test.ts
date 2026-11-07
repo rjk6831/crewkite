@@ -99,6 +99,7 @@ test('authentication discovery exposes only bounded metadata and grants no autho
       assert.deepEqual(Object.keys(result).sort(), [
         'authMethod',
         'billing',
+        'expired',
         'qualified',
         'status',
       ]);
@@ -110,6 +111,46 @@ test('authentication discovery exposes only bounded metadata and grants no autho
       assert.equal(error.cause, undefined, scenario.name);
     }
   }
+  // A subscription sign-in that no longer works reads as signed out, whatever its exit code.
+  const now = Date.parse('2026-11-07T12:00:00Z');
+  for (const [name, value, exitCode, expired] of [
+    ['logged out', { authMethod: 'claude.ai', loggedIn: false }, 0, true],
+    ['logged out exit 1', { authMethod: 'claude.ai', loggedIn: false }, 1, true],
+    [
+      'past expiry',
+      { authMethod: 'claude.ai', loggedIn: true, loginExpiresAt: '2026-11-01T00:00:00Z' },
+      0,
+      true,
+    ],
+    [
+      'future expiry',
+      { authMethod: 'claude.ai', loggedIn: true, loginExpiresAt: '2026-12-05T11:31:59.032Z' },
+      0,
+      false,
+    ],
+    [
+      'unreadable expiry',
+      { authMethod: 'claude.ai', loggedIn: true, loginExpiresAt: privateText },
+      0,
+      false,
+    ],
+  ] as const) {
+    const result = projectAuthStatus({ stdout: encode(value), stderrBytes: 0, exitCode, now });
+    assert.equal(result.expired, expired, name);
+    assert.equal(result.status, expired ? 'signed-out' : 'subscription-candidate', name);
+    assert.equal(result.authMethod, expired ? 'none' : 'claude.ai', name);
+    assert(!JSON.stringify(result).includes(privateText), name);
+  }
+  assert.throws(
+    () =>
+      projectAuthStatus({
+        stdout: encode({ authMethod: 'api_key', loggedIn: false }),
+        stderrBytes: 0,
+        exitCode: 1,
+        now,
+      }),
+    { name: 'DiscoveryError', reason: 'inconsistent-status' },
+  );
   for (const [kind, argv] of [
     ['version', ['--version']],
     ['help', ['--help']],

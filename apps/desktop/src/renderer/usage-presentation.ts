@@ -353,7 +353,10 @@ const failedReads = new Map([
   ['unreadable-output', 'An earlier CrewKite version could not read the client output.'],
 ]);
 const nextSteps = new Map([
-  ['no-usage-report', 'The client answered without a usage report. Its reply is below.'],
+  [
+    'no-usage-report',
+    'The client answers this way when its sign-in has expired or it bills an API key. Run claude auth login in Terminal with your Claude subscription account, then check the Anthropic sign-in. Its reply is below.',
+  ],
   ['client-error', 'Check the Anthropic sign-in, then refresh.'],
   ['usage-unavailable', 'Check that the client is signed in with a subscription plan.'],
   ['unreadable-output', 'Refresh to read it again.'],
