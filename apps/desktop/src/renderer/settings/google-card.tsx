@@ -1,9 +1,11 @@
 import { useState } from 'react';
+import { GoogleRecovery } from '../google-recovery.tsx';
 import { GoogleSetup } from '../google-setup.tsx';
 import { type GoogleSetupStage, googleReasonLine } from '../google-setup-flow.ts';
 import { usageCards } from '../thread/usage-cards.ts';
 import { ClientStatus, QuotaRefresh } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
+import { providerEvidence } from './provider-evidence.ts';
 import { ConnectLine } from './providers/connect.tsx';
 
 export function GoogleCard({ header, workspace, entry, now, actions, scopes }: CardProps) {
@@ -19,6 +21,7 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
     <ProviderCard
       family="google"
       entry={entry}
+      evidence={providerEvidence('google', entry, header, now)}
       reasonLine={googleReasonLine(entry?.reason, header, connecting)}
       client={header.usageReaders.find((reader) => reader.family === 'google')?.client}
       onCheck={() => actions.checkClient('google')}
@@ -26,6 +29,7 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
         <>
           <ConnectLine family="google" header={header} workspace={workspace} />
           <GoogleSetup snapshot={header} workspace={workspace} onConnecting={setConnecting} />
+          <GoogleRecovery header={header} workspace={workspace} />
           <ClientStatus family="google" header={header} now={now} facts={false}>
             {connected && (
               <QuotaRefresh

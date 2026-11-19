@@ -43,6 +43,20 @@ export const ChatCheckOutputSchema = z.strictObject({
   bytes: z.number().int().nonnegative(),
 });
 
+/**
+ * What started a run: a fix turn, the last slice of a plan, a merged copy, the person's Run tests,
+ * the required checks of an Accept, or the gate after a writing turn.
+ */
+export const ChatCheckTriggerSchema = z.enum([
+  'fix',
+  'plan',
+  'combined',
+  'manual',
+  'accept',
+  'after-write',
+]);
+export type ChatCheckTrigger = z.infer<typeof ChatCheckTriggerSchema>;
+
 export const CHECK_TAIL_CHARACTERS = 1000;
 export const CHECK_RUNS_KEPT = 9;
 
@@ -51,12 +65,20 @@ export const ChatCheckRunSchema = z.strictObject({
   checkId: ChatCheckSchema.shape.id,
   label: ChatCheckSchema.shape.label,
   command: ChatCheckSchema.shape.command,
+  trigger: ChatCheckTriggerSchema,
   /**
-   * What started the run: a fix turn, the last slice of a plan, a merged copy, or the person's
-   * Run tests.
+   * The plan slice the run checked: the slice's own copy for after-write, the thread's copy just
+   * after that slice merged for combined. A plan has at most 8 slices. Missing outside a plan.
    */
-  trigger: z.enum(['fix', 'plan', 'combined', 'manual']),
-  status: z.enum(['running', 'passed', 'failed', 'stopped']),
+  slice: z.number().int().min(1).max(8).optional(),
+  // unknown: CrewKite could not prove the check's processes ended. Nothing may edit the copy.
+  status: z.enum(['running', 'passed', 'failed', 'stopped', 'unknown']),
+  /**
+   * Files the check itself changed in the copy, the first 50 by path, and how many changed in all.
+   * A run that changed files cannot pass.
+   */
+  changedPaths: z.array(z.string().min(1).max(1024)).max(50).optional(),
+  changedCount: z.number().int().positive().optional(),
   /** Why a run failed or stopped, in words for the person. */
   reason: z.string().min(1).max(300).nullable(),
   startedAt: timestamp,
@@ -72,7 +94,7 @@ export type ChatCheckRun = z.infer<typeof ChatCheckRunSchema>;
 /** The question the person answers before checks run: the exact commands, and what changed. */
 export const ChatChecksAskSchema = z.strictObject({
   requestId: z.string().regex(/^chkask_[0-9a-f]{32}$/),
-  trigger: z.enum(['fix', 'plan', 'combined', 'manual']),
+  trigger: ChatCheckTriggerSchema,
   commands: z
     .array(z.strictObject({ label: z.string().max(80), resolved: z.string().max(500) }))
     .max(16),
@@ -102,3 +124,23 @@ export const ChatChecksEditSchema = z.strictObject({
   remove: ChatCheckSchema.shape.id.optional(),
 });
 export type ChatChecksEdit = z.infer<typeof ChatChecksEditSchema>;
+
+/**
+ * Releases a thread held by a check that journaled its start and never recorded a process group,
+ * on the person's word. The controller proves nothing and signals nothing. A check whose recorded
+ * group is still present keeps holding the thread.
+ */
+export const ReleaseChatCheckPayloadSchema = z.strictObject({
+  taskId: z.string().regex(/^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/),
+  confirm: z.literal('explicit'),
+  /** What the person checked before releasing. It stays with the check's record. */
+  note: z
+    .string()
+    .min(1)
+    .max(300)
+    .refine(
+      (value) => value.isWellFormed() && new TextEncoder().encode(value).byteLength <= 300,
+      'Text exceeds 300 bytes.',
+    )
+    .regex(/\S/),
+});

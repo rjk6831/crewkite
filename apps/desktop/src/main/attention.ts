@@ -21,13 +21,14 @@ export function installThreadAttention(window: BrowserWindow) {
     if (!attention) throw new Error('The thread notice is invalid.');
     app.setBadgeCount(attention.badge);
     const notice = attention.notice;
-    if (!notice || !Notification.isSupported()) return;
+    if (!notice) return;
     // A monotonic clock, so a wall clock set back cannot hold a thread's notices.
     const now = performance.now();
     // Entries past the gap say nothing more, so the map holds only the last five seconds.
     for (const [taskId, at] of posted) if (now - at >= NOTICE_GAP_MS) posted.delete(taskId);
     if (posted.has(notice.taskId)) return;
     posted.set(notice.taskId, now);
+    if (!Notification.isSupported()) return;
     const notification = new Notification({ title: noticeText(notice) });
     const release = () => shown.delete(notification);
     notification.on('click', () => {

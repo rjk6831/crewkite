@@ -1,8 +1,18 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from 'node:fs';
 import { userInfo } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, join, resolve } from 'node:path';
 import type { TestContext } from 'node:test';
 import {
   AnthropicNativeProfileSchema,
@@ -38,6 +48,75 @@ import {
   fixtureModel,
   repositoryFixture,
 } from '../providers/openai/replacement-fixture.ts';
+
+/**
+ * A folder for PATH that holds links to these installed tools and nothing else, so a test that
+ * runs git through the process owner can never reach an installed gh.
+ */
+function installedTools(directory: string, ...tools: string[]) {
+  const folder = join(directory, 'installed-tools');
+  mkdirSync(folder, { recursive: true });
+  for (const tool of tools) {
+    const found = (process.env.PATH ?? '')
+      .split(delimiter)
+      .map((entry) => join(entry, tool))
+      .find((path) => existsSync(path));
+    assert(found, `${tool} is installed`);
+    symlinkSync(found, join(folder, tool));
+  }
+  return folder;
+}
+
+// A fake gh for GitHub tests. It logs each call with the JSON it was handed, then answers from
+// answers.json in its own folder, keyed by method and path for gh api and by the words otherwise.
+// An answer with `die` ends the process by SIGKILL after the call was logged, the way a write can
+// reach GitHub and lose its answer. `stdout` is a response body gh prints with a refusal.
+const fakeGhScript = `#!${realpathSync(process.execPath)}
+const { appendFileSync, readFileSync } = require('node:fs');
+const { join } = require('node:path');
+const argv = process.argv.slice(2);
+const at = argv.indexOf('--input');
+const input = at < 0 ? null : JSON.parse(readFileSync(argv[at + 1], 'utf8'));
+appendFileSync(join(__dirname, 'calls.jsonl'), JSON.stringify({ argv, input }) + '\\n');
+const key = argv[0] === 'api' ? argv[argv.indexOf('--method') + 1] + ' ' + argv.at(-1) : argv.join(' ');
+const answer = JSON.parse(readFileSync(join(__dirname, 'answers.json'), 'utf8'))[key];
+if (!answer) {
+  process.stderr.write('fake gh has no answer for ' + key + '\\n');
+  process.exit(3);
+}
+if (answer.die) process.kill(process.pid, 'SIGKILL');
+if (answer.json !== undefined) process.stdout.write(JSON.stringify(answer.json));
+if (answer.stdout !== undefined) process.stdout.write(JSON.stringify(answer.stdout));
+if (answer.stderr) process.stderr.write(answer.stderr);
+process.exitCode = answer.code ?? 0;
+`;
+type FakeGhAnswer = {
+  json?: unknown;
+  stdout?: unknown;
+  stderr?: string;
+  code?: number;
+  die?: true;
+};
+
+/** Puts the fake gh in `<directory>/gh-bin` and answers the calls it is given. */
+function fakeGh(directory: string) {
+  const bin = join(directory, 'gh-bin');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'gh'), fakeGhScript);
+  chmodSync(join(bin, 'gh'), 0o700);
+  return {
+    bin,
+    answer: (answers: Record<string, FakeGhAnswer>) =>
+      writeFileSync(join(bin, 'answers.json'), JSON.stringify(answers)),
+    calls: (): { argv: string[]; input: unknown }[] =>
+      existsSync(join(bin, 'calls.jsonl'))
+        ? readFileSync(join(bin, 'calls.jsonl'), 'utf8')
+            .split('\n')
+            .filter(Boolean)
+            .map((line) => JSON.parse(line))
+        : [],
+  };
+}
 
 const fixtureClientHash = createHash('sha256').update(readFileSync(process.execPath)).digest('hex');
 
@@ -699,4 +778,14 @@ async function acknowledgeGoogleTerms(context: {
   assert.equal(result.outcome, 'applied');
 }
 
-export { acknowledgeGoogleTerms, binding, fixtureClientHash, nativeSetup, nativeWait, setup };
+export type { FakeGhAnswer };
+export {
+  acknowledgeGoogleTerms,
+  binding,
+  fakeGh,
+  fixtureClientHash,
+  installedTools,
+  nativeSetup,
+  nativeWait,
+  setup,
+};

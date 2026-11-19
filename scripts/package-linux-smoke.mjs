@@ -15,6 +15,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { _electron, expect } from '@playwright/test';
+import { CREWKITE_VERSION } from '../packages/contracts/src/version.ts';
 import { inspectLinuxElf, linuxTarget } from './package-linux.mjs';
 
 const { values } = parseArgs({ options: { arch: { type: 'string' }, id: { type: 'string' } } });
@@ -240,7 +241,7 @@ rpm -qpi /tmp/crewkite.rpm
 rpm -qpl /tmp/crewkite.rpm
 rpm -qpR /tmp/crewkite.rpm
 dnf install -y /tmp/crewkite.rpm
-test "$(rpm -q --qf '%{NAME} %{VERSION} %{ARCH}' crewkite)" = "crewkite 0.1.0 $1"
+test "$(rpm -q --qf '%{NAME} %{VERSION} %{ARCH}' crewkite)" = "crewkite ${CREWKITE_VERSION} $1"
 rpm -V crewkite
 test "$(stat -c '%u:%g:%a' /opt/crewkite/chrome-sandbox)" = '0:0:4755'
 for program in /opt/crewkite/crewkite /usr/bin/crewkite /opt/crewkite/resources/bin/crewkite; do
@@ -252,7 +253,7 @@ test -f /usr/share/applications/crewkite.desktop
 dnf install -y shadow-utils util-linux
 useradd -m smoke
 runuser -u smoke -- env HOME=/home/smoke /opt/crewkite/resources/app/runtime/bin/node --input-type=module --eval "$4" "$2"
-test "$(runuser -u smoke -- env HOME=/home/smoke /usr/bin/crewkite --version)" = '0.1.0'
+test "$(runuser -u smoke -- env HOME=/home/smoke /usr/bin/crewkite --version)" = '${CREWKITE_VERSION}'
 case "$(runuser -u smoke -- env HOME=/home/smoke /usr/bin/crewkite --help)" in
   'Usage: crewkite'*) ;;
   *) echo 'Installed CLI help failed' >&2; exit 1 ;;

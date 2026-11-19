@@ -14,7 +14,7 @@ import {
 import { fileDigestSync } from '../file-digest.ts';
 import type { ChatClientResolution, NativeProfileResolution } from '../openai/profile.ts';
 import { probeClient } from './client-probe.ts';
-import { nativeAuthEnvironment } from './native-discovery.ts';
+import { nativeAuthEnvironment, ownedClaudeConfigDir } from './native-discovery.ts';
 import { liveModelIds } from './protocol.ts';
 
 const descriptor = {
@@ -57,6 +57,8 @@ const clientHash = '5262ce9de86243fed0d21edc39b271555d56780d0112e2b194439fe1c666
 const subscriptionMetadata = z.strictObject({
   authMethod: z.literal('claude.ai'),
   status: z.literal('subscription-candidate'),
+  // Stored records have no expired field, so it stays optional.
+  expired: z.literal(false).optional(),
   billing: z.literal('unknown'),
   qualified: z.literal(false),
 });
@@ -82,7 +84,10 @@ function resolve(
     return unavailable('unsupported-platform');
   if (!environment.HOME || environment.HOME !== userInfo().homedir)
     return unavailable('native-home-unavailable');
-  if (environment.CLAUDE_CONFIG_DIR !== undefined)
+  if (
+    environment.CLAUDE_CONFIG_DIR !== undefined &&
+    environment.CREWKITE_CLAUDE_PROFILE === undefined
+  )
     return unavailable('configuration-location-unsupported');
   let found = false;
   for (const directory of [
@@ -109,7 +114,12 @@ function resolve(
         client: { executable, sha256: clientHash, version: selected.clientVersion },
         environment: nativeAuthEnvironment(environment, '/tmp'),
         locationHash: createHash('sha256')
-          .update(JSON.stringify({ home: environment.HOME, configurationHome: null }))
+          .update(
+            JSON.stringify({
+              home: environment.HOME,
+              configurationHome: ownedClaudeConfigDir(environment),
+            }),
+          )
           .digest('hex'),
       };
     } catch {}
@@ -138,7 +148,8 @@ export function resolveAnthropicChatClient(
 ): ChatClientResolution {
   const gate =
     clientHostGate('anthropic', environment) ??
-    (environment.CLAUDE_CONFIG_DIR !== undefined
+    (environment.CLAUDE_CONFIG_DIR !== undefined &&
+    environment.CREWKITE_CLAUDE_PROFILE === undefined
       ? {
           reason: 'configuration-location-unsupported',
           detail:
@@ -179,7 +190,12 @@ export function resolveAnthropicChatClient(
       client: found.client,
       environment: nativeAuthEnvironment(environment, '/tmp'),
       locationHash: createHash('sha256')
-        .update(JSON.stringify({ home: environment.HOME, configurationHome: null }))
+        .update(
+          JSON.stringify({
+            home: environment.HOME,
+            configurationHome: ownedClaudeConfigDir(environment),
+          }),
+        )
         .digest('hex'),
     },
   };

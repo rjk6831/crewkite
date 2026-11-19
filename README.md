@@ -41,7 +41,7 @@ Download the [latest release](https://github.com/rjk6831/crewkite/releases/lates
 - Ubuntu and Debian: [crewkite_amd64.deb](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite_amd64.deb) or [crewkite_arm64.deb](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite_arm64.deb), then `sudo apt install ./crewkite_amd64.deb`.
 - Fedora: [crewkite.x86_64.rpm](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite.x86_64.rpm) or [crewkite.aarch64.rpm](https://github.com/rjk6831/crewkite/releases/latest/download/crewkite.aarch64.rpm), then `sudo dnf install ./crewkite.x86_64.rpm`.
 
-Linux is a preview. The DEB was tested on Ubuntu 24.04 with desktop launch. The RPM was tested on Fedora 45 for install, headless runtime and the CLI. Google is not available on Linux. Windows is not supported yet. The [preview guide](docs/preview.md) covers install, uninstall and where state lives. Version 0.1.0 starts fresh installed state; directory-preview import waits for 0.1.1.
+Linux is a preview. The DEB was tested on Ubuntu 24.04 with desktop launch. The RPM was tested on Fedora 45 for install, headless runtime and the CLI. Google is not available on Linux. Windows is not supported yet. The [preview guide](docs/preview.md) covers install, uninstall and where state lives. Version 0.1.0 starts fresh installed state; directory-preview import waits for a later release.
 
 From source:
 
@@ -51,11 +51,11 @@ From source:
 
 Connect each provider once from its card. OpenAI signs in through CrewKite's own client home; the person's existing client sign-in stays separate. Later launches reconnect providers that were connected before.
 
-Check for Updates… sits under About in the CrewKite menu on macOS and in Help on Linux. CrewKite also checks once a day after launch and offers a newer release's download page. Updating is a manual download in 0.1.x.
+Check for Updates… sits under About in the CrewKite menu on macOS and in Help on Linux. CrewKite also checks once a day after launch and offers a newer release's download page. Updating is a manual download.
 
-### Known issue in 0.1.0
+### Expired Anthropic sign-in
 
-If Claude Code's own sign-in has expired, CrewKite 0.1.0 still shows Anthropic as Ready with its usage unknown, and Anthropic turns stop with "The Anthropic client is not signed in." No credits or API billing are used. Run `claude auth login` in Terminal and choose your Claude subscription account, then click Check Anthropic sign-in on the Anthropic card in Settings. Version 0.1.1 shows the expired sign-in on the card.
+CrewKite 0.1.0 showed Anthropic as Ready when Claude Code's own sign-in had expired, and Anthropic turns stopped with "The Anthropic client is not signed in." From 0.2.0 the card reads signed out when Claude Code reports that it is not logged in, and says to sign in again. CrewKite does not compare the reported expiry time with the clock yet, because I have not captured how the client reports and renews it. A client that still reports itself logged in shows as signed in, and a turn it refuses stops with the same line. No credits or API billing are used. Run `claude auth login` in Terminal and choose your Claude subscription account, then click Check Anthropic sign-in on the Anthropic card in Settings.
 
 OpenAI compatibility follows its protocol checks and replies; version 0.133.0 introduced the named read profile. Anthropic accepts builds from 2.1.259 within its tested major, and the Google quota reader accepts builds from 1.4.0 within its tested major. Settings shows the found version and its checked-build date. [Provider routes](docs/providers.md#client-versions) lists tested builds, update commands and setup.
 
@@ -71,7 +71,7 @@ CrewKite's safety rests on POSIX behavior. Each provider client runs in its own 
 
 ## Plans per family
 
-CrewKite puts no plan gate of its own. Each family works on whatever plan its provider allows, and the provider's limits apply. CrewKite sets no API key and never falls back to paid API billing. The OpenAI route stops with a message when its client is signed in with an API key, because that bills per token. [Provider routes](docs/providers.md#plans-per-family) has the longer notes on each line.
+CrewKite puts no plan gate of its own. Each family works on whatever plan its provider allows, and the provider's limits apply. CrewKite sets no API key and never falls back to paid API billing. The OpenAI and Anthropic routes stop a turn with a message when their client is signed in with an API key, because that bills per token. [Provider routes](docs/providers.md#plans-per-family) has the longer notes on each line.
 
 | Family | Account | Plan facts |
 |--------|---------|------------|
@@ -88,10 +88,9 @@ Google's third-party access FAQ says that third-party access through its coding 
 
 After 0.1.0, in rough order. [docs/roadmap.md](docs/roadmap.md) has the detail.
 
-- Design systems, planned for 0.2.0 as a core feature. Configure a design system once and CrewKite enforces it on every provider. One reusable file names a project's tokens, its component library and its rules, such as the spacing steps and which raw values are banned. CrewKite can draft that file from an existing token source, and several projects can share one design system. Every crew role gets the same design brief whichever provider runs it, so a builder on OpenAI, a fixer on Google and a reviewer on Anthropic work to one standard. Before review, the controller checks each candidate in its own code: a token check flags raw colors, sizes and spacing, and a screenshot check renders the screens you list in both themes. A failed check blocks Accept and goes back to the fixer with the exact lines. CrewKite's own interface follows the same rules: shared components that take only design tokens, and a screenshot check of every provider card, the rail and the inspector tabs in both themes before a build is signed.
-- GitHub in the thread, planned for 0.2.0, through your own GitHub sign-in. CrewKite already pushes a branch, opens a pull request and reads branch status. Next, the thread follows the pull request's CI as it runs: every check, its status and its log, with the failing step and lines pulled out. One click sends a failure to the fixer with that log excerpt, and the fix lands in the thread's copy for you to accept and push. Re-run failed jobs, read review comments in the thread, and squash merge with your own title, description and sign-off. The controller runs every GitHub step in its own code, and a merge first shows exactly what lands on the base branch and waits for your click.
+- Version 0.2.0 holds design systems enforced on every provider, GitHub in the thread, API connections for OpenAI and Anthropic, and recipes with loops and results. The [roadmap](docs/roadmap.md#020) says what each one holds and what is left.
 - Named builders. A crew roster where each builder has its own provider, model and effort, with a live view of who works on which slice and the subagents each one starts.
-- An API key route for each provider. It gives the full model list for Anthropic and a Google route inside Google's terms.
+- A Google API route inside Google's terms, and the full model list for Anthropic.
 - Grok (xAI) as the other choice for the G row. Grok's own coding client speaks the same protocol as the Google route and signs in with your xAI subscription, so it would bring a fourth subscription family to Linux and to people who skip the Google route. It ships after I review xAI's terms and qualify Grok on macOS and Linux.
 - Windows, once the port above is done.
 - Google on Linux, plus Linux task writers, formatting and verification.
@@ -128,6 +127,7 @@ Raymond J. Kraft
 - [Usage and routing](docs/routing.md)
 - [Continuity and recovery](docs/continuity.md)
 - [Crew and permissions](docs/crew-and-permissions.md)
+- [Terms](docs/terms.md)
 - [Testing approach](docs/testing.md)
 - [Roadmap](docs/roadmap.md)
 - [Releases](docs/releases.md)

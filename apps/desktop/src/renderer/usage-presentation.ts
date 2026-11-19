@@ -3,6 +3,8 @@ import {
   type ChatCatalogEntry,
   type ChatCatalogRead,
   type ChatFamily,
+  CONNECTION_COPY,
+  type ConnectionsRead,
   canonicalJson,
   type LocalHardwareStatus,
   type LocalSetup,
@@ -10,12 +12,14 @@ import {
   type Policy,
   type Route,
   type Snapshot,
+  type Spend,
   tightestAllowance,
   type Window,
   windowAppliesTo,
 } from '@crewkite/contracts';
 
 import { formatSize } from './format-size.ts';
+import { connectionAttention } from './settings/connection-view.ts';
 import type { UsageCard, UsageReading } from './usage-gauges.tsx';
 
 type Reserve = Policy['reserves'][number];
@@ -353,7 +357,10 @@ const failedReads = new Map([
   ['unreadable-output', 'An earlier CrewKite version could not read the client output.'],
 ]);
 const nextSteps = new Map([
-  ['no-usage-report', 'The client answered without a usage report. Its reply is below.'],
+  [
+    'no-usage-report',
+    'This can happen when its sign-in has expired or it bills an API key. Run claude auth login in Terminal with your Claude subscription account, then check the Anthropic sign-in. Its reply is below.',
+  ],
   ['client-error', 'Check the Anthropic sign-in, then refresh.'],
   ['usage-unavailable', 'Check that the client is signed in with a subscription plan.'],
   ['unreadable-output', 'Refresh to read it again.'],
@@ -528,7 +535,7 @@ export function readAgo(
 export type RailBar = { text: string; percent: number | null };
 export type RailFamily = {
   family: ChatFamily;
-  /** Two bars when the family reports a five-hour and a weekly window, else one. Empty for Local and for a family not connected that has read nothing. */
+  /** A bar for each period the family reports and one for a window with no length that limits the model, else one. Empty for Local and for a family not connected that has read nothing. */
   bars: RailBar[];
   /** The family runs on this computer and reports no allowance. */
   unlimited: boolean;
@@ -633,6 +640,33 @@ export function railFamilies(
       scoped.find((window) => applies.includes(window)) ??
       [...scoped].sort((left, right) => (left.percent ?? 0) - (right.percent ?? 0))[0];
     const pair = !fiveHour && !both && weekly && modelWindow ? [weekly, modelWindow] : null;
+    // A slot the provider client reported with no length, such as main:primary, keeps its own name.
+    // When it limits the family's model it gets a bar beside the period bars, and the one with the
+    // least left wins if there are several. A named pool, such as Google's 3p-5h, is not a slot and
+    // gets no bar of its own.
+    const periods = (['five-hour', 'weekly'] as const).filter((label) =>
+      applies.some((window) => window.label.toLowerCase() === label),
+    );
+    const unnamed = applies
+      .filter(
+        (window) =>
+          window.percent !== null &&
+          bucketWindow.test(window.windowId) &&
+          !(periods as readonly string[]).includes(window.label.toLowerCase()),
+      )
+      .sort((left, right) => (left.percent ?? 0) - (right.percent ?? 0))[0];
+    const periodBars = periods.map((label) => {
+      const { percent } = period(label);
+      return { text: `${barNames[label]} ${percentText(percent)}`, percent };
+    });
+    const ownBar = unnamed
+      ? [
+          {
+            text: `${windowLabel(unnamed.windowId).split(',')[0] ?? unnamed.windowId} ${percentText(unnamed.percent)}`,
+            percent: unnamed.percent,
+          },
+        ]
+      : [];
     // A provider that is not connected and has read nothing keeps its row with Connect, so the
     // rail shows one gauge per provider. It has no bar to draw yet. Google reads its quota only
     // once it is connected, so until then its row is Connect alone, whatever an older read left.
@@ -646,24 +680,26 @@ export function railFamilies(
         : credit
           ? [{ text: credit, percent: tightest.percent }]
           : both
-            ? (['five-hour', 'weekly'] as const).map((label) => {
-                const { percent } = period(label);
-                return { text: `${barNames[label]} ${percentText(percent)}`, percent };
-              })
+            ? [...periodBars, ...ownBar]
             : pair
-              ? pair.map((window, index) => ({
-                  text: `${index === 0 ? barNames.weekly : (windowLabel(window.windowId).split(',')[0] ?? window.windowId)} ${percentText(window.percent)}`,
-                  percent: window.percent,
-                }))
-              : [
-                  {
-                    text:
-                      tightest.percent === null
-                        ? 'unknown'
-                        : `${percentText(tightest.percent)} left`,
-                    percent: tightest.percent,
-                  },
-                ];
+              ? [
+                  ...pair.map((window, index) => ({
+                    text: `${index === 0 ? barNames.weekly : (windowLabel(window.windowId).split(',')[0] ?? window.windowId)} ${percentText(window.percent)}`,
+                    percent: window.percent,
+                  })),
+                  ...ownBar,
+                ]
+              : periods.length === 1 && unnamed
+                ? [...periodBars, ...ownBar]
+                : [
+                    {
+                      text:
+                        tightest.percent === null
+                          ? 'unknown'
+                          : `${percentText(tightest.percent)} left`,
+                      percent: tightest.percent,
+                    },
+                  ];
     const until = tightest.resetsAt ? Date.parse(tightest.resetsAt) - nowMs : null;
     return {
       family: entry.family,
@@ -681,6 +717,67 @@ export function railFamilies(
           : null,
     };
   });
+}
+
+type Money = { amountMicros: number; currency: string };
+const money = ({ amountMicros, currency }: Money) => {
+  const format = (micros: number) =>
+    new Intl.NumberFormat('en-US', { style: 'currency', currency }).format(micros / 1_000_000);
+  // A cost below a cent still cost something, so it never rounds to zero.
+  return amountMicros > 0 && amountMicros < 10_000
+    ? `under ${format(10_000)}`
+    : format(amountMicros);
+};
+const day = (at: string) =>
+  new Date(at).toLocaleDateString('en-GB', { day: 'numeric', month: 'short', timeZone: 'UTC' });
+
+/**
+ * What an API connection's spend says on the rail. Reported, estimated and unreported each keep
+ * their own words and are never added up, and a cost nothing reported never reads as zero. A
+ * price-table estimate names the day its prices were read.
+ */
+export function spendText(spend: Spend | null): string {
+  if (!spend) return 'No turns yet';
+  const turns = spend.unreportedTurns;
+  return [
+    spend.reported && `${money(spend.reported)} reported`,
+    spend.estimated &&
+      `${money(spend.estimated)} estimated${spend.estimated.basis === 'price-table' ? ` from ${day(spend.estimated.at)} prices` : ''}`,
+    turns > 0 && `${CONNECTION_COPY.spendNotReported} for ${turns} turn${turns === 1 ? '' : 's'}`,
+  ]
+    .filter(Boolean)
+    .join(', ');
+}
+
+/**
+ * One API connection under its family on the rail: its name, its spend, and what it needs before
+ * it can run, if anything.
+ */
+export type RailConnection = {
+  connectionId: string;
+  label: string;
+  spend: string;
+  attention: string | null;
+};
+
+/**
+ * The API connections of one family, each on its own line under the family's allowance. A line
+ * shows spend and never a percent, and Local, which bills nothing, never has one.
+ */
+export function railConnections(
+  read: ConnectionsRead | null,
+  family: ChatFamily,
+): RailConnection[] {
+  return (read?.connections ?? [])
+    .filter((connection) => connection.family === family && connection.billingMode === 'api')
+    .map((connection) => ({
+      connectionId: connection.connectionId,
+      label: connection.label ?? CONNECTION_COPY.apiLabel,
+      spend: spendText(
+        read?.spend.find((row) => row.connectionId === connection.connectionId)?.spend ?? null,
+      ),
+      attention: connectionAttention(connection),
+    }));
 }
 
 // A catalog that predates Local, or one read before it, still gets a Local row.

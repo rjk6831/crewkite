@@ -1,8 +1,13 @@
-import type { ChatCatalogRead, ChatFamily, ChatModelSelection } from '@crewkite/contracts';
+import type {
+  ChatCatalogRead,
+  ChatFamily,
+  ChatModelSelection,
+  ChatThread,
+} from '@crewkite/contracts';
 import { useEffect, useState } from 'react';
 import { familyName } from '../components.tsx';
-import { handoffThread, readCatalog, type ThreadSource } from './commands.ts';
-import { type LimitOffer, offerChoices } from './handoff-offer.ts';
+import { configureThread, handoffThread, readCatalog, type ThreadSource } from './commands.ts';
+import { type LimitOffer, offerChoices, resetStart, startTime } from './handoff-offer.ts';
 import './handoff-card.css';
 
 const reason = (failure: unknown, fallback: string) =>
@@ -16,13 +21,16 @@ export function LimitOfferCard({
   source,
   taskId,
   offer,
+  startAt,
 }: {
   source: ThreadSource;
   taskId: string;
   offer: LimitOffer;
+  /** The thread's start at reset, when the person asked for one. */
+  startAt?: ChatThread['startAt'];
 }) {
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
-  const [busy, setBusy] = useState<ChatFamily | null>(null);
+  const [busy, setBusy] = useState<ChatFamily | 'wait' | null>(null);
   const [problem, setProblem] = useState<string | null>(null);
 
   useEffect(() => {
@@ -49,7 +57,24 @@ export function LimitOfferCard({
     }
   }
 
+  async function wait(on: boolean) {
+    setBusy('wait');
+    setProblem(null);
+    try {
+      await configureThread(source, { taskId, startAtReset: on });
+    } catch (failure) {
+      setProblem(reason(failure, 'The start was not changed.'));
+    } finally {
+      setBusy(null);
+    }
+  }
+
   if (!catalog && !problem) return null;
+  const resets = startAt
+    ? startAt.at
+    : catalog
+      ? resetStart(catalog, offer.family, Date.now())
+      : null;
   const choices = catalog ? offerChoices(catalog, offer.family, offer.mode) : [];
   return (
     <section className="th-row th-offer" aria-label="Continue on another provider">
@@ -79,6 +104,34 @@ export function LimitOfferCard({
             ))}
           </div>
         </>
+      )}
+      {startAt && (
+        <p>
+          Starts at {startTime(startAt.at)} when the {familyName(startAt.family)} window resets.{' '}
+          <button
+            type="button"
+            className="th-offer-option"
+            disabled={busy !== null}
+            onClick={() => void wait(false)}
+          >
+            Cancel
+          </button>
+        </p>
+      )}
+      {!startAt && resets && (
+        <div className="th-offer-options">
+          <button
+            type="button"
+            className="th-offer-option"
+            disabled={busy !== null}
+            onClick={() => void wait(true)}
+          >
+            <span>Start at reset</span>
+            <span className="th-muted">
+              {startTime(resets)} when {familyName(offer.family)} resets
+            </span>
+          </button>
+        </div>
       )}
       {problem && (
         <p className="th-error" role="alert">

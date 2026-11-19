@@ -51,6 +51,13 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0051](0051-own-openai-client-home-and-explicit-connect.md) | The OpenAI client runs in a home of its own, and every provider connects explicitly | Proposed |
 | [0052](0052-credit-spending-is-a-per-provider-switch-that-defaults-off.md) | Credit spending is a per-provider switch that defaults off | Proposed |
 | [0053](0053-providers-read-in-goal-order.md) | Providers read in GOAL order | Proposed |
+| [0054](0054-release-a-google-metadata-hold-once-its-owner-is-proven-gone.md) | Release a Google metadata hold once its owner is proven gone | Proposed |
+| [0055](0055-a-project-design-system-is-one-file-in-the-w3c-tokens-format.md) | A project's design system is one file in the W3C design tokens format where it fits | Proposed |
+| [0056](0056-an-api-connection-spends-only-where-i-assign-it.md) | An API connection spends only for the thread or role I assign it to | Proposed |
+| [0057](0057-a-recipe-is-one-file-and-only-a-saved-version-runs.md) | A recipe is one file in the project, and only a version I saved runs | Proposed |
+| [0058](0058-a-schedule-cannot-be-saved-without-a-budget.md) | A schedule cannot be saved without a budget | Proposed |
+| [0059](0059-results-stay-on-the-device.md) | Results stay on the device | Proposed |
+| [0060](0060-a-recipe-changes-from-results-only-through-a-proposal-i-approve.md) | A recipe changes from results only through a proposal I approve and can revert | Proposed |
 
 ## Writing a new record
 

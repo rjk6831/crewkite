@@ -10,7 +10,9 @@ export type ChangeCommandHost = {
   task: (taskId: string) => Task | undefined;
   /** The thread after the ownership check, with the process groups still recorded. */
   checkedThread: (task: Task) => { thread: ChatThread; left: number[] };
-  ownershipUnknown: (left: number[], then: string) => CommandResult;
+  ownershipUnknown: (left: number[]) => CommandResult;
+  /** A check runs in the copy or waits on its question. */
+  checksBusy: (taskId: string) => boolean;
   projectPath: (projectId: string) => string | undefined;
   scratchDirectory: (taskId: string) => string;
   systemLine: (task: Task, text: string) => void;
@@ -24,6 +26,13 @@ const blocked = (reason: string, next?: string): CommandResult => ({
   ...(next ? { next } : {}),
 });
 
+/**
+ * A check reads the copy while it runs and may write to it. Publishing or changing the copy then
+ * leaves a result that describes neither version.
+ */
+export const checksRunning = (): CommandResult =>
+  blocked('checks-running', 'Wait for the checks to finish or stop them, then try again.');
+
 const hunkRefusals: Record<string, string> = {
   'not-changed': 'This file has no changes to review.',
   'hunks-unavailable': 'This file takes Accept and Discard for the whole file only.',
@@ -32,7 +41,10 @@ const hunkRefusals: Record<string, string> = {
 
 type Ready = { task: Task; root: string; base: string; scratch: string };
 
-/** The thread, project and copy a hunk command needs. A running turn blocks a change to the copy. */
+/**
+ * The thread, project and copy a hunk command needs. A running turn or check blocks a change to
+ * the copy.
+ */
 function ready(
   host: ChangeCommandHost,
   taskId: string,
@@ -44,7 +56,8 @@ function ready(
   const { thread, left } = host.checkedThread(task);
   if (writes && thread.activeTurnId)
     return blocked('turn-running', `Wait for the reply or stop it, then ${verb}.`);
-  if (writes && left.length) return host.ownershipUnknown(left, verb);
+  if (writes && left.length) return host.ownershipUnknown(left);
+  if (writes && host.checksBusy(task.id)) return checksRunning();
   const root = host.projectPath(task.projectId);
   if (!root) return blocked('project-not-found', `Add the project again, then ${verb}.`);
   if (!thread.base || !thread.scratchReady)

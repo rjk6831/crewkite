@@ -1,0 +1,285 @@
+{
+  "pull-request-created": {
+    "url": "https://api.github.com/repos/crew-kite/demo-shop/pulls/42",
+    "id": 2104858832,
+    "html_url": "https://github.com/crew-kite/demo-shop/pull/42",
+    "number": 42,
+    "state": "open",
+    "draft": false,
+    "title": "feat: chart monthly sales",
+    "user": {
+      "login": "rjk-fixture",
+      "type": "User"
+    },
+    "head": {
+      "label": "crew-kite:feat/sales-chart",
+      "ref": "feat/sales-chart",
+      "sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4"
+    },
+    "base": {
+      "label": "crew-kite:main",
+      "ref": "main",
+      "sha": "0d3c2b1a0f9e8d7c6b5a49382716051f2e3d4c5b"
+    },
+    "merged": false,
+    "mergeable": null,
+    "mergeable_state": "unknown",
+    "merge_commit_sha": null
+  },
+  "pull-request-open": {
+    "url": "https://api.github.com/repos/crew-kite/demo-shop/pulls/42",
+    "html_url": "https://github.com/crew-kite/demo-shop/pull/42",
+    "number": 42,
+    "state": "open",
+    "draft": false,
+    "title": "feat: chart monthly sales",
+    "body": "Chart monthly sales.",
+    "head": {
+      "ref": "feat/sales-chart",
+      "sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4"
+    },
+    "base": {
+      "ref": "main",
+      "sha": "0d3c2b1a0f9e8d7c6b5a49382716051f2e3d4c5b"
+    },
+    "merged": false,
+    "mergeable": true,
+    "mergeable_state": "clean",
+    "merge_commit_sha": "4f1d6c3b2a19e8d7c6b5a4938271605f4e3d2c1b"
+  },
+  "branch-main-protected": {
+    "name": "main",
+    "commit": {
+      "sha": "0d3c2b1a0f9e8d7c6b5a49382716051f2e3d4c5b"
+    },
+    "protected": true,
+    "protection": {
+      "enabled": true,
+      "required_status_checks": {
+        "enforcement_level": "non_admins",
+        "contexts": ["verify"],
+        "checks": [
+          {
+            "context": "verify",
+            "app_id": 15368
+          }
+        ]
+      }
+    }
+  },
+  "rules-main": [
+    {
+      "type": "deletion",
+      "ruleset_source_type": "Repository",
+      "ruleset_source": "crew-kite/demo-shop",
+      "ruleset_id": 812
+    },
+    {
+      "type": "required_status_checks",
+      "ruleset_source_type": "Repository",
+      "ruleset_source": "crew-kite/demo-shop",
+      "ruleset_id": 813,
+      "parameters": {
+        "strict_required_status_checks_policy": false,
+        "do_not_enforce_on_create": false,
+        "required_status_checks": [
+          {
+            "context": "e2e",
+            "integration_id": 15368
+          }
+        ]
+      }
+    }
+  ],
+  "check-runs-red": {
+    "total_count": 2,
+    "check_runs": [
+      {
+        "id": 31790001,
+        "name": "verify",
+        "head_sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4",
+        "status": "completed",
+        "conclusion": "failure",
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        }
+      },
+      {
+        "id": 31790002,
+        "name": "lint",
+        "head_sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4",
+        "status": "completed",
+        "conclusion": "success",
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        }
+      }
+    ]
+  },
+  "check-runs-green": {
+    "total_count": 3,
+    "check_runs": [
+      {
+        "id": 31790101,
+        "name": "verify",
+        "head_sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4",
+        "status": "completed",
+        "conclusion": "success",
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        }
+      },
+      {
+        "id": 31790001,
+        "name": "verify",
+        "head_sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4",
+        "status": "completed",
+        "conclusion": "failure",
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        }
+      },
+      {
+        "id": 31790102,
+        "name": "e2e",
+        "head_sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4",
+        "status": "completed",
+        "conclusion": "success",
+        "app": {
+          "id": 15368,
+          "slug": "github-actions"
+        }
+      }
+    ]
+  },
+  "commit-status-empty": {
+    "state": "pending",
+    "sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4",
+    "total_count": 0,
+    "statuses": []
+  },
+  "merge-applied": {
+    "sha": "4f1d6c3b2a19e8d7c6b5a4938271605f4e3d2c1b",
+    "merged": true,
+    "message": "Pull Request successfully merged"
+  },
+  "user": {
+    "login": "rjk-fixture",
+    "id": 51234567,
+    "type": "User"
+  },
+  "review-comments-without-reply": [
+    {
+      "id": 1999,
+      "path": "src/chart.ts",
+      "line": 12,
+      "original_line": 12,
+      "body": "Round the monthly totals here.",
+      "user": {
+        "login": "reviewer-fixture"
+      },
+      "created_at": "2026-11-18T08:30:00Z",
+      "html_url": "https://github.com/crew-kite/demo-shop/pull/42#discussion_r1999"
+    }
+  ],
+  "merge-refused": {
+    "stdout": {
+      "message": "Required status check \"verify\" is expected.",
+      "documentation_url": "https://docs.github.com/rest/pulls/pulls#merge-a-pull-request",
+      "status": "405"
+    },
+    "stderr": "gh: Required status check \"verify\" is expected. (HTTP 405)\n"
+  },
+  "pull-request-exists": {
+    "stdout": {
+      "message": "Validation Failed",
+      "errors": [
+        {
+          "resource": "PullRequest",
+          "code": "custom",
+          "message": "A pull request already exists for crew-kite:feat/sales-chart."
+        }
+      ],
+      "documentation_url": "https://docs.github.com/rest/pulls/pulls#create-a-pull-request",
+      "status": "422"
+    },
+    "stderr": "gh: Validation Failed (HTTP 422)\n"
+  },
+  "pulls-from-branch": [
+    {
+      "number": 42,
+      "state": "open",
+      "draft": false,
+      "created_at": "2026-11-17T16:20:00Z",
+      "merged_at": null,
+      "html_url": "https://github.com/crew-kite/demo-shop/pull/42",
+      "head": {
+        "label": "crew-kite:feat/sales-chart",
+        "ref": "feat/sales-chart",
+        "sha": "7c1e5d2a9f3b8e4c6d0a1b2c3d4e5f60718293a4"
+      },
+      "base": {
+        "ref": "main"
+      }
+    },
+    {
+      "number": 41,
+      "state": "closed",
+      "draft": false,
+      "created_at": "2026-11-02T10:05:00Z",
+      "merged_at": null,
+      "html_url": "https://github.com/crew-kite/demo-shop/pull/41",
+      "head": {
+        "label": "crew-kite:feat/sales-chart",
+        "ref": "feat/sales-chart",
+        "sha": "2b7e151628aed2a6abf7158809cf4f3c762e7160"
+      },
+      "base": {
+        "ref": "main"
+      }
+    }
+  ],
+  "review-comments-with-long-reply": [
+    {
+      "id": 2001,
+      "in_reply_to_id": 1999,
+      "path": "src/chart.ts",
+      "line": 12,
+      "original_line": 12,
+      "body": "Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders. Rounded the monthly totals to whole cents before they reach the chart, and kept the raw sums for the tooltip so nothing is lost when a month has many small orders.",
+      "user": {
+        "login": "rjk-fixture"
+      },
+      "created_at": "2026-11-18T08:58:00Z",
+      "html_url": "https://github.com/crew-kite/demo-shop/pull/42#discussion_r2001"
+    },
+    {
+      "id": 1999,
+      "path": "src/chart.ts",
+      "line": 12,
+      "original_line": 12,
+      "body": "Round the monthly totals here.",
+      "user": {
+        "login": "reviewer-fixture"
+      },
+      "created_at": "2026-11-18T08:30:00Z",
+      "html_url": "https://github.com/crew-kite/demo-shop/pull/42#discussion_r1999"
+    },
+    {
+      "id": 1998,
+      "path": "src/labels.ts",
+      "line": null,
+      "original_line": 3,
+      "body": "Name the axis.",
+      "user": {
+        "login": "reviewer-fixture"
+      },
+      "created_at": "2026-11-18T08:29:00Z",
+      "html_url": "https://github.com/crew-kite/demo-shop/pull/42#discussion_r1998"
+    }
+  ]
+}

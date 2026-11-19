@@ -2,6 +2,8 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   type ChatCatalogRead,
+  type Connection,
+  type ConnectionsRead,
   type LocalSetup,
   ObservationSchema,
   type Route,
@@ -17,7 +19,9 @@ import {
   gaugeHue,
   nativeUsageClients,
   projectUsagePresentation,
+  railConnections,
   railFamilies,
+  spendText,
   usageCardFamily,
   windowLabel,
 } from './usage-presentation.ts';
@@ -385,12 +389,74 @@ test('the rail shows five-hour and weekly bars, one bar for a single window, and
       expect: { bars: ['5 h 68%', 'week 63%'], resetsIn: 2880 * 60_000, read: 'read 2 m ago' },
     },
     {
-      claim: 'OpenAI primary is the five-hour bar and secondary the weekly bar',
+      claim: 'OpenAI windows that report a five-hour and a weekly length get a bar each',
       entry: entry('openai', [
         window('client:primary', 'five-hour', 12, 40),
         window('client:secondary', 'weekly', 70, 4000),
       ]),
       expect: { bars: ['5 h 12%', 'week 70%'], resetsIn: 40 * 60_000, read: 'read 2 m ago' },
+    },
+    {
+      claim:
+        'a window with no reported length keeps its own name beside the weekly bar and never reads 5 h',
+      entry: entry('openai', [
+        window('client:primary', 'client:primary', 12, 40),
+        window('client:secondary', 'weekly', 70, 4000),
+      ]),
+      expect: { bars: ['week 70%', 'Main window 12%'], resetsIn: 40 * 60_000 },
+    },
+    {
+      claim: 'a Google row keeps 5 h and week, and the pool for other vendors gets no bar',
+      entry: entry(
+        'google',
+        [
+          window('gemini-5h', 'five-hour', 60, 100),
+          window('gemini-weekly', 'weekly', 80, 4000),
+          window('3p-5h', '3p-5h', 40, 100),
+          window('3p-weekly', '3p-weekly', 70, 4000),
+        ],
+        { defaultModel: 'gemini-large' },
+      ),
+      expect: { bars: ['5 h 60%', 'week 80%'] },
+    },
+    {
+      claim: 'a slot with no length gets its own bar beside two period bars',
+      entry: entry(
+        'openai',
+        [
+          window('large:primary', 'five-hour', 60, 100),
+          window('large:secondary', 'weekly', 80, 4000),
+          window('large_spark:primary', 'large_spark:primary', 30, 100),
+        ],
+        { defaultModel: 'large-spark' },
+      ),
+      expect: { bars: ['5 h 60%', 'week 80%', 'Spark 30%'] },
+    },
+    {
+      claim: 'a slot for another model draws no bar, and its percent never sets the reset line',
+      entry: entry(
+        'openai',
+        [
+          window('large:primary', 'five-hour', 60, 100),
+          window('large:secondary', 'weekly', 80, 4000),
+          window('large_spark:primary', 'large_spark:primary', 30, 50),
+        ],
+        { defaultModel: 'large-1' },
+      ),
+      expect: { bars: ['5 h 60%', 'week 80%'], resetsIn: 100 * 60_000 },
+    },
+    {
+      claim: 'with two slots of no length the one with the least left gets the bar',
+      entry: entry(
+        'openai',
+        [
+          window('large:primary', 'large:primary', 50, 100),
+          window('large:secondary', 'weekly', 80, 4000),
+          window('large_spark:primary', 'large_spark:primary', 30, 100),
+        ],
+        { defaultModel: 'large-spark' },
+      ),
+      expect: { bars: ['week 80%', 'Spark 30%'] },
     },
     {
       claim: 'a family with one window gets one bar, and an unconnected reader asks for Connect',
@@ -654,4 +720,92 @@ test('every usage card maps to its provider, the Anthropic card included', () =>
   assert.equal(usageCardFamily('native-quota:anthropic', scopes), 'anthropic');
   assert.equal(usageCardFamily('route:openai', scopes), 'openai');
   assert.equal(usageCardFamily('route:unknown', scopes), undefined);
+});
+
+// Claim: an API connection shows what its turns cost apart from any allowance. Reported,
+// estimated and unreported keep their own words, and a cost nothing reported never reads as zero.
+test('API spend never reads as zero when nothing reported it, and never joins the allowance', () => {
+  const usd = (amountMicros: number) => ({ amountMicros, currency: 'USD' });
+  const cases: [string, Parameters<typeof spendText>[0], string][] = [
+    ['no turn ran there yet', null, 'No turns yet'],
+    [
+      'turns the client reported nothing for',
+      { reported: null, estimated: null, unreportedTurns: 2 },
+      'Spend not reported for 2 turns',
+    ],
+    [
+      'a reported cost beside an unreported turn',
+      { reported: usd(1_250_000), estimated: null, unreportedTurns: 1 },
+      '$1.25 reported, Spend not reported for 1 turn',
+    ],
+    [
+      'a cost under a cent',
+      { reported: usd(1_200), estimated: null, unreportedTurns: 0 },
+      'under $0.01 reported',
+    ],
+    [
+      'a dated price-table estimate',
+      {
+        reported: null,
+        estimated: { ...usd(400_000), basis: 'price-table', at: '2026-11-13T00:00:00.000Z' },
+        unreportedTurns: 0,
+      },
+      '$0.40 estimated from 13 Nov prices',
+    ],
+  ];
+  for (const [claim, spend, text] of cases) assert.equal(spendText(spend), text, claim);
+
+  const connection = (
+    connectionId: string,
+    family: Connection['family'],
+    change: Partial<Connection> = {},
+  ): Connection => ({
+    connectionId,
+    family,
+    backend: 'native-client',
+    billingMode: 'api',
+    profileId: `${family}-api`,
+    keepConnected: false,
+    readiness: 'ready',
+    proofGeneration: 1,
+    observedMode: 'api',
+    observedAt: DEMO_TIME,
+    ...change,
+  });
+  const read: ConnectionsRead = {
+    loginLines: [],
+    connections: [
+      connection('con_01KA0000000000000000000001', 'openai'),
+      connection('con_01KA0000000000000000000002', 'openai', {
+        label: 'Team key',
+        readiness: 'needs-attention',
+        observedMode: 'subscription',
+      }),
+      connection('con_01KA0000000000000000000003', 'anthropic', { billingMode: 'subscription' }),
+    ],
+    assignments: [],
+    spend: [
+      {
+        connectionId: 'con_01KA0000000000000000000002',
+        spend: { reported: usd(420_000), estimated: null, unreportedTurns: 0 },
+      },
+    ],
+  };
+  assert.deepEqual(railConnections(read, 'openai'), [
+    {
+      connectionId: 'con_01KA0000000000000000000001',
+      label: 'API billing',
+      spend: 'No turns yet',
+      attention: null,
+    },
+    {
+      connectionId: 'con_01KA0000000000000000000002',
+      label: 'Team key',
+      spend: '$0.42 reported',
+      attention: 'Sign-in changed. Reconnect this API connection.',
+    },
+  ]);
+  // A subscription connection keeps its allowance bars and has no spend line, and Local has none.
+  assert.deepEqual(railConnections(read, 'anthropic'), []);
+  assert.deepEqual(railConnections(read, 'local'), []);
 });

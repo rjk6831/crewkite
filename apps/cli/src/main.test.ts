@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { once } from 'node:events';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
@@ -19,6 +19,10 @@ import {
 } from '@crewkite/contracts';
 import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { runCli } from './main.ts';
+
+const bundledSchema = readdirSync(new URL('../../controller/migrations/', import.meta.url)).filter(
+  (name) => name.endsWith('.sql'),
+).length;
 
 test('CLI lists traverse empty pages and preserve incomplete output', async (context) => {
   // A home 120 characters deep still serves the CLI, since the control socket is not inside it.
@@ -125,7 +129,7 @@ test('CLI lists traverse empty pages and preserve incomplete output', async (con
   ownSocketDirectory(dirname(controllerSocketPath(home)));
   server.listen(controllerSocketPath(home));
   await once(server, 'listening');
-  publishControllerSocket(home, controllerSocketPath(home));
+  publishControllerSocket(home, controllerSocketPath(home), bundledSchema);
   const execute = async (args: string[]) => {
     let out = '',
       err = '';
@@ -343,7 +347,7 @@ test('CLI operation actions keep exact review bindings and bounded continuation'
   ownSocketDirectory(dirname(controllerSocketPath(home)));
   server.listen(controllerSocketPath(home));
   await once(server, 'listening');
-  publishControllerSocket(home, controllerSocketPath(home));
+  publishControllerSocket(home, controllerSocketPath(home), bundledSchema);
   const execute = async (args: string[]) => {
     let out = '',
       err = '';
@@ -451,4 +455,49 @@ test('CLI operation actions keep exact review bindings and bounded continuation'
   writeFileSync(requestPath, ' '.repeat(262145));
   assert.equal((await execute(['task', 'github', taskId, '--request', requestPath])).code, 1);
   assert.equal(commands.length, 0);
+});
+
+test('the CLI refuses a live controller on an older schema before it sends the token', async (context) => {
+  const base = mkdtempSync('/tmp/crewkite-cli-');
+  const home = join(base, 'home');
+  mkdirSync(home, { recursive: true, mode: 0o700 });
+  writeFileSync(join(home, 'token'), 'a'.repeat(64), { mode: 0o600 });
+  let received = 0;
+  const server = createServer((socket) => {
+    socket.on('error', () => {});
+    socket.on('data', () => {
+      received += 1;
+    });
+  });
+  context.after(async () => {
+    await new Promise<void>((done) => server.close(() => done()));
+    rmSync(base, { recursive: true, force: true });
+  });
+  ownSocketDirectory(dirname(controllerSocketPath(home)));
+  server.listen(controllerSocketPath(home));
+  await once(server, 'listening');
+  publishControllerSocket(home, controllerSocketPath(home), bundledSchema - 1);
+  const older =
+    'An older CrewKite is still running with this home. Quit it from its menu, then open CrewKite again.';
+  for (const args of [
+    ['task', 'list'],
+    ['task', 'list', '--json'],
+    ['thread', 'list'],
+  ]) {
+    let out = '';
+    let err = '';
+    const code = await runCli([...args, '--home', home], {
+      out: (value) => {
+        out += value;
+      },
+      err: (value) => {
+        err += value;
+      },
+    });
+    assert.notEqual(code, 0, args.join(' '));
+    if (args.includes('--json'))
+      assert.deepEqual(JSON.parse(out), { kind: 'error', message: older });
+    else assert.equal(err, `${older}\n`, args.join(' '));
+  }
+  assert.equal(received, 0);
 });

@@ -1,0 +1,118 @@
+/* The renderer's design tokens: colors, spacing steps, radii, shadows and font families. The
+   other stylesheets read them, and design-system.test.ts fails on a value written around them.
+   Dark is the theme until the app sets data-theme. A token that changes with the theme is set in
+   both theme blocks under the same name; the rest are set once, in the last block. */
+
+:root,
+:root[data-theme="dark"] {
+  --background: #151718;
+  --sidebar: #111314;
+  --surface: #1b1e20;
+  --surface-raised: #222629;
+  --surface-hover: #292e31;
+  --border: #2b3033;
+  --border-strong: #3a4145;
+  --text: #e5e8e7;
+  --text-muted: #a1aaa8;
+  --text-dim: #8f9996;
+  --accent: #d0e7a1;
+  --accent-ink: #202a17;
+  --accent-soft: #d0e7a110;
+  --blue: #8fb9ec;
+  --amber: #e1be83;
+  --red: #ec9992;
+  --green: #9ed3ad;
+  --diff-add-text: var(--green);
+  --diff-del-text: var(--red);
+  /* Family text takes a tint of the panel colour that reads at 4.5:1 on every surface. */
+  --family-openai: #5fcfc4;
+  --family-anthropic: #f0917c;
+  --family-google: #9aa2ec;
+  --family-local: #e8c56e;
+  --shadow-overlay: 0 24px 100px #0007;
+}
+
+:root[data-theme="light"] {
+  --background: #f7f8f5;
+  --sidebar: #eff1ed;
+  --surface: #fff;
+  /* Raised and hover fills stand clear of the sidebar and the page, and secondary text reads at
+     6:1 or better on every light surface. */
+  --surface-raised: #e6ebe1;
+  --surface-hover: #dde3d7;
+  --border: #d2d8cd;
+  --border-strong: #b5beaf;
+  --text: #1c241f;
+  --text-muted: #4a584e;
+  --text-dim: #4f5e53;
+  --accent: #426326;
+  --accent-ink: #fff;
+  --accent-soft: #4263260d;
+  --blue: #335f98;
+  --amber: #8e621c;
+  --red: #b64b44;
+  --green: #33744a;
+  --diff-add-text: #276040;
+  --diff-del-text: #9c3a34;
+  --family-openai: #1a6f69;
+  --family-anthropic: #b4482f;
+  --family-google: #3d45a0;
+  --family-local: #7a5d10;
+  --shadow-overlay: 0 24px 100px #34482d25;
+}
+
+:root {
+  /* The four kite panels, one per family: teal, coral, indigo and gold. They are drawn the same in
+     both themes, like the wordmark. */
+  --family-openai-fill: #40b0a8;
+  --family-anthropic-fill: #e87860;
+  --family-google-fill: #4850a8;
+  --family-local-fill: #e0b860;
+  /* The dim layer behind a modal dialog, and the white an exported page renders on. */
+  --scrim: #050807b3;
+  --paper: #fff;
+
+  --shadow-tooltip: 0 8px 24px #0004;
+  --shadow-raised: 0 2px 14px #0002;
+  --shadow-highlight: inset 0 1px 0 #ffffff08;
+  /* Rings and marks draw an edge inside the box without moving its content. */
+  --shadow-ring: inset 0 0 0 1px var(--border);
+  --shadow-ring-strong: inset 0 0 0 1px var(--border-strong);
+  --shadow-ring-accent: inset 0 0 0 1px var(--accent);
+  --shadow-mark: inset 2px 0 0 var(--accent);
+
+  --font-ui: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+  --font-code: "JetBrains Mono", monospace;
+
+  /* Spacing and radius move in 2px steps, so --space-3 is 6px and --radius-4 is 8px. A step
+     exists only where the interface uses it. */
+  --space-1: 2px;
+  --space-2: 4px;
+  --space-3: 6px;
+  --space-4: 8px;
+  --space-5: 10px;
+  --space-6: 12px;
+  --space-7: 14px;
+  --space-8: 16px;
+  --space-9: 18px;
+  --space-10: 20px;
+  --space-11: 22px;
+  --space-12: 24px;
+  --space-13: 26px;
+  --space-14: 28px;
+  --space-15: 30px;
+  --space-16: 32px;
+  --space-28: 56px;
+  --space-30: 60px;
+
+  --radius-1: 2px;
+  --radius-2: 4px;
+  --radius-3: 6px;
+  --radius-4: 8px;
+  --radius-5: 10px;
+  --radius-6: 12px;
+  --radius-7: 14px;
+  --radius-8: 16px;
+  --radius-9: 18px;
+  --radius-pill: 999px;
+}

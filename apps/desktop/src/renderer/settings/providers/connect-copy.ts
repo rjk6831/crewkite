@@ -12,7 +12,8 @@ export const EXPIRED: Record<ChatFamily, string> = {
   local: 'LM Studio no longer accepts the saved token.',
 };
 
-export const LOCAL_NOT_RUNNING = 'LM Studio is not running. Local reconnects when it starts.';
+export const LOCAL_NOT_RUNNING =
+  'The local server is not running. Local reconnects when it starts.';
 
 const claudeCode = (version: string | null) => (version ? `Claude Code ${version}` : 'Claude Code');
 

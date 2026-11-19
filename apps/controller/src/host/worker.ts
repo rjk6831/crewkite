@@ -67,6 +67,8 @@ const commandEnvironmentNames = new Set([
   'LOGNAME',
   'NO_COLOR',
   'PATH',
+  // ssh reads the agent's socket here, so a push to an ssh remote can use the person's keys.
+  'SSH_AUTH_SOCK',
   'TMPDIR',
   'TZ',
   'USER',
@@ -98,6 +100,8 @@ export type OwnedCommandLifecycle = Readonly<{
   intent: (launch: OwnedCommandLaunch) => void;
   owned: (group: number) => void;
   quiescent: (group: number) => void;
+  /** Called after intent when no process was ever created, so the intent holds nothing. */
+  unlaunched?: () => void;
 }>;
 
 function synchronous(callback: () => void) {
@@ -407,22 +411,33 @@ export class OwnedCommand {
       });
       validateCommandLaunch(launch);
       synchronous(() => options.lifecycle.intent(launch as OwnedCommandLaunch));
-      // This is an observable prelaunch pin, matching the existing toolchain boundary.
-      // A same-user adversary that swaps the path around exec is outside this claim.
-      commandDirectory(launch.cwd);
-      verifyOwnedCommandExecutable(launch.executable, launch.executableSha256);
       this.lifecycle = options.lifecycle;
     } else {
       mkdirSync(options.environmentHome, { recursive: true, mode: 0o700 });
     }
     if (streaming) {
       if (!launch) throw Error('Command launch is unavailable.');
-      this.child = spawn(launch.executable, [...launch.argv], {
-        cwd: launch.cwd,
-        detached: true,
-        stdio: ['pipe', 'pipe', 'pipe'],
-        env: { ...launch.environment },
-      });
+      // spawnCheckChild would hide which step threw. Its acknowledgment can throw after the child
+      // exists, so only a throw inside this block proves that no process was created.
+      let ticket: ReturnType<typeof enrollCheckRoot> | undefined;
+      try {
+        // This is an observable prelaunch pin, matching the existing toolchain boundary.
+        // A same-user adversary that swaps the path around exec is outside this claim.
+        commandDirectory(launch.cwd);
+        verifyOwnedCommandExecutable(launch.executable, launch.executableSha256);
+        ticket = enrollCheckRoot('fixture', true);
+        this.child = spawnProcess(launch.executable, [...launch.argv], {
+          cwd: launch.cwd,
+          detached: true,
+          stdio: ['pipe', 'pipe', 'pipe'],
+          env: { ...launch.environment, ...ticket.environment },
+        });
+      } catch (error) {
+        this.recordUnlaunched();
+        ticket?.failed();
+        throw error;
+      }
+      ticket.acknowledge(this.child);
     } else {
       this.child = spawn(process.execPath, [...options.argv], {
         cwd: options.directory,
@@ -440,6 +455,8 @@ export class OwnedCommand {
     }
     this.group = this.child.pid ?? 0;
     this.ownsGroup = streaming && this.group > 0;
+    // A spawn with no pid created no process. Node reports its error on a later tick.
+    if (!this.group) this.recordUnlaunched();
     this.exited = new Promise((resolve) => {
       this.child.once('exit', (code, signal) =>
         resolve({ code, signal, quiescent: this.group > 0 && groupAbsent(this.group) }),
@@ -588,6 +605,15 @@ export class OwnedCommand {
         return false;
       }
     return quiescent;
+  }
+  // The intent stays when this callback fails, so the owner reads the command as unknown.
+  private recordUnlaunched() {
+    try {
+      synchronous(() => this.lifecycle?.unlaunched?.());
+    } catch {
+      this.failed = true;
+      this.ownershipUnknown = true;
+    }
   }
   stop() {
     if (this.streaming) {

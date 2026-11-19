@@ -4,6 +4,7 @@ import { usageCards } from '../thread/usage-cards.ts';
 import { anthropicReadReason, creditText } from '../usage-presentation.ts';
 import { ClientStatus, clientFor } from './client-status.tsx';
 import { Allowance, type CardProps, CreditSwitch, ProviderCard } from './provider-card.tsx';
+import { providerEvidence } from './provider-evidence.ts';
 import { ConnectLine } from './providers/connect.tsx';
 
 const signInText = (state: string | undefined) =>
@@ -31,6 +32,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
     <ProviderCard
       family="anthropic"
       entry={entry}
+      evidence={providerEvidence('anthropic', entry, header, now)}
       onCheck={() => actions.checkClient('anthropic')}
       detail={connection?.state === 'signed-in' ? 'Signed in with a subscription' : undefined}
       main={

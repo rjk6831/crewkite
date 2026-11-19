@@ -67,10 +67,25 @@ export interface DesktopSource {
   savePrompts?(): Promise<'saved' | 'cancelled'>;
   /** List what the diagnostics bundle holds, then save it as a folder the person names. */
   exportDiagnostics?(input: { taskId?: string }): Promise<'saved' | 'cancelled'>;
+  /** The feedback report for what the person wrote and the version lines they ticked. */
+  feedbackDraft?(input: {
+    what: string;
+    app: boolean;
+    os: boolean;
+    clients: boolean;
+    clientVersions: string[];
+  }): Promise<string>;
+  /** Copy the report, or open a new GitHub issue holding it. The person sends it themselves. */
+  sendFeedback?(input: { report: string; to: 'copy' | 'github' }): Promise<'done' | 'refused'>;
   /** Hide the line about the last unexpected close. */
   dismissCrash?(): Promise<void>;
   /** Save one project's notes as a Markdown file. Main reads them and shows the dialog. */
   saveNotes?(projectId: string): Promise<'saved' | 'cancelled'>;
+  /**
+   * Save one project's recorded results as JSON. Main reads every page from the controller and
+   * shows the dialog, and answers the record count and the file's name.
+   */
+  saveResults?(projectId: string): Promise<'cancelled' | { records: number; file: string }>;
   /** Save the usage numbers of a thread or project as CSV. Main reads them and shows the dialog. */
   saveAnalytics?(input: ReadChatAnalyticsPayload): Promise<'saved' | 'cancelled'>;
   /**
@@ -111,7 +126,7 @@ export type ThreadAttentionInput = {
   notice: {
     taskId: string;
     title: string;
-    kind: 'reply' | 'failed' | 'permission' | 'crew' | 'crew-stopped';
+    kind: 'reply' | 'failed' | 'limit' | 'permission' | 'crew' | 'crew-stopped';
   } | null;
 };
 
@@ -212,4 +227,6 @@ export class FrameDecoder {
 export * from './analytics-csv.ts';
 export * from './analytics-format.ts';
 export * from './mentions.ts';
+export * from './results.ts';
 export * from './slash-commands.ts';
+export * from './workflow.ts';

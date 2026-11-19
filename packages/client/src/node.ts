@@ -137,23 +137,50 @@ export function controllerSocketPlace(home: string, temporary = tmpdir()): strin
   return join(mkdtempSync(join(base, prefix)), name);
 }
 
-/** The controller records the socket it bound in its home, where its clients read it. */
-export function publishControllerSocket(home: string, socketPath: string): void {
+type SocketRecord = { socketPath: string; schema?: number };
+
+/**
+ * The controller records the socket it bound in its home, where its clients read it, with the
+ * schema version its database runs. An app compares that with its own before it attaches.
+ */
+export function publishControllerSocket(home: string, socketPath: string, schema: number): void {
   const file = join(home, SOCKET_RECORD);
   const next = `${file}.${process.pid}`;
-  writeFileSync(next, socketPath, { mode: 0o600, flag: 'w' });
+  const record = JSON.stringify({ socketPath, schema });
+  writeFileSync(next, record, { mode: 0o600, flag: 'w' });
   renameSync(next, file);
+}
+
+// A controller from before the schema check wrote the bare socket path, so its record has no
+// schema. Later ones write JSON.
+function parseSocketRecord(text: string): SocketRecord {
+  let record: SocketRecord | undefined = { socketPath: text };
+  if (text.startsWith('{'))
+    try {
+      // A later controller may add fields. They are ignored, so the schema check can still say
+      // which version holds the home.
+      const { socketPath, schema } = JSON.parse(text);
+      record =
+        typeof socketPath === 'string' && Number.isSafeInteger(schema) && schema > 0
+          ? { socketPath, schema }
+          : undefined;
+    } catch {
+      record = undefined;
+    }
+  if (!record || !isAbsolute(record.socketPath))
+    throw new Error('The controller socket record is invalid.');
+  return record;
 }
 
 /** Remove the record when it still names this socket. */
 export function withdrawControllerSocket(home: string, socketPath: string): void {
   const file = join(home, SOCKET_RECORD);
   try {
-    if (readFileSync(file, 'utf8') === socketPath) unlinkSync(file);
+    if (parseSocketRecord(readFileSync(file, 'utf8')).socketPath === socketPath) unlinkSync(file);
   } catch {}
 }
 
-function readSocketRecord(home: string, uid: number | undefined): string {
+function readSocketRecord(home: string, uid: number | undefined): SocketRecord {
   let file: number;
   try {
     file = openSync(
@@ -175,9 +202,7 @@ function readSocketRecord(home: string, uid: number | undefined): string {
       state.uid !== uid
     )
       throw new Error('The controller socket record must be private to its owner.');
-    const path = readFileSync(file, 'utf8');
-    if (!isAbsolute(path)) throw new Error('The controller socket record is invalid.');
-    return path;
+    return parseSocketRecord(readFileSync(file, 'utf8'));
   } finally {
     closeSync(file);
   }
@@ -234,18 +259,18 @@ export function readControllerToken(home: string, uid = mine()): string {
 }
 
 /**
- * The socket the controller bound and the token for it. The socket comes from the record in the
- * home, so a client with another temporary directory finds it, and it is checked before the token
- * goes anywhere.
+ * The socket the controller bound, the token for it and the schema version the controller
+ * recorded, if it recorded one. The socket comes from the record in the home, so a client with
+ * another temporary directory finds it, and it is checked before the token goes anywhere.
  */
 export function readControllerEndpoint(
   home: string,
   uid = mine(),
-): { socketPath: string; token: string } {
+): { socketPath: string; token: string; schema?: number } {
   const token = readControllerToken(home, uid);
-  const socketPath = readSocketRecord(home, uid);
+  const { socketPath, schema } = readSocketRecord(home, uid);
   checkControllerSocket(socketPath, uid);
-  return { socketPath, token };
+  return { socketPath, token, ...(schema === undefined ? {} : { schema }) };
 }
 
 export class ControllerClient {
@@ -453,11 +478,14 @@ export class ControllerClient {
             ? 65000
             : command.command === 'StartProjectCommand'
               ? 86410000
-              : [
+              : // A merge check and a merge proposal fetch the pull request's base first.
+                [
                     'ReadGitHub',
                     'PushChatBranch',
                     'OpenChatPullRequest',
                     'ReadChatBranchStatus',
+                    'CheckChatMerge',
+                    'ProposeRemoteEffect',
                   ].includes(command.command)
                 ? 125000
                 : command.command === 'StopProjectOperation'
@@ -470,7 +498,9 @@ export class ControllerClient {
                         ? 15000
                         : ['RefreshAnthropicUsage', 'StopAnthropicUsage'].includes(command.command)
                           ? 40000
-                          : command.command === 'CheckNativeConnection'
+                          : // A connection's proof runs its client's 30 s read.
+                            command.command === 'CheckNativeConnection' ||
+                              command.command === 'ProveConnection'
                             ? 35000
                             : // A setup step can first wait up to 20 s for a quota read, then
                               // runs to its own deadline: 300 s for the browser sign-in, 30 s
@@ -479,30 +509,50 @@ export class ControllerClient {
                               ? 330000
                               : command.command === 'InitializeGoogleAcp'
                                 ? 55000
-                                : command.command === 'DiscoverGoogleAcp'
+                                : command.command === 'DiscoverGoogleAcp' ||
+                                    command.command === 'RefreshGoogleAcpModels'
                                   ? 45000
-                                  : [
-                                        'ObserveUsage',
-                                        'RefreshChatModels',
-                                        'CheckProviderClient',
-                                        'StopGoogleAcpSetup',
-                                      ].includes(command.command)
-                                    ? 30000
-                                    : command.command === 'PrepareCandidateEvaluation' &&
-                                        command.payload.checkRecipeId === 'crewkite-verify-v1'
-                                      ? 65000
-                                      : // A Local command can start a model read, which the
-                                        // controller gives 20 s.
-                                        [
-                                            'ConfigureLocal',
-                                            'BeginLocalConnectionInput',
-                                            'CancelLocalConnectionInput',
-                                            'DisconnectLocal',
-                                            'RefreshLocalModels',
-                                            'SelectLocalModel',
-                                          ].includes(command.command)
-                                        ? 20000
-                                        : 5000),
+                                  : // A draft runs one model turn with a three-minute deadline.
+                                    command.command === 'DraftDesignSystem'
+                                    ? 200000
+                                    : // A remote write, its reconcile, a review comment read
+                                      // and a merge readiness read run gh like a GitHub read.
+                                      [
+                                          'ConfirmRemoteEffect',
+                                          'ReconcileRemoteEffect',
+                                          'ReadReviewComments',
+                                          'ReadMergeReadiness',
+                                        ].includes(command.command)
+                                      ? 125000
+                                      : // A check reads up to 16 MiB of style files.
+                                        command.command === 'RunDesignCheck'
+                                        ? 65000
+                                        : [
+                                              'ObserveUsage',
+                                              'RefreshChatModels',
+                                              'CheckProviderClient',
+                                              'StopGoogleAcpSetup',
+                                            ].includes(command.command)
+                                          ? 30000
+                                          : command.command === 'PrepareCandidateEvaluation' &&
+                                              command.payload.checkRecipeId === 'crewkite-verify-v1'
+                                            ? 65000
+                                            : // A Local command can start a model read, which the
+                                              // controller gives 20 s.
+                                              [
+                                                  'ConfigureLocal',
+                                                  'BeginLocalConnectionInput',
+                                                  'CancelLocalConnectionInput',
+                                                  'DisconnectLocal',
+                                                  'RefreshLocalModels',
+                                                  'SelectLocalModel',
+                                                ].includes(command.command)
+                                              ? 20000
+                                              : // A dependency copy answers when it is done,
+                                                // within its own ten-minute deadline.
+                                                command.command === 'PrepareDependencies'
+                                                ? 630000
+                                                : 5000),
       );
       this.pending.set(command.key, { resolve, timer });
       socket.write(frame);
@@ -690,3 +740,4 @@ export {
 } from './installed-state.ts';
 export { transferArtifact } from './output.ts';
 export { verifyRuntimeIntegrity } from './runtime-integrity.ts';
+export { replaceFile } from './whole-file.ts';

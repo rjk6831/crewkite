@@ -1,4 +1,5 @@
 import {
+  type BillingMode,
   type ChatCatalogEntry,
   type ChatFamily,
   type ChatHandoffMode,
@@ -96,6 +97,18 @@ export function ruledOut(message: string): ChatFamily[] {
 /** What the controller knows about one named file of a slice, read from the scratch copy. */
 export type PlanFile = { bytes: number; image: boolean };
 
+/**
+ * A role a slice's turns run as on its assigned family. Its build runs as the assistant, or as an
+ * ask when the slice only reads, whichever crew member takes it. Its fix runs as the fixer there
+ * when the crew has no fixer of its own.
+ */
+export type SliceRole = 'assistant' | 'ask' | 'fixer';
+/**
+ * The connection the person assigned for a role on a family, and whether it can run now, or null
+ * for the family's own route.
+ */
+export type AssignedRoute = { billingMode: BillingMode; ready: boolean } | null;
+
 export type PlanInputs = {
   /** The catalog at proposal time. Only connected families with allowance left take a slice. */
   families: readonly ChatCatalogEntry[];
@@ -125,6 +138,13 @@ export type PlanInputs = {
   ) => boolean;
   /** Each named file, by scratch path. A file the slice will create counts as empty text. */
   files: Readonly<Record<string, PlanFile>>;
+  /**
+   * The connection assigned for a role on a family. A crew member on one takes a slice while that
+   * connection can run, whatever the family's allowance, since the catalog reads only the family's
+   * own route. A slice moved out of the crew never lands on an API connection. Absent: no role has
+   * one.
+   */
+  assigned?: (family: ChatFamily, role: SliceRole) => AssignedRoute;
 };
 
 export type PlanSliceRow = ChatPlanState['slices'][number];
@@ -207,11 +227,16 @@ function assignSlice(
       ?.models.find((model) => model.model === selection.model)?.label ?? selection.model;
   const named = (selection: { family: ChatFamily; model: string }) =>
     `${familyName[selection.family]} (${label(selection)})`;
-  // Why a model cannot take the slice, or null when it can.
-  const blockedBy = (selection: ChatModelSelection): string | null => {
+  const build: SliceRole = slice.readOnly ? 'ask' : 'assistant';
+  const assigned = (member: Member) => inputs.assigned?.(member.selection.family, build) ?? null;
+  // Why a member's model cannot take the slice, or null when it can.
+  const blockedBy = (member: Member): string | null => {
+    const { selection } = member;
     const entry = inputs.families.find((value) => value.family === selection.family);
     const name = familyName[selection.family];
     if (inputs.excluded.includes(selection.family)) return `your message rules out ${name}`;
+    const route = assigned(member);
+    if (route) return route.ready ? null : `${name}'s assigned connection is not ready`;
     if (!entry?.connected) return `${name} is not connected`;
     if (!ranked.includes(entry)) return `${name} has no allowance left`;
     if (selection.family !== 'local') return null;
@@ -246,9 +271,9 @@ function assignSlice(
               ]
             : []),
         ];
-  const open = order.filter((member) => blockedBy(member.selection) === null);
+  const open = order.filter((member) => blockedBy(member) === null);
   const first = order[0] as Member;
-  const firstWhy = blockedBy(first.selection);
+  const firstWhy = blockedBy(first);
   const chosen = open[0];
   if (chosen) {
     const why = chosen === first ? chosen.why : `${chosen.role}, since ${firstWhy as string}`;
@@ -257,17 +282,25 @@ function assignSlice(
     return { assignment, candidates, missing: null };
   }
   // No model of the crew can take it. The handoff rule may move it when the thread allows that.
-  const out = order.map((member) => blockedBy(member.selection) as string).join(', and ');
+  const out = order.map((member) => blockedBy(member) as string).join(', and ');
   if (!inputs.autoHandoff)
     return {
       assignment: null,
       candidates: [],
       missing: `Slice ${slice.id} (${slice.difficulty}) has no model in the crew to run on: ${out}. Continue on another provider is off.`,
     };
+  // The handoff rule moves a slice for a limit or a missing provider, so it never lands where its
+  // build, or its fix when the crew has no fixer, would run on API billing (ADR 0056).
+  const away: SliceRole[] = fixer ? [build] : [build, 'fixer'];
   const others = rank(inputs.families, [
     ...crew.map((member) => member.family),
     ...inputs.excluded,
-  ]).filter((entry) => (entry.family !== 'local' || localFits) && modelOf(entry) !== null);
+  ]).filter(
+    (entry) =>
+      (entry.family !== 'local' || localFits) &&
+      modelOf(entry) !== null &&
+      !away.some((role) => inputs.assigned?.(entry.family, role)?.billingMode === 'api'),
+  );
   const top = others[0];
   if (!top)
     return {

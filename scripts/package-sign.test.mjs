@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { CREWKITE_VERSION } from '../packages/contracts/src/version.ts';
 import { packageInventory, releaseEnvironment, signPackage } from './package-sign.mjs';
 
 const environment = {
@@ -70,7 +71,7 @@ test('macOS release signing freezes signed hashes before the outer seal and refu
     put(join(app, 'Contents/Info.plist'), '<plist/>');
     put(
       join(app, 'Contents/Resources/app/package.json'),
-      JSON.stringify({ name: 'crewkite', productName: 'CrewKite', version: '0.1.0' }),
+      JSON.stringify({ name: 'crewkite', productName: 'CrewKite', version: CREWKITE_VERSION }),
     );
     if (scenario !== 'missing-icon')
       put(join(app, 'Contents/Resources/CrewKite.icns'), 'icnsfixture');
@@ -152,8 +153,8 @@ test('macOS release signing freezes signed hashes before the outer seal and refu
             CFBundleDisplayName: name,
             CFBundleExecutable: name,
             CFBundleIdentifier: `com.rootsnolimits.crewkite${helper ? `.helper${role ? `.${role}` : ''}` : ''}`,
-            CFBundleVersion: '0.1.0',
-            CFBundleShortVersionString: '0.1.0',
+            CFBundleVersion: CREWKITE_VERSION,
+            CFBundleShortVersionString: CREWKITE_VERSION,
             CFBundleIconFile: 'CrewKite.icns',
           }),
         };

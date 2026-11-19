@@ -1,21 +1,32 @@
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { createHash } from 'node:crypto';
+import { once } from 'node:events';
 import {
   copyFileSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { test } from 'node:test';
 import { fileURLToPath } from 'node:url';
-import { resolveRuntime } from './runtime.ts';
+import { encodeFrame, FrameDecoder } from '@crewkite/client';
+import { controllerSocketPlace, publishControllerSocket } from '@crewkite/client/node';
+import {
+  DesktopController,
+  IncompatibleController,
+  offlineNotice,
+  resolveRuntime,
+} from './runtime.ts';
 
 const app = realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
 const node = realpathSync(process.execPath);
@@ -186,4 +197,102 @@ test('a source desktop on the real controller starts apps/controller and never t
     () => resolveRuntime(app, { ...environment, CREWKITE_SOURCE_STATE_ROOT: tmpdir() }),
     /must be your home folder/,
   );
+});
+
+test('the desktop attaches only to a live controller on its own schema and starts none beside another', async (t) => {
+  const root = realpathSync(join(app, '../..'));
+  const bundled = readdirSync(join(root, 'apps/controller/migrations')).filter((name) =>
+    name.endsWith('.sql'),
+  ).length;
+  const state = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-handshake-')));
+  const sockets: string[] = [];
+  t.after(() => {
+    for (const socket of sockets) rmSync(socket, { force: true });
+    rmSync(state, { recursive: true, force: true });
+  });
+  // A start runs this empty file, which exits at once, so any start shows as a refused startup.
+  const controller = join(state, 'exits.mjs');
+  writeFileSync(controller, '');
+  const older =
+    'An older CrewKite is still running with this home. Quit it from its menu, then open CrewKite again.';
+  for (const [index, row] of [
+    // 0.1.0 records no schema.
+    { schema: undefined, live: true, outcome: older },
+    { schema: bundled - 1, live: true, outcome: older },
+    {
+      schema: bundled + 1,
+      live: true,
+      outcome: 'A newer CrewKite is running with this home. Use that version.',
+    },
+    { schema: bundled, live: true, outcome: 'attached' },
+    // An older controller that crashed left its record and socket file, and holds nothing.
+    {
+      schema: undefined,
+      live: false,
+      outcome: 'The controller refused startup. Another process may own this home.',
+    },
+  ].entries()) {
+    const home = join(state, `home-${index}`);
+    mkdirSync(home, { mode: 0o700 });
+    writeFileSync(join(home, 'token'), 'a'.repeat(64), { mode: 0o600 });
+    const socketPath = controllerSocketPlace(home);
+    sockets.push(socketPath);
+    const tokens: string[] = [];
+    const server = createServer((socket) => {
+      const decoder = new FrameDecoder();
+      socket.on('error', () => {});
+      socket.on('data', (bytes) => {
+        for (const message of decoder.push(bytes))
+          if (message.type === 'hello') {
+            tokens.push(message.token);
+            socket.write(encodeFrame({ type: 'welcome', protocol: 1, cursor: '0' }));
+          }
+      });
+    });
+    if (row.live) {
+      server.listen(socketPath);
+      await once(server, 'listening');
+    } else
+      spawnSync(process.execPath, [
+        '-e',
+        'require("node:net").createServer().listen(process.argv[1],()=>process.exit(0))',
+        socketPath,
+      ]);
+    // A 0.1.0 controller wrote the bare path, which publishControllerSocket no longer does.
+    if (row.schema === undefined)
+      writeFileSync(join(home, 'control-socket'), socketPath, { mode: 0o600 });
+    else publishControllerSocket(home, socketPath, row.schema);
+    const desktop = new DesktopController({
+      mode: 'workspace',
+      root,
+      node: process.execPath,
+      controller,
+      home,
+      profile: join(state, 'profile'),
+    });
+    const outcome = await desktop.connect().then(
+      () => 'attached',
+      (error: Error) => error.message,
+    );
+    await desktop.close();
+    if (row.live) await new Promise((closed) => server.close(closed));
+    assert.equal(outcome, row.outcome, `schema ${row.schema}, live ${row.live}`);
+    // The token goes only to a controller the desktop attaches to.
+    assert.equal(tokens.length, outcome === 'attached' ? 1 : 0);
+  }
+});
+
+test('the offline notice carries a reason only for the older controller refusal', () => {
+  const refusal = new IncompatibleController('An older CrewKite is still running with this home.');
+  assert.deepEqual(offlineNotice(refusal), {
+    kind: 'connection',
+    state: 'offline',
+    reconnectAvailable: true,
+    reason: 'An older CrewKite is still running with this home.',
+  });
+  assert.deepEqual(offlineNotice(new Error('The controller refused startup.')), {
+    kind: 'connection',
+    state: 'offline',
+    reconnectAvailable: true,
+  });
 });

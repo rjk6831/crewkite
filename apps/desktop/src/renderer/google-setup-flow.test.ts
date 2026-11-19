@@ -33,6 +33,7 @@ const setup = (
   auth: { method: null, status: 'unknown' },
   reason: null,
   googleTerms: { version: GOOGLE_TERMS_VERSION, at: '2026-10-28T00:00:00.000Z' },
+  modelRefresh: null,
   ...change,
 });
 

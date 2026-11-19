@@ -609,17 +609,19 @@ export function App(props: AppProps) {
       setChanges(await client.readChanges(id));
     };
     if (branch) void accept(branch).catch(say);
-    else setLinePrompt({ label: 'New branch', value: `crewkite/${slug(title)}`, submit: accept });
+    else setLinePrompt({ label: 'New branch', value: `feat/${slug(title)}`, submit: accept });
   }
 
   function pushFlow() {
     const id = taskRef.current;
     const branch = thread?.lastAcceptance?.branch;
+    const commit = thread?.lastAcceptance?.commit;
     if (!id || !branch) throw new Error('Accept the changes on a branch first.');
+    if (!commit) throw new Error('Accept again to record the commit, then push.');
     setConfirm({
-      question: `Push ${branch} to origin with your own git credentials? (y/n)`,
+      question: `Push commit ${commit.slice(0, 12)} to ${branch} on origin with your own git credentials? (y/n)`,
       yes: async () => {
-        const result = await client.push(id, branch);
+        const result = await client.push(id, branch, commit);
         setNotice(
           applied(result)
             ? `Pushed ${branch}.`

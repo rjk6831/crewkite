@@ -12,10 +12,12 @@ import { FamilyMark } from '../thread/family-mark.tsx';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import type { UsageGaugeCard } from '../usage-presentation.ts';
 import '../thread/subagents.css';
+import { Fact } from '../components.tsx';
 import { Select } from '../select.tsx';
 import { ClientRecord } from './client-status.tsx';
 import { readFamilyDefaults, writeFamilyDefault } from './preferences.ts';
 import type { ProviderActions } from './provider-actions.ts';
+import type { ProviderEvidence } from './provider-evidence.ts';
 
 export type CatalogEntry = ChatCatalogRead['families'][number];
 
@@ -239,6 +241,7 @@ export function ProviderCard({
   models,
   client,
   onCheck,
+  evidence,
 }: {
   family: ChatFamily;
   entry: CatalogEntry | undefined;
@@ -254,6 +257,8 @@ export function ProviderCard({
   client?: ClientVersionStatus;
   /** Reads the client again, after the person updates or installs it. */
   onCheck?: () => Promise<void> | void;
+  /** Sign-in, model list, quota read and any blocker, each stated on its own. */
+  evidence: ProviderEvidence;
 }) {
   const found = client ?? entry?.client;
   // The check often finds what was already shown, so the button says it ran and when.
@@ -303,6 +308,18 @@ export function ProviderCard({
             : detail}
         </span>
       </header>
+      {!unavailable && evidence.blocker && (
+        <p className="st-blocker" role="status">
+          {evidence.blocker}
+        </p>
+      )}
+      {!unavailable && (
+        <div className="facts-grid compact">
+          <Fact label="Sign-in" value={evidence.signIn} />
+          <Fact label="Models" value={evidence.models} />
+          <Fact label="Quota" value={evidence.usage} />
+        </div>
+      )}
       {!unavailable && found && (
         <div className={found.accepted ? 'st-client' : 'st-client is-refused'}>
           <p role="status">{found.message}</p>

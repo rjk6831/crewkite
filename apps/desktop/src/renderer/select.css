@@ -4,7 +4,7 @@
 .ck-select {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   min-width: 0;
   text-align: left;
   cursor: pointer;
@@ -37,38 +37,38 @@ button.ck-select .ck-select-value {
   position: fixed;
   z-index: 1000;
   box-sizing: border-box;
-  padding: 4px;
+  padding: var(--space-2);
   overflow-y: auto;
   border: 1px solid var(--border-strong);
-  border-radius: 10px;
+  border-radius: var(--radius-5);
   background: var(--surface-raised);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-overlay);
   color: var(--text);
   font-size: 12.5px;
 }
 .ck-select-group {
-  margin: 6px 0 2px;
-  padding: 0 10px;
+  margin: var(--space-3) 0 var(--space-1);
+  padding: 0 var(--space-5);
   color: var(--text-dim);
   font-size: 11px;
   font-weight: 600;
   letter-spacing: 0.2px;
 }
 .ck-select-group:first-child {
-  margin-top: 2px;
+  margin-top: var(--space-1);
 }
 .ck-select-option {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 7px 10px;
-  border-radius: 7px;
+  gap: var(--space-5);
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-4);
   cursor: pointer;
   white-space: nowrap;
 }
 .ck-select-option.in-group {
-  padding-left: 16px;
+  padding-left: var(--space-8);
 }
 .ck-select-option > span {
   overflow: hidden;

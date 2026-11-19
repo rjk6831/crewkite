@@ -13,7 +13,7 @@ The installed design keeps application files separate from private state. The de
 
 The OpenAI client's own home sits under `providers/openai/` in the installed root. It holds the client's sign-in and history for CrewKite, separate from the person's own client home. [Provider routes](providers.md#openai) gives its exact location. The controller log stays at `home/controller.log`. An absolute `XDG_DATA_HOME` selects the Linux data root; a relative value is refused.
 
-A fresh installed 0.1.0 starts fresh state. Import from an initialized directory preview and rollback qualification are deferred to 0.1.1. An incompatible database schema must be refused through a read-only check before any state write. Application replacement must preserve the selected state path and must never restore an older ledger over later records.
+A fresh installed 0.1.0 starts fresh state. Import from an initialized directory preview and rollback qualification wait for a later release. An incompatible database schema must be refused through a read-only check before any state write. Application replacement must preserve the selected state path and must never restore an older ledger over later records.
 
 The planned formats are a macOS arm64 DMG and Linux x64 and arm64 DEB and RPM packages. I use native platform tools and retain the existing payload checks, bundled Node identity, runtime dependency closure and notices. The manifest hashes the final signed bytes. The macOS bundle identity is `com.rootsnolimits.crewkite`. Signing and notarization claims wait for recorded verification and first-open evidence for the exact assets.
 

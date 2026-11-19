@@ -40,11 +40,12 @@ import { LimitOfferCard } from './handoff-card.tsx';
 import { limitOffer } from './handoff-offer.ts';
 import type { HistoryFind } from './history-reveal.ts';
 import { Inspector, type InspectorTab } from './inspector.tsx';
-import { MessageList, modelLine, StartingTurn } from './message-list.tsx';
+import { MessageList, modelLine, type Reveal, StartingTurn } from './message-list.tsx';
 import { catalogLabels, ModelLabels } from './model-labels.ts';
 import { outputLimitLine } from './output-limit.ts';
 import { planRow } from './plan-card.ts';
 import { PlanCard } from './plan-card.tsx';
+import { usePrepareDependencies, useThreadCopy } from './prepare-dependencies.tsx';
 import { ProjectNotesProvider } from './project-notes.tsx';
 import { QueuedList } from './queued-list.tsx';
 import {
@@ -67,6 +68,7 @@ import { ThreadTitle } from './thread-title.tsx';
 import type { TurnIdentity, TurnView } from './turn-fold.ts';
 import { useReveal } from './use-reveal.ts';
 import { useThread } from './use-thread.ts';
+import { copyNeed, HELD } from './work-view.ts';
 import './thread.css';
 
 export type ThreadTask = { id: string; title: string };
@@ -109,12 +111,9 @@ function changeCount(items: ReturnType<typeof useThread>['items']) {
 }
 
 /** The thread inside its project's notes, which the chip and Save as note read. */
-export function ThreadView({
-  projectId,
-  ...props
-}: Parameters<typeof ThreadBody>[0] & { projectId?: string }) {
+export function ThreadView(props: Parameters<typeof ThreadBody>[0]) {
   return (
-    <ProjectNotesProvider source={props.source} projectId={projectId ?? null}>
+    <ProjectNotesProvider source={props.source} projectId={props.projectId ?? null}>
       <ThreadBody {...props} />
     </ProjectNotesProvider>
   );
@@ -123,6 +122,7 @@ export function ThreadView({
 function ThreadBody({
   source,
   task,
+  projectId,
   projectName,
   header,
   preview,
@@ -137,6 +137,7 @@ function ThreadBody({
   task: ThreadTask;
   /** The message this thread was just created with, shown at once in place of the skeleton. */
   first?: FirstSend | null;
+  projectId?: string;
   projectName: string;
   header: WorkspaceState | null;
   preview: boolean;
@@ -162,16 +163,41 @@ function ThreadBody({
     reload,
     retry,
   } = useThread(source, task.id, connection);
-  const reveal = useReveal(find, items, state.loaded, reach);
+  const found = useReveal(find, items, state.loaded, reach);
+  // A slice row in the Work tab opens its turn the way a search result does. Its nonces count down
+  // from -1 and never repeat, so none matches a search result's, and a new search result takes
+  // over from it.
+  const [opened, setOpened] = useState<Reveal | null>(null);
+  const opens = useRef(0);
+  const openTurn = useCallback((turnId: string) => {
+    opens.current -= 1;
+    setOpened({ key: `turn:${turnId}`, terms: [], nonce: opens.current });
+  }, []);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: a new search result clears the opened turn
+  useEffect(() => setOpened(null), [find]);
+  const reveal = opened ?? found;
   const [catalog, setCatalog] = useState<ChatCatalogRead | null>(null);
   const labels = useMemo(() => catalogLabels(catalog), [catalog]);
   const [inspector, setInspector] = useState<{
     open: boolean;
     tab: InspectorTab;
     focus: string | null;
+    line?: number | null;
   }>({ open: false, tab: 'changes', focus: null });
   const [notice, setNotice] = useState<string | null>(null);
   const [sharing, setSharing] = useState(false);
+  // The thread's own dependency copy. The Checks card, the Work tab and Accept's refusal share
+  // one Prepare dependencies, so a click in one shows as running in the others.
+  const { preparations, reload: readCopy } = useThreadCopy(source, task.id, state.thread);
+  const preparing = usePrepareDependencies(source, task.id, readCopy);
+  const systemLines = useMemo(
+    () => state.messages.filter((message) => message.author.kind === 'system'),
+    [state.messages],
+  );
+  const copy = useMemo(
+    () => ({ preparations, lines: systemLines, preparing }),
+    [preparations, systemLines, preparing],
+  );
   const counter = useRef(0);
   const composer = useRef<ComposerHandle>(null);
   const toggle = useRef<HTMLButtonElement>(null);
@@ -361,20 +387,28 @@ function ThreadBody({
       }}
     />
   );
-  const checked = thread?.checks && (thread.checks.runs.length > 0 || thread.checks.ask) && (
-    <ChecksCard
-      checks={thread.checks}
-      onStop={async () => {
-        const last = newestTurnId(state);
-        if (last) await stopTurn(source, { taskId: task.id, turnId: last });
-      }}
-      onAnswer={async (requestId, choice) => {
-        const last = newestTurnId(state);
-        if (last)
-          await resolvePermission(source, { taskId: task.id, turnId: last, requestId, choice });
-      }}
-    />
-  );
+  const copyLine = useMemo(() => copyNeed(copy.preparations, copy.lines), [copy]);
+  const checked = thread?.checks &&
+    (thread.checks.runs.length > 0 ||
+      thread.checks.ask ||
+      copyLine ||
+      preparing.busy ||
+      preparing.line) && (
+      <ChecksCard
+        checks={thread.checks}
+        copy={copyLine}
+        preparing={preparing}
+        onStop={async () => {
+          const last = newestTurnId(state);
+          if (last) await stopTurn(source, { taskId: task.id, turnId: last });
+        }}
+        onAnswer={async (requestId, choice) => {
+          const last = newestTurnId(state);
+          if (last)
+            await resolvePermission(source, { taskId: task.id, turnId: last, requestId, choice });
+        }}
+      />
+    );
   const replyId = useMemo(
     () => (activeTurn ? null : lastReply(state, items)),
     [activeTurn, state, items],
@@ -432,7 +466,16 @@ function ThreadBody({
       item.turn.identity?.role === 'ask' &&
       sliceId === undefined &&
       item.turn.identity.slice === undefined;
-    if (!note && !retryable && !regenerate && !limit && !side) return null;
+    // Until this thread's first Accept, the newest reply that edited files names the step after
+    // it, so the way from a change to a branch is never a guess.
+    const review =
+      item.kind === 'turn' &&
+      newest &&
+      item.turn.ended &&
+      sliceId === undefined &&
+      !thread?.lastAcceptance &&
+      item.turn.blocks.some((block) => block.kind === 'tool' && block.diff);
+    if (!note && !retryable && !regenerate && !limit && !side && !review) return null;
     const choices =
       rejected && catalog
         ? tryWithChoices(
@@ -461,6 +504,21 @@ function ThreadBody({
           >
             Stop side question
           </button>
+        )}
+        {review && !activeTurn && (
+          <>
+            <p className="th-muted">
+              The edits wait in the scratch copy. Review them in Changes, then choose Accept to
+              branch.
+            </p>
+            <button
+              type="button"
+              className="th-option"
+              onClick={() => setInspector({ open: true, tab: 'changes', focus: null })}
+            >
+              Open Changes
+            </button>
+          </>
         )}
         {(retryable || regenerate) && !activeTurn && (
           <RerunControl
@@ -494,8 +552,9 @@ function ThreadBody({
 
   // A running turn is the usual reason to wait. These hold the queue after a turn has ended.
   const paused = !!thread?.queuePaused && activeTurn === null;
+  // The Work tab shows what holds the thread, and the release beside it.
   const held = thread?.ownershipUnknown
-    ? 'Waiting for a provider process from an earlier turn to exit. Quit it, then send another message.'
+    ? `${HELD.join(' ')} Open the Work tab to see what holds it.`
     : paused
       ? pausedQueueLine(queued?.length ?? 0)
       : offer
@@ -569,6 +628,7 @@ function ThreadBody({
                       source={source}
                       taskId={task.id}
                       offer={offer}
+                      startAt={thread?.startAt}
                     />
                   )}
                 </>
@@ -643,7 +703,12 @@ function ThreadBody({
             onClose={closeInspector}
             changesKey={changesKey}
             focusPath={inspector.focus}
+            focusLine={inspector.line ?? null}
+            projectId={projectId ?? null}
+            onFocus={(tab, focus, line) => setInspector({ open: true, tab, focus, line })}
+            onOpenTurn={openTurn}
             onConfigure={(patch) => void configure(patch)}
+            copy={copy}
           />
         )}
       </div>

@@ -82,6 +82,8 @@ export type OwnedProjectCommandLifecycle = Readonly<{
   intent: (request: OwnedProjectCommandRequest) => void;
   owned: (group: number) => void;
   quiescent: (group: number) => void;
+  /** Called after intent when no process was ever created, so the intent holds nothing. */
+  unlaunched?: () => void;
 }>;
 export type OwnedProjectCommandExecution = Readonly<{
   stdout: AsyncIterable<Uint8Array>;

@@ -1,6 +1,6 @@
-import type { ChatCatalogChange, ChatCatalogRead } from '@crewkite/contracts';
+import type { ChatCatalogChange, ChatCatalogRead, ConnectionsRead } from '@crewkite/contracts';
 import { useEffect, useState } from 'react';
-import { readCatalog, type ThreadSource } from '../thread/commands.ts';
+import { readCatalog, readConnections, type ThreadSource } from '../thread/commands.ts';
 
 /**
  * The model catalog the composer offers. It reads again whenever `changed` does, so a new usage
@@ -40,6 +40,57 @@ export function useCatalog(source: ThreadSource | undefined, changed: unknown) {
     };
   }, [source, changed, modelRead]);
   return { catalog, error, modelRead };
+}
+
+// Every connections read on screen, so a change made in Settings or the Crew tab shows on the rail
+// and in the other at once. No controller event says a connection changed.
+const connectionReads = new Set<() => void>();
+
+/** Reads the connections again wherever they show. Call it after a command changed one. */
+export function connectionsChanged() {
+  for (const again of connectionReads) again();
+}
+
+/**
+ * The billing connections and what each API connection spent, with one thread's assignments when
+ * `taskId` is given. It reads again whenever `changed` does, when a turn ends, since an ended turn
+ * may have spent, and after `connectionsChanged`. A failed read keeps the last one.
+ */
+export function useConnections(
+  source: ThreadSource | undefined,
+  changed: unknown,
+  taskId?: string | null,
+) {
+  const [read, setRead] = useState<ConnectionsRead | null>(null);
+  const [ended, setEnded] = useState<string | null>(null);
+  const [changes, setChanges] = useState(0);
+  useEffect(
+    () =>
+      source?.subscribe((event) => {
+        if (event.type === 'chat.turn' && event.payload.endedAt) setEnded(event.payload.id);
+      }),
+    [source],
+  );
+  useEffect(() => {
+    const again = () => setChanges((count) => count + 1);
+    connectionReads.add(again);
+    return () => void connectionReads.delete(again);
+  }, []);
+  // biome-ignore lint/correctness/useExhaustiveDependencies: `changed`, `ended` and `changes` trigger the read
+  useEffect(() => {
+    if (!source) return;
+    let active = true;
+    readConnections(source, taskId ?? undefined).then(
+      (next) => {
+        if (active) setRead(next);
+      },
+      () => {},
+    );
+    return () => {
+      active = false;
+    };
+  }, [source, taskId, changed, ended, changes]);
+  return read;
 }
 
 /** Display time that ticks. A preview shows its fixtures at the time they were observed. */

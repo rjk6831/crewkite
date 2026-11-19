@@ -1,7 +1,7 @@
 /* Google connect progress: one bar for the whole connect and the named steps under it. */
 .gs-progress {
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .gs-progress p {
   margin: 0;
@@ -12,9 +12,9 @@
 .gs-progress-track {
   height: 6px;
   overflow: hidden;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: var(--surface-hover);
-  box-shadow: inset 0 0 0 1px var(--border);
+  box-shadow: var(--shadow-ring);
 }
 .gs-progress-fill {
   height: 100%;
@@ -24,7 +24,7 @@
 }
 .gs-progress-steps {
   display: grid;
-  gap: 4px;
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -34,7 +34,7 @@
 .gs-progress-steps li {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .gs-progress-steps li.is-done {
   color: var(--text-muted);
@@ -68,10 +68,10 @@
 /* The terms summary and its acknowledgement stand out from the rest of the card. */
 .gs-terms {
   display: grid;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: var(--space-4);
+  padding: var(--space-6) var(--space-7);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-4);
   background: var(--surface-hover);
   color: var(--text);
 }
@@ -89,14 +89,14 @@
   cursor: pointer;
 }
 .gs-how p {
-  margin: 6px 0 0;
+  margin: var(--space-3) 0 0;
 }
 /* The connect actions sit in the card flow and scroll with the text around them. */
 .gs-actions {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .gs-actions:empty {
   display: none;
@@ -109,7 +109,7 @@
   position: absolute;
   width: 1px;
   height: 1px;
-  margin: -1px;
+  margin: calc(-1 * var(--space-1));
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;

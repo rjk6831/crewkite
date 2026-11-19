@@ -32,8 +32,9 @@ import {
   type ConversationEntry,
   canonicalJson,
   GitHubReadRequestSchema,
+  GOOGLE_RECOVERY_HOLD_COPY,
+  LocalAnyEndpointSchema,
   LocalAuthModeSchema,
-  LocalEndpointSchema,
   LocalModelSelectionSchema,
   MAX_FRAME_BYTES,
   NativeHandoffTargetsSchema,
@@ -52,9 +53,13 @@ import {
 } from '@crewkite/contracts';
 import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { runUsageAnalytics } from './chat/analytics.ts';
-import { connectChat } from './chat/connect.ts';
+import { assertSameSchema, connectChat } from './chat/connect.ts';
+import { runConnectionsCommand } from './chat/connections.ts';
 import { runExportCommand } from './chat/export.ts';
 import { runNotesCommand } from './chat/notes.ts';
+import { runRecipeCommand } from './chat/recipes.ts';
+import { runResultsCommand } from './chat/results.ts';
+import { runScheduleCommand } from './chat/schedules.ts';
 import {
   type Connect,
   notDone,
@@ -76,6 +81,10 @@ const help = `Usage: crewkite                     interactive mode in a terminal
        crewkite <--help|-h|help>         print this text
        crewkite -p <message> [--thread task-id | --project project-id | --register] [--model family[/model[:effort]]] [--permission-policy ask|allow-edits|allow-all] [--file path ...] [--json]
        crewkite thread <new|send|watch|permit|deny|stop|accept|push|pr|list|show|changes> ... (crewkite thread --help)
+       crewkite connections [add|check|keep|disconnect|forget] ... (crewkite connections --help)
+       crewkite recipe <list|show|run> ... (crewkite recipe --help)
+       crewkite loop <list|pause|resume|restart> ... (crewkite loop --help)
+       crewkite results [--project id] [--recipe r] [--export file] [--json] (crewkite results --help)
        crewkite diagnostics export <folder> [--thread task-id] [--home path]
        crewkite search <text> [--limit 1..50] [--per-thread 1..5] [--json] [--home path]
        crewkite notes <list|add|remove> <project-id> [text|note-id] [--json] (crewkite notes --help)
@@ -96,7 +105,7 @@ const help = `Usage: crewkite                     interactive mode in a terminal
        crewkite task switch <task-id> <route-id> [--json] [--home path]
        crewkite conversation show <task-id> [--before-cursor cursor] [--json] [--home path]
        crewkite local status [--json] [--home path]
-       crewkite local configure --endpoint ws://127.0.0.1:port [--authentication token|none] [--json] [--home path]
+       crewkite local configure --endpoint ws://127.0.0.1:port|http://host:port [--authentication token|none] [--json] [--home path]
        crewkite local <connect|refresh-models> --consent [--json] [--home path]
        crewkite local cancel-input <operation-id> [--json] [--home path]
        crewkite local disconnect [--json] [--home path]
@@ -106,6 +115,7 @@ const help = `Usage: crewkite                     interactive mode in a terminal
        crewkite native profiles [--json] [--home path]
        crewkite native import-google --consent [--json] [--home path]
        crewkite native setup <show|initialize|authenticate|discover|stop> --family google [--consent] [--json] [--home path]
+       crewkite native setup <recover|refresh> --family google --consent [--json] [--home path]
        crewkite usage show [--json] [--home path]
        crewkite usage <thread|project> <id> [--csv new-file] [--json] [--home path]
        crewkite usage refresh --family google|openai|anthropic [--native-trust --usage-scope hash] [--json] [--home path]
@@ -160,6 +170,10 @@ export async function runCli(
   if (args[0] === 'diagnostics') return runDiagnosticsCommand(args.slice(1), output, connect);
   if (args[0] === 'search') return runSearchCommand(args.slice(1), output, connect);
   if (args[0] === 'notes') return runNotesCommand(args.slice(1), output, connect);
+  if (args[0] === 'connections') return runConnectionsCommand(args.slice(1), output, connect);
+  if (args[0] === 'recipe') return runRecipeCommand(args.slice(1), output, connect);
+  if (args[0] === 'loop') return runScheduleCommand(args.slice(1), output, connect);
+  if (args[0] === 'results') return runResultsCommand(args.slice(1), output, connect);
   if (args[0] === 'usage' && (args[1] === 'thread' || args[1] === 'project'))
     return runUsageAnalytics(args.slice(1), output, connect);
   if (args[0] === 'export') return runExportCommand(args.slice(1), output, connect);
@@ -359,7 +373,7 @@ export async function runCli(
       if (['connect', 'refresh-models'].includes(action) && !values.consent)
         throw new Error('This Local action requires explicit --consent.');
       if (action === 'configure') {
-        LocalEndpointSchema.parse(values.endpoint);
+        LocalAnyEndpointSchema.parse(values.endpoint);
         if (values.authentication !== undefined) LocalAuthModeSchema.parse(values.authentication);
       }
       if (action === 'select-model')
@@ -468,7 +482,9 @@ export async function runCli(
         (action === 'profiles' && id === undefined) ||
         (importingGoogle && id === undefined) ||
         (settingUpGoogle &&
-          ['show', 'initialize', 'authenticate', 'discover', 'stop'].includes(id ?? ''))
+          ['show', 'initialize', 'authenticate', 'discover', 'stop', 'recover', 'refresh'].includes(
+            id ?? '',
+          ))
       )
     )
       throw new Error('Use native profiles, import-google or setup.');
@@ -477,7 +493,7 @@ export async function runCli(
       (values.family !== 'google' || (['show', 'stop'].includes(id ?? '') && values.consent))
     )
       throw new Error(
-        'Use native setup with --family google. Consent applies only to initialize, authenticate or discover.',
+        'Use native setup with --family google. Consent applies only to initialize, authenticate, discover, recover or refresh.',
       );
     if (
       ((settingUpGoogle && !['show', 'stop'].includes(id ?? '')) || importingGoogle) &&
@@ -671,7 +687,17 @@ export async function runCli(
           ? 'Repository paths must contain 1 to 4096 characters.'
           : 'Use a project ID, a title up to 200 characters, an outcome up to 4096 characters and 1 to 100 criteria up to 4096 characters each.',
       );
-    const connected = await connectController({ ...readControllerEndpoint(home), actor });
+    const endpoint = readControllerEndpoint(home);
+    try {
+      await assertSameSchema(endpoint);
+    } catch (error) {
+      if (!values.json) throw error;
+      output.out(
+        `${JSON.stringify({ kind: 'error', message: error instanceof Error ? error.message : 'Refused.' })}\n`,
+      );
+      return CLI_EXIT.failed;
+    }
+    const connected = await connectController({ ...endpoint, actor });
     client = connected;
     let sent: Command | undefined;
     const request = (
@@ -1188,13 +1214,50 @@ export async function runCli(
           const profile =
             workspace.nativeProfiles.find((value) => value.id === 'google-acp-v1') ?? null;
           print(
-            { cursor: workspace.cursor, setup, profile },
+            {
+              cursor: workspace.cursor,
+              setup,
+              profile,
+              holds: workspace.googleMetadataHolds ?? [],
+            },
             terminalText(
-              `${googleAcpLabel}\nSetup ${setup?.state ?? 'uninitialized'}, revision ${setup?.revision ?? 0}\nReason ${setup?.reason ?? profile?.reason ?? 'not-configured'}\nProof ${setup?.proofId ?? 'none'}\nOperation ${setup?.operationId ?? 'none'}${profile && 'configOptions' in profile ? `\nModels ${profile.configOptions?.model.supported.join(', ') ?? 'unknown'}\nThought levels ${profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}` : ''}`,
+              `${googleAcpLabel}\nSetup ${setup?.state ?? 'uninitialized'}, revision ${setup?.revision ?? 0}\nReason ${setup?.reason ?? profile?.reason ?? 'not-configured'}\nProof ${setup?.proofId ?? 'none'}\nOperation ${setup?.operationId ?? 'none'}${setup?.modelRefresh ? `\nModel refresh ${setup.modelRefresh.outcome} at ${setup.modelRefresh.at}${setup.modelRefresh.reason ? `, ${setup.modelRefresh.reason}` : ''}` : ''}${(workspace.googleMetadataHolds ?? []).map((row) => `\nHeld ${row.operation} ${row.commandId}: ${GOOGLE_RECOVERY_HOLD_COPY[row.reason]}`).join('')}${profile && 'configOptions' in profile ? `\nModels ${profile.configOptions?.model.supported.join(', ') ?? 'unknown'}\nThought levels ${profile.configOptions?.thoughtLevel?.supported.join(', ') ?? 'unknown'}` : ''}`,
             ),
           );
           return 0;
         }
+        if (id === 'recover') {
+          // Recover releases only operations whose recorded process group is proven gone. Every
+          // other row stays held with its reason, and no released result is ever published.
+          const result = await request(
+            'RecoverGoogleMetadata',
+            { consent: 'explicit' },
+            setup?.revision ?? 0,
+          );
+          const recovery = result.data?.kind === 'google-metadata-recovery' ? result.data : null;
+          const lines = recovery
+            ? [
+                recovery.outcome === 'clear' ? 'Nothing was holding Google.' : null,
+                ...recovery.settled.map(
+                  (row) => `Released ${row.operation} ${row.commandId}. Its result stays unknown.`,
+                ),
+                ...recovery.held.map(
+                  (row) =>
+                    `Held ${row.operation} ${row.commandId}: ${GOOGLE_RECOVERY_HOLD_COPY[row.reason]}`,
+                ),
+                recovery.swept.removed || recovery.swept.failed
+                  ? `Temporary usage folders removed: ${recovery.swept.removed}. Not removed: ${recovery.swept.failed}.`
+                  : null,
+              ]
+            : [result.reason ?? result.outcome, result.next ? `Next: ${result.next}` : null];
+          print(
+            { command: sent, result },
+            [...lines, `Command key ${sent?.key}`].filter(Boolean).join('\n'),
+          );
+          return succeeded(result) ? 0 : 2;
+        }
+        if (id === 'refresh' && (setup?.state !== 'ready' || !setup.proofId))
+          throw new Error('Refresh reads models again from Ready. Read setup status first.');
         if ((id === 'authenticate' || id === 'discover') && !setup?.proofId)
           throw new Error('Initialize Google ACP and inspect its retained proof first.');
         if (id === 'stop' && !setup?.operationId)
@@ -1203,6 +1266,7 @@ export async function runCli(
           initialize: 'InitializeGoogleAcp',
           authenticate: 'AuthenticateGoogleAcp',
           discover: 'DiscoverGoogleAcp',
+          refresh: 'RefreshGoogleAcpModels',
           stop: 'StopGoogleAcpSetup',
         } as const;
         const result = await request(
@@ -1210,7 +1274,9 @@ export async function runCli(
           {
             profileId: 'google-acp-v1',
             ...(id === 'stop' ? { operationId: setup?.operationId } : { consent: 'explicit' }),
-            ...(id === 'authenticate' || id === 'discover' ? { proofId: setup?.proofId } : {}),
+            ...(id === 'authenticate' || id === 'discover' || id === 'refresh'
+              ? { proofId: setup?.proofId }
+              : {}),
             ...(id === 'authenticate' ? { method: 'oauth-personal' } : {}),
           },
           setup?.revision ?? 0,

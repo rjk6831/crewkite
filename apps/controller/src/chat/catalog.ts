@@ -401,9 +401,11 @@ function remaining(input: ChatCatalogInput, family: ChatFamily): Entry['remainin
 
 /**
  * The period a window covers, as `five-hour` or `weekly`, so the rail can draw one bar for each.
- * The reported period decides when there is one. Otherwise the id does: the Anthropic readers write
- * five-hour, weekly and weekly-<model>, and the OpenAI client calls its five-hour window primary
- * and its weekly one secondary. Any other window keeps its id.
+ * Only a length the reading reports decides it, or an ID the family's own reader wrote from a
+ * provider field that names the period: the Anthropic readers write five-hour, weekly and
+ * weekly-<model>. The OpenAI client names its slots primary and secondary and does not say how
+ * long either one is, and some plans have no five-hour limit, so a slot with no reported length
+ * keeps its id.
  */
 function windowLabel(observation: CatalogObservation): string {
   const id = observation.windowId;
@@ -411,8 +413,8 @@ function windowLabel(observation: CatalogObservation): string {
   if (period === 18_000) return 'five-hour';
   if (period === 604_800) return 'weekly';
   if (period !== undefined) return id;
-  if (id === 'five-hour' || id.endsWith(':primary')) return 'five-hour';
-  if (id === 'weekly' || id.startsWith('weekly-') || id.endsWith(':secondary')) return 'weekly';
+  if (id === 'five-hour') return 'five-hour';
+  if (id === 'weekly' || id.startsWith('weekly-')) return 'weekly';
   return id;
 }
 

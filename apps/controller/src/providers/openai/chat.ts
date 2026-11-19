@@ -11,6 +11,7 @@ import {
 import { dirname, extname, isAbsolute, join, relative, resolve } from 'node:path';
 import {
   type AgentEvent,
+  type BillingMode,
   type ChatFailure,
   type ChatPermissionOption,
   ChatSetEffortSchema,
@@ -52,6 +53,7 @@ import {
   projectOpenAiUsage,
   type UsageReporter,
 } from './discovery.ts';
+import { openAiAccountMode } from './login.ts';
 import {
   type NativeLaunch,
   nativeDiscoveryEnvironment,
@@ -110,6 +112,15 @@ export type OpenAiChatDeps = Readonly<{
   spawn?: Spawn;
   /** Tests run the wait after Stop by hand. */
   schedule?: Schedule;
+  /**
+   * The mode the client's sign-in reported for a turn on a connection, read before anything was
+   * sent. The controller records it as the connection's proof.
+   */
+  onAccountMode?: (proof: {
+    connectionId: string;
+    mode: BillingMode | null;
+    proofGeneration: number;
+  }) => void;
   /** The thread tools server for this turn, with its own token. Null runs the turn without. */
   threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }>;
@@ -117,6 +128,8 @@ export type OpenAiChatDeps = Readonly<{
 export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
   return {
     family: 'openai',
+    // Both modes show in account/read before the turn sends anything.
+    connectionModes: ['subscription', 'api'],
     startTurn: (request, emit) => {
       const turn = turnTools(deps.threadTools, request, emit);
       return new OpenAiChatTurn({ ...deps, threadTools: () => turn.server }, turn.request, emit)
@@ -325,6 +338,15 @@ const envelope = z.object({
 });
 const rpcError = z.object({ code: maybe(z.number().int().safe()), message: maybe(z.string()) });
 const accountReply = z.object({ account: z.object({ type: z.string() }).nullable() });
+const accountUpdate = z.object({ authMode: maybe(z.string()) });
+// shortcut: no build is confirmed to report a dollar cost, so the turn reads costUsd from a usage
+// frame when one carries it and otherwise leaves the spend unreported. Upgrade: name the real
+// field after a live run on an API key shows what the client sends.
+const costFrame = z.object({
+  tokenUsage: z.object({
+    last: z.object({ costUsd: maybe(z.number().nonnegative().max(1_000_000)) }),
+  }),
+});
 const limitsReply = z.object({ ordinaryUsageAllowed: maybe(z.boolean()) });
 // The reply names the policy the thread runs under. A build that leaves it out is taken at its
 // word; one that names another policy than the one sent is not, since edits would then run
@@ -459,6 +481,17 @@ const errorNotice = z.object({ error: maybe(turnError), willRetry: maybe(z.boole
 const turnDone = z.object({
   turn: z.object({ id: maybe(id), status: maybe(z.string()), error: maybe(turnError) }),
 });
+/**
+ * The turn statuses the client's schema lists. At turn/completed only completed is a finished
+ * turn, interrupted is a stop and failed an error. Any other status fails the turn as
+ * completion-unknown. The protocol check compares a build's own list with this one.
+ */
+export const TURN_STATUSES: ReadonlySet<string> = new Set([
+  'completed',
+  'interrupted',
+  'failed',
+  'inProgress',
+]);
 const approval = z.object({
   itemId: maybe(id),
   reason: maybe(z.string()),
@@ -586,12 +619,23 @@ class OpenAiChatTurn {
   private tokensIn: number | null = null;
   private tokensOut: number | null = null;
   private childSpent = false;
+  // Dollars the client reported for the turn, in millionths. Null until a frame carries one.
+  private costMicros: number | null = null;
+  private modeChanged = false;
+  // The turn's own account read found the chosen mode. Sign-in notices count from then on.
+  private modeRead = false;
+  private get onAccountMode() {
+    return this.deps.onAccountMode;
+  }
   private childItems = 0;
   private readonly startedAt: number;
   private readonly finish: (result: ChatTurnResult) => void;
   private readonly schedule: Schedule;
 
+  private readonly deps: OpenAiChatDeps;
+
   constructor(deps: OpenAiChatDeps, request: ChatTurnRequest, emit: (event: AgentEvent) => void) {
+    this.deps = deps;
     this.request = request;
     this.emit = emit;
     this.schedule = deps.schedule ?? defaultSchedule;
@@ -648,6 +692,20 @@ class OpenAiChatTurn {
     this.initialize();
   }
 
+  /** What the turn runs on: the family's own sign-in, or the home of its API connection. */
+  private get billingMode(): BillingMode {
+    return this.request.connection?.billingMode ?? 'subscription';
+  }
+
+  /** An API connection keeps its own Codex home, so its key never replaces the subscription. */
+  private profileEnvironment(source: NodeJS.ProcessEnv): NodeJS.ProcessEnv {
+    const { CREWKITE_CODEX_PROFILE: _own, ...rest } = source;
+    const connection = this.request.connection;
+    return connection?.billingMode === 'api'
+      ? { ...rest, CREWKITE_CODEX_PROFILE: connection.profileId }
+      : rest;
+  }
+
   private launch(deps: OpenAiChatDeps): ChatFailure | null {
     let step: 'client' | 'storage' | 'spawn' = 'client';
     try {
@@ -657,7 +715,7 @@ class OpenAiChatTurn {
       const executable = verifiedClient(launch);
       step = 'storage';
       const env = withGitCeiling(
-        nativeDiscoveryEnvironment(launch.environment),
+        nativeDiscoveryEnvironment(this.profileEnvironment(launch.environment)),
         this.request.scratch.directory,
       );
       prepareCodexHome(env);
@@ -739,10 +797,18 @@ class OpenAiChatTurn {
               message: 'Codex sent account details CrewKite could not read.',
             }),
           );
-        // A subscription sign-in is the billing premise. An API key or other account would bill
-        // per token, so chat does not run on one.
-        if (account.data.account?.type !== 'chatgpt')
-          return this.fail(
+        // The mode the client signed in with has to be the mode the person chose. With no
+        // connection that is the subscription, since an API key would bill per token. Nothing has
+        // been sent yet, so a mismatch costs nothing.
+        const mode = openAiAccountMode(
+          account.data.account === null ? null : (account.data.account?.type ?? ''),
+        );
+        const connection = this.request.connection;
+        this.modeRead = mode === this.billingMode;
+        // The turn takes its own reason before the proof is recorded. A sign-out stops every turn
+        // on the connection, and this one keeps the line that says why.
+        if (!this.modeRead)
+          this.fail(
             chatFailure({
               stage: 'session',
               kind: 'signed-out',
@@ -750,9 +816,23 @@ class OpenAiChatTurn {
               message:
                 account.data.account === null
                   ? 'Codex is not signed in.'
-                  : 'Codex is not signed in with a ChatGPT plan.',
+                  : mode === undefined
+                    ? 'Codex reports an account type CrewKite does not know, so nothing was sent.'
+                    : this.billingMode === 'api'
+                      ? 'Codex is not signed in with an API key for this connection.'
+                      : 'Codex is not signed in with a ChatGPT plan.',
             }),
           );
+        // An account type CrewKite cannot place proves nothing either way.
+        if (connection && mode !== undefined)
+          this.onAccountMode?.({
+            connectionId: connection.connectionId,
+            mode,
+            proofGeneration: connection.proofGeneration,
+          });
+        if (!this.modeRead) return;
+        // An API key has no plan allowance to read.
+        if (this.billingMode === 'api') return this.readConfig();
         this.call('account/rateLimits/read', rateLimitsParams(this.codex) ?? undefined, (reply) => {
           // Usage is advisory, so a failed read does not stop the turn.
           if ('result' in reply) {
@@ -1385,6 +1465,28 @@ class OpenAiChatTurn {
       }
       case 'account/rateLimits/updated':
         return this.rateLimits(method, params);
+      case 'account/updated': {
+        // A sign-in that changes under a running turn ends it, on a connection or on the family's
+        // own route: a subscription turn must not go on under an API key. A connection turn's cost
+        // then stays unreported, since part of it may have billed in the other mode. A notice
+        // that comes before the turn's own account read is older than that read's answer.
+        if (!this.modeRead) return;
+        const mode = openAiAccountMode(accountUpdate.safeParse(params).data?.authMode ?? undefined);
+        if (mode !== this.billingMode) {
+          this.modeChanged = true;
+          this.fail(
+            chatFailure({
+              stage: 'stream',
+              kind: 'signed-out',
+              method: 'account/updated',
+              message: this.request.connection
+                ? 'The sign-in for this connection changed during the turn, so it stopped.'
+                : 'The ChatGPT sign-in changed during the turn, so it stopped.',
+            }),
+          );
+        }
+        return;
+      }
       case 'warning':
       case 'deprecationNotice':
       case 'configWarning': {
@@ -1427,7 +1529,18 @@ class OpenAiChatTurn {
           return this.fail(
             this.providerFailure('stream', null, this.terminal ?? turn?.error ?? null),
           );
-        return this.end({ stopReason: 'done', failure: null });
+        if (turn?.status === 'completed') return this.end({ stopReason: 'done', failure: null });
+        // A missing, unreadable or new status says nothing about whether the work finished.
+        return this.fail(
+          chatFailure({
+            stage: 'finish',
+            kind: 'completion-unknown',
+            method: 'turn/completed',
+            message: turn?.status
+              ? `Codex ended the turn with a status CrewKite does not know (${clip(turn.status, 80)}).`
+              : 'Codex ended the turn without a status CrewKite could read.',
+          }),
+        );
       }
       case 'mcpServer/startupStatus/updated': {
         const value = mcpStatus.safeParse(params).data;
@@ -1941,6 +2054,8 @@ class OpenAiChatTurn {
 
   /** Adds one model request's tokens to the turn. True when the frame carried any. */
   private spend(params: unknown) {
+    const cost = costFrame.safeParse(params).data?.tokenUsage.last.costUsd;
+    if (cost != null) this.costMicros = (this.costMicros ?? 0) + Math.round(cost * 1_000_000);
     const last = spent.safeParse(params).data?.tokenUsage.last;
     if (last?.inputTokens != null) this.tokensIn = (this.tokensIn ?? 0) + last.inputTokens;
     if (last?.outputTokens != null) this.tokensOut = (this.tokensOut ?? 0) + last.outputTokens;
@@ -2058,6 +2173,17 @@ class OpenAiChatTurn {
           : session,
       usage: this.usage,
       changedPaths: [...this.changed],
+      ...(this.request.connection?.billingMode === 'api' &&
+      !this.modeChanged &&
+      this.costMicros !== null
+        ? {
+            spend: {
+              reported: { amountMicros: this.costMicros, currency: 'USD' },
+              estimated: null,
+              unreportedTurns: 0,
+            },
+          }
+        : {}),
     });
   }
 }

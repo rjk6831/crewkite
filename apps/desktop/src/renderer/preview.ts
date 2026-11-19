@@ -1,6 +1,8 @@
 import { foldersOf, rankMentions } from '@crewkite/client';
 import {
+  type ChatCatalogRead,
   type CommandResult,
+  type ConnectionsRead,
   canonicalJson,
   type Event,
   PROJECT_NOTES_BYTES,
@@ -8,12 +10,27 @@ import {
   type Task,
   type TaskPageRequest,
   type WorkspaceStamp,
+  webhookUrl,
 } from '@crewkite/contracts';
+import { CREWKITE_VERSION } from '@crewkite/contracts/version';
 import { createDemoFixtures, createTestIds, DEMO_TIME } from '@crewkite/testkit';
 import { externalLink } from '../shared/external-link.ts';
+import { designPreview } from './design/preview-design.ts';
+import { recipesPreview } from './recipes/preview-recipes.ts';
+import { connectionsPreview } from './settings/preview-connections.ts';
 import { settingsPreview } from './settings/preview-data.ts';
+import {
+  providerCatalog,
+  providerFacts,
+  rulesPreview,
+  setupNotes,
+  setupThread,
+} from './settings/preview-states.ts';
 import type { DesktopCommand, DesktopSource } from './source.ts';
+import { acceptPreview } from './thread/preview-accept.ts';
+import { githubPreview } from './thread/preview-github.ts';
 import { createThreadScript } from './thread/preview-script.ts';
+import { workPreview } from './thread/preview-work.ts';
 
 export function createPreviewSource(): DesktopSource {
   const fixtures = createDemoFixtures();
@@ -21,6 +38,9 @@ export function createPreviewSource(): DesktopSource {
   state.tasks = [structuredClone(fixtures.task)];
   const { localHardware, ...providers } = settingsPreview(state.routes, DEMO_TIME);
   Object.assign(state, providers);
+  // A named state, such as ?preview=1&state=provider-stale, changes the facts it is named for.
+  const named = new URLSearchParams(window.location.search).get('state');
+  Object.assign(state, providerFacts(named, state, DEMO_TIME));
   const id = createTestIds(DEMO_TIME, 1000n);
   const listeners = new Set<(event: Event) => void>();
   let cursor = 0n;
@@ -69,7 +89,16 @@ export function createPreviewSource(): DesktopSource {
       .map(([name, body]) => ({ name, body }))
       .sort((a, b) => (a.name < b.name ? -1 : 1)),
   });
-  const notes = new Map<string, { id: string; text: string; createdAt: string }[]>();
+  const notes = new Map<string, { id: string; text: string; createdAt: string }[]>([
+    [
+      fixtures.task.projectId,
+      setupNotes(named).map((text, index) => ({
+        id: `not_${String(index + 1).padStart(26, '0')}`,
+        text,
+        createdAt: new Date(0).toISOString(),
+      })),
+    ],
+  ]);
   const noteList = (projectId: string) => {
     const rows = notes.get(projectId) ?? [];
     return {
@@ -180,7 +209,47 @@ export function createPreviewSource(): DesktopSource {
     }
     return null;
   }
+  // A named state, such as ?preview=1&state=findings, sets up the design system and its findings.
+  const design = designPreview(
+    new URLSearchParams(window.location.search).get('state'),
+    fixtures.task.projectId,
+    fixtures.task.id,
+  );
+  // ?preview=1&state=api-spend puts two API connections on the rail: one whose turns reported no
+  // cost, and one with a reported cost whose sign-in changed. The connections- states start the
+  // Settings card and the Crew tab's API billing, and every other preview has none.
+  const connections = connectionsPreview(
+    named,
+    DEMO_TIME,
+    named === 'api-spend' ? apiSpendPreview() : null,
+  );
   const scripts = new Map<string, ReturnType<typeof createThreadScript>>();
+  // A gh- state, such as ?preview=1&state=gh-open, starts the demo thread accepted and pushed and
+  // answers the GitHub writes, CI and review comments of the Changes tab.
+  const github = githubPreview(
+    new URLSearchParams(window.location.search).get('state'),
+    fixtures.task.id,
+    {
+      publish: (type, payload) => emit(type, payload, fixtures.task),
+      patch: (thread) => scripts.get(fixtures.task.id)?.patch(thread),
+    },
+  );
+  // A recipes- state, such as ?preview=1&state=recipes-schedule, answers the Recipes page.
+  const recipes = recipesPreview(
+    new URLSearchParams(window.location.search).get('state'),
+    fixtures.task.projectId,
+    fixtures.task.id,
+  );
+  // A work- state, such as ?preview=1&state=work-running, starts the demo thread on a plan in
+  // that state and answers the records the Work tab reads beside it.
+  const work = workPreview(
+    new URLSearchParams(window.location.search).get('state'),
+    fixtures.task.id,
+  );
+  // An accept- state answers Accept with required checks, and rules- the writing rules export.
+  const accept = acceptPreview(named, fixtures.task.id);
+  const rules = rulesPreview(named);
+  const setup = setupThread(named);
   function chatCommand(name: string, payload: Record<string, unknown>): CommandResult | null {
     if (!chatCommands.has(name)) return null;
     // The catalog read has no task, and the scripted thread answers it for the demo task.
@@ -204,10 +273,41 @@ export function createPreviewSource(): DesktopSource {
         taskId === fixtures.task.id,
       );
       scripts.set(taskId, script);
+      if (taskId === fixtures.task.id && github.thread) script.patch(github.thread);
+      if (taskId === fixtures.task.id && work.thread) script.patch(work.thread);
+      if (taskId === fixtures.task.id && accept.thread) script.patch(accept.thread);
+      if (taskId === fixtures.task.id && connections.thread) script.patch(connections.thread);
+      if (taskId === fixtures.task.id && setup) script.patch(setup);
     }
     return script.command(name, payload);
   }
+  let webhookAddress: string | null = null;
   async function command(input: DesktopCommand): Promise<CommandResult> {
+    const designed = design.command(
+      (input as { command: string }).command,
+      input.payload as Record<string, unknown>,
+    );
+    if (designed) return designed;
+    const recipe = recipes.command(
+      (input as { command: string }).command,
+      input.payload as Record<string, unknown>,
+    );
+    if (recipe) return recipe;
+    const githubAnswer = github.command(
+      (input as { command: string }).command,
+      input.payload as Record<string, unknown>,
+    );
+    if (githubAnswer) return githubAnswer;
+    const workAnswer = work.command(
+      (input as { command: string }).command,
+      input.payload as Record<string, unknown>,
+    );
+    if (workAnswer) return workAnswer;
+    const name = (input as { command: string }).command;
+    const answered =
+      accept.command(name, input.payload as Record<string, unknown>) ??
+      rules(name, input.payload as Record<string, unknown>);
+    if (answered) return answered;
     const composer = composerCommand(
       (input as { command: string }).command,
       input.payload as Record<string, unknown>,
@@ -217,7 +317,21 @@ export function createPreviewSource(): DesktopSource {
       (input as { command: string }).command,
       input.payload as Record<string, unknown>,
     );
-    if (chat) return chat;
+    if (chat) {
+      // The style files a design finding points at show in Changes beside the scripted edit.
+      const extra = input.command === 'ReadChatChanges' ? design.changes() : [];
+      const read = chat.data as { files?: unknown[]; total?: number } | undefined;
+      if (extra.length && read?.files) {
+        read.files.push(...extra);
+        read.total = read.files.length;
+      }
+      const catalog = chat.data as ChatCatalogRead | undefined;
+      if (input.command === 'ReadChatCatalog' && catalog)
+        catalog.families = providerCatalog(named, catalog.families);
+      return chat;
+    }
+    const connected = connections.command(name, input.payload as Record<string, unknown>);
+    if (connected) return connected;
     switch (input.command) {
       case 'CreateTask': {
         const created: Task = {
@@ -232,6 +346,20 @@ export function createPreviewSource(): DesktopSource {
         state.tasks.push(created);
         emit('task.created', created, created);
         return { outcome: 'applied', entity: created, revision: created.revision };
+      }
+      case 'ReadWebhook':
+        return { outcome: 'applied', data: { kind: 'webhook', url: webhookAddress } };
+      case 'SetWebhook': {
+        const url = String(input.payload.url ?? '').trim();
+        const checked = url === '' ? '' : webhookUrl(url);
+        if (checked === null)
+          return {
+            outcome: 'blocked',
+            reason: 'webhook-address-invalid',
+            next: 'That address is not allowed. Use https, or http to this computer.',
+          };
+        webhookAddress = checked || null;
+        return { outcome: 'applied' };
       }
       case 'GetSnapshot':
         return { outcome: 'applied', data: { kind: 'snapshot', snapshot: structuredClone(state) } };
@@ -274,6 +402,7 @@ export function createPreviewSource(): DesktopSource {
     nativeProfiles: state.nativeProfiles,
     googleAcpSetup: state.googleAcpSetup,
     googleAcpInstall: state.googleAcpInstall,
+    googleMetadataHolds: state.googleMetadataHolds,
     nativeConnections: state.nativeConnections,
     localSetup: state.localSetup,
     localHardware,
@@ -357,6 +486,30 @@ export function createPreviewSource(): DesktopSource {
       listener('connected');
       return () => {};
     },
+    // The export as main answers it. The state picks the answer: a save that went through, a
+    // dialog that was cancelled, or a write that failed.
+    saveResults: async () => {
+      if (named === 'recipes-results-cancelled') return 'cancelled';
+      if (named === 'recipes-results-failed')
+        throw new Error('The file could not be written there. Choose another place.');
+      return { records: 43, file: 'crewkite-results.json' };
+    },
+    // The feedback report as main builds it, from what was written and the lines ticked.
+    feedbackDraft: async (draft) => {
+      const versions = [
+        ...(draft.app ? [`App: ${CREWKITE_VERSION}`] : []),
+        ...(draft.os ? ['OS: Darwin 25.1.0 arm64'] : []),
+        ...(draft.clients && draft.clientVersions.length
+          ? [`Clients: ${draft.clientVersions.join(', ')}`]
+          : []),
+      ];
+      return [
+        '## What happened',
+        '',
+        draft.what.trim() || '(nothing written yet)',
+        ...(versions.length ? ['', '## Versions', '', ...versions] : []),
+      ].join('\n');
+    },
     // The browser preview has no main process, so it opens the checked address itself.
     openLink: async (url) => {
       const target = externalLink(url);
@@ -364,5 +517,46 @@ export function createPreviewSource(): DesktopSource {
       window.open(target.href, '_blank', 'noopener,noreferrer');
       return 'opened';
     },
+  };
+}
+
+function apiSpendPreview(): ConnectionsRead {
+  const connection = {
+    backend: 'native-client',
+    billingMode: 'api',
+    keepConnected: true,
+    readiness: 'ready',
+    proofGeneration: 1,
+    observedMode: 'api',
+    observedAt: DEMO_TIME,
+  } as const;
+  const openai = 'con_01KA0000000000000000000001';
+  const anthropic = 'con_01KA0000000000000000000002';
+  return {
+    loginLines: [],
+    connections: [
+      { ...connection, connectionId: openai, family: 'openai', profileId: 'openai-api' },
+      {
+        ...connection,
+        connectionId: anthropic,
+        family: 'anthropic',
+        profileId: 'anthropic-api',
+        label: 'Team key',
+        readiness: 'needs-attention',
+        observedMode: 'subscription',
+      },
+    ],
+    assignments: [],
+    spend: [
+      { connectionId: openai, spend: { reported: null, estimated: null, unreportedTurns: 2 } },
+      {
+        connectionId: anthropic,
+        spend: {
+          reported: { amountMicros: 420_000, currency: 'USD' },
+          estimated: null,
+          unreportedTurns: 0,
+        },
+      },
+    ],
   };
 }

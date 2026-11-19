@@ -122,6 +122,39 @@ test('each family names its own tested build, minimum and update command, with t
   );
 });
 
+test('the client matrix in docs/providers.md states the tested and minimum builds of every family', () => {
+  const labels: Record<keyof typeof CLIENT_VERSIONS, string> = {
+    openai: 'OpenAI',
+    anthropic: 'Anthropic',
+    google: 'Google quota reader',
+  };
+  const lines = readFileSync(
+    new URL('../../../../docs/providers.md', import.meta.url),
+    'utf8',
+  ).split('\n');
+  const header = lines.findIndex((line) => line.startsWith('| Family | Client | Tested build'));
+  assert.notEqual(header, -1, 'the client matrix header');
+  const cellsOf = (line: string) =>
+    line
+      .slice(1, -1)
+      .split('|')
+      .map((cell) => cell.trim());
+  const columns = cellsOf(lines[header] ?? '');
+  const rows = new Map<string, string[]>();
+  for (const line of lines.slice(header + 2)) {
+    if (!line.startsWith('|')) break;
+    const cells = cellsOf(line);
+    rows.set(cells[0] ?? '', cells);
+  }
+  for (const [family, label] of Object.entries(labels)) {
+    const cells = rows.get(label);
+    assert(cells, `${family} row`);
+    const value = CLIENT_VERSIONS[family as keyof typeof CLIENT_VERSIONS];
+    assert.equal(cells[columns.indexOf('Tested build')], value.tested, family);
+    assert.equal(cells[columns.indexOf('Minimum')], value.minimum, family);
+  }
+});
+
 test('Settings and the CLI name the found version and the state in plain words', () => {
   const at = (family: keyof typeof CLIENT_VERSIONS, version: string | null) =>
     clientVersionStatus(family, { state: 'version', path: '/opt/homebrew/bin/client', version });
@@ -415,7 +448,15 @@ test('the version read is bounded, kills its whole process group and passes a mi
   const { root, bin, store, client, link } = scratch();
   try {
     const pids = join(root, 'pids');
-    link(client('codex', `sleep 30 &\necho $! > '${pids}'\nsleep 30`));
+    const hanging = client(
+      'codex',
+      `[ "$1" = warm ] && exit 0\nsleep 30 &\necho $! > '${pids}'\nsleep 30`,
+    );
+    // The first run of a new executable can take longer than the 300 ms bound while macOS
+    // checks it. One run that exits at once pays that cost, so the bound below starts counting
+    // against a script that is already known to start quickly.
+    spawnSync(hanging, ['warm']);
+    link(hanging);
     const started = Date.now();
     const hung = findClient('openai', {
       directories: [bin],

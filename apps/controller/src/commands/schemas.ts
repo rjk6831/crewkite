@@ -20,6 +20,7 @@ import {
   GoogleNativePermissionModeSchema,
   GrantSchema,
   HashSchema,
+  LocalAnyEndpointSchema,
   LocalAuthModeSchema,
   LocalEndpointSchema,
   type LocalHardwareStatus,
@@ -555,7 +556,7 @@ const LocalControlFields = z.strictObject({
   openProbeRevision: RevisionSchema.nullable().default(null),
   revision: RevisionSchema,
   connectionRevision: RevisionSchema,
-  endpoint: LocalEndpointSchema.nullable(),
+  endpoint: LocalAnyEndpointSchema.nullable(),
   observation: LocalModelObservationSchema.nullable(),
   selection: LocalModelSelectionSchema.nullable(),
   // The selected model's key outlives a reconnect, which clears the observation, so the next read

@@ -326,6 +326,13 @@ function MessageStep({
       <p className="onb-lead">
         This message goes into the composer when you open it. CrewKite does not send it.
       </p>
+      {/* The steps after the welcome, up to the first accepted change, so none is a guess. */}
+      <ol className="onb-next" aria-label="After the welcome">
+        <li>Press Enter to send it. The reply streams into the thread.</li>
+        <li>Ask for a change. With the default permissions, each edit and command asks first.</li>
+        <li>Edits land in a scratch copy. Your checkout is not touched.</li>
+        <li>Open Changes, review the files, then choose Accept to branch.</li>
+      </ol>
       <label className="onb-message-label" htmlFor={field}>
         Your first message
       </label>

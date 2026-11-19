@@ -137,13 +137,16 @@ export function threadNotices(
         if (step === 'stopped') found.push({ taskId, kind: 'crew-stopped' });
       }
     } else if (event.type === 'agent.event') {
-      // A stop is the person's own doing. An error or a usage limit turns the dot to Failed, and
-      // the notice says so.
+      // A stop is the person's own doing. An error or a usage limit turns the dot to Failed. The
+      // notice names which one it was.
       const ended = payload.type === 'turn.completed' ? payload.stopReason : null;
       if (ended === 'done' || ended === 'error' || ended === 'limit') {
         const step = chains.get(taskId) ?? null;
         if (!step || !RUNNING_STEPS.has(step))
-          found.push({ taskId, kind: ended === 'done' ? 'reply' : 'failed' });
+          found.push({
+            taskId,
+            kind: ended === 'done' ? 'reply' : ended === 'limit' ? 'limit' : 'failed',
+          });
       }
       if (
         payload.type === 'permission.requested' &&

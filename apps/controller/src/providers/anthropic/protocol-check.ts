@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdirSync, readFileSync, realpathSync } from 'node:fs';
+import { closeSync, mkdirSync, openSync, readFileSync, readSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
 import { clientRecord } from '../client-record.ts';
 import { CLIENT_VERSIONS, parseClientVersion } from '../client-versions.ts';
@@ -93,6 +93,30 @@ function dry(binary: string, home: string, argv: readonly string[]) {
   // Reaching the probe flag means every flag before it parsed. Anything else is the build's refusal.
   const reached = said.includes(`unknown option '${PROBE}'`) && !/Unknown --|invalid/.test(said);
   return { reached, said: said.slice(0, 200) };
+}
+
+/**
+ * Every `subtype: "error_..."` literal in the client file, such as error_max_turns. The file is a
+ * script bundle or a compiled binary that carries one, so it is read in chunks as bytes.
+ */
+function errorSubtypes(binary: string) {
+  const found = new Set<string>();
+  const literal = /subtype:\s?["'](error_[a-z_]{1,60})["']/g;
+  const fd = openSync(realpathSync(binary), 'r');
+  const chunk = Buffer.alloc(8 * 1024 * 1024);
+  let carry = '';
+  try {
+    for (;;) {
+      const read = readSync(fd, chunk, 0, chunk.length, null);
+      if (read === 0) break;
+      const text = carry + chunk.toString('latin1', 0, read);
+      for (const match of text.matchAll(literal)) found.add(match[1]);
+      carry = text.slice(-80);
+    }
+  } finally {
+    closeSync(fd);
+  }
+  return found;
 }
 
 async function changelog(tested: string): Promise<Row[]> {
@@ -257,6 +281,19 @@ export async function check(context: { binary: string; work: string; validate: V
       detail: ok ? 'parsed' : 'the parser refused a recorded frame',
     });
   }
+
+  // The error subtypes the build names in its own code. One the adapter does not know fails every
+  // turn that ends on it, so a build that adds one needs a look before a person meets it.
+  const named = errorSubtypes(binary);
+  const added = [...named].filter((subtype) => !RESULT_SUBTYPES.has(subtype));
+  rows.push({
+    request: 'result',
+    shape: 'error subtypes',
+    result: added.length ? 'refused' : named.size ? 'accepted' : 'warning',
+    detail: added.length
+      ? `${added.join(', ')} not known to the adapter`
+      : [...named].join(', ') || 'the build names no error subtype this check can find',
+  });
 
   // The documentation says --bare will become the default for -p, and bare mode never reads the
   // sign-in. A build that lists a flag to turn it off is the one the adapters should pass.

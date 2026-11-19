@@ -17,6 +17,7 @@ import {
 } from '@crewkite/contracts';
 import { transferArtifact } from '../../../../packages/client/src/output.ts';
 import { Controller } from '../commands/controller.ts';
+import { fanOut } from '../recipes/events.ts';
 import { serve } from '../server/index.ts';
 import { taskActivityPage } from './activity.ts';
 import { Store } from './index.ts';
@@ -300,4 +301,80 @@ test('task activity pages retain every whole event across cursor and byte bounda
     reason: 'activity-history-unavailable',
     next: 'Retained activity could not be read. No history was skipped.',
   });
+});
+
+test('a savepoint or a listener that throws leaves no row and no event behind', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'ck-savepoint-'));
+  const store = new Store(join(directory, 'state.sqlite'));
+  t.after(() => {
+    store.close();
+    rmSync(directory, { recursive: true, force: true });
+  });
+  store.applyMigrations(fileURLToPath(new URL('../../migrations/', import.meta.url)));
+  const id = (prefix: string, number: number) => `${prefix}_${String(number).padStart(26, '0')}`;
+  const event = (number: number) => ({
+    protocol: 1 as const,
+    id: id('evt', number),
+    at: '2026-10-18T00:00:00.000Z',
+    taskId: null,
+    revision: 0,
+    type: 'attempt.output' as const,
+    payload: { attemptId: id('att', 1), generation: 0, channel: 'stdout' as const, text: 'x' },
+  });
+  const heard: string[] = [];
+  store.subscribe((sent) => heard.push(sent.id));
+  store.transaction(() => {
+    store.append(event(1));
+    assert.throws(
+      () =>
+        store.savepoint('listener', () => {
+          store.append(event(2));
+          throw new Error('listener failed');
+        }),
+      /listener failed/,
+    );
+    // The cursor the rolled-back event held is handed out again here.
+    store.append(event(3));
+    assert.equal(
+      store.savepoint('listener', () => 'kept'),
+      'kept',
+    );
+  });
+  assert.deepEqual(heard, [id('evt', 1), id('evt', 3)]);
+  const stored = store.db.prepare('SELECT event_id FROM events ORDER BY cursor').all();
+  assert.deepEqual(
+    stored.map((row) => row.event_id),
+    heard,
+  );
+  assert.throws(() => store.savepoint('listener', () => 1), /requires a transaction/);
+
+  // Two listeners behind the fan-out: the first writes and throws on every event, and the second
+  // still hears each one. Only the second's events are kept, and the failure is logged once.
+  let next = 3;
+  const logged: string[] = [];
+  const observe = fanOut(
+    store,
+    {
+      first: () => {
+        store.append(event(++next));
+        throw new Error('first failed');
+      },
+      second: () => {
+        store.append(event(++next));
+      },
+    },
+    (line) => logged.push(line),
+  );
+  heard.length = 0;
+  const plan = {
+    kind: 'plan-started' as const,
+    taskId: id('tsk', 1),
+    at: '2026-10-18T00:00:00.000Z',
+  };
+  store.transaction(() => {
+    observe(plan);
+    observe(plan);
+  });
+  assert.deepEqual(heard, [id('evt', 5), id('evt', 7)]);
+  assert.deepEqual(logged, ['first: Error: first failed']);
 });

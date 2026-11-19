@@ -18,3 +18,11 @@ export function formatLocalTime(
     ...(options.timeZone ? { timeZone: options.timeZone } : {}),
   });
 }
+
+/** A time from today as "4:06 PM", and an earlier one with its day, as "Nov 17, 4:06 PM". */
+export function shortTime(iso: string): string {
+  const at = new Date(iso);
+  return at.toDateString() === new Date().toDateString()
+    ? at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
+    : at.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+}

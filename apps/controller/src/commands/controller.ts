@@ -6,7 +6,9 @@ import {
   fstatSync,
   lstatSync,
   mkdirSync,
+  mkdtempSync,
   openSync,
+  rmSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import { basename, join } from 'node:path';
@@ -15,6 +17,7 @@ import {
   type Artifact,
   ArtifactSchema,
   type Attempt,
+  type BillingMode,
   type Candidate,
   type ChatCatalogRead,
   type ChatFamily,
@@ -23,8 +26,10 @@ import {
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
+  type Connection,
   type Event,
   googleTermsCurrent,
+  isOpenAiLocalEndpoint,
   type ModelCatalogObservation,
   ModelCatalogObservationSchema,
   type Observation,
@@ -37,6 +42,7 @@ import {
   type Task,
   TaskSchema,
   TimestampSchema,
+  webhookUrl,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { CREWKITE_VERSION } from '@crewkite/contracts/version';
@@ -45,29 +51,46 @@ import type { ChatAdapter, ChatTurnRequest } from '../chat/adapter.ts';
 import { readAnalytics } from '../chat/analytics.ts';
 import { buildChatCatalog } from '../chat/catalog.ts';
 import { ChatClientRefused, type ChatClientResolvers, chatClient } from '../chat/clients.ts';
+import { Connections, connectionMutations, connectionsCommand } from '../chat/connections.ts';
 import { exportThread } from '../chat/export.ts';
 import { McpRegistry } from '../chat/mcp-servers.ts';
 import { ProjectNotes } from '../chat/project-notes.ts';
 import { notesCommand, notesMutations } from '../chat/project-notes-command.ts';
+import { readWritingRules } from '../chat/prompt.ts';
 import { crewsCommand, crewsMutations, SavedCrews } from '../chat/saved-crews.ts';
 import { deletePrompt, PromptsRefused, readPrompts, savePrompt } from '../chat/saved-prompts.ts';
 import { chatScratchDirectory } from '../chat/scratch-folder.ts';
 import { ChatService } from '../chat/service.ts';
 import { ThreadToolsBroker, type ThreadToolsServer } from '../chat/thread-tools/broker.ts';
+import { writingRulesExportCommand } from '../chat/writing-rules-export.ts';
 import { TaskConversation } from '../conversation/conversation.ts';
+import { DesignChecks, findingMutations, findingsCommand } from '../design/check.ts';
+import type { PreviewHost } from '../design/screenshots.ts';
+import { DesignSystems, designCommand, designMutations } from '../design/service.ts';
 import { ConnectLog } from '../diagnostics/connect-log.ts';
 import { readDiagnostics } from '../diagnostics/read.ts';
 import { CandidateEvidence } from '../evidence/index.ts';
 import type { prepareToolchain } from '../evidence/toolchain-definition.ts';
 import { ToolchainVerification } from '../evidence/toolchain-verify.ts';
 import { ExtensionHost } from '../extensions/host.ts';
-import type { GitIdentity } from '../host/publication.ts';
+import { RemoteEffects } from '../github/effects.ts';
+import { policyCommand } from '../github/policy.ts';
+import { DependencyPreparer, dependenciesCommand } from '../host/dependencies.ts';
+import { readLaunchIdentity } from '../host/launch-identity.ts';
+import type { GitIdentitySource } from '../host/publication.ts';
 import { inspectSourceDetails, projectRoot } from '../host/source.ts';
 import { type GitState, gitProblem, gitState } from '../host/vcs-probe.ts';
 import { groupAbsent, type OwnedCommand, type OwnedWorker, type Schedule } from '../host/worker.ts';
+import { postThreadNotice, WebhookNotifier } from '../notices/webhook.ts';
 import { anthropicChatAdapter } from '../providers/anthropic/chat.ts';
+import { authStatusMode } from '../providers/anthropic/discovery.ts';
 import { type AnthropicLiveModel, readAnthropicModels } from '../providers/anthropic/models.ts';
 import type { NativeConnectionChecks } from '../providers/anthropic/native-connection.ts';
+import {
+  anthropicApiLoginLine,
+  prepareClaudeConfigDir,
+  startNativeAuthStatus,
+} from '../providers/anthropic/native-discovery.ts';
 import type { AnthropicUsageRefresh } from '../providers/anthropic/usage-refresh.ts';
 import type { AcpInstallDependencies } from '../providers/google/acp/install.ts';
 import type { GoogleAcpInstallation } from '../providers/google/acp/install-operation.ts';
@@ -90,22 +113,35 @@ import {
 } from '../providers/google/profile.ts';
 import { localChatAdapter } from '../providers/local/chat.ts';
 import { connectLocalModel } from '../providers/local/chat-connect.ts';
+import { connectOpenAiModel } from '../providers/local/openai-compat.ts';
 import type { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
 import type { LocalInputHelper, startLocalSecretInput } from '../providers/local/secure-input.ts';
 import { openAiChatAdapter } from '../providers/openai/chat.ts';
 import { openAiCreditReading } from '../providers/openai/discovery.ts';
+import { openAiApiLoginLine, startOpenAiAccountStep } from '../providers/openai/login.ts';
 import {
   modelReadFailure,
   type OpenAiModelCatalogObservation,
   OpenAiModelCatalogObservationSchema,
   startOpenAiModelCatalogObservation,
 } from '../providers/openai/model-catalog.ts';
-import type { startNativeSession } from '../providers/openai/native-discovery.ts';
+import {
+  nativeDiscoveryEnvironment,
+  prepareCodexHome,
+  type startNativeSession,
+} from '../providers/openai/native-discovery.ts';
 import type { NativeProfileResolution } from '../providers/openai/profile.ts';
 import type { startReplacement } from '../providers/openai/replacement.ts';
+import { draftCommand } from '../recipes/draft.ts';
+import { fanOut } from '../recipes/events.ts';
+import { ResultRecorder } from '../recipes/results.ts';
+import { RecipeRuns, runMutations, runsCommand } from '../recipes/run.ts';
+import { Scheduler, schedulesCommand } from '../recipes/scheduler.ts';
+import { Recipes, recipeMutations, recipesCommand } from '../recipes/service.ts';
+import { RunTracker } from '../recipes/tracker.ts';
 import { activityBodyChunks, taskActivityOutputPage, taskActivityPage } from '../store/activity.ts';
 import { createIds, type IdPrefix } from '../store/ids.ts';
-import { type LaunchIntent, Store } from '../store/index.ts';
+import { type LaunchIdentity, type LaunchIntent, Store } from '../store/index.ts';
 import { assertSchemaCompatibility } from '../store/schema-compatibility.ts';
 import { projectPage, taskPage } from '../store/workspace.ts';
 import { AcceptanceCommands } from './acceptance.ts';
@@ -114,6 +150,7 @@ import { CombinedCommands } from './combined.ts';
 import { CombinedAssemblyCommands } from './combined-assembly.ts';
 import { CombinedEvaluationCommands } from './combined-evaluation.ts';
 import { EvaluationCommands } from './evaluation.ts';
+import { recoverGoogleMetadata, recoverGoogleMetadataCommand } from './google-recovery.ts';
 import { acknowledgeGoogleTerms, googleTermsGate } from './google-terms.ts';
 import { NativeEvidenceCommands } from './native-evidence.ts';
 import { NativeLaunchCommands } from './native-launch.ts';
@@ -151,6 +188,16 @@ export type { NativePilotAppointment } from './schemas.ts';
 const CHAT_MODEL_CATALOG = 'chat-model-catalog:openai';
 const CHAT_MODEL_READ = 'chat-model-read:openai';
 
+// Commands whose contracts are fixed and whose handlers are not built yet. Each answers blocked
+// before any receipt is written, so the same key runs for real once its handler lands. A handler
+// that lands takes its name off this list.
+const PENDING_COMMANDS: ReadonlySet<string> = new Set<Command['command']>([]);
+const notAvailable = (): CommandResult => ({
+  outcome: 'blocked',
+  reason: 'not-available',
+  next: 'This version cannot run this command yet. Nothing changed.',
+});
+
 export type ControllerOptions = {
   home: string;
   now?: () => string;
@@ -158,13 +205,28 @@ export type ControllerOptions = {
   routes?: Route[];
   observations?: Observation[];
   workerPath?: string;
-  identity?: GitIdentity | (() => GitIdentity | undefined);
+  /**
+   * The Git identity for commits. A fixed one stands for every project. A function reads the
+   * user's global config, for projects whose policy names it; the others read their own config.
+   */
+  identity?: GitIdentitySource;
+  /**
+   * HOME, PATH and the like for the git and gh a remote write runs. Without it they get the
+   * person's own. Tests pass a temporary HOME and a PATH that holds no installed gh.
+   */
+  gitEnvironment?: Readonly<Record<string, string>>;
   scenarioForRoute?: (
     route: Route,
     generation: number,
   ) => Extract<import('@crewkite/contracts').FakeWorkerInput, { type: 'start' }>['scenario'];
   afterIntent?: (intent: LaunchIntent) => void;
   schedule?: Schedule;
+  /** The timer recipe schedules wait on. Tests pass their own, so no other timer mixes in. */
+  scheduleStarts?: Schedule;
+  /** Lets a loop take checklist work. Off in the app until the checklist reader is exact. */
+  checklistWork?: boolean;
+  /** Lets a report recipe run. Off in the app until a report thread refuses Accept. */
+  reportRuns?: boolean;
   nativeProfile?: () => NativeProfileResolution;
   nativeProfiles?: () => NativeProfileResolution[];
   nativeSpawn?: Parameters<typeof startReplacement>[2]['spawn'];
@@ -187,6 +249,12 @@ export type ControllerOptions = {
   localProbe?: (
     endpoint: string,
   ) => Promise<boolean | 'token-required' | 'timeout' | 'unavailable' | 'open'>;
+  /** The fetch for OpenAI-compatible Local endpoints. Tests pass a fake server's. */
+  localFetch?: typeof fetch;
+  /** The fetch for webhook posts. Tests pass their own. */
+  webhookFetch?: typeof fetch;
+  /** Where a dropped webhook post is logged. Tests pass their own. */
+  webhookLog?: (line: string) => void;
   localDiscovery?: Omit<Parameters<typeof startLocalDiscovery>[2], 'lifecycle'>;
   localWriter?: Omit<Parameters<typeof startLocalReplacement>[2], 'lifecycle' | 'onSubmitted'>;
   prepareVerification?: typeof prepareToolchain;
@@ -198,11 +266,20 @@ export type ControllerOptions = {
   chatClients?: ChatClientResolvers;
   /** Fixed Anthropic picker rows for a scripted setup, in place of reading the client. */
   anthropicModels?: readonly AnthropicLiveModel[];
+  /** Digests of this boot and machine for a home. Tests pass their own. */
+  launchIdentity?: (home: string) => LaunchIdentity;
+  /**
+   * The preview process and the browser capture for the screenshot check. Tests pass their own.
+   * The declared previews always come from the store.
+   */
+  previews?: Omit<PreviewHost, 'declared'>;
 };
 
 export class Controller {
   readonly store!: Store;
   readonly home: string;
+  /** Read once at startup. Each launch intent writes it in the intent's own transaction. */
+  readonly launchIdentity!: LaunchIdentity;
   readonly now: () => string;
   readonly id: (prefix: IdPrefix) => string;
 
@@ -224,6 +301,11 @@ export class Controller {
     abort: AbortController;
     promise: Promise<CommandResult>;
   };
+  /** Design drafts still waiting on their model, by command key. */
+  private readonly drafts = new Map<
+    string,
+    { hash: string; principal: string; promise: Promise<CommandResult> }
+  >();
   readonly nativeReviewWorkers = new Map<string, NativeReviewRuntime>();
   localSecret: LocalSecretCell | null = null;
   localOperation?: LocalOperationRuntime;
@@ -239,6 +321,9 @@ export class Controller {
   readonly options: ControllerOptions;
   profiles: NativeProfileResolution[];
   private closing?: Promise<void>;
+  private readonly webhook: WebhookNotifier;
+  /** Clients attached to this controller, as the server counts them. Schedules start only then. */
+  private clients = 0;
   readonly workers = new Map<string, FakeRuntime | NativeRuntime>();
   readonly quotaRetries = new Map<string, () => void>();
   private chatModelRead?: {
@@ -338,6 +423,8 @@ export class Controller {
     this.owner = new DatabaseSync(ownerPath);
     try {
       this.owner.exec('PRAGMA busy_timeout=0; BEGIN EXCLUSIVE;');
+      // The key file joins the home only once this controller owns it.
+      this.launchIdentity = (options.launchIdentity ?? readLaunchIdentity)(this.home);
       this.store = new Store(join(this.home, 'state.sqlite'));
       this.store.applyMigrations(migrations);
       this.store.transaction(() => {
@@ -370,10 +457,15 @@ export class Controller {
       this.conversation = new TaskConversation(this.store);
       this.recover();
       this.nativeConnections().recover();
+      // The records change now. Each kept connection's proof starts once startup has finished.
+      this.connections()
+        .restore()
+        .catch(() => {});
       this.anthropicUsage().recover();
       this.googleInstallation().recover();
       this.taskOperations().recover();
       this.chat().recover();
+      this.remoteEffects().recover();
       this.armQuotaRetries();
       for (const row of this.store.db
         .prepare("SELECT candidate_id FROM publications WHERE state='prepared'")
@@ -384,6 +476,11 @@ export class Controller {
       this.owner.close();
       throw error;
     }
+    // A Google metadata row whose recorded group is proven gone stops holding the gate before the
+    // launch steps below look at it. A failure here leaves every hold in place.
+    try {
+      this.store.transaction(() => recoverGoogleMetadata(this, 'automatic'));
+    } catch {}
     // Google setup is three client runs and can take a minute. Recovery above has settled any
     // interrupted step, so the runs that need no click start here.
     if (this.store.hasConnectedOnce('google')) this.connectLog.begin('google', 'auto');
@@ -394,6 +491,125 @@ export class Controller {
     // Local reconnects its saved endpoint from the desktop at launch.
     if (this.store.hasConnectedOnce('local') && this.localControl().endpoint)
       this.connectLog.begin('local', 'auto');
+    // Recovery and the launch steps above have committed what they will. The webhook posts from
+    // here, so a restart never posts for work that ended before it started.
+    this.webhook = new WebhookNotifier({
+      address: () => this.store.webhookUrl(),
+      fetch: options.webhookFetch ?? fetch,
+      now: () => new Date(this.now()),
+      log: options.webhookLog ?? ((line) => process.stderr.write(`${line}\n`)),
+    });
+    // Recovery told the tracker what it stopped. A run whose thread it left waiting or finished
+    // is read again from the thread once. A failure here leaves the rows as they are, and the
+    // controller still starts.
+    try {
+      this.runTracker().reconcile();
+    } catch (error) {
+      process.stderr.write(`Recipe runs were not read again at startup: ${String(error)}\n`);
+    }
+    // A step whose turn recovery failed ends from the turn's row.
+    try {
+      this.results().reconcile();
+    } catch (error) {
+      process.stderr.write(`Step records were not closed at startup: ${String(error)}\n`);
+    }
+    // Schedules read the runs as the tracker left them. A start that came due while CrewKite was
+    // closed waits for the first client to attach.
+    try {
+      this.scheduler().wake();
+    } catch {}
+  }
+
+  /**
+   * The server tells the controller how many clients are attached. The first one after a time
+   * with none lets the schedules make the starts they missed. Nothing here can refuse a client:
+   * a schedule that fails to wake is logged and the client attaches all the same.
+   */
+  clientsChanged(count: number) {
+    const first = this.clients === 0 && count > 0;
+    this.clients = count;
+    if (!first || this.closed) return;
+    try {
+      this.scheduler().wake();
+    } catch (error) {
+      process.stderr.write(`Schedules did not wake: ${String(error)}\n`);
+    }
+  }
+
+  private schedulerRuntime?: Scheduler;
+  private scheduler(): Scheduler {
+    this.schedulerRuntime ??= new Scheduler({
+      store: this.store,
+      now: this.now,
+      recipes: this.recipes(),
+      runs: this.recipeRuns(),
+      projectPath: (projectId) => this.projectPath(projectId),
+      families: () => this.withProfiles(() => this.chatCatalog().families),
+      // The same read a start at reset makes before it runs anything.
+      refreshUsage: async (family) => {
+        if (family === 'openai') await this.refreshOpenAiUsage('interval');
+        else if (family === 'anthropic') await this.anthropicUsage().refreshWhenDue(this.id('cmd'));
+        else await this.refreshGoogleUsage('interval');
+      },
+      attached: () => this.clients > 0,
+      schedule: this.options.scheduleStarts,
+      notify: (notice) => this.webhook?.notify(notice),
+      changed: (projectId, recipeId) =>
+        this.event('recipes.changed', null, 0, { projectId, recipeId }),
+    });
+    return this.schedulerRuntime;
+  }
+
+  // Built on the first event, so the runs hear what startup recovery stops.
+  private runTrackerRuntime?: RunTracker;
+  private runTracker(): RunTracker {
+    this.runTrackerRuntime ??= new RunTracker({
+      store: this.store,
+      now: this.now,
+      home: this.home,
+      projectPath: (projectId) => this.projectPath(projectId),
+      families: () => this.withProfiles(() => this.chatCatalog().families),
+      changed: (projectId, recipeId) =>
+        this.event('recipes.changed', null, 0, { projectId, recipeId }),
+      onRun: (next, before) => this.scheduler().settled(next, before),
+    });
+    return this.runTrackerRuntime;
+  }
+
+  // Built on the first event too, so the records hear what startup recovery stops.
+  private resultsRuntime?: ResultRecorder;
+  private results(): ResultRecorder {
+    this.resultsRuntime ??= new ResultRecorder({
+      store: this.store,
+      // shortcut: record IDs borrow a message ID's time-ordered suffix, like run IDs do. Upgrade:
+      // add 'srs' to IdPrefix and to the testkit ID helper.
+      id: () => `srs_${this.id('msg').slice(4)}`,
+      home: this.home,
+      projectPath: (projectId) => this.projectPath(projectId),
+      now: this.now,
+    });
+    return this.resultsRuntime;
+  }
+
+  private remoteEffectsRuntime?: RemoteEffects;
+  private remoteEffects(): RemoteEffects {
+    this.remoteEffectsRuntime ??= new RemoteEffects({
+      store: this.store,
+      home: this.home,
+      now: this.now,
+      id: () => this.id('rfx'),
+      projectPath: (projectId) => this.projectPath(projectId),
+      environment: this.options.gitEnvironment,
+      // The thread hears each change and reads the record again.
+      changed: (taskId, change) =>
+        this.event(
+          'remote-effect.updated',
+          taskId,
+          this.store.get<Task>('task', taskId)?.revision ?? 0,
+          change,
+        ),
+    });
+    return this.remoteEffectsRuntime;
   }
 
   private taskOperationRuntime?: TaskOperations;
@@ -412,6 +628,7 @@ export class Controller {
           record.revision,
           taskOperationSummary(record),
         ),
+      launchIdentity: this.launchIdentity,
     });
     return this.taskOperationRuntime;
   }
@@ -462,6 +679,328 @@ export class Controller {
     return this.notesRuntime;
   }
 
+  private designRuntime?: DesignSystems;
+  private designSystems(): DesignSystems {
+    this.designRuntime ??= new DesignSystems({
+      store: this.store,
+      now: this.now,
+      projectPath: (projectId) => this.projectPath(projectId),
+      saved: (projectId, system, versionHash) =>
+        this.designChecks().saved(projectId, system, versionHash),
+      draftTurn: async (input) => {
+        const selection = this.orchestratorSelection();
+        return selection && this.chat().oneTurn({ ...input, role: 'orchestrator', selection });
+      },
+    });
+    return this.designRuntime;
+  }
+
+  private recipesRuntime?: Recipes;
+  private recipes(): Recipes {
+    this.recipesRuntime ??= new Recipes({
+      store: this.store,
+      now: this.now,
+      checklistWork: this.options.checklistWork,
+      reportRuns: this.options.reportRuns,
+      // shortcut: recipe IDs borrow a message ID's time-ordered suffix, like notes do. Upgrade:
+      // add 'rcp' to IdPrefix and to the testkit ID helper.
+      id: () => `rcp_${this.id('msg').slice(4)}`,
+      home: this.home,
+      projectPath: (projectId) => this.projectPath(projectId),
+      // The same facts a turn start reads: a connected family, a model it accepts, and for
+      // Google the current terms. One catalog serves the whole crew, built with the profiles
+      // resolved once, as a workspace read does.
+      readiness: (selections) =>
+        this.withProfiles(() => {
+          const families = this.chatCatalog().families;
+          const terms = googleTermsCurrent(this.store.googleAcpSetup().googleTerms);
+          return selections.map((selection) => {
+            const family = families.find((entry) => entry.family === selection.family);
+            if (!family?.connected) return 'not-connected';
+            if (!this.chatSelection(selection, families)) return 'model-unknown';
+            if (selection.family === 'google' && !terms) return 'terms-pending';
+            return null;
+          });
+        }),
+      armed: (record, body, approved) => this.scheduler().armed(record, body, approved),
+      forgotten: (recipeId) => this.scheduler().forgotten(recipeId),
+      changed: (projectId, recipeId) =>
+        this.event('recipes.changed', null, 0, { projectId, recipeId }),
+    });
+    return this.recipesRuntime;
+  }
+
+  private recipeRunsRuntime?: RecipeRuns;
+  private recipeRuns(): RecipeRuns {
+    this.recipeRunsRuntime ??= new RecipeRuns({
+      store: this.store,
+      now: this.now,
+      // shortcut: run IDs borrow a message ID's time-ordered suffix, like recipe IDs do. Upgrade:
+      // add 'rrn' to IdPrefix and to the testkit ID helper.
+      id: () => `rrn_${this.id('msg').slice(4)}`,
+      home: this.home,
+      projectPath: (projectId) => this.projectPath(projectId),
+      recipes: this.recipes(),
+      createTask: (input) => this.createTask(input),
+      startThread: (task, setup, effects, matches) =>
+        this.chat().startRecipeThread(task, setup, effects, matches),
+      families: () => this.withProfiles(() => this.chatCatalog().families),
+      changed: (projectId, recipeId) =>
+        this.event('recipes.changed', null, 0, { projectId, recipeId }),
+      reportRuns: this.options.reportRuns,
+      checklistWork: this.options.checklistWork,
+    });
+    return this.recipeRunsRuntime;
+  }
+
+  /**
+   * The model a project's own question runs on: the orchestrator of the default crew when that
+   * crew is saved with one, else the model a new thread starts on. Null when nothing can run it.
+   */
+  private orchestratorSelection(): ChatModelSelection | null {
+    const { crews, defaultCrew } = this.savedCrews().read();
+    const pinned = crews
+      .find((crew) => `saved:${crew.id}` === defaultCrew)
+      ?.members.find((member) => member.role === 'orchestrator')?.selection;
+    return (pinned && this.chatSelection(pinned)) || this.chatSelection();
+  }
+
+  /**
+   * A draft asks its model before the command's transaction opens. A retry that arrives while the
+   * model is still answering waits for that answer, so one key never asks a model twice.
+   */
+  private draftDesignSystem(
+    command: Extract<Command, { command: 'DraftDesignSystem' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const hash = hashCanonical(command);
+    const running = this.drafts.get(command.key);
+    if (running)
+      return running.hash === hash && running.principal === principal
+        ? running.promise
+        : Promise.resolve({
+            outcome: 'denied',
+            reason: 'idempotency-key-reused',
+            next: 'Use a new key for changed command content.',
+          });
+    const promise = this.designSystems()
+      .drafting(command.payload, () => this.commitCommand(command, principal))
+      .finally(() => this.drafts.delete(command.key));
+    this.drafts.set(command.key, { hash, principal, promise });
+    return promise;
+  }
+
+  /**
+   * A merge is proposed only when its head merges cleanly onto the pull request's base, fetched
+   * now, and GitHub's required checks and rules let it through. A conflict refuses with its paths,
+   * and Resolve conflicts in the Changes tab starts the resolution. The proposal names what GitHub
+   * showed, and the send reads it again.
+   */
+  private async proposeMerge(
+    command: Extract<Command, { command: 'ProposeRemoteEffect' }>,
+    principal: string,
+  ): Promise<CommandResult> {
+    const { taskId, target, request } = command.payload;
+    if (request.kind !== 'merge' || !this.store.get<Task>('task', taskId))
+      return { outcome: 'blocked', reason: 'task-not-found', next: 'Choose a registered task.' };
+    if (!target.baseRef)
+      return {
+        outcome: 'blocked',
+        reason: 'merge-base-unknown',
+        next: 'Name the branch the pull request merges into, then propose the merge.',
+      };
+    // The base is fetched from the remote that points at the pull request's repository, so a
+    // repository no remote of the project names refuses before any fetch or GitHub read.
+    const remote = this.remoteEffects().remoteFor(taskId, target.repo);
+    if (!remote)
+      return {
+        outcome: 'blocked',
+        reason: 'repository-not-a-remote',
+        next: `${target.repo.host}/${target.repo.owner}/${target.repo.name} is not a remote of this project. Choose the project's own repository.`,
+      };
+    const checked = await this.chat().checkMerge({
+      taskId,
+      remote,
+      base: target.baseRef,
+      head: request.expectedHead,
+    });
+    if (checked.outcome !== 'applied') return checked;
+    const ready = await this.remoteEffects().mergeReadiness(target);
+    if (ready.reason !== null)
+      return { outcome: 'blocked', reason: 'merge-not-ready', next: ready.reason };
+    const proposed = this.commitCommand(command, principal);
+    return proposed.outcome === 'applied' ? { ...proposed, next: ready.line } : proposed;
+  }
+
+  private designChecksRuntime?: DesignChecks;
+  private designChecks(): DesignChecks {
+    this.designChecksRuntime ??= new DesignChecks({
+      store: this.store,
+      now: this.now,
+      // shortcut: findings borrow a message ID's time-ordered suffix, like notes do. Upgrade: add
+      // 'dsf' to IdPrefix and to the testkit ID helper.
+      id: () => `dsf_${this.id('msg').slice(4)}`,
+      projectPath: (projectId) => this.projectPath(projectId),
+      scratchDirectory: (taskId) => chatScratchDirectory(this.home, taskId),
+      recordRun: (taskId, run) => this.chat().recordCheckRun(taskId, run),
+      checksInCopy: (taskId) => this.chat().checksInCopy(taskId),
+    });
+    return this.designChecksRuntime;
+  }
+
+  private dependenciesRuntime?: DependencyPreparer;
+  /** The dependency copy for each writable directory. Each copy's checks ask it for their environment. */
+  dependencies(): DependencyPreparer {
+    this.dependenciesRuntime ??= new DependencyPreparer({
+      store: this.store,
+      home: this.home,
+      now: this.now,
+      // shortcut: borrows a message ID's time-ordered suffix, like findings do. Upgrade: add 'prp'
+      // to IdPrefix and to the testkit ID helper.
+      id: () => `prp_${this.id('msg').slice(4)}`,
+      projectPath: (projectId) => this.projectPath(projectId),
+    });
+    return this.dependenciesRuntime;
+  }
+
+  private connectionsRuntime?: Connections;
+  private connections(): Connections {
+    // A connection's profile folder sits under the state root its turns' environment names, so
+    // the folder the person signs in to is the one its turns run in.
+    const environment = (connection: Connection) =>
+      connection.family === 'anthropic'
+        ? {
+            ...this.chatEnvironment('anthropic'),
+            CREWKITE_CLAUDE_PROFILE: connection.profileId,
+          }
+        : { ...this.chatEnvironment('openai'), CREWKITE_CODEX_PROFILE: connection.profileId };
+    this.connectionsRuntime ??= new Connections({
+      store: this.store,
+      now: this.now,
+      // shortcut: borrows a message ID's time-ordered suffix, like findings do. Upgrade: add 'con'
+      // to IdPrefix and to the testkit ID helper.
+      id: () => `con_${this.id('msg').slice(4)}`,
+      client: {
+        prepare: (connection) =>
+          connection.family === 'anthropic'
+            ? prepareClaudeConfigDir(environment(connection))
+            : prepareCodexHome(nativeDiscoveryEnvironment(environment(connection))),
+        loginLine: (connection) =>
+          connection.family === 'anthropic'
+            ? anthropicApiLoginLine(environment(connection), connection.profileId)
+            : openAiApiLoginLine(environment(connection), connection.profileId),
+        readMode: (connection) => this.readConnectionMode(connection),
+        signOut: (connection) =>
+          connection.family === 'anthropic'
+            ? this.signOutAnthropicConnection(connection)
+            : this.signOutOpenAiConnection(connection),
+      },
+      stopTurns: (connectionId) => this.chat().stopConnectionTurns(connectionId),
+    });
+    return this.connectionsRuntime;
+  }
+
+  /**
+   * The mode an API connection's own profile is signed in with, read by its client outside any
+   * turn: OpenAI's account read, Anthropic's auth status. Each runs once through the owned process
+   * path with its own timeout and sends no prompt. Null when signed out, undefined when the client
+   * could not be run or named nothing CrewKite can place.
+   */
+  private async readConnectionMode(
+    connection: Connection,
+  ): Promise<BillingMode | null | undefined> {
+    if (connection.billingMode !== 'api' || connection.backend !== 'native-client') return;
+    const profile =
+      connection.family === 'openai'
+        ? this.options.openAiUsageClient?.()
+        : connection.family === 'anthropic'
+          ? this.chatClientFor('anthropic').profile
+          : undefined;
+    if (!profile?.facts.available || !profile.client || !profile.environment) return;
+    const directory = mkdtempSync(join(this.home, `${connection.family}-proof-`));
+    const launch = {
+      ...profile.client,
+      directory,
+      repositoryRoot: this.home,
+      environment:
+        connection.family === 'openai'
+          ? { ...profile.environment, CREWKITE_CODEX_PROFILE: connection.profileId }
+          : { ...profile.environment, CREWKITE_CLAUDE_PROFILE: connection.profileId },
+    };
+    try {
+      if (connection.family === 'openai') {
+        const { metadata } = await startOpenAiAccountStep(launch, 'read', {
+          schedule: this.options.schedule,
+          spawn: this.options.openAiUsageSpawn,
+        }).result;
+        return metadata?.success ? metadata.mode : undefined;
+      }
+      const { metadata } = await startNativeAuthStatus(launch, {
+        schedule: this.options.schedule,
+        spawn: this.options.nativeSpawn,
+      }).result;
+      return metadata ? authStatusMode(metadata) : undefined;
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Forget on an OpenAI API connection signs out its own Codex home. The subscription sign-in has
+   * its own command, and no other family's client is touched here.
+   */
+  private async signOutOpenAiConnection(connection: Connection) {
+    if (
+      connection.family !== 'openai' ||
+      connection.billingMode !== 'api' ||
+      connection.backend !== 'native-client'
+    )
+      return;
+    const profile = this.options.openAiUsageClient?.();
+    if (!profile?.facts.available || !profile.client || !profile.environment) return;
+    const directory = mkdtempSync(join(this.home, 'openai-sign-out-'));
+    try {
+      const handle = startOpenAiAccountStep(
+        {
+          ...profile.client,
+          directory,
+          repositoryRoot: this.home,
+          environment: { ...profile.environment, CREWKITE_CODEX_PROFILE: connection.profileId },
+        },
+        'sign-out',
+        { schedule: this.options.schedule, spawn: this.options.openAiUsageSpawn },
+      );
+      await handle.result;
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
+  /**
+   * Forget on an Anthropic API connection signs out its own configuration folder. The person's
+   * subscription sign-in lives in the default folder and is not touched.
+   */
+  private async signOutAnthropicConnection(connection: Connection) {
+    if (connection.billingMode !== 'api' || connection.backend !== 'native-client') return;
+    const profile = this.chatClientFor('anthropic').profile;
+    if (!profile?.facts.available || !profile.client || !profile.environment) return;
+    const directory = mkdtempSync(join(this.home, 'anthropic-sign-out-'));
+    try {
+      const handle = startNativeAuthStatus(
+        {
+          ...profile.client,
+          directory,
+          repositoryRoot: this.home,
+          environment: { ...profile.environment, CREWKITE_CLAUDE_PROFILE: connection.profileId },
+        },
+        { schedule: this.options.schedule, spawn: this.options.nativeSpawn, signOut: true },
+      );
+      await handle.result;
+    } finally {
+      rmSync(directory, { recursive: true, force: true });
+    }
+  }
+
   private crewsRuntime?: SavedCrews;
   private savedCrews(): SavedCrews {
     this.crewsRuntime ??= new SavedCrews(this.store.db, this.now);
@@ -479,15 +1018,35 @@ export class Controller {
       // time-ordered suffix. Upgrade: add 'trn' to IdPrefix and to the testkit ID helper.
       id: (prefix) => (prefix === 'trn' ? `trn_${this.id('msg').slice(4)}` : this.id(prefix)),
       emit: (type, taskId, revision, payload) => this.event(type, taskId, revision, payload),
+      // The notifier exists once startup is done, so nothing that ended before it is posted.
+      notice: (event) => postThreadNotice(this.store, this.webhook, event),
+      // A recipe run's row and the plan's step records follow the thread in the same transaction.
+      // Both are built on the first event, so they hear what startup recovery stops.
+      observe: fanOut(
+        this.store,
+        {
+          run_tracker: (event) => this.runTracker().observe(event),
+          step_records: (event) => this.results().observe(event),
+        },
+        (line) => process.stderr.write(`${line}\n`),
+      ),
       adapters: this.options.chatAdapters ?? this.defaultChatAdapters(),
       resolveEnvironment: (family) => this.chatEnvironment(family),
+      launchIdentity: this.launchIdentity,
       googleTermsAcknowledged: () => googleTermsCurrent(this.store.googleAcpSetup().googleTerms),
       familyModel: (family) => this.store.familyModel(family),
       projectPath: (projectId) => this.projectPath(projectId),
       projectNotes: (projectId) => this.projectNotes().texts(projectId),
+      writingRules: () => this.store.writingRules(),
       resolveSelection: (_taskId, selection) => this.chatSelection(selection),
       catalog: () => this.chatCatalog(),
       localContext: () => this.localContext(),
+      // A start at reset reads the window again before it runs anything. Local has no window.
+      refreshUsage: async (family) => {
+        if (family === 'openai') await this.refreshOpenAiUsage('interval');
+        else if (family === 'anthropic') await this.anthropicUsage().refreshWhenDue(this.id('cmd'));
+        else if (family === 'google') await this.refreshGoogleUsage('interval');
+      },
       // A settled turn spent allowance, so the gauge reads again.
       onTurnSettled: (family) => {
         if (family === 'anthropic') void this.anthropicUsage().refreshWhenDue(this.id('cmd'));
@@ -497,6 +1056,15 @@ export class Controller {
       threadToolsDown: () =>
         this.threadToolsRuntime !== undefined && (!this.threadToolsRuntime.ready || this.closed),
       mcp: this.mcpServers,
+      previews: {
+        ...this.options.previews,
+        declared: (projectId) => this.store.designPreview(projectId),
+      },
+      remoteEffects: this.remoteEffects(),
+      dependencies: this.dependencies(),
+      // The design check needs no permission and starts no process, so Accept runs it in its own
+      // command. A project with no saved design system answers design-system-not-found.
+      designCheck: (taskId) => this.designChecks().run(taskId),
     });
     return this.chatRuntime;
   }
@@ -551,6 +1119,8 @@ export class Controller {
   // What the Google and Local clients last reported about the files they take. Memory only: the
   // next turn on each family reports again.
   private googlePrompt: GooglePromptCapabilities | null = null;
+  /** The read of an OpenAI-compatible Local endpoint that last started. Tests wait on it. */
+  openAiRead?: Promise<void>;
   private localVision: { modelKey: string; vision: boolean } | null = null;
   // What the OpenAI client said about credits during the last chat turn. The quota read keeps its
   // own copy on disk, and the newer of the two counts.
@@ -823,7 +1393,7 @@ export class Controller {
       return {
         outcome: 'blocked',
         reason: 'ownership-unknown',
-        next: `Quit process ${leftover.join(', ')} from the last model read, then refresh models.`,
+        next: `CrewKite cannot confirm that process ${leftover.join(', ')} from the last model read ended. Refresh models checks again. If it stays, export diagnostics before taking further action.`,
       };
     const record = ChatModelReadSchema.parse({
       version: 1,
@@ -881,7 +1451,7 @@ export class Controller {
     );
     if (record.groups.length) observation = null;
     record.reason = record.groups.length
-      ? `Process ${record.groups.join(', ')} from the model read did not exit. Quit it, then refresh models.`
+      ? `CrewKite cannot confirm that process ${record.groups.join(', ')} from the model read ended. Refresh models checks again. If it stays, export diagnostics before taking further action.`
       : observation
         ? null
         : modelReadFailure(failure);
@@ -900,8 +1470,10 @@ export class Controller {
     return { outcome: 'applied', data: { kind: 'chat-catalog', ...this.chatCatalog() } };
   }
 
-  private chatSelection(selection?: ChatModelSelection): ChatModelSelection | null {
-    const families = this.chatCatalog().families;
+  private chatSelection(
+    selection?: ChatModelSelection,
+    families = this.chatCatalog().families,
+  ): ChatModelSelection | null {
     if (selection) {
       const models = families.find((entry) => entry.family === selection.family)?.models ?? [];
       const model = models.find((entry) => entry.model === selection.model);
@@ -969,6 +1541,14 @@ export class Controller {
         environment: request.environment,
       }),
       spawn: this.options.nativeSpawn as Parameters<typeof openAiChatAdapter>[0]['spawn'],
+      // The client proved the mode of a connection's sign-in before sending. A missing sign-in
+      // ends the connection's availability and stops its other turns, the way the person's own
+      // check does. A connection forgotten meanwhile has nothing to record.
+      onAccountMode: ({ connectionId, mode, proofGeneration }) => {
+        try {
+          this.connections().record(connectionId, mode, false, proofGeneration);
+        } catch {}
+      },
       onUsage: (usage) => {
         const reading = openAiCreditReading(usage);
         if (reading) this.openAiTurnCredits = { ...reading, observedAt: this.now() };
@@ -977,6 +1557,14 @@ export class Controller {
     });
     const anthropic = anthropicChatAdapter({
       launch: () => client('anthropic'),
+      // The client's system/init proved the mode of a connection's sign-in before sending. A
+      // source the client names that CrewKite does not know proves nothing. A connection forgotten
+      // meanwhile has nothing to record.
+      onAccountMode: ({ connectionId, mode, proofGeneration }) => {
+        try {
+          if (mode) this.connections().record(connectionId, mode, false, proofGeneration);
+        } catch {}
+      },
       spawn: this.options.nativeSpawn as Parameters<typeof anthropicChatAdapter>[0]['spawn'],
       schedule: this.options.schedule,
       onUsage: (reading) => this.anthropicUsage().recordTurnReading(reading),
@@ -1026,6 +1614,15 @@ export class Controller {
         if (!control.endpoint || !this.localConnected(control))
           throw Error('Local is not connected. Open Settings, load a model and connect Local.');
         // The probe at connect decided whether a token exists. The saved mode does not.
+        if (isOpenAiLocalEndpoint(control.endpoint)) {
+          const connection = await connectOpenAiModel({
+            endpoint: control.endpoint,
+            model: request.selection.model,
+            fetch: this.options.localFetch,
+          });
+          this.localVision = { modelKey: connection.modelKey, vision: false };
+          return { ...connection, connectedWithoutToken: true };
+        }
         const secret = this.localSecretMatches(control)
           ? (this.localSecret?.secret.toString('utf8') ?? null)
           : null;
@@ -1065,6 +1662,19 @@ export class Controller {
         next: 'Send a valid protocol 1 command.',
       };
     const command = parsed.data;
+    if (PENDING_COMMANDS.has(command.command)) return notAvailable();
+    // A copy takes real time, so it answers when the copy is done. It writes no receipt: running it
+    // again prepares the same copy again.
+    if (
+      command.command === 'PrepareDependencies' ||
+      command.command === 'ReadDependencyPreparation'
+    )
+      return dependenciesCommand(
+        this.dependencies(),
+        (taskId) => !!this.store.get<Task>('task', taskId),
+        (taskId) => this.store.transaction(() => this.chat().preparationRefusal(taskId)),
+        command,
+      );
     if (
       [
         'PrepareProjectCommand',
@@ -1109,6 +1719,10 @@ export class Controller {
       return this.checkProviderClient(command.payload.family);
     const termsRefusal = googleTermsGate(this.store, command, (runId) => this.isPreparedAcp(runId));
     if (termsRefusal) return termsRefusal;
+    if (command.command === 'RefreshGoogleAcpModels') {
+      // A refresh from Ready changes no connect state, so it stays out of the connect log.
+      return this.executeAcpSetup(command, principal);
+    }
     if (
       [
         'InitializeGoogleAcp',
@@ -1145,6 +1759,10 @@ export class Controller {
       return check;
     }
     if (command.command === 'SignInOpenAi') return this.signInOpenAi(command);
+    // A proof waits on the client and records only what it says, so it keeps no receipt. Running
+    // it again reads the mode again.
+    if (command.command === 'ProveConnection')
+      return this.connections().prove(command.payload.connectionId, true);
     if (command.command === 'SignOutOpenAi') return this.signOutOpenAi(command);
     if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
       return this.anthropicUsage().execute(command);
@@ -1155,18 +1773,42 @@ export class Controller {
     if (
       command.command === 'PushChatBranch' ||
       command.command === 'OpenChatPullRequest' ||
-      command.command === 'ReadChatBranchStatus'
+      command.command === 'ReadChatBranchStatus' ||
+      command.command === 'CheckChatMerge'
     ) {
       if (!this.store.get<Task>('task', command.payload.taskId))
         return { outcome: 'blocked', reason: 'task-not-found', next: 'Choose a registered task.' };
       if (command.command === 'PushChatBranch') return this.chat().pushBranch(command.payload);
       if (command.command === 'OpenChatPullRequest')
         return this.chat().openPullRequest(command.payload);
+      if (command.command === 'CheckChatMerge') return this.chat().checkMerge(command.payload);
       return this.chat().branchStatus(command.payload);
     }
+    // A merge proposal first merges its head onto the base it would land on, then reads what
+    // GitHub asks of that head. Both wait on the network and write nothing, so they run before the
+    // command's transaction. A replay answers from its receipt.
+    if (
+      command.command === 'ProposeRemoteEffect' &&
+      command.payload.request.kind === 'merge' &&
+      !this.store.receipt(command.key)
+    )
+      return this.proposeMerge(command, principal);
+    // A confirmed write and a reconcile wait on git, gh and the network, so they answer later.
+    // The write's own state answers a repeat, so neither keeps a receipt.
+    if (command.command === 'ConfirmRemoteEffect')
+      return this.remoteEffects().confirm(command.payload);
+    if (command.command === 'ReconcileRemoteEffect')
+      return this.remoteEffects().reconcile(command.payload);
+    if (command.command === 'ReadReviewComments')
+      return this.remoteEffects().readReviewComments(command.payload);
+    if (command.command === 'ReadMergeReadiness')
+      return this.remoteEffects().readMergeReadiness(command.payload);
     // The file copies before the command's transaction opens. A replay answers from its receipt.
     if (command.command === 'ImportChatAttachment' && !this.store.receipt(command.key))
       return this.chat().importing(command.payload, () => this.commitCommand(command, principal));
+    // A replay answers from its receipt and asks no model.
+    if (command.command === 'DraftDesignSystem' && !this.store.receipt(command.key))
+      return this.draftDesignSystem(command, principal);
     const preparing = this.verificationPreparation;
     if (preparing?.key === command.key)
       return preparing.hash === hashCanonical(command) && preparing.principal === principal
@@ -1369,6 +2011,8 @@ export class Controller {
   close(): void | Promise<void> {
     if (this.closed) return this.closing;
     this.closed = true;
+    this.webhook.close();
+    this.schedulerRuntime?.close();
     for (const cancel of this.quotaRetries.values()) cancel();
     this.quotaRetries.clear();
     const native: Promise<unknown>[] = [];
@@ -1376,6 +2020,8 @@ export class Controller {
     if (operationClosing) native.push(operationClosing);
     const chatClosing = this.chatRuntime?.close();
     if (chatClosing) native.push(chatClosing);
+    const effectsClosing = this.remoteEffectsRuntime?.close();
+    if (effectsClosing) native.push(effectsClosing);
     // The thread tools socket closes now, so a controller started next on this home binds its
     // own. Nothing the store holds waits on it.
     const tools = this.threadToolsRuntime;
@@ -1518,7 +2164,9 @@ export class Controller {
         'InitializeGoogleAcp',
         'AuthenticateGoogleAcp',
         'DiscoverGoogleAcp',
+        'RefreshGoogleAcpModels',
         'StopGoogleAcpSetup',
+        'RecoverGoogleMetadata',
       ].includes(command.command)
     ) {
       const setup = this.store.googleAcpSetup();
@@ -1539,8 +2187,37 @@ export class Controller {
     // Saved crews belong to no task. The controller checks names, the limit and the default when
     // it applies the command, and a replayed key answers from its receipt.
     if (crewsMutations.includes(command.command)) return;
+    // A design system belongs to a project. A save checks its own expected version.
+    if (designMutations.includes(command.command)) return;
+    // A recipe belongs to a project. A save checks its own expected version.
+    if (recipeMutations.includes(command.command) || runMutations.includes(command.command)) return;
+    // So does a schedule, which belongs to its recipe.
+    if (command.command === 'SetRecipeSchedule') return;
+    // A design check reads its thread as it stands, and a finding names its own thread.
+    if (findingMutations.includes(command.command)) return;
+    // A policy belongs to a project. A save replaces it whole, and a replayed key answers from its
+    // receipt.
+    if (command.command === 'SetRepositoryPolicy') return;
+    // A remote write checks its own thread and state, and a replayed key answers from its receipt.
+    if (
+      command.command === 'ProposeRemoteEffect' ||
+      command.command === 'CancelRemoteEffect' ||
+      command.command === 'SettleRemoteEffect'
+    )
+      return;
+    // So does an Accept attempt, which names its own thread.
+    if (command.command === 'CancelAcceptance') return;
     // The credit switch belongs to no task. A replayed key answers from its receipt.
     if (command.command === 'SetCreditSpending') return;
+    // So does the webhook address, which belongs to the controller and no task.
+    if (command.command === 'SetWebhook') return;
+    // A connection or an assignment checks its own record, and a replayed key answers from its
+    // receipt.
+    if (connectionMutations.includes(command.command)) return;
+    // So do the writing rules: one preference per rule, shared by desktop and CLI.
+    if (command.command === 'SetWritingRule') return;
+    // An export belongs to a project. It checks its own preview hash and the file's digest.
+    if (command.command === 'ExportWritingRules') return;
     // So does the default model per family.
     if (command.command === 'SetFamilyModel') return;
     if (
@@ -1550,6 +2227,7 @@ export class Controller {
         'StopChatTurn',
         'ConfigureChatThread',
         'RunChatTests',
+        'ReleaseChatCheck',
         'HandoffChatThread',
         'AcceptChatChanges',
         'SteerChatMessage',
@@ -1601,6 +2279,27 @@ export class Controller {
         revision: task.revision,
         next: 'Refresh the task and review the action.',
       };
+  }
+
+  /** A new task in a project, the way a new thread starts. Runs inside a command's transaction. */
+  private createTask(payload: {
+    projectId: string;
+    title: string;
+    outcome: string;
+    criteria: string[];
+  }): Task {
+    const task = TaskSchema.parse({
+      ...payload,
+      id: this.id('tsk'),
+      state: 'draft',
+      waitingReason: null,
+      revision: 0,
+      runId: null,
+      next: 'Prepare the run.',
+    });
+    this.store.put('task', task.id, task.revision, task);
+    this.event('task.created', task.id, task.revision, task);
+    return task;
   }
 
   private apply(
@@ -1714,6 +2413,8 @@ export class Controller {
         return this.chat().configure(command.payload, effects);
       case 'RunChatTests':
         return this.chat().runTests(command.payload, effects);
+      case 'ReleaseChatCheck':
+        return this.chat().releaseCheck(command.payload, effects);
       case 'HandoffChatThread':
         return this.chat().handoff(command.payload, effects);
       case 'SteerChatMessage':
@@ -1749,12 +2450,11 @@ export class Controller {
       case 'RunExtensionCommand':
         return this.extensions().run(command.payload);
       case 'AcceptChatChanges':
-        return this.chat().accept(
-          command.payload,
-          typeof this.options.identity === 'function'
-            ? this.options.identity()
-            : this.options.identity,
-        );
+        return this.chat().accept(command.payload, this.options.identity, effects);
+      case 'ReadAcceptance':
+        return this.chat().readAcceptance(command.payload);
+      case 'CancelAcceptance':
+        return this.chat().cancelAcceptance(command.payload, effects);
       case 'ReadChatThread':
       case 'ReadChatChanges': {
         if (!this.store.get<Task>('task', command.payload.taskId))
@@ -1814,14 +2514,108 @@ export class Controller {
           },
           command.payload,
         );
+      case 'ReadConnections':
+      case 'AddConnection':
+      case 'AssignConnection':
+      case 'UnassignConnection':
+      case 'SetKeepConnected':
+      case 'DisconnectConnection':
+      case 'ForgetConnection':
+        return connectionsCommand(this.connections(), command, effects);
+      case 'ReadWritingRules':
+        return {
+          outcome: 'applied',
+          data: { kind: 'writing-rules', ...readWritingRules(this.store.writingRules()) },
+        };
+      case 'SetWritingRule':
+        this.store.putWritingRule({
+          ruleId: command.payload.ruleId,
+          enabled: command.payload.enabled,
+          updatedAt: this.now(),
+        });
+        return { outcome: 'applied' };
+      case 'PreviewWritingRulesExport':
+      case 'ExportWritingRules':
+        return writingRulesExportCommand(
+          { store: this.store, projectPath: (projectId) => this.projectPath(projectId) },
+          command,
+        );
       case 'ReadProjectNotes':
       case 'AddProjectNote':
       case 'EditProjectNote':
       case 'RemoveProjectNote':
         return notesCommand(this.projectNotes(), command);
+      case 'ReadDesignSystem':
+      case 'ImportDesignSystem':
+      case 'DraftDesignSystem':
+      case 'SaveDesignSystem':
+      case 'SetDesignSystemDelivery':
+      case 'SetDesignPreview':
+        return designCommand(this.designSystems(), command);
+      case 'ReadRecipes':
+      case 'ReadRecipe':
+      case 'ResolveRecipeChecks':
+      case 'SetRecipeFolder':
+      case 'SaveRecipe':
+      case 'ForgetRecipe':
+        return recipesCommand(this.recipes(), command);
+      case 'DraftRecipe':
+        return draftCommand(this.store, command.payload);
+      case 'RunRecipe':
+      case 'ReadRecipeRuns':
+        return runsCommand(this.recipeRuns(), command, effects);
+      case 'SetRecipeSchedule':
+      case 'ReadSchedules':
+        return schedulesCommand(this.scheduler(), command, effects);
+      case 'ReadResults': {
+        const { projectId, recipeId } = command.payload;
+        return {
+          outcome: 'applied',
+          data: { kind: 'results', ...this.results().read(projectId, recipeId) },
+        };
+      }
+      case 'ExportResults':
+        return {
+          outcome: 'applied',
+          data: { kind: 'results-export', ...this.results().page(command.payload) },
+        };
+      case 'RunDesignCheck':
+      case 'ReadDesignFindings':
+      case 'ResolveDesignFinding':
+        return findingsCommand(this.designChecks(), command);
+      case 'ReadRepositoryPolicy':
+      case 'SetRepositoryPolicy':
+        return policyCommand(
+          { store: this.store, now: this.now, projectPath: (id) => this.projectPath(id) },
+          command,
+        );
+      case 'ReadRemoteEffects':
+        return this.remoteEffects().read(command.payload);
+      case 'ProposeRemoteEffect':
+        return this.remoteEffects().propose(command.payload);
+      case 'CancelRemoteEffect':
+        return this.remoteEffects().cancel(command.payload);
+      case 'SettleRemoteEffect':
+        return this.remoteEffects().settle(command.payload);
+      case 'ReadRemoteEffectPreview':
+        return this.remoteEffects().preview(command.payload);
       case 'SetFamilyModel': {
         const { family, selection } = command.payload;
         this.store.setFamilyModel(family, selection);
+        return { outcome: 'applied' };
+      }
+      case 'ReadWebhook':
+        return { outcome: 'applied', data: { kind: 'webhook', url: this.store.webhookUrl() } };
+      case 'SetWebhook': {
+        const url = command.payload.url.trim() === '' ? '' : webhookUrl(command.payload.url);
+        if (url === null)
+          return {
+            outcome: 'blocked',
+            reason: 'webhook-address-invalid',
+            next: 'That address is not allowed. Use https, or http to this computer.',
+          };
+        // The address can be a bearer secret, so the receipt keeps no copy of it.
+        this.store.setWebhookUrl(url);
         return { outcome: 'applied' };
       }
       case 'SetCreditSpending': {
@@ -1884,8 +2678,11 @@ export class Controller {
       case 'InitializeGoogleAcp':
       case 'AuthenticateGoogleAcp':
       case 'DiscoverGoogleAcp':
+      case 'RefreshGoogleAcpModels':
       case 'StopGoogleAcpSetup':
         return this.applyAcpSetup(command, effects);
+      case 'RecoverGoogleMetadata':
+        return recoverGoogleMetadataCommand(this);
       case 'ObserveUsage':
         return this.observeUsage(command, effects);
       case 'RegisterProject': {
@@ -1942,17 +2739,7 @@ export class Controller {
       case 'CreateTask': {
         if (!this.store.get('project', command.payload.projectId))
           return { outcome: 'blocked', reason: 'project-not-found' };
-        const task = TaskSchema.parse({
-          ...command.payload,
-          id: this.id('tsk'),
-          state: 'draft',
-          waitingReason: null,
-          revision: 0,
-          runId: null,
-          next: 'Prepare the run.',
-        });
-        this.store.put('task', task.id, task.revision, task);
-        this.event('task.created', task.id, task.revision, task);
+        const task = this.createTask(command.payload);
         return { outcome: 'applied', entity: task, revision: task.revision };
       }
       case 'AmendTask': {

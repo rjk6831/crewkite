@@ -916,6 +916,7 @@ export class UsageCommands {
         ...(this.usageResolution.status ? { next: this.usageResolution.status.message } : {}),
       };
     this.store.beginGoogleMetadata(command.key, 'usage', reader.authority_revision, now);
+    this.store.recordLaunchIdentity('google-metadata', command.key, this.launchIdentity, now);
     const resolution = this.usageResolution;
     effects.push(
       () => void this.launchGoogleUsage(command.key, reader.authority_revision, resolution),
@@ -1012,7 +1013,7 @@ export class UsageCommands {
           },
           quiescent: (_, group) =>
             this.store.transaction(() =>
-              this.store.finishGoogleMetadata(commandId, group, this.now()),
+              this.store.finishGoogleMetadata(commandId, group, this.now(), 'closed'),
             ),
         },
       });
@@ -1031,7 +1032,9 @@ export class UsageCommands {
           reader.authority_revision !== authorityRevision
         )
           result = { outcome: 'blocked', reason: 'usage-read-revoked' };
-        else if (!outcome.quiescent || operation?.state !== 'quiescent')
+        // The fence: only a normal close publishes, under the reader authority the read began
+        // with. A row recovery settled after proving its group gone keeps its result unknown.
+        else if (!outcome.quiescent || !this.store.googleMetadataPublishable(commandId))
           result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
         else if (!outcome.reason && outcome.metadata) {
           const observedAt = this.now();
@@ -1121,7 +1124,7 @@ export class UsageCommands {
             operation?.state === 'intent' &&
             (beforeSpawn || (error instanceof GoogleWriterError && error.reason === 'start'))
           )
-            this.store.finishGoogleMetadata(commandId, null, this.now());
+            this.store.finishGoogleMetadata(commandId, null, this.now(), 'closed');
           else if (operation?.state !== 'quiescent') this.store.unknownGoogleMetadata(commandId);
           const reader = this.store.googleUsageReader();
           const finished = this.store
@@ -1129,7 +1132,7 @@ export class UsageCommands {
             .find((row) => row.command_id === commandId);
           if (reader.authority_revision !== authorityRevision || this.closed)
             result = { outcome: 'blocked', reason: 'usage-read-revoked' };
-          else if (finished?.state === 'quiescent')
+          else if (finished?.state === 'quiescent' && finished.settlement !== 'owner-absent')
             result = { outcome: 'blocked', reason: 'usage-read-failed' };
           this.finishMetadataReceipt(commandId, result);
         });
@@ -1172,9 +1175,6 @@ export class UsageCommands {
         this.options.googleUsageClient?.() ??
         resolveGoogleUsageClient(process.env, undefined, { cachedOnly: true });
       const reader = this.store.googleUsageReader();
-      const operation = this.store
-        .googleMetadataOperations()
-        .find((row) => row.command_id === report.commandId);
       if (
         !resolution.available ||
         !report.home ||
@@ -1183,9 +1183,8 @@ export class UsageCommands {
         reader.authority_revision !== report.authorityRevision ||
         reader.last_attempt_at !== report.attemptedAt ||
         reader.last_observed_at !== report.observedAt ||
-        operation?.kind !== 'usage' ||
-        operation.state !== 'quiescent' ||
-        operation.authority_revision !== report.authorityRevision
+        // The same fence as the read's own publication.
+        !this.store.googleMetadataPublishable(report.commandId)
       )
         return;
       observations = googleUsageObservations(report.buckets, [routeId], report.observedAt);

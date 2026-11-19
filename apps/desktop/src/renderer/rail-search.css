@@ -1,15 +1,15 @@
 .rs {
   flex-shrink: 0;
-  margin-top: 6px;
+  margin-top: var(--space-3);
 }
 .rs-field {
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 0 6px 0 8px;
+  gap: var(--space-4);
+  padding: 0 var(--space-3) 0 var(--space-4);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   color: var(--text-dim);
 }
 .rs-field:has(.rs-input:focus-visible) {
@@ -20,7 +20,7 @@
 .rs-input {
   flex: 1;
   min-width: 0;
-  padding: 8px 0;
+  padding: var(--space-4) 0;
   background: transparent;
   border: 0;
   outline: 0;
@@ -36,7 +36,7 @@
   align-items: center;
   padding: 0;
   border: 0;
-  border-radius: 3px;
+  border-radius: var(--radius-2);
   background: none;
   cursor: pointer;
 }
@@ -49,7 +49,7 @@
   height: 20px;
 }
 .rs-note {
-  margin: 4px 2px 0;
+  margin: var(--space-2) var(--space-1) 0;
   color: var(--text-dim);
   font-size: 10px;
   line-height: 1.4;
@@ -62,18 +62,18 @@
 }
 .rs-list {
   max-height: 42vh;
-  margin-top: 6px;
+  margin-top: var(--space-3);
   overflow-y: auto;
   overscroll-behavior: contain;
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   background: var(--surface);
 }
 .rs-group + .rs-group {
   border-top: 1px solid var(--border);
 }
 .rs-title {
-  padding: 8px 10px 4px;
+  padding: var(--space-4) var(--space-5) var(--space-2);
   overflow: hidden;
   color: var(--text-muted);
   font-size: 11px;
@@ -82,9 +82,9 @@
 }
 .rs-hit {
   display: flex;
-  gap: 8px;
+  gap: var(--space-4);
   align-items: baseline;
-  padding: 5px 10px 6px;
+  padding: var(--space-3) var(--space-5) var(--space-3);
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.4;
@@ -96,7 +96,7 @@
   color: var(--text);
 }
 .rs-hit.is-active {
-  box-shadow: inset 2px 0 0 var(--accent);
+  box-shadow: var(--shadow-mark);
 }
 .rs-kind {
   flex: none;
@@ -116,7 +116,7 @@
 }
 .rs-snippet mark {
   background: var(--accent-soft);
-  border-radius: 2px;
+  border-radius: var(--radius-1);
   color: inherit;
 }
 .navigation.is-collapsed .rs {

@@ -8,12 +8,12 @@
 .settings-page {
   flex: 1;
   min-height: 0;
-  padding: 28px 32px 56px;
+  padding: var(--space-14) var(--space-16) var(--space-28);
   overflow-y: auto;
 }
 .st-column {
   display: grid;
-  gap: 16px;
+  gap: var(--space-8);
   max-width: 1080px;
   margin: 0 auto;
 }
@@ -21,17 +21,17 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-6);
 }
 .settings-page h1 {
-  margin-bottom: 4px;
+  margin-bottom: var(--space-2);
   font-size: 22px;
   letter-spacing: -0.5px;
 }
 .st-error {
-  padding: 10px 12px;
+  padding: var(--space-5) var(--space-6);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-4);
   color: var(--amber);
   font-size: 12px;
 }
@@ -39,22 +39,22 @@
 /* Cards */
 .st-card {
   container-type: inline-size;
-  padding: 18px 20px 22px;
+  padding: var(--space-9) var(--space-10) var(--space-11);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-5);
   background: var(--surface);
 }
 .st-card-head {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-5);
   min-height: 24px;
-  margin-bottom: 18px;
+  margin-bottom: var(--space-9);
 }
 .st-card-head .family-mark {
   width: 20px;
   height: 20px;
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   font-size: 11px;
 }
 .st-card-head h2 {
@@ -71,9 +71,9 @@
   white-space: nowrap;
 }
 .st-pill {
-  padding: 2px 9px;
+  padding: var(--space-1) var(--space-5);
   border: 1px solid var(--border-strong);
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   color: var(--text-muted);
   font-size: 11px;
   white-space: nowrap;
@@ -85,7 +85,7 @@
 .st-body {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-  gap: 28px;
+  gap: var(--space-14);
   align-items: start;
 }
 @container (max-width: 760px) {
@@ -95,13 +95,13 @@
 }
 .st-col {
   display: grid;
-  gap: 22px;
+  gap: var(--space-11);
   align-content: start;
   min-width: 0;
 }
 .st-block {
   display: grid;
-  gap: 10px;
+  gap: var(--space-5);
   min-width: 0;
 }
 .st-subhead,
@@ -109,9 +109,9 @@
   display: flex;
   align-items: baseline;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-6);
   margin: 0;
-  padding-bottom: 7px;
+  padding-bottom: var(--space-4);
   border-bottom: 1px solid var(--border);
 }
 .st-subhead h3,
@@ -134,8 +134,8 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: center;
-  gap: 8px 12px;
-  margin: -8px 0 16px;
+  gap: var(--space-4) var(--space-6);
+  margin: calc(-1 * var(--space-4)) 0 var(--space-8);
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.5;
@@ -151,6 +151,24 @@
 .st-client.is-refused p {
   color: var(--text);
 }
+.st-card > .facts-grid {
+  margin-bottom: var(--space-9);
+}
+.st-blocker {
+  margin-bottom: var(--space-6);
+  border-left: 2px solid var(--border-strong);
+  padding-left: var(--space-4);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.st-steps {
+  display: grid;
+  gap: var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
 .st-note {
   color: var(--text-muted);
   font-size: 11px;
@@ -160,7 +178,7 @@
 .st-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .st-block [role="status"] {
   font-size: 12px;
@@ -177,7 +195,7 @@
 .st-models {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--space-3);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -185,10 +203,10 @@
 .st-models li {
   display: inline-flex;
   align-items: center;
-  gap: 7px;
-  padding: 3px 9px;
+  gap: var(--space-4);
+  padding: var(--space-2) var(--space-5);
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
   background: var(--surface-raised);
   font-size: 12px;
 }
@@ -216,9 +234,9 @@
 .st-row {
   display: grid;
   grid-template-columns: minmax(200px, 340px) minmax(0, 1fr);
-  gap: 18px;
+  gap: var(--space-9);
   align-items: center;
-  padding: 14px 0;
+  padding: var(--space-7) 0;
   border-top: 1px solid var(--border);
 }
 .st-row:first-child {
@@ -231,7 +249,7 @@
 .st-field {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-2);
 }
 .st-name {
   color: var(--text);
@@ -245,7 +263,7 @@
 .st-controls {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .st-controls .ck-select {
   width: var(--st-select-width);
@@ -260,13 +278,13 @@
   align-self: flex-start;
   overflow: hidden;
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
 }
 .st-segment label {
   position: relative;
   flex-direction: row;
   white-space: nowrap;
-  padding: 7px 16px;
+  padding: var(--space-4) var(--space-8);
   color: var(--text-muted);
   cursor: pointer;
 }
@@ -275,7 +293,7 @@
 }
 .st-segment label.is-on {
   background: color-mix(in srgb, var(--accent) 16%, transparent);
-  box-shadow: inset 0 0 0 1px var(--accent);
+  box-shadow: var(--shadow-ring-accent);
   color: var(--text);
   font-weight: 600;
 }
@@ -289,6 +307,50 @@
 .st-segment label:focus-within {
   outline: 2px solid var(--accent);
   outline-offset: -2px;
+}
+
+/* Project setup: a row's name, what the part is with its state under it, and its button. The state
+   reads in body text once something is set up and muted before, and its words say which. */
+.st-setup {
+  display: grid;
+  margin: 0;
+}
+.st-setup-row {
+  display: grid;
+  grid-template-columns: 96px minmax(0, 1fr) auto;
+  gap: var(--space-4) var(--space-9);
+  align-items: center;
+  padding: var(--space-7) 0;
+  border-top: 1px solid var(--border);
+}
+.st-setup-row:last-child {
+  padding-bottom: 0;
+}
+.st-setup dd {
+  margin: 0;
+}
+.st-setup-state {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.st-setup-line {
+  color: var(--text-muted);
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.st-setup-line.is-set {
+  color: var(--text);
+}
+/* In a narrow card the button drops under the state, so the words keep the width. */
+@container (max-width: 680px) {
+  .st-setup-row {
+    grid-template-columns: 96px minmax(0, 1fr);
+  }
+  .st-setup-action {
+    grid-column: 2;
+  }
 }
 
 /* Rail strip. Every connected family has a row, and a missing value reads unknown. */
@@ -313,7 +375,7 @@
 .st-crew-pick {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   min-width: 0;
 }
 .st-crew-pick .ck-select {
@@ -331,7 +393,7 @@
 .st-crew-pick .sa-switch-row {
   flex: 0 0 auto;
   flex-wrap: nowrap;
-  margin-left: 8px;
+  margin-left: var(--space-4);
   white-space: nowrap;
 }
 
@@ -343,11 +405,90 @@
 /* The note beside a credit switch that is on. It informs, so it takes the accent tint. */
 .st-credit-note {
   margin: 0;
-  padding: 6px 10px;
+  padding: var(--space-3) var(--space-5);
   border-left: 2px solid var(--accent);
-  border-radius: 4px;
+  border-radius: var(--radius-2);
   background: color-mix(in srgb, var(--accent) 8%, transparent);
   color: var(--text-muted);
   font-size: 11px;
   line-height: 1.5;
+}
+
+/* The exact export text, shown before anything is written. */
+.st-preview-title {
+  padding-bottom: var(--space-4);
+  border-bottom: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.st-preview {
+  max-height: 320px;
+  overflow: auto;
+  margin: 0 0 var(--space-6);
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-3);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: var(--font-code);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* API connections. Each one is a block: what it is with its actions, the mismatch line, the
+   sign-in line while it needs one, and Keep connected. */
+.st-connections-body {
+  display: grid;
+  gap: var(--space-9);
+}
+.st-connections {
+  display: grid;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.st-connection {
+  display: grid;
+  gap: var(--space-5);
+  padding: var(--space-7) 0;
+  border-top: 1px solid var(--border);
+}
+.st-connection:first-child {
+  padding-top: 0;
+  border-top: 0;
+}
+.st-connection .st-row {
+  padding: 0;
+  border-top: 0;
+}
+.st-sign-in {
+  display: grid;
+  gap: var(--space-3);
+}
+.st-sign-in-line {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-4);
+}
+/* A profile path is long and has no spaces, so the line breaks anywhere. */
+.st-sign-in-line code {
+  flex: 1;
+  min-width: 0;
+  padding: var(--space-4) var(--space-6);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-3);
+  background: var(--surface-raised);
+  color: var(--text);
+  font-family: var(--font-code);
+  font-size: 11px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.st-controls .st-connection-label {
+  width: var(--st-select-width);
+  max-width: 100%;
 }

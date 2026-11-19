@@ -56,7 +56,8 @@ export function createTestIds(start = DEMO_TIME, seed = 0n) {
       | 'hnd'
       | 'evt'
       | 'cmd'
-      | 'msg',
+      | 'msg'
+      | 'rfx',
   ) => {
     const suffix = encode(counter, 16);
     counter++;

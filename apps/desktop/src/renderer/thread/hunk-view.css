@@ -2,19 +2,19 @@
 .th-hunks {
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding: 6px 0;
+  gap: var(--space-4);
+  padding: var(--space-3) 0;
   border-top: 1px solid var(--border);
 }
 .th-hunk-note {
   margin: 0;
-  padding: 0 10px;
+  padding: 0 var(--space-5);
   font-size: 12px;
 }
 .th-hunk {
   border: 1px solid var(--border);
-  border-radius: 8px;
-  margin: 0 8px;
+  border-radius: var(--radius-4);
+  margin: 0 var(--space-4);
   overflow: hidden;
 }
 .th-hunk.is-accepted {
@@ -24,8 +24,8 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
-  padding: 5px 8px;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
   background: var(--surface);
   font-size: 12px;
 }
@@ -45,7 +45,7 @@
   display: block;
   width: 100%;
   min-width: max-content;
-  padding: 0 10px;
+  padding: 0 var(--space-5);
   border: 0;
   background: transparent;
   color: inherit;
@@ -63,7 +63,12 @@
   color: var(--diff-del-text);
 }
 .th-patch .th-hunk-line.is-picked {
-  box-shadow: inset 3px 0 0 var(--accent, var(--text));
+  box-shadow: var(--shadow-mark);
+}
+/* The line a design finding names. */
+.th-patch .th-hunk-line.is-target {
+  background: color-mix(in srgb, var(--amber) 16%, transparent);
+  box-shadow: var(--shadow-mark);
 }
 .th-patch .th-hunk-line:focus-visible {
   outline-offset: -2px;
@@ -71,15 +76,15 @@
 .th-hunk-comment {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  padding: 7px 10px;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
   border-top: 1px solid var(--border);
   font-size: 12px;
 }
 .th-hunk-comment label {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: var(--space-2);
 }
 .th-hunk-comment p {
   margin: 0;

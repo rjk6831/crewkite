@@ -15,6 +15,7 @@ import {
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
+import { CREWKITE_VERSION } from '../packages/contracts/src/version.ts';
 import { buildDmg } from './package-dmg.mjs';
 import { packageInventory } from './package-sign.mjs';
 
@@ -74,7 +75,7 @@ test('macOS disk images retain the attested app and hash only final stapled byte
       JSON.stringify({
         version: 1,
         kind: 'signed-app',
-        productVersion: '0.1.0',
+        productVersion: CREWKITE_VERSION,
         revision,
         app: 'CrewKite.app',
         developerID: true,

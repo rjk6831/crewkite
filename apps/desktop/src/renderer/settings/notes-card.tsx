@@ -16,9 +16,18 @@ import { addNote, editNote, readNotes, removeNote, type ThreadSource } from '../
 export function NotesCard({
   source,
   projects,
+  show,
+  onChanged,
 }: {
   source: ThreadSource & Pick<DesktopSource, 'saveNotes'>;
   projects: { id: string; name: string }[];
+  /**
+   * A project another card sent the person here for. Each new request picks it, unless a note is
+   * being written or edited for the project on screen.
+   */
+  show?: { projectId: string } | null;
+  /** Called after a note is added, edited or deleted. */
+  onChanged?: () => void;
 }) {
   const [chosen, setChosen] = useState('');
   const projectId = projects.some(({ id }) => id === chosen) ? chosen : (projects[0]?.id ?? '');
@@ -44,10 +53,20 @@ export function NotesCard({
   // and the sentence below it always belong to the project the person is looking at.
   const shown = useRef(projectId);
   shown.current = projectId;
+  // Text the person typed is never dropped for another card's request. With a note being written
+  // or edited, the card keeps its project and its text, and only focus comes here.
+  const drafting = useRef(false);
+  drafting.current = text.trim() !== '' || editing !== null;
+  useEffect(() => {
+    if (!show || show.projectId === shown.current || drafting.current) return;
+    setNote(null);
+    setChosen(show.projectId);
+  }, [show]);
   async function change(run: () => Promise<ProjectNotesRead>, done: string) {
     const target = projectId;
     try {
       const next = await run();
+      onChanged?.();
       if (shown.current !== target) return false;
       setRead(next);
       setNote(done);

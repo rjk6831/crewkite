@@ -21,8 +21,10 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { buildHandoff } from '../continuity/index.ts';
+import { checkCommit, PolicyRefused, policyBlocked, repositoryPolicy } from '../github/policy.ts';
 import {
   applyPublication,
+  commitIdentity,
   type GitIdentity,
   preparePublication,
   refValue,
@@ -30,6 +32,10 @@ import {
 } from '../host/publication.ts';
 import { committedFiles, inspectSource, materialize } from '../host/source.ts';
 import type { Controller } from './controller.ts';
+
+// The message every accepted candidate carries. The policy adds the sign-off when it wants one.
+const CANDIDATE_MESSAGE =
+  'feat: apply checked task candidate\n\nApply the accepted candidate after its required checks.\n';
 
 // Route switches, resume, transfer, acceptance, publication and patch export.
 export class AcceptanceCommands {
@@ -466,18 +472,21 @@ export class AcceptanceCommands {
           if (!reviews.some((check) => this.reviewMatches(check, run, method, cycle, candidate)))
             return { outcome: 'blocked', reason: 'selected-review-not-complete' };
     }
-    const identity =
-      frozenIdentity ??
-      (typeof this.options.identity === 'function'
-        ? this.options.identity()
-        : this.options.identity);
-    if (!identity)
-      return {
-        outcome: 'blocked',
-        reason: 'git-identity-missing',
-        next: 'Configure a Git name and email before acceptance.',
-      };
-    validateIdentity(identity);
+    const policy = repositoryPolicy(this.store, task.projectId);
+    const configured = frozenIdentity ?? commitIdentity(policy, path, this.options.identity);
+    let identity: GitIdentity;
+    // The same check runs again where the commit is built. Here it runs before the person is
+    // asked to approve, so nobody approves a commit or branch the policy then refuses.
+    try {
+      ({ identity } = checkCommit(policy, {
+        message: CANDIDATE_MESSAGE,
+        destinationRef: command.payload.destinationRef,
+        identity: configured && validateIdentity(configured),
+      }));
+    } catch (failure) {
+      if (failure instanceof PolicyRefused) return policyBlocked(failure.violation);
+      throw failure;
+    }
     const at = frozenAt ?? this.now();
     const grant = this.grant(run, 'accept-candidate', command.payload.destinationRef);
     const writerIntent = this.store
@@ -513,8 +522,11 @@ export class AcceptanceCommands {
       repository,
       base: run.source.base,
       files: this.evidence.read(candidate).files,
+      policy,
+      destinationRef: command.payload.destinationRef,
       identity,
       at,
+      message: CANDIDATE_MESSAGE,
     });
     const artifact = {
       id: this.id('art'),

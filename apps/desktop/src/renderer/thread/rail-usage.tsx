@@ -4,9 +4,9 @@ import { familyName } from '../components.tsx';
 import { connectInPlace, RAIL_TOAST_MS, railConnectLine } from '../local-setup-flow.ts';
 import { familyModel, onFamilyDefaults } from '../settings/preferences.ts';
 import { focusSettingsCard } from '../settings/provider-card.tsx';
-import { useCatalog } from '../settings/use-catalog.ts';
+import { useCatalog, useConnections } from '../settings/use-catalog.ts';
 import { formatSpan } from '../usage-gauges.tsx';
-import { railFamilies } from '../usage-presentation.ts';
+import { railConnections, railFamilies } from '../usage-presentation.ts';
 import type { ThreadSource } from './commands.ts';
 import { FamilyMark } from './family-mark.tsx';
 
@@ -29,6 +29,7 @@ export function RailUsage({
   refresh?: () => Promise<WorkspaceState>;
 }) {
   const { catalog } = useCatalog(source, header);
+  const connections = useConnections(source, header);
   const [now, setNow] = useState(Date.now);
   // A default model picked in Settings changes which windows count, so the rows redraw at once.
   useEffect(() => {
@@ -177,6 +178,15 @@ export function RailUsage({
               {row.read && <span>{row.read}</span>}
             </span>
           )}
+          {/* An API connection's spend sits on its own line under the allowance and never joins
+              its percent. */}
+          {railConnections(connections, row.family).map((line) => (
+            <p key={line.connectionId} className="rail-usage-api">
+              <span>{line.label}</span>
+              <span>{line.spend}</span>
+              {line.attention && <span>{line.attention}</span>}
+            </p>
+          ))}
           {row.setUp &&
             (onOpenSettings ? (
               <button

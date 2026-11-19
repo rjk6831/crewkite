@@ -324,3 +324,111 @@ else process.exitCode=3;
   operations.recover();
   assert.equal((await operations.execute(read)).outcome, 'already-applied');
 });
+
+test('a GitHub read binds to the thread accepted commit as well as the checkout head', async (t) => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'ck-github-accepted-')));
+  const repo = join(home, 'repository');
+  mkdirSync(repo);
+  git(repo, ['init', '--quiet']);
+  writeFileSync(join(repo, 'source.txt'), 'one\n');
+  git(repo, ['add', '.']);
+  const commit = (message: string) => {
+    git(repo, [
+      '-c',
+      'user.name=Fixture',
+      '-c',
+      'user.email=fixture@example.test',
+      'commit',
+      '--quiet',
+      '--allow-empty',
+      '-m',
+      message,
+    ]);
+    return git(repo, ['rev-parse', 'HEAD']).toString().trim();
+  };
+  const accepted = commit('accepted');
+  git(repo, ['branch', 'crewkite/accepted']);
+  const head = commit('checkout head');
+  git(repo, ['remote', 'add', 'origin', 'https://github.com/example/project.git']);
+  const previousPath = process.env.PATH;
+  let sequence = 0;
+  const id = (prefix: string) => `${prefix}_${String(++sequence).padStart(26, '0')}`;
+  const store = new Store(join(home, 'state.sqlite'));
+  store.applyMigrations(fileURLToPath(new URL('../../migrations/', import.meta.url)));
+  const task: Task = {
+    id: id('tsk'),
+    projectId: id('prj'),
+    title: 'Accepted commit read',
+    outcome: 'Read CI',
+    criteria: ['Bound to the accepted commit'],
+    state: 'draft',
+    revision: 0,
+    runId: null,
+    waitingReason: null,
+    next: null,
+  };
+  store.transaction(() => {
+    store.put('project', task.projectId, 0, { id: task.projectId, name: 'Fixture', revision: 0 });
+    store.put('task', task.id, 0, task);
+    store.db
+      .prepare('INSERT INTO project_paths(project_id,path) VALUES (?,?)')
+      .run(task.projectId, repo);
+    store.db.prepare('INSERT INTO chat_threads(task_id,body) VALUES (?,?)').run(
+      task.id,
+      JSON.stringify({
+        taskId: task.id,
+        scratchReady: true,
+        base: head,
+        selection: null,
+        lastAcceptance: { branch: 'crewkite/accepted', at: 'now', fileCount: 1, commit: accepted },
+      }),
+    );
+  });
+  const operations = new TaskOperations({
+    store,
+    artifacts: new ArtifactFiles(join(home, 'artifacts')),
+    home,
+    now: () => new Date().toISOString(),
+    id,
+    event: () => {},
+  });
+  t.after(async () => {
+    await operations.close();
+    store.close();
+    process.env.PATH = previousPath;
+    rmSync(home, { recursive: true, force: true });
+  });
+  const bin = join(home, 'bin');
+  mkdirSync(bin);
+  writeFileSync(
+    join(bin, 'gh'),
+    `#!${realpathSync(process.execPath)}
+console.log(JSON.stringify({number:1,head:{sha:'${accepted}'},state:'open',draft:false,html_url:'https://github.com/example/project/pull/1'}));
+`,
+  );
+  chmodSync(join(bin, 'gh'), 0o700);
+  process.env.PATH = `${bin}:${previousPath ?? ''}`;
+  const read = (headSha: string) =>
+    operations.execute(
+      CommandSchema.parse({
+        protocol: 1,
+        key: id('cmd'),
+        actor: { id: 'fixture', kind: 'cli' },
+        expectedRevision: 0,
+        command: 'ReadGitHub',
+        payload: {
+          taskId: task.id,
+          request: {
+            kind: 'pull-request',
+            repository: { host: 'github.com', owner: 'example', name: 'project' },
+            headSha,
+            pullRequest: '1',
+          },
+        },
+      }) as TaskOperationCommand,
+    );
+  assert.equal((await read(accepted)).outcome, 'applied');
+  const refused = await read('3'.repeat(40));
+  assert.equal(refused.outcome, 'blocked');
+  assert.match(refused.next ?? '', /accepted chat commit/);
+});

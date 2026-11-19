@@ -3,7 +3,8 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { test } from 'node:test';
-import { addedProblem, commandWords, detectChecks, testsLine } from './checks.ts';
+import type { ChatCheck } from '@crewkite/contracts';
+import { addedProblem, commandWords, describe, detectChecks, testsLine } from './checks.ts';
 
 // Claim: the controller reads the declared checks from the project files and nothing else. A
 // command is plain words, never a shell line. The table is the whole detection contract.
@@ -222,4 +223,46 @@ test('the run tests line names the failed command, not the last one', () => {
     ],
   ];
   for (const [input, line] of cases) assert.equal(testsLine(...input), line);
+});
+
+// Claim: the question shows a package.json script as what a command runs only when the package
+// manager runs that root script. A word that only looks like a script name, a manager's own
+// command, or a command aimed at another workspace shows the command as written.
+test('a check shows the root script it runs, and only that script', (t) => {
+  const directory = mkdtempSync(join(tmpdir(), 'crewkite-scripts-'));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  writeFileSync(
+    join(directory, 'package.json'),
+    JSON.stringify({ scripts: { test: 'node --test', dev: 'vite', build: 'tsc' } }),
+  );
+  const shown = (command: string) =>
+    describe(
+      {
+        id: 'custom:1',
+        label: command,
+        kind: 'custom',
+        source: 'custom',
+        command,
+        resolved: command,
+        enabled: true,
+        pin: null,
+      } as ChatCheck,
+      directory,
+    ).resolved;
+  for (const [command, runs] of [
+    ['npm test', 'npm test runs test: node --test'],
+    ['npm run dev', 'npm run dev runs dev: vite'],
+    ['npm build', 'npm build'],
+    ['pnpm dev', 'pnpm dev runs dev: vite'],
+    ['pnpm run build', 'pnpm run build runs build: tsc'],
+    ['pnpm --filter web test', 'pnpm --filter web test'],
+    ['pnpm -C packages/web test', 'pnpm -C packages/web test'],
+    ['npm -w web test', 'npm -w web test'],
+    ['pnpm -w test', 'pnpm -w test runs test: node --test'],
+    ['yarn workspace web test', 'yarn workspace web test'],
+    ['bun test', 'bun test'],
+    ['bun run test', 'bun run test runs test: node --test'],
+    ['pnpm exec vite build', 'pnpm exec vite build'],
+  ] as const)
+    assert.equal(shown(command), runs, command);
 });

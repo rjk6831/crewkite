@@ -7,6 +7,7 @@ import { usageCards } from '../thread/usage-cards.ts';
 import { creditText } from '../usage-presentation.ts';
 import { ClientStatus, QuotaRefresh } from './client-status.tsx';
 import { Allowance, type CardProps, CreditSwitch, ProviderCard } from './provider-card.tsx';
+import { providerEvidence } from './provider-evidence.ts';
 import { ConnectLine } from './providers/connect.tsx';
 import { connectedOnce } from './providers/connect-copy.ts';
 
@@ -27,6 +28,7 @@ export function OpenAiCard({
     <ProviderCard
       family="openai"
       entry={entry}
+      evidence={providerEvidence('openai', entry, header, now)}
       onCheck={() => actions.checkClient('openai')}
       detail="Signs in through its own client"
       main={

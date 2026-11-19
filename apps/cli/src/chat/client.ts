@@ -23,6 +23,8 @@ import {
   type Command,
   type CommandResult,
   CommandSchema,
+  type ConnectionsRead,
+  ConnectionsReadSchema,
   ConversationEntrySchema,
   type DiagnosticsRead,
   DiagnosticsReadSchema,
@@ -32,6 +34,8 @@ import {
   ProjectNotesReadSchema,
   type ProjectPage,
   type ProjectPageRequest,
+  type RemoteEffectsRead,
+  RemoteEffectsReadSchema,
   type SavedCrewsRead,
   SavedCrewsReadSchema,
   type SavedPrompts,
@@ -71,6 +75,7 @@ export type ChatTransport = {
 const readCommands = new Set([
   'CompleteChatMention',
   'ExportChatThread',
+  'ExportResults',
   'InspectSource',
   'SearchChatHistory',
 ]);
@@ -172,6 +177,9 @@ export function chatClient(
     readPrompts: (): Promise<SavedPrompts> => read('ReadChatPrompts', {}, SavedPromptsSchema),
     /** The crews saved in the desktop's Settings and the default. The desktop edits them. */
     readCrews: (): Promise<SavedCrewsRead> => read('ReadSavedCrews', {}, SavedCrewsReadSchema),
+    /** The billing connections, their spend and the sign-in line of each API connection. */
+    readConnections: (): Promise<ConnectionsRead> =>
+      read('ReadConnections', {}, ConnectionsReadSchema),
     readNotes: (projectId: string): Promise<ProjectNotesRead> =>
       read('ReadProjectNotes', { projectId }, ProjectNotesReadSchema),
     /** A note change answers with a small record, so these read the list again. */
@@ -252,12 +260,23 @@ export function chatClient(
     },
     /**
      * `confirmed` is true only after the person answered the push question, in the view or with
-     * --confirm on the command line. The controller refuses a push without it.
+     * --confirm on the command line. The controller refuses a push without it, and refuses one
+     * whose `commit` is no longer the one the thread accepted.
      */
-    push: (taskId: string, branch: string, remote = 'origin') =>
-      send('PushChatBranch', { taskId, branch, remote, confirmed: true }),
+    push: (taskId: string, branch: string, commit: string, remote = 'origin') =>
+      send('PushChatBranch', { taskId, branch, commit, remote, confirmed: true }),
     openPullRequest: (taskId: string, branch: string, title: string, body = '') =>
       send('OpenChatPullRequest', { taskId, branch, title, body }),
+    /** The thread's GitHub writes, oldest first. */
+    readRemoteEffects: (taskId: string): Promise<RemoteEffectsRead> =>
+      read('ReadRemoteEffects', { taskId }, RemoteEffectsReadSchema),
+    /**
+     * Merges the accepted commit onto `base` fetched from `remote`, outside any checkout. A
+     * conflict moves the merge into the thread's copy and starts the fixer, as Resolve conflicts
+     * does in the desktop.
+     */
+    checkMerge: (taskId: string, base: string, remote: string) =>
+      send('CheckChatMerge', { taskId, base, remote }),
     async listThreads(): Promise<{ threads: TaskSummary[]; complete: boolean }> {
       const header = await transport.workspaceState();
       const threads: TaskSummary[] = [];

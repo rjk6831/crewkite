@@ -132,6 +132,9 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         endedAt: ago(170_000),
         failure: usageLimit(),
         handoffFrom: null,
+        rules: null,
+        designSystem: null,
+        spend: null,
       },
       {
         ...shared,
@@ -143,6 +146,9 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         endedAt: null,
         failure: null,
         handoffFrom: 'openai',
+        rules: null,
+        designSystem: null,
+        spend: null,
       },
     );
     thread = {
@@ -308,6 +314,9 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
       endedAt: null,
       failure: null,
       handoffFrom: null,
+      rules: null,
+      designSystem: null,
+      spend: null,
     };
     setTurn(turn);
     setThread({ activeTurnId: turnId });
@@ -541,5 +550,6 @@ export function createThreadScript(bus: PreviewBus, taskId: string, seeded: bool
         return null;
     }
   }
-  return { command };
+  // A preview state can start the thread further along, such as accepted and pushed.
+  return { command, patch: setThread };
 }

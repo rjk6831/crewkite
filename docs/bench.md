@@ -26,16 +26,16 @@ pnpm bench --family <family> --model <id> --effort <effort> --tasks <ids|all>
 
 `--tasks` takes a comma separated list of task ids, or `all`. With `all`, a task that has no verification record is skipped and listed as an exclusion. Naming an unverified task by id runs it and marks it unverified in the file.
 
-The run uses the clients installed and signed in on this machine, through the normal chat adapters and the controller's chat thread path. The harness makes no network calls of its own. It starts a controller on a home inside a work folder, registers a project made from the task's base commit, opens a thread, sets the thread's permission policy, sends the task text, and waits for the turn to end.
+The run uses the clients installed and signed in on this machine, through the normal chat adapters and the controller's chat thread path. The harness makes no network calls of its own. It starts a controller on a home inside a work folder, registers a project made from the task's base commit, opens a thread, sets the thread's permission policy, sends the task text, and follows the thread until its whole workflow ends.
 
 The work folder is made with `mkdtemp` under the system temporary directory, so it sits outside this checkout and outside every repository. Only the run files go to `--out`. The run refuses a work folder that sits inside the checkout or inside any repository, because a client working in a scratch copy there could run git against my real repository. The scratch copy has no `.git` of its own. During a run `GIT_CEILING_DIRECTORIES` names the work folder's parent, and every check gets the same variable. The clients build their own environment, so the variable above does not reach them, but each chat client launch now sets the same variable to the copy's parent itself. The location of the work folder is the second thing that keeps a client away from my checkout.
 
-The default permission policy is allow edits. The client may edit files in the scratch copy and has to ask before it runs a command. Nobody answers during a run, so a task whose turn needs a command stops at the question and ends as timed out. `--allow-all` lets the client run any command with my own permissions and prints a warning when I pass it. A command run that way can reach anything my account can reach, including files outside the scratch copy. The run file and the table name the policy the run used.
+The default permission policy is allow edits. The client may edit files in the scratch copy and has to ask before it runs a command. Nobody answers during a run, so a task whose turn needs a command stops at the question. The harness records it as failed with the question as the reason and stops the turn. `--allow-all` lets the client run any command with my own permissions and prints a warning when I pass it. A command run that way can reach anything my account can reach, including files outside the scratch copy. The run file and the table name the policy the run used.
 
 Other options:
 
 - `--review` runs a review turn on each finished task and records its findings.
-- `--timeout-minutes <n>` limits one work turn. The default is 30.
+- `--timeout-minutes <n>` limits the work turn and whatever it starts. The default is 30.
 - `--out <folder>` sets where the run files go. The default is `internal/bench`.
 - `--keep` keeps the work folder with each task's scratch copy and check copy. Without it, the folder is removed when the run ends, and also when I stop the run with Ctrl+C.
 - `--allow-all` sets the permission policy to allow all, as described above.

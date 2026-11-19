@@ -411,8 +411,9 @@ export function MessageList({
   }, [items, last]);
   // A search hit: put its row at the top, once the thread has it, and mark it.
   const [hit, setHit] = useState<string | null>(null);
-  const revealed = useRef(-1);
-  const aligned = useRef(-1);
+  // The nonce of the reveal already done. Null until the first, since any number is a nonce.
+  const revealed = useRef<number | null>(null);
+  const aligned = useRef<number | null>(null);
   // biome-ignore lint/correctness/useExhaustiveDependencies: the layout is read when the reveal runs
   useLayoutEffect(() => {
     if (!reveal) {

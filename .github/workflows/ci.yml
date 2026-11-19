@@ -50,9 +50,16 @@ jobs:
       - name: Policy self-tests
         run: node --test scripts/policy.test.mjs
 
+  # The Node suite runs in two shards, each in its own job, so each fits the twelve-minute window.
+  # Every other stage of verify runs in both.
   verify:
+    name: verify (shard ${{ matrix.shard }} of 2)
     runs-on: macos-15
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,12 +82,13 @@ jobs:
         shell: bash
         run: pnpm verify 2>&1 | tee "$RUNNER_TEMP/verify-output.log"
         env:
+          CREWKITE_TEST_SHARD: ${{ matrix.shard }}/2
           PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
       - name: Keep the verify output
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: verify-output-macos
+          name: verify-output-macos-${{ matrix.shard }}
           path: ${{ runner.temp }}/verify-output.log
           if-no-files-found: warn
           retention-days: 14
@@ -88,12 +96,14 @@ jobs:
   # The Linux preview (ADR 0013, amendment of 2026-10-31) runs lint, types, policy and the Node
   # test suite on both architectures. The desktop build and the Electron journey stay on macOS.
   linux:
-    name: linux (${{ matrix.arch }})
+    name: linux (${{ matrix.arch }}, shard ${{ matrix.shard }} of 2)
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
+        arch: [x64, arm64]
+        shard: [1, 2]
         include:
           - arch: x64
             runner: ubuntu-24.04
@@ -119,12 +129,13 @@ jobs:
         run: |
           { pnpm lint && pnpm types && pnpm policy && pnpm test; } 2>&1 | tee "$RUNNER_TEMP/linux-output.log"
         env:
+          CREWKITE_TEST_SHARD: ${{ matrix.shard }}/2
           PROVENANCE_PATTERN: ${{ vars.PROVENANCE_PATTERN }}
       - name: Keep the output
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: linux-output-${{ matrix.arch }}
+          name: linux-output-${{ matrix.arch }}-${{ matrix.shard }}
           path: ${{ runner.temp }}/linux-output.log
           if-no-files-found: warn
           retention-days: 14

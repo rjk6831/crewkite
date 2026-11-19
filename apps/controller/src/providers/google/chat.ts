@@ -1439,17 +1439,27 @@ export function googleChatAdapter(deps: {
                   'Rephrase the request or pick another model in the composer, then send again.',
               }),
             };
+          else if (reason === 'end_turn') terminal = { stopReason: 'done', failure: null };
           else {
-            if (reason !== 'end_turn')
-              notice(
-                reason === 'max_tokens'
-                  ? 'The reply stopped at the model output limit.'
-                  : reason === 'max_turn_requests'
-                    ? 'The agent stopped at its limit of steps for one turn.'
-                    : `The Google client ended the turn with an unrecognized reason: ${clip(reason, 60)}.`,
-                'warning',
-              );
-            terminal = { stopReason: 'done', failure: null };
+            const limited = reason === 'max_tokens' || reason === 'max_turn_requests';
+            const said =
+              reason === 'max_tokens'
+                ? 'The reply stopped at the model output limit.'
+                : reason === 'max_turn_requests'
+                  ? 'The agent stopped at its limit of steps for one turn.'
+                  : `The Google client ended the turn with an unrecognized reason: ${clip(reason, 60)}.`;
+            notice(said, 'warning');
+            // Only end_turn says the agent finished. A known limit stopped it partway, and any
+            // other reason leaves CrewKite unable to say how far the work got.
+            terminal = {
+              stopReason: 'error',
+              failure: chatFailure({
+                stage,
+                kind: limited ? 'incomplete' : 'completion-unknown',
+                method: 'session/prompt',
+                message: said,
+              }),
+            };
           }
         } catch (error) {
           workError = error;

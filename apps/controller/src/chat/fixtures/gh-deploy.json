@@ -1,0 +1,46 @@
+{
+  "runList": [
+    {
+      "databaseId": 5501,
+      "name": "release",
+      "status": "completed",
+      "conclusion": "success",
+      "url": "https://github.com/rjk6831/demo-shop/actions/runs/5501",
+      "createdAt": "2026-10-24T09:01:00Z",
+      "headSha": "__MERGE__"
+    },
+    {
+      "databaseId": 5502,
+      "name": "deploy",
+      "status": "in_progress",
+      "conclusion": "",
+      "url": "https://github.com/rjk6831/demo-shop/actions/runs/5502",
+      "createdAt": "2026-10-24T09:01:30Z",
+      "headSha": "__MERGE__"
+    }
+  ],
+  "deployments": [
+    {
+      "id": 9001,
+      "sha": "__MERGE__",
+      "ref": "main",
+      "environment": "production",
+      "created_at": "2026-10-24T09:02:00Z"
+    }
+  ],
+  "statusInProgress": [
+    {
+      "state": "in_progress",
+      "target_url": "https://github.com/rjk6831/demo-shop/actions/runs/5502",
+      "environment_url": ""
+    },
+    { "state": "queued", "target_url": "" }
+  ],
+  "statusSuccess": [
+    {
+      "state": "success",
+      "target_url": "https://github.com/rjk6831/demo-shop/actions/runs/5502",
+      "environment_url": "https://shop.example.com"
+    }
+  ]
+}

@@ -16,6 +16,7 @@ const GATED = new Set([
   'InitializeGoogleAcp',
   'AuthenticateGoogleAcp',
   'DiscoverGoogleAcp',
+  'RefreshGoogleAcpModels',
 ]);
 
 export const googleTermsAcknowledged = (store: Store) =>

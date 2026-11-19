@@ -77,6 +77,12 @@ On startup the controller reconciles attempts and effects before it dispatches a
 
 Reopening a task shows what is known, what is uncertain and the safe next actions. It never restarts inference by itself.
 
+## Start at reset
+
+When a turn stops on a usage limit and CrewKite has recorded the family's reset time, the thread offers Start at reset. The wait is a field on the thread record, so a restart keeps it, and Cancel clears it. It shows as "Starts at 14:05 when the Anthropic window resets."
+
+At that time the controller reads usage again. The stopped message runs again only if the window reads open, the thread is free and no other thread has a turn on that family. A window that still reads at its limit moves the start to its new reset time, and the thread says so only when that time moved. A reading that cannot be had, or a busy thread, tries again in fifteen minutes. An unreadable reading says so once in the thread, and after a day of them the wait ends with one line. A side question runs beside the thread and leaves the wait in place. The start stays on the family that stopped, so it never reaches API billing or credits the person did not allow for the turn. A turn that ran on an assigned connection cannot start at reset, since CrewKite reads no reset time for that connection. A new message in the thread ends the wait, and so does a connection assigned meanwhile to that message's role on the family.
+
 ## Durability
 
 SQLite runs in WAL mode on local disk with full synchronous writes for control records. Before a migration changes an existing database, the controller writes a consistent copy beside it. It keeps that copy and the newest earlier copy from a different version. Artifacts are written, hashed and published before their references commit. A consistent backup includes the referenced artifacts. Disk-full and corrupt-evidence conditions keep the last valid state and surface an explicit blocker.

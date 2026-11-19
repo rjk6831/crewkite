@@ -2,10 +2,10 @@
 
 .th-offer {
   display: grid;
-  gap: 10px;
-  padding: 12px 14px;
+  gap: var(--space-5);
+  padding: var(--space-6) var(--space-7);
   border: 1px solid var(--border);
-  border-radius: 10px;
+  border-radius: var(--radius-5);
   background: var(--surface);
   font-size: 13px;
 }
@@ -15,15 +15,15 @@
 .th-offer-options {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .th-offer-option {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  padding: 6px 12px;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-6);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-4);
   background: var(--surface-raised);
   color: var(--text);
   font-size: 12px;

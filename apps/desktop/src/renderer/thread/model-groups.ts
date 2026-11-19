@@ -49,3 +49,18 @@ export function offLine(entry: Pick<Entry, 'family' | 'needsConnect'>, localSeen
   if (localSeen) return localSeen;
   return entry.needsConnect ? 'Connect in Settings' : 'Not connected';
 }
+
+const knownEffortLabels: Readonly<Record<string, string>> = {
+  minimal: 'Minimal',
+  low: 'Low',
+  medium: 'Medium',
+  high: 'High',
+  xhigh: 'Extra high',
+  ultra: 'Ultra',
+  max: 'Max',
+  default: 'Default',
+};
+/** The label of an effort. A level a client added since shows its own name, first letter up. */
+export const effortLabel = (effort: ChatEffort): string =>
+  knownEffortLabels[effort] ??
+  `${effort.charAt(0).toUpperCase()}${effort.slice(1).replaceAll(/[-_.]/g, ' ')}`;

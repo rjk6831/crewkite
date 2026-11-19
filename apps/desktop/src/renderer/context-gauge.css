@@ -1,10 +1,10 @@
-/* Tile colors sampled from the wordmark. The wordmark keeps them in both themes, so the meter
+/* The tiles are the wordmark's kite panels. The wordmark keeps them in both themes, so the meter
    does too. */
 .context-gauge {
-  --context-gauge-indigo: #4851ac;
-  --context-gauge-amber: #e5b962;
-  --context-gauge-coral: #eb7c61;
-  --context-gauge-teal: #40b1ab;
+  --context-gauge-indigo: var(--family-google-fill);
+  --context-gauge-amber: var(--family-local-fill);
+  --context-gauge-coral: var(--family-anthropic-fill);
+  --context-gauge-teal: var(--family-openai-fill);
   display: inline-flex;
   flex: none;
   vertical-align: middle;
@@ -18,9 +18,9 @@
   height: auto;
   min-inline-size: 32px;
   min-block-size: 32px;
-  padding: 2px;
+  padding: var(--space-1);
   border: 0;
-  border-radius: 8px;
+  border-radius: var(--radius-4);
   background: transparent;
   box-shadow: none;
   filter: none;
@@ -78,7 +78,7 @@
 }
 .context-gauge .context-gauge-button:has(.context-gauge-dot) {
   grid-auto-flow: column;
-  gap: 3px;
+  gap: var(--space-2);
 }
 .context-gauge .context-gauge-dot {
   inline-size: 5px;
@@ -146,13 +146,13 @@
   inset: auto 8px;
   inline-size: max-content;
   max-inline-size: min(272px, calc(100vw - 16px));
-  margin: 0 0 8px;
-  padding: 10px 12px 11px;
+  margin: 0 0 var(--space-4);
+  padding: var(--space-5) var(--space-6) var(--space-6);
   overflow: visible;
   border: 1px solid var(--border-strong);
-  border-radius: 10px;
+  border-radius: var(--radius-5);
   background: var(--surface-raised);
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-overlay);
   color: var(--text-muted);
   font-size: 12px;
   line-height: 1.5;
@@ -170,19 +170,19 @@
   text-transform: uppercase;
 }
 .context-gauge .context-gauge-status {
-  margin: 2px 0 6px;
+  margin: var(--space-1) 0 var(--space-3);
   color: var(--text);
   font-weight: 500;
 }
 .context-gauge .context-gauge-figures {
   display: grid;
-  gap: 1px;
-  margin: 0 0 6px;
+  gap: var(--space-1);
+  margin: 0 0 var(--space-3);
 }
 .context-gauge .context-gauge-figures > div {
   display: flex;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-8);
 }
 .context-gauge .context-gauge-figures dt {
   white-space: nowrap;
@@ -193,8 +193,8 @@
   font-variant-numeric: tabular-nums;
 }
 .context-gauge .context-gauge-note {
-  margin-top: 8px;
-  padding-top: 7px;
+  margin-top: var(--space-4);
+  padding-top: var(--space-4);
   border-top: 1px solid var(--border);
   color: var(--text-dim);
   font-size: 11px;

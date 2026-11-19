@@ -1,0 +1,8 @@
+2026-10-24T08:00:06.1Z ##[group]Run pnpm test
+2026-10-24T08:00:06.2Z pnpm test
+2026-10-24T08:00:06.3Z env:
+2026-10-24T08:00:06.3Z   NPM_TOKEN: [REDACTED]
+2026-10-24T08:02:40.9Z not ok 3 - cart total rounds to cents
+2026-10-24T08:02:40.9Z   AssertionError: expected 10.99 to equal 11
+2026-10-24T08:02:40.9Z     at src/cart.test.ts:42:10
+2026-10-24T08:02:44.0Z ##[error]Process completed with exit code 1.

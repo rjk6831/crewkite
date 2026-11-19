@@ -900,7 +900,15 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
       'anthropic-metadata-ownership-pending',
     );
     if (mode === 'held') {
-      assert.equal(f.controller.anthropicUsage().refreshWhenDue(f.command().key), undefined);
+      // A due read while this one runs waits for it and starts no second process.
+      const joined = f.controller.anthropicUsage().refreshWhenDue(f.command().key);
+      assert(joined instanceof Promise);
+      let ended = false;
+      void joined.then(() => {
+        ended = true;
+      });
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(ended, false);
       assert.equal(
         (await f.controller.execute(f.command(), 'local-owner')).reason,
         'anthropic-metadata-ownership-pending',
@@ -910,6 +918,8 @@ test('manual usage Stop, failed cooldown and uncertain ownership never replay a 
         'local-owner',
       );
       assert.equal(stopped.outcome, 'applied');
+      await joined;
+      assert.deepEqual([ended, f.calls()], [true, 1]);
     }
     const result = await running;
     assert.equal(result.outcome, mode === 'unknown' ? 'outcome-unknown' : 'blocked');

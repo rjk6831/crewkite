@@ -22,7 +22,8 @@ export type EntryIcon =
   | 'theme'
   | 'sidebar'
   | 'about'
-  | 'connect';
+  | 'connect'
+  | 'recipes';
 
 export type PaletteEntry = {
   id: string;
@@ -42,6 +43,7 @@ export type PaletteApp = {
   newThread(): void;
   openSettings(): void;
   openSettingsSection(id: string): void;
+  openRecipes(): void;
   about(): void;
   switchThread(step: 1 | -1): void;
   addProject: (() => void) | null;
@@ -62,6 +64,7 @@ export const SETTINGS_SECTIONS: readonly { id: string; label: string }[] = [
   { id: 'settings-mcp', label: 'MCP servers' },
   { id: 'settings-extensions', label: 'Extensions' },
   { id: 'settings-prompts', label: 'Prompts' },
+  { id: 'settings-project-setup', label: 'Project setup' },
 ];
 
 // A new slash command fails to compile here until it has a name the palette can show.
@@ -203,6 +206,14 @@ export function paletteEntries(
       run: () => defer(() => provided().exporter?.share()),
       disabled: !exporter,
       explicit: true,
+    },
+    {
+      id: 'open-recipes',
+      label: 'Open recipes',
+      hint: 'Recipes, their loops and their results.',
+      keywords: 'loops results graph hooks schedule',
+      icon: 'recipes',
+      run: app.openRecipes,
     },
     slash('settings'),
     ...settings,
