@@ -144,6 +144,7 @@ export async function serve(
               socket.setTimeout(0);
               send({ type: 'welcome', protocol: 1, cursor: controller.store.cursor() });
               authenticated.add(socket);
+              controller.clientsChanged(authenticated.size);
               void controller.refreshUsage('connect');
               continue;
             }
@@ -198,9 +199,13 @@ export async function serve(
                   }
                   return;
                 }
-                // Reads and Local setup answer on their own, so a slow read never holds a write
-                // behind it in this socket's line. Their changes still commit in arrival order:
-                // execute reaches its transaction before its first wait.
+                // Reads, Local setup and the long commands below answer on their own, so a slow
+                // command never holds another behind it in this socket's line. Most of them reach
+                // their transaction before their first wait, so their changes commit in arrival
+                // order. Some wait first, a Google start among them, so a command sent after one
+                // can commit before it. The start compares the setup, task, run, source and plan
+                // again before it commits, and the commit checks the revision, so a late commit
+                // refuses when any of them moved.
                 if (
                   [
                     'GetWorkspaceState',
@@ -223,14 +228,29 @@ export async function serve(
                     'PushChatBranch',
                     'OpenChatPullRequest',
                     'ReadChatBranchStatus',
+                    'CheckChatMerge',
+                    'ProposeRemoteEffect',
+                    'ConfirmRemoteEffect',
+                    'ReconcileRemoteEffect',
+                    'ReadReviewComments',
+                    'ReadMergeReadiness',
                     'RefreshAnthropicUsage',
                     'StopAnthropicUsage',
                     'CheckNativeConnection',
+                    'ProveConnection',
+                    // A dependency copy runs up to ten minutes and a design draft up to three.
+                    // The copy takes its place before its first wait, and a draft saves nothing.
+                    'PrepareDependencies',
+                    'DraftDesignSystem',
+                    // A Google start waits up to 30 seconds before it commits, and a stop for that
+                    // run has to be answered while it waits.
+                    'StartRun',
                     'InstallGoogleAcp',
                     'StopGoogleAcpInstall',
                     'InitializeGoogleAcp',
                     'AuthenticateGoogleAcp',
                     'DiscoverGoogleAcp',
+                    'RefreshGoogleAcpModels',
                     'StopGoogleAcpSetup',
                   ].includes(command.command) ||
                   (command.command === 'PrepareCandidateEvaluation' &&
@@ -269,6 +289,7 @@ export async function serve(
         unsubscribe?.();
         sockets.delete(socket);
         authenticated.delete(socket);
+        controller.clientsChanged(authenticated.size);
       });
     });
     await new Promise<void>((resolve, reject) => {
@@ -299,7 +320,10 @@ export async function serve(
       }
       withdrawControllerSocket(controller.home, socketPath);
     };
-    publishControllerSocket(controller.home, socketPath);
+    // Startup migrated the database to every migration this build bundles, so its version is the
+    // schema an app of this build expects.
+    const schema = controller.store.db.prepare('PRAGMA user_version').get()?.user_version;
+    publishControllerSocket(controller.home, socketPath, schema as number);
     void controller.refreshUsage('start');
     usageTimer = setInterval(() => {
       if (authenticated.size) void controller.refreshUsage('interval');

@@ -7,7 +7,14 @@ import { join, resolve } from 'node:path';
 import test from 'node:test';
 import { spawnCheckChild as spawn } from '../../host/check-ownership.ts';
 import { groupAbsent } from '../../host/worker.ts';
-import { NativeDiscoveryError, startNativeAuthStatus } from './native-discovery.ts';
+import { metadataCommand } from './discovery.ts';
+import {
+  anthropicApiLoginLine,
+  NativeDiscoveryError,
+  nativeAuthEnvironment,
+  ownedClaudeConfigDir,
+  startNativeAuthStatus,
+} from './native-discovery.ts';
 
 const secret = 'private-native-account@example.test';
 const fixture = `
@@ -446,5 +453,52 @@ test('authentication metadata waits for bounded owned child and descendant clean
     const absent = owned.every(({ child }) => !child.pid || groupAbsent(child.pid));
     if (closed && absent) rmSync(root, { recursive: true, force: true });
     assert(closed && absent, 'owned fixture streams and groups must be absent');
+  }
+});
+
+test('an API connection gets its own configuration folder, sign-in line and sign-out command', () => {
+  const source = { HOME: '/people', CREWKITE_HOME: '/people/.crewkite' };
+  const environment = nativeAuthEnvironment(
+    { ...source, CREWKITE_CLAUDE_PROFILE: 'anthropic-api-1' },
+    '/tmp',
+  );
+  assert.equal(
+    environment.CLAUDE_CONFIG_DIR,
+    '/people/.crewkite/providers/anthropic/claude-profiles/anthropic-api-1',
+  );
+  // A folder the person set stays refused on the family's own route.
+  assert.throws(() => nativeAuthEnvironment({ ...source, CLAUDE_CONFIG_DIR: '/x' }, '/tmp'));
+  assert.equal(
+    anthropicApiLoginLine(source, 'anthropic-api-1'),
+    "CLAUDE_CONFIG_DIR='/people/.crewkite/providers/anthropic/claude-profiles/anthropic-api-1' claude auth login --console",
+  );
+  assert.deepEqual(metadataCommand('auth-logout').argv, ['auth', 'logout']);
+});
+
+// Claim: an API connection's folder sits under the state root the controller runs on, whatever
+// HOME is, for every step that names it: the folder made, the sign-in line, the proof and the
+// turn all read it from the environment this function builds.
+test('an Anthropic connection folder follows the controller home and the installed state root', () => {
+  const home = userInfo().homedir;
+  const installed = join(home, 'Library/Application Support/CrewKite');
+  for (const [name, source, root] of [
+    ['a controller home', { HOME: home, CREWKITE_HOME: '/work/ck' }, '/work/ck'],
+    [
+      'an installed state root',
+      {
+        HOME: home,
+        CREWKITE_HOME: join(installed, 'home'),
+        CREWKITE_PROFILE: join(installed, 'profile'),
+        CREWKITE_INSTALLED_STATE_ROOT: installed,
+      },
+      installed,
+    ],
+  ] as const) {
+    const built = nativeAuthEnvironment(source, '/tmp');
+    assert.equal(
+      ownedClaudeConfigDir({ ...built, CREWKITE_CLAUDE_PROFILE: 'anthropic-api-1' }),
+      join(root, 'providers/anthropic/claude-profiles/anthropic-api-1'),
+      name,
+    );
   }
 });

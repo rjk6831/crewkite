@@ -3,6 +3,7 @@ import { ChatChecksEditSchema, ChatChecksStateSchema } from './checks.ts';
 import { ClientVersionStatusSchema } from './client-versions.ts';
 import { ChatPlanConflictsSchema, chatPlanLaneSchema } from './plan-lanes.ts';
 import { AllowSubagentsSchema, subagentActivityFields } from './subagents.ts';
+import { WritingRuleSetSchema } from './writing-rules.ts';
 
 // Shared shape of a chat thread, its turns and the live agent stream.
 // Every provider adapter translates its native protocol into these events.
@@ -285,6 +286,14 @@ export const ChatPlanStateSchema = z
       )
       .min(1)
       .max(MAX_PLAN_SLICES),
+    /**
+     * Set on the plan a report recipe's run proposed, for the plan's whole life: its slices only
+     * read and it closes with a challenge and one report message. `messageId` is the message that
+     * asks for the report, once the controller has written it. The report turn is the turn that
+     * answers that message, on whichever provider it runs, so nothing is told from a message's
+     * words.
+     */
+    report: z.strictObject({ messageId: id('msg').nullable() }).optional(),
   })
   .refine(
     (state) => new Set(state.slices.map((slice) => slice.id)).size === state.slices.length,
@@ -335,6 +344,10 @@ export const ChatFailureSchema = z.strictObject({
     'stopped',
     'internal',
     'attachment-rejected',
+    // The client stopped at a known output or step limit before it finished the work.
+    'incomplete',
+    // The client ended without a terminal status this adapter accepts as success.
+    'completion-unknown',
   ]),
   message: z.string().min(1).max(4096),
   providerMessage: z.string().max(16_384).nullable().default(null),
@@ -497,7 +510,68 @@ export const ChatTurnStateSchema = z.enum([
   'failed',
 ]);
 
+/**
+ * What a send was admitted to. A send that opens no turn says why, so a script never waits for a
+ * turn that will not come.
+ */
+export const ChatAdmissionSchema = z.discriminatedUnion('outcome', [
+  z.strictObject({ outcome: z.literal('started'), turnId: ChatTurnIdSchema }),
+  z.strictObject({
+    outcome: z.literal('handed-on'),
+    turnId: ChatTurnIdSchema,
+    from: ChatFamilySchema,
+    to: ChatFamilySchema,
+  }),
+  z.strictObject({ outcome: z.literal('queued'), messageId: id('msg') }),
+  z.strictObject({
+    outcome: z.literal('refused'),
+    reason: z.enum([
+      'credits-paused',
+      'no-eligible-provider',
+      'provider-not-ready',
+      'ownership-unknown',
+      'thread-busy',
+      // Any other refusal. The message and next step say what it was.
+      'blocked',
+    ]),
+    message: z.string().min(1).max(1024),
+    next: z.string().min(1).max(1024),
+  }),
+]);
+export type ChatAdmission = z.infer<typeof ChatAdmissionSchema>;
+
 /** Durable record of one turn. Lives beside the task; the live stream is in the event log. */
+const money = {
+  /** Millionths of one unit of `currency`. */
+  amountMicros: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
+  currency: z.string().regex(/^[A-Z]{3}$/),
+};
+
+/**
+ * Spend on an API connection, for one turn or summed for the rail. Reported, estimated and
+ * unreported stay separate and are never merged. Unknown is never zero: a spend that reports
+ * nothing, estimates nothing and counts no unreported turn is refused. An estimate names its basis
+ * and the date its prices or totals were read.
+ */
+export const SpendSchema = z
+  .strictObject({
+    reported: z.strictObject(money).nullable(),
+    estimated: z
+      .strictObject({
+        ...money,
+        basis: z.enum(['client-estimate', 'price-table']),
+        at: timestamp,
+      })
+      .nullable(),
+    /** Turns that ran with no cost the client reported. */
+    unreportedTurns: z.number().int().nonnegative(),
+  })
+  .refine(
+    (spend) => spend.reported !== null || spend.estimated !== null || spend.unreportedTurns > 0,
+    'Spend says what was reported, estimated or left unreported.',
+  );
+export type Spend = z.infer<typeof SpendSchema>;
+
 export const ChatTurnSchema = z.strictObject({
   id: ChatTurnIdSchema,
   taskId: id('tsk'),
@@ -523,6 +597,31 @@ export const ChatTurnSchema = z.strictObject({
   outputLimit: ChatOutputLimitSchema.optional(),
   /** The plan slice whose lane opened the turn. It runs in that slice's own scratch copy. */
   slice: ChatPlanSliceIdSchema.optional(),
+  /** The writing rules the turn received. Null for a turn that received none or ran before them. */
+  rules: WritingRuleSetSchema.nullable().default(null),
+  /** The design system version the turn received. */
+  designSystem: z
+    .strictObject({
+      version: z.number().int().min(1),
+      versionHash: z.string().regex(/^[a-f0-9]{64}$/),
+      /**
+       * The UTF-8 bytes of the design brief the turn carried, whether in a new session's system
+       * context or in a resumed turn's block. Absent on turns recorded before this field.
+       */
+      briefBytes: z.number().int().min(0).optional(),
+    })
+    .nullable()
+    .default(null),
+  /**
+   * What the turn cost on an API connection. Null on a subscription or Local turn. An API turn
+   * starts with one unreported turn, so a turn that ends without a report never reads as free.
+   */
+  spend: SpendSchema.nullable().default(null),
+  /**
+   * The connection the person assigned for this turn's role or thread. Absent when the turn ran on
+   * the family's own route: its subscription sign-in, or Local.
+   */
+  connectionId: id('con').optional(),
 });
 export type ChatTurn = z.infer<typeof ChatTurnSchema>;
 
@@ -614,6 +713,20 @@ export const ChatThreadSchema = z.strictObject({
    * message waits for Send now or Remove. It clears when the queue empties.
    */
   queuePaused: z.boolean().optional(),
+  /**
+   * The newest turn stopped on a usage limit and the person asked to run its message again when
+   * the window reopens. `at` is the reset time recorded for the family. The controller reads
+   * usage again at that time and starts the turn only if the window really reset.
+   */
+  startAt: z
+    .strictObject({
+      turnId: ChatTurnIdSchema,
+      family: ChatFamilySchema,
+      at: timestamp,
+      /** When the family's usage first could not be read at the reset. The wait ends a day later. */
+      unreadSince: timestamp.optional(),
+    })
+    .optional(),
   /** The crew the thread runs and how far it runs on its own. A thread with no crew is manual. */
   crew: ChatCrewSchema.nullable().default(null),
   flightMode: ChatFlightModeSchema.default('manual'),
@@ -649,6 +762,34 @@ export const ChatThreadSchema = z.strictObject({
       at: timestamp,
       /** The pull request opened for the branch, or the compare link the person was given. */
       pullRequestUrl: z.url().max(2048).nullable().default(null),
+    })
+    .nullable()
+    .optional(),
+  /**
+   * The commit this thread last pushed to each branch of a remote that is not a GitHub repository,
+   * newest first. The next push to that branch leases on it. A GitHub push leases on the write
+   * journal, which a reconcile and a settle keep current.
+   */
+  pushes: z
+    .array(
+      z.strictObject({
+        branch: z.string().min(1).max(200),
+        remote: z.string().min(1).max(100),
+        commit: z.string().regex(/^[a-f0-9]{40}$/),
+      }),
+    )
+    .max(64)
+    .optional(),
+  /**
+   * A merge with the pull request's base that waits in the copy: the remote and branch it was
+   * fetched from, the accepted branch it goes on and the files that conflicted. Accept clears it.
+   */
+  pendingMerge: z
+    .strictObject({
+      remote: z.string().min(1).max(100),
+      branch: z.string().min(1).max(200),
+      target: z.string().min(1).max(200),
+      paths: z.array(z.string().min(1).max(4096)).min(1).max(16),
     })
     .nullable()
     .optional(),
@@ -717,6 +858,11 @@ export const ConfigureChatThreadPayloadSchema = z.strictObject({
   handoffMode: ChatHandoffModeSchema.optional(),
   /** Take a queued message back before it starts. */
   dequeue: id('msg').optional(),
+  /**
+   * True runs the message a usage limit stopped again when the family's window resets. False
+   * cancels a start that waits. Needs a recorded reset time.
+   */
+  startAtReset: z.boolean().optional(),
   /** Null clears the crew; the thread goes back to manual. */
   crew: ChatCrewSchema.nullable().optional(),
   flightMode: ChatFlightModeSchema.optional(),
@@ -747,11 +893,13 @@ export const AcceptChatChangesPayloadSchema = z.strictObject({
 const branchName = AcceptChatChangesPayloadSchema.shape.branch;
 /**
  * Push an accepted branch with the person's own git credentials. Only a person's click sends it,
- * after the confirmation sentence; `confirmed` records that they saw it.
+ * after the confirmation sentence; `confirmed` records that they saw it. `commit` is the accepted
+ * commit that sentence named, so a thread that accepted again since refuses.
  */
 export const PushChatBranchPayloadSchema = z.strictObject({
   taskId: id('tsk'),
   branch: branchName,
+  commit: z.string().regex(/^[a-f0-9]{40}$/),
   remote: z
     .string()
     .regex(/^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$/)
@@ -779,9 +927,29 @@ export const ChatPullRequestResultSchema = z.strictObject({
   /** gh opened the request, or gh is missing and this is the compare link to open by hand. */
   via: z.enum(['gh', 'compare-link']),
 });
-export const ChatBranchStatusSchema = z.strictObject({
-  branch: branchName,
-  /** Null when gh is missing or cannot read the repository; the reason says which. */
+/**
+ * Fetch a pull request's base from a remote the person configured and merge the accepted commit
+ * onto it outside any checkout. Conflicts move into the copy, and one fixer turn resolves them.
+ */
+export const CheckChatMergePayloadSchema = z.strictObject({
+  taskId: id('tsk'),
+  remote: PushChatBranchPayloadSchema.shape.remote,
+  base: branchName,
+});
+/** What a merge check found against the fetched base: a clean merge, or the conflicting files. */
+export const ChatMergeCheckSchema = z.strictObject({
+  state: z.enum(['clean', 'conflicts']),
+  base: z.string().regex(/^[a-f0-9]{40}$/),
+  paths: z.array(z.string().min(1).max(4096)).max(16),
+});
+export type ChatMergeCheck = z.infer<typeof ChatMergeCheckSchema>;
+/**
+ * What GitHub ran for the merge commit on the base branch. A list is null when GitHub could not
+ * be read for it. A deployment whose status could not be read has the state `unknown`.
+ */
+export const ChatDeploySchema = z.strictObject({
+  commit: z.string().regex(/^[a-f0-9]{40}$/),
+  base: branchName,
   runs: z
     .array(
       z.strictObject({
@@ -793,8 +961,65 @@ export const ChatBranchStatusSchema = z.strictObject({
         createdAt: timestamp,
       }),
     )
+    .max(10)
+    .nullable(),
+  deployments: z
+    .array(
+      z.strictObject({
+        id: z.string().min(1).max(64),
+        environment: z.string().min(1).max(256),
+        state: z.string().min(1).max(64),
+        url: z.url().max(2048).nullable(),
+        createdAt: timestamp,
+      }),
+    )
+    .max(10)
+    .nullable(),
+  /** True while something is unfinished and the two hours are not over. */
+  following: z.boolean(),
+  reason: z.string().min(1).max(400).nullable(),
+});
+export type ChatDeploy = z.infer<typeof ChatDeploySchema>;
+export const ChatBranchStatusSchema = z.strictObject({
+  branch: branchName,
+  /** The merge commit's workflow runs and deployments. Null until this thread merged. */
+  deploy: ChatDeploySchema.nullable().default(null),
+  /** Null when gh is missing or cannot read the repository; the reason says which. */
+  runs: z
+    .array(
+      z.strictObject({
+        id: z.string().min(1).max(64),
+        name: z.string().min(1).max(256),
+        status: z.enum(['queued', 'in_progress', 'completed', 'waiting', 'requested', 'pending']),
+        conclusion: z.string().min(1).max(64).nullable(),
+        url: z.url().max(2048),
+        createdAt: timestamp,
+        /** The run attempt this row reads. Null until a run view reads it. */
+        attempt: z.number().int().positive().nullable().default(null),
+        jobs: z
+          .array(
+            z.strictObject({
+              id: z.string().min(1).max(64),
+              name: z.string().min(1).max(256),
+              status: z.string().min(1).max(64),
+              conclusion: z.string().min(1).max(64).nullable(),
+              url: z.url().max(2048),
+            }),
+          )
+          .max(50)
+          .default([]),
+      }),
+    )
     .max(20)
     .nullable(),
+  /** The accepted commit the runs were read for. Null when none is accepted. */
+  commit: z
+    .string()
+    .regex(/^[a-f0-9]{40}$/)
+    .nullable()
+    .default(null),
+  /** The remote branch now points at a newer commit than the accepted one. */
+  headMoved: z.boolean().default(false),
   reason: z.string().min(1).max(400).nullable(),
   readAt: timestamp,
 });
@@ -1091,6 +1316,11 @@ export const SetCreditSpendingPayloadSchema = z.strictObject({
 
 export const ChatCatalogEntrySchema = z.strictObject({
   family: ChatFamilySchema,
+  /**
+   * The family's own route is signed in: its subscription, or Local. An API connection never sets
+   * it. Ranking reads this, so an API connection reaches a turn only through its assignment (ADR
+   * 0056).
+   */
   connected: z.boolean(),
   reason: z.string().max(1024).nullable().default(null),
   models: z

@@ -176,7 +176,10 @@ test('migration 021 upgrades a version 20 database after its backup', (t) => {
   const store = new Store(path);
   t.after(() => store.close());
   store.applyMigrations(migrations);
-  assert.equal(store.db.prepare('PRAGMA user_version').get()?.user_version, 21);
+  assert.equal(
+    store.db.prepare('PRAGMA user_version').get()?.user_version,
+    readdirSync(migrations).filter((file) => file.endsWith('.sql')).length,
+  );
   assert.ok(readdirSync(directory).includes('state.sqlite.before-v20.sqlite'));
   assert.equal(store.db.prepare('SELECT count(*) AS n FROM entities').get()?.n, 1);
   assert.deepEqual(new SavedCrews(store.db, () => '').read(), {

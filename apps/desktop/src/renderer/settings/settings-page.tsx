@@ -1,11 +1,16 @@
 import type { WorkspaceState } from '@crewkite/contracts';
 import { ArrowLeft } from 'lucide-react';
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
+import { useDesignSystems } from '../design/context.ts';
+import { DesignSystemCard } from '../design/system-card.tsx';
+import type { RecipesView } from '../recipes/recipes-page.tsx';
 import type { Workspace } from '../source.ts';
 import { projectUsagePresentation } from '../usage-presentation.ts';
 import { AnthropicCard } from './anthropic-card.tsx';
+import { ConnectionsCard } from './connections-card.tsx';
 import { CrewsCard } from './crews-card.tsx';
 import { ExtensionsCard } from './extensions-card.tsx';
+import { FeedbackCard } from './feedback-card.tsx';
 import { GeneralCard } from './general-card.tsx';
 import { GoogleCard } from './google-card.tsx';
 import { LocalCard } from './local-card.tsx';
@@ -15,7 +20,10 @@ import { OpenAiCard } from './openai-card.tsx';
 import { ProjectUsageCard } from './project-usage-card.tsx';
 import { PromptsCard } from './prompts-card.tsx';
 import { useProviderActions } from './provider-actions.ts';
+import { SetupCard } from './setup-card.tsx';
 import { useCatalog, useClock } from './use-catalog.ts';
+import { WebhookCard } from './webhook-card.tsx';
+import { WritingRulesCard } from './writing-rules-card.tsx';
 import './settings.css';
 
 /**
@@ -30,6 +38,8 @@ export function SettingsPage({
   onShowWelcome,
   threadId,
   onClose,
+  onOpenThread,
+  onOpenRecipes,
 }: {
   workspace: Workspace;
   header: WorkspaceState;
@@ -40,6 +50,9 @@ export function SettingsPage({
   threadId?: string;
   /** Leaves Settings for the thread that was open. */
   onClose?: () => void;
+  onOpenThread?: (taskId: string) => void;
+  /** Opens the Recipes page on a project and one of its views. */
+  onOpenRecipes?: (projectId: string, view: RecipesView) => void;
 }) {
   const { catalog, error, modelRead } = useCatalog(workspace.source, header);
   const actions = useProviderActions(workspace);
@@ -75,6 +88,13 @@ export function SettingsPage({
     window.addEventListener('keydown', keydown);
     return () => window.removeEventListener('keydown', keydown);
   }, [onClose]);
+  // The Project setup card sends the person to the notes of the project it shows.
+  const [notesFor, setNotesFor] = useState<{ projectId: string } | null>(null);
+  // A rule, the design system or a note saved on this page reads the card's Context row again. A
+  // version saved in the design system editor counts as well.
+  const [contextSaves, setContextSaves] = useState(0);
+  const contextSaved = () => setContextSaves((count) => count + 1);
+  const { saved: designSaves } = useDesignSystems();
   const entry = (family: string) => catalog?.families.find((value) => value.family === family);
   return (
     <main className="settings-page" aria-labelledby="settings-title">
@@ -101,15 +121,49 @@ export function SettingsPage({
           source={workspace.source}
           threadId={threadId}
         />
+        <FeedbackCard source={workspace.source} catalog={catalog} />
+        <WebhookCard source={workspace.source} />
         <CrewsCard catalog={catalog} projects={workspace.projects} />
         <GoogleCard {...card} entry={entry('google')} />
         <OpenAiCard {...card} entry={entry('openai')} modelRead={modelRead} />
         <AnthropicCard {...card} entry={entry('anthropic')} />
         <LocalCard {...card} entry={entry('local')} />
+        {workspace.source && <ConnectionsCard source={workspace.source} changed={header} />}
         <McpCard />
         <ExtensionsCard source={workspace.source} />
         {workspace.source && <PromptsCard source={workspace.source} />}
-        {workspace.source && <NotesCard source={workspace.source} projects={workspace.projects} />}
+        {workspace.source && (
+          <WritingRulesCard
+            source={workspace.source}
+            projects={workspace.projects}
+            onChanged={contextSaved}
+          />
+        )}
+        {workspace.source && (
+          <SetupCard
+            source={workspace.source}
+            workspace={workspace}
+            contextChanged={contextSaves + designSaves}
+            onShowNotes={(projectId) => setNotesFor({ projectId })}
+            onOpenThread={onOpenThread}
+            onOpenRecipes={onOpenRecipes}
+          />
+        )}
+        {workspace.source && (
+          <DesignSystemCard
+            source={workspace.source}
+            projects={workspace.projects}
+            onChanged={contextSaved}
+          />
+        )}
+        {workspace.source && (
+          <NotesCard
+            source={workspace.source}
+            projects={workspace.projects}
+            show={notesFor}
+            onChanged={contextSaved}
+          />
+        )}
         {workspace.source && (
           <ProjectUsageCard source={workspace.source} projects={workspace.projects} />
         )}

@@ -25,12 +25,16 @@ import {
 } from 'react';
 import { AnalyticsView } from '../analytics-view.tsx';
 import { familyName } from '../components.tsx';
+import { useDesignSystems } from '../design/context.ts';
+import { RULE_GROUP } from '../design/findings.ts';
+import { DesignTab, useDesignFindings } from '../design/findings-tab.tsx';
 import {
   ExtensionInspectorTab,
   extensionTabId,
   slotsOf,
   useExtensions,
 } from '../extension-slots.tsx';
+import { shortTime } from '../format-time.ts';
 import { clientFor } from '../settings/client-status.tsx';
 import { CrewSelect, useCrewChoices } from '../settings/crews-card.tsx';
 import { modelChoices, SelectionFields } from '../settings/general-card.tsx';
@@ -47,9 +51,10 @@ import {
   permissionPolicies,
 } from '../settings/preferences.ts';
 import { useProviderActions } from '../settings/provider-actions.ts';
-import { useCatalog } from '../settings/use-catalog.ts';
+import { useCatalog, useConnections } from '../settings/use-catalog.ts';
 import { type UsageCard, UsageGauges } from '../usage-gauges.tsx';
 import { projectUsagePresentation, usageCardFamily } from '../usage-presentation.ts';
+import { ApiBilling } from './api-billing.tsx';
 import { ChangesPanel } from './changes-panel.tsx';
 import { ChecksSettings } from './checks-card.tsx';
 import { configureThread, runTests, type ThreadSource } from './commands.ts';
@@ -60,12 +65,24 @@ import { usageCards, useUsageClock } from './usage-cards.ts';
 import './crew.css';
 import { Select } from '../select.tsx';
 import { useModelLabel } from './model-labels.ts';
+import type { ThreadCopy } from './prepare-dependencies.tsx';
 import { InfoMark, RoleInfo } from './role-info.tsx';
 import { SubagentSwitch } from './subagent-switch.tsx';
+import { WorkTab } from './work-tab.tsx';
 
-export type InspectorTab = 'changes' | 'usage' | 'analytics' | 'crew' | 'thread' | `ext:${string}`;
+export type InspectorTab =
+  | 'changes'
+  | 'work'
+  | 'design'
+  | 'usage'
+  | 'analytics'
+  | 'crew'
+  | 'thread'
+  | `ext:${string}`;
 const tabs: { id: InspectorTab; label: string }[] = [
   { id: 'changes', label: 'Changes' },
+  { id: 'work', label: 'Work' },
+  { id: 'design', label: 'Design' },
   { id: 'usage', label: 'Usage' },
   { id: 'analytics', label: 'Analytics' },
   { id: 'crew', label: 'Crew' },
@@ -218,6 +235,34 @@ function ResizeHandle({
   );
 }
 
+/**
+ * Which edges of a scrolling row hide tabs, so the row can fade there. More tabs than the panel
+ * holds would otherwise end at a hard cut that reads as the last tab.
+ */
+function useOverflowEdges(row: RefObject<HTMLElement | null>, layout: string) {
+  const [edges, setEdges] = useState<'none' | 'start' | 'end' | 'both'>('none');
+  // biome-ignore lint/correctness/useExhaustiveDependencies: layout names the tabs, so a new tab measures again
+  useLayoutEffect(() => {
+    const node = row.current;
+    if (!node) return;
+    const measure = () => {
+      const start = node.scrollLeft > 1;
+      const end = node.scrollLeft + node.clientWidth < node.scrollWidth - 1;
+      setEdges(start && end ? 'both' : start ? 'start' : end ? 'end' : 'none');
+    };
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    for (const child of node.children) observer.observe(child);
+    node.addEventListener('scroll', measure, { passive: true });
+    return () => {
+      observer.disconnect();
+      node.removeEventListener('scroll', measure);
+    };
+  }, [row, layout]);
+  return edges;
+}
+
 const refreshFamilies = ['google', 'openai', 'anthropic'] as const;
 
 function UsageTab({
@@ -311,13 +356,6 @@ function turnState(turn: ChatTurn): { label: string; tone: string } {
   return { label: stateLabels[turn.state], tone: turn.state };
 }
 
-const endedLabel = (iso: string) => {
-  const at = new Date(iso);
-  return at.toDateString() === new Date().toDateString()
-    ? at.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })
-    : at.toLocaleString([], { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
-};
-
 const asked = (text: string) => {
   const line = text.replace(/\s+/g, ' ').trim();
   return line.length > 80 ? `${line.slice(0, 79)}…` : line;
@@ -366,7 +404,7 @@ function TurnRow({ turn, reply }: { turn: ChatTurn; reply: ChatMessage | undefin
         )}
         {turn.endedAt && (
           <time dateTime={turn.endedAt} title={turn.endedAt}>
-            Ended {endedLabel(turn.endedAt)}
+            Ended {shortTime(turn.endedAt)}
           </time>
         )}
       </div>
@@ -590,6 +628,9 @@ function CrewTab({
   const { choices } = useCrewChoices();
   const current = choiceNamed(choices, crew?.name);
   const idBase = useId();
+  // A draft has no thread record yet, so it has nothing to assign a connection to.
+  const billingTask = !draft && thread ? thread.taskId : null;
+  const connections = useConnections(source, null, billingTask);
   // Builder turns run on the thread's selection, which the composer follows. Moving it in the same
   // configure call keeps the builder row and the composer on one model.
   function assign(role: string, selection: ChatModelSelection | null) {
@@ -680,6 +721,18 @@ function CrewTab({
       <p className="th-muted">
         {current?.hint ?? 'Pick a preset or a crew you saved in Settings > Crews.'}
       </p>
+      {billingTask && (
+        <ApiBilling
+          source={source}
+          taskId={billingTask}
+          read={connections}
+          slot="thread"
+          family={null}
+          label="Whole thread"
+          heading="Billing for the whole thread"
+          onNote={setNote}
+        />
+      )}
       <ul className="th-crew-roles" aria-label="Roles">
         {ChatCrewRoleSchema.options.map((role) => {
           const member = crew?.members.find((value) => value.role === role);
@@ -723,6 +776,17 @@ function CrewTab({
                 </span>
               ) : (
                 <span className="th-muted">{fallback ?? 'Not in this crew'}</span>
+              )}
+              {billingTask && member && (
+                <ApiBilling
+                  source={source}
+                  taskId={billingTask}
+                  read={connections}
+                  slot={role}
+                  family={member.selection.family}
+                  label={crewRoleNames[role]}
+                  onNote={setNote}
+                />
               )}
               {role === 'orchestrator' && crew && (
                 <button
@@ -843,7 +907,12 @@ export function Inspector({
   onClose,
   changesKey,
   focusPath,
+  focusLine = null,
+  projectId = null,
+  onFocus,
+  onOpenTurn,
   onConfigure,
+  copy,
   draft = false,
 }: {
   source: ThreadSource;
@@ -860,7 +929,16 @@ export function Inspector({
   onClose: () => void;
   changesKey: number;
   focusPath: string | null;
+  /** The line a design finding names, marked in the file's hunks. */
+  focusLine?: number | null;
+  projectId?: string | null;
+  /** Opens a tab at a file, and at a line in Changes. */
+  onFocus?: (tab: InspectorTab, path: string, line: number | null) => void;
+  /** Scrolls the thread to a turn and marks it, as a search result does. */
+  onOpenTurn?: (turnId: string) => void;
   onConfigure: (patch: ThreadSettings) => void;
+  /** The thread's own dependency copy and the Prepare dependencies the Work and Changes tabs share. */
+  copy?: ThreadCopy;
   /**
    * A new thread before its first send. Only Crew and Thread show, and their changes wait in the
    * new thread until the send creates it.
@@ -869,8 +947,24 @@ export function Inspector({
 }) {
   const panel = useRef<HTMLElement>(null);
   const size = useInspectorWidth(panel);
+  const strip = useRef<HTMLDivElement>(null);
   const extensionRead = useExtensions(source).read;
   const extensionTabs = slotsOf(extensionRead, 'inspector-tab');
+  // The Design tab shows only for a project with a saved design system.
+  const design = useDesignFindings(source, taskId, draft ? null : projectId, thread, changesKey);
+  const { open: openDesignSystem } = useDesignSystems();
+  const missingDesign = tab === 'design' && design.checked && !design.hasSystem;
+  const shownTabs = draft
+    ? tabs.filter(({ id }) => draftTabs.includes(id))
+    : [
+        ...tabs.filter(({ id }) => id !== 'design' || design.hasSystem),
+        ...extensionTabs.map((slot) => ({ id: extensionTabId(slot), label: slot.title })),
+      ];
+  // The row is measured again when a tab comes or goes or the Design count changes its width.
+  const fade = useOverflowEdges(strip, `${shownTabs.map(({ id }) => id).join()}:${design.open}`);
+  useEffect(() => {
+    if (missingDesign && !draft && projectId) onTab('changes');
+  }, [missingDesign, draft, projectId, onTab]);
   // An extension tab whose extension turned off falls back to Changes once the read is in.
   const missingTab =
     !draft &&
@@ -906,14 +1000,8 @@ export function Inspector({
         onSave={size.save}
       />
       <div className="th-inspector-head">
-        <div role="tablist" aria-label="Inspector sections">
-          {(draft
-            ? tabs.filter(({ id }) => draftTabs.includes(id))
-            : [
-                ...tabs,
-                ...extensionTabs.map((slot) => ({ id: extensionTabId(slot), label: slot.title })),
-              ]
-          ).map((item) => (
+        <div ref={strip} role="tablist" aria-label="Inspector sections" data-fade={fade}>
+          {shownTabs.map((item) => (
             <button
               key={item.id}
               type="button"
@@ -922,9 +1010,17 @@ export function Inspector({
               aria-selected={tab === item.id}
               aria-controls="th-inspector-panel"
               className={tab === item.id ? 'active' : ''}
+              aria-label={
+                item.id === 'design' && design.open > 0
+                  ? `Design, ${design.open} open ${design.open === 1 ? 'finding' : 'findings'}`
+                  : undefined
+              }
               onClick={() => onTab(item.id)}
             >
               {item.label}
+              {item.id === 'design' && design.open > 0 && (
+                <span className="th-tab-count">{design.open}</span>
+              )}
             </button>
           ))}
         </div>
@@ -942,10 +1038,47 @@ export function Inspector({
           <ChangesPanel
             source={source}
             taskId={taskId}
+            projectId={draft ? null : projectId}
             title={title}
             thread={thread}
             refreshKey={changesKey}
             focusPath={focusPath}
+            focusLine={focusLine}
+            designCounts={design.hasSystem ? design.byFile : null}
+            onOpenDesign={(path) => onFocus?.('design', path, null)}
+            preparing={copy?.preparing}
+          />
+        )}
+        {tab === 'work' && copy && (
+          <WorkTab
+            source={source}
+            taskId={taskId}
+            thread={thread}
+            turns={turns}
+            copy={copy}
+            onOpenTurn={(turnId) => onOpenTurn?.(turnId)}
+          />
+        )}
+        {tab === 'design' && !design.checked && (
+          <p className="th-muted">Reading the design system.</p>
+        )}
+        {tab === 'design' && design.hasSystem && (
+          <DesignTab
+            state={design}
+            focusFile={focusPath}
+            onOpenChanges={(path, line) => onFocus?.('changes', path, line)}
+            onUpdateSystem={(finding) => {
+              if (projectId)
+                openDesignSystem({
+                  projectId,
+                  add: {
+                    group: RULE_GROUP[finding.rule],
+                    value: finding.found,
+                    file: finding.file,
+                    line: finding.line,
+                  },
+                });
+            }}
           />
         )}
         {tab === 'usage' && <UsageTab source={source} header={header} preview={preview} />}

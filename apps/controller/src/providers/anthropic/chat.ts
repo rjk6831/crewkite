@@ -18,6 +18,7 @@ import { performance } from 'node:perf_hooks';
 import {
   type AgentEvent,
   type AnthropicUsageReadingSchema,
+  type BillingMode,
   type ChatFailure,
   type ChatPermissionOption,
   type ChatPermissionPolicy,
@@ -45,7 +46,11 @@ import { GitCeilingError, withGitCeiling } from '../../host/git-ceiling.ts';
 import { defaultSchedule, groupAbsent, type Schedule } from '../../host/worker.ts';
 import { recordClient } from '../client-record.ts';
 import { fileDigestSync } from '../file-digest.ts';
-import { armOwnedCleanup } from './native-discovery.ts';
+import {
+  armOwnedCleanup,
+  ownedClaudeConfigDir,
+  prepareClaudeConfigDir,
+} from './native-discovery.ts';
 import { knownFlags, RESULT_SUBTYPES, withKnownFlags } from './protocol.ts';
 
 // One chat turn on the official claude client: `--print` with stream-json in both directions,
@@ -130,6 +135,17 @@ const frame = z.object({
   subtype: z.string().optional(),
   parent_tool_use_id: z.string().nullish(),
 });
+// The values the client reports when it found an API key: its own settings, a helper, the
+// environment. A subscription sign-in reports none. Matching exact names keeps an unfamiliar value
+// from stopping a subscription turn.
+const API_KEY_SOURCES = new Set([
+  'user',
+  'project',
+  'org',
+  'temporary',
+  'apiKeyHelper',
+  'ANTHROPIC_API_KEY',
+]);
 // effort is the level the client sends after its own default, caps and model downgrades, and
 // null when it sends none. Builds that do not publish it leave it out.
 const init = z.object({
@@ -138,6 +154,9 @@ const init = z.object({
   effort: ChatSetEffortSchema.nullish().catch(undefined),
   // The names the client lists for feature detection. A list that changed shape drops out.
   capabilities: z.array(z.string().max(80)).max(64).optional().catch(undefined),
+  // Where the client found an API key. A subscription sign-in reports none. Builds that do not
+  // publish it leave it out.
+  apiKeySource: z.string().max(80).optional().catch(undefined),
 });
 const streamEvent = z.object({
   event: z.object({
@@ -209,6 +228,8 @@ const result = z.object({
   api_error: loose(z.string()),
   api_error_status: loose(z.number().int()),
   usage: loose(usage),
+  // Dollars the client priced the run at. Read only for an API connection, which bills them.
+  total_cost_usd: loose(z.number().nonnegative().max(1_000_000)),
   modelUsage: loose(
     z.record(z.string(), z.object({ contextWindow: loose(z.number().int().positive()) }).catch({})),
   ),
@@ -325,8 +346,12 @@ export function verifiedExecutable(path: string, sha256: string) {
 // client.
 export function chatEnvironment(source: NodeJS.ProcessEnv, temporary: string): NodeJS.ProcessEnv {
   if (!source.HOME || !isAbsolute(source.HOME)) throw new Error('environment');
+  // An API connection names its profile. The folder is CrewKite's own and the person's
+  // CLAUDE_CONFIG_DIR is never passed on, so the subscription sign-in is not touched.
+  const owned = ownedClaudeConfigDir(source);
   return {
     HOME: source.HOME,
+    ...(owned ? { CLAUDE_CONFIG_DIR: owned } : {}),
     USER: userInfo().username,
     PATH: source.PATH || '/usr/bin:/bin',
     LANG: source.LANG || 'C',
@@ -569,11 +594,23 @@ export function anthropicChatAdapter(deps: {
   schedule?: Schedule;
   /** Each rate limit frame that reports a window. The last one in a turn is the newest. */
   onUsage?: (reading: UsageReading) => void;
+  /**
+   * The mode the client reported at system/init for a turn on a connection, read before anything
+   * was sent. The controller records it as the connection's proof. Null when the client named no
+   * source CrewKite knows.
+   */
+  onAccountMode?: (proof: {
+    connectionId: string;
+    mode: BillingMode | null;
+    proofGeneration: number;
+  }) => void;
   /** The thread tools server for this turn, with its own token. Null runs the turn without. */
   threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
 }): ChatAdapter {
   return {
     family: 'anthropic',
+    // The mode shows in system/init before the turn sends its first request.
+    connectionModes: ['subscription', 'api'],
     startTurn: (request, emit) => {
       const turn = turnTools(deps.threadTools, request, emit);
       return startTurn({ ...deps, threadTools: () => turn.server }, turn.request, emit);
@@ -655,7 +692,11 @@ function startTurn(
     if (!isAbsolute(scratch) || !isAbsolute(request.work.directory)) throw new Error();
     const temporary = join(request.work.directory, 'tmp');
     mkdirSync(temporary, { recursive: true, mode: 0o700 });
-    environment = withGitCeiling(chatEnvironment(request.environment, temporary), scratch);
+    const { CREWKITE_CLAUDE_PROFILE: _own, ...base } = request.environment;
+    const api = request.connection?.billingMode === 'api' ? request.connection : null;
+    const profileEnvironment = api ? { ...base, CREWKITE_CLAUDE_PROFILE: api.profileId } : base;
+    prepareClaudeConfigDir(profileEnvironment);
+    environment = withGitCeiling(chatEnvironment(profileEnvironment, temporary), scratch);
   } catch (error) {
     return refuse(
       chatFailure({
@@ -780,6 +821,8 @@ function startTurn(
   let resultSeen = false;
   let outcome: Outcome | null = null;
   let usageSeen: ChatTurnResult['usage'] = null;
+  // Dollars the client priced the run at, in millionths. Null until a result carries one.
+  let costMicros: number | null = null;
   let lastCall: number | null = null;
   let apiError: { kind: ChatFailure['kind']; resetsAt: string | null } | null = null;
   let closed = false;
@@ -996,6 +1039,50 @@ function startTurn(
   const onInit = (value: unknown) => {
     const parsed = init.safeParse(value);
     if (!parsed.success) return unreadable('system/init');
+    // The client reports where it found an API key before its first request, and none for a
+    // subscription sign-in. That is the mode the turn would bill in. It has to be the mode the
+    // person chose, so a mismatch stops the turn here, before anything was sent, and the work can
+    // move to another provider. A value it does not know goes to the trace.
+    const key = parsed.data.apiKeySource;
+    const observed: BillingMode | null =
+      key !== undefined && API_KEY_SOURCES.has(key)
+        ? 'api'
+        : key === 'none'
+          ? 'subscription'
+          : null;
+    const chosen: BillingMode = request.connection?.billingMode ?? 'subscription';
+    if (request.connection)
+      deps.onAccountMode?.({
+        connectionId: request.connection.connectionId,
+        mode: observed,
+        proofGeneration: request.connection.proofGeneration,
+      });
+    // A subscription turn with no named source stays as before. A connection turn needs the proof.
+    const mismatch = observed === null ? request.connection !== undefined : observed !== chosen;
+    if (mismatch) {
+      decide(
+        'error',
+        chatFailure({
+          stage: 'session',
+          kind: 'signed-out',
+          message:
+            chosen === 'api'
+              ? 'The Anthropic client is not signed in with an API account for this connection, so CrewKite stopped the turn before it sent anything.'
+              : 'The Anthropic client would bill an API key, so CrewKite stopped the turn before it sent anything.',
+          providerMessage: null,
+          method: 'system/init',
+          nextAction:
+            chosen === 'api'
+              ? 'Run the sign-in line for this connection in your own terminal, then check the connection.'
+              : 'Remove the API key from Claude Code settings, run claude auth login with your Claude subscription account, then check the Anthropic sign-in in Settings.',
+        }),
+      );
+      endInput();
+      signal('SIGTERM');
+      return;
+    }
+    if (key !== undefined && key !== 'none' && observed === null)
+      unknown(`system/init apiKeySource ${clip(key, 40)}`);
     session = parsed.data.session_id;
     if (parsed.data.model) model = parsed.data.model;
     if (parsed.data.capabilities?.length && build)
@@ -1338,6 +1425,7 @@ function startTurn(
       const data = parsed.data;
       const reported = sessionId.safeParse(data.session_id);
       if (reported.success) session ??= reported.data;
+      if (data.total_cost_usd != null) costMicros = Math.round(data.total_cost_usd * 1_000_000);
       const windows = Object.values(data.modelUsage ?? {});
       const capacity =
         data.modelUsage?.[model]?.contextWindow ??
@@ -1360,7 +1448,19 @@ function startTurn(
           providerMessage: clip(text, 16_384) || null,
           method: `result/${label(data.subtype)}`,
         };
-        if (
+        // A subtype the client does not document is a release CrewKite has not read. Its text
+        // decides nothing, so a line in it that mentions a limit never moves the work elsewhere.
+        if (!RESULT_SUBTYPES.has(data.subtype ?? ''))
+          decide(
+            'error',
+            chatFailure({
+              ...base,
+              stage: 'finish',
+              kind: 'completion-unknown',
+              message: `The client ended the turn with a result CrewKite does not know (${base.method}). Check for a CrewKite update.`,
+            }),
+          );
+        else if (
           apiError?.kind === 'usage-limit' ||
           data.api_error === 'usage_limit_reached' ||
           USAGE_LIMIT.test(text)
@@ -1402,14 +1502,12 @@ function startTurn(
         else
           decide(
             'error',
+            // The turn limit is a known step limit, so the work stopped partway.
             chatFailure({
               ...base,
-              kind: 'protocol',
-              // A subtype the client documents has its own line. A new one is a release CrewKite
-              // has not read, and the turn ends in the client's own words.
-              message: !RESULT_SUBTYPES.has(data.subtype ?? '')
-                ? `The client ended the turn with a result CrewKite does not know (${base.method}). Check for a CrewKite update.`
-                : data.subtype === 'error_max_turns'
+              kind: data.subtype === 'error_max_turns' ? 'incomplete' : 'protocol',
+              message:
+                data.subtype === 'error_max_turns'
                   ? 'The client reached its turn limit before it finished.'
                   : 'The client reported an error and ended the turn.',
             }),
@@ -1544,6 +1642,16 @@ function startTurn(
             : null,
       usage: usageSeen,
       changedPaths: [...changed],
+      // Only a connection that bills per token has a spend, and only the client's own figure counts.
+      ...(request.connection?.billingMode === 'api' && costMicros !== null
+        ? {
+            spend: {
+              reported: { amountMicros: costMicros, currency: 'USD' as const },
+              estimated: null,
+              unreportedTurns: 0,
+            },
+          }
+        : {}),
     });
   };
   // Close input, interrupt, then escalate. armOwnedCleanup sends SIGKILL at one second and

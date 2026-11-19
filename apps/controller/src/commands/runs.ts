@@ -559,6 +559,7 @@ export class RunCommands {
         scratchPath,
         this.now(),
       );
+    this.store.recordLaunchIdentity('launch', attempt.id, this.launchIdentity, this.now());
     if (combined) {
       const member = this.store
         .combinedMembers(combined.run_id)

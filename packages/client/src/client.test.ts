@@ -2,7 +2,15 @@ import assert from 'node:assert/strict';
 import { execFileSync, spawn } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { once } from 'node:events';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import { createServer, type Socket } from 'node:net';
 import { dirname, join, resolve } from 'node:path';
 import { test } from 'node:test';
@@ -28,6 +36,10 @@ import {
 } from './node.ts';
 
 const token = 'a'.repeat(64);
+// The CLI refuses a controller that records another schema than the migrations it bundles.
+const bundledSchema = readdirSync(
+  new URL('../../../apps/controller/migrations/', import.meta.url),
+).filter((name) => name.endsWith('.sql')).length;
 const actor = { id: 'terminal', kind: 'cli' as const };
 const suffix = '01ARZ3NDEKTSV4RRFFQ69G5FAV';
 const task = {
@@ -106,7 +118,7 @@ async function serve(
   try {
     server.listen(socketPath);
     await once(server, 'listening');
-    publishControllerSocket(home, socketPath);
+    publishControllerSocket(home, socketPath, bundledSchema);
   } catch (error) {
     rmSync(base, { recursive: true, force: true });
     throw error;
@@ -643,6 +655,7 @@ test('CLI actions preserve controller bindings and validate exported bytes', asy
     auth: { method: 'oauth-personal', status: 'authenticated' },
     reason: 'qualification-pending',
     googleTerms: null,
+    modelRefresh: null,
   };
   const acpCases = [
     'show',

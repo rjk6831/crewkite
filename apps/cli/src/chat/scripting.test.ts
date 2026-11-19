@@ -6,8 +6,11 @@ import { test } from 'node:test';
 import { CLI_JSON_LINE_SHAPE, type CliJsonLine, CliJsonLineSchema } from '@crewkite/contracts';
 import { cliJsonLineShape } from '../../../../packages/contracts/src/cli-shape.ts';
 import { createSyntheticRepository } from '../../../../packages/testkit/src/repository.ts';
+import { OperationStore } from '../../../controller/src/commands/operation-store.ts';
+import { installedTools } from '../../../controller/src/store/controller-fixture.ts';
 import { printRequested, runCli } from '../main.ts';
 import { startScriptedController } from '../scripted-controller.ts';
+import type { ChatClient } from './client.ts';
 import { connectChat } from './connect.ts';
 import { runPrint, waitingQueueLine } from './scripting.ts';
 
@@ -363,22 +366,125 @@ test('thread commands with --json write only lines the published schema accepts'
     assert.equal(refused.io.out, '', args.join(' '));
   }
 
-  // Accept makes a local branch. Push without --confirm sends nothing and says what it would do.
+  // Accept makes a local branch. Push without --confirm sends nothing and names the commit it
+  // would push. A push that names another commit is refused before git runs.
   const accept = capture(parse);
   assert.equal(
     await runCli(
-      ['thread', 'accept', taskId, 'cli/clamp-discount', '--json', '--home', home],
+      ['thread', 'accept', taskId, 'feat/clamp-discount', '--json', '--home', home],
       accept.output,
     ),
     0,
   );
-  const push = capture(parse);
-  assert.equal(await runCli(['thread', 'push', taskId, '--json', '--home', home], push.output), 2);
+  const accepted = lines.at(-1);
+  const commit =
+    accepted?.kind === 'result' ? (accepted.data as { commit?: string } | undefined)?.commit : '';
+  const push = (...args: string[]) =>
+    runCli(['thread', 'push', taskId, ...args, '--json', '--home', home], capture(parse).output);
+  assert.equal(await push(), 2);
   const last = lines.at(-1);
-  assert.match(
+  assert.equal(
     last?.kind === 'error' ? last.message : '',
-    /cli\/clamp-discount to origin[\s\S]*--confirm/,
+    `This pushes commit ${commit} to feat/clamp-discount on origin with your own git credentials. Run it again with --confirm --commit ${commit} to push.`,
   );
+  assert.equal(await push('--confirm', '--commit', '0'.repeat(40)), 2);
+  const stale = lines.at(-1);
+  assert.deepEqual(stale?.kind === 'result' && [stale.command, stale.reason], [
+    'PushChatBranch',
+    'branch-not-accepted',
+  ]);
+
+  // A merge check needs a base: the pull request's, or --base. The project has no origin, so the
+  // controller's fetch fails on this computer and its refusal comes back as one result line.
+  const merge = (...args: string[]) =>
+    runCli(
+      ['thread', 'merge-check', taskId, ...args, '--json', '--home', home],
+      capture(parse).output,
+    );
+  assert.equal(await merge(), 2);
+  const unnamed = lines.at(-1);
+  assert.match(unnamed?.kind === 'error' ? unnamed.message : '', /--base/);
+  assert.equal(await merge('--base', 'main'), 2);
+  const checked = lines.at(-1);
+  assert.deepEqual(
+    checked?.kind === 'result' && [checked.command, checked.outcome, checked.reason],
+    ['CheckChatMerge', 'blocked', 'fetch-failed'],
+  );
+});
+
+// Claim: a refused send prints its admission, exits notDone and never waits for a turn. The
+// controller's answer is injected, and the thread never opens a turn.
+test('print mode writes a refused admission, exits 2 and does not wait for a turn', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'crewkite-home-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const taskId = 'tsk_01HZZZZZZZZZZZZZZZZZZZZZZZ';
+  const read = {
+    thread: { taskId, activeTurnId: null, permissionPolicy: 'ask', queued: [] },
+    turns: [],
+    messages: [],
+    liveEvents: [],
+    cursor: '0',
+  };
+  const model = { model: 'm', label: 'm', defaultEffort: 'default' };
+  const catalog = {
+    families: [{ family: 'openai', connected: true, defaultModel: 'm', models: [model] }],
+  };
+  let waits = 0;
+  const client = {
+    readCatalog: async () => catalog,
+    readThread: async () => read,
+    send: async () => ({
+      outcome: 'blocked',
+      reason: 'credits-paused',
+      next: 'Turn credit spending on in Settings or pick another provider.',
+    }),
+    transport: {
+      subscribe: async () => {
+        waits += 1;
+        return () => {};
+      },
+      close: () => {},
+    },
+  } as unknown as ChatClient;
+  const run = capture();
+  const code = await runPrint(
+    ['-p', 'Fix it', '--thread', taskId, '--model', 'openai', '--json', '--home', home],
+    run.output,
+    async () => client,
+  );
+  assert.equal(code, 2);
+  const lines = run.io.out
+    .split('\n')
+    .filter(Boolean)
+    .map((value) => CliJsonLineSchema.parse(JSON.parse(value)));
+  assert.deepEqual(
+    lines.map((value) => value.kind),
+    ['result'],
+  );
+  const [result] = lines;
+  assert.deepEqual(result.kind === 'result' && result.admission, {
+    outcome: 'refused',
+    reason: 'credits-paused',
+    message: 'OpenAI is out of included allowance and credit spending is off.',
+    next: 'Turn credit spending on in Settings or pick another provider.',
+  });
+  assert.equal(waits, 1);
+});
+
+// Claim: with --json, an option that does not parse still ends in a JSON error line.
+test('an unknown option with --json prints a JSON error line', async () => {
+  for (const args of [
+    ['-p', 'Hello', '--bogus', '--json'],
+    ['thread', 'list', '--bogus', '--json'],
+  ]) {
+    const run = capture();
+    const code = await (args[0] === '-p'
+      ? runPrint(args, run.output, connectChat)
+      : runCli(args, run.output));
+    assert.equal(code, 2, args.join(' '));
+    const line = CliJsonLineSchema.parse(JSON.parse(run.io.out));
+    assert.equal(line.kind, 'error', args.join(' '));
+  }
 });
 
 test('a computer without git reports degraded health and names git when it refuses a project', {
@@ -436,4 +542,82 @@ test('thread stop names how many queued messages wait behind it and says nothing
     },
   ];
   for (const row of rows) assert.equal(waitingQueueLine(row.result), row.line, row.name);
+});
+
+// Claim: release-check sends nothing until the person adds --confirm and one quoted note within
+// its bound, and then the controller releases the thread. The check here journaled its start and never recorded a group.
+test('release-check refuses without confirm and note, and releases with both', {
+  timeout: 60_000,
+}, async (t) => {
+  // Only git on PATH, so nothing the controller runs can find gh or a provider client.
+  const tools = mkdtempSync(join(tmpdir(), 'crewkite-path-'));
+  const saved = process.env.PATH;
+  process.env.PATH = installedTools(tools, 'git');
+  t.after(() => {
+    process.env.PATH = saved;
+    rmSync(tools, { recursive: true, force: true });
+  });
+  const { home, repository, controller } = await startScriptedController(t, []);
+  const added = capture();
+  assert.equal(
+    await runCli(['project', 'add', repository, '--json', '--home', home], added.output),
+    0,
+  );
+  const client = await connectChat(home);
+  const taskId = (await client.createThread(JSON.parse(added.io.out).result.entity.id, 'Hold')).id;
+  client.transport.close();
+  const id = (prefix: string) => `${prefix}_${'0'.repeat(25)}1`;
+  const definition = { id: id('art'), hash: 'a'.repeat(64), bytes: 0, mediaType: 'text/plain' };
+  const now = () => new Date(0).toISOString();
+  const journal = new OperationStore(controller.store, now);
+  journal.createAndBegin(
+    { id: id('cmd'), taskId, kind: 'project-command', definition },
+    `cmd_${'0'.repeat(25)}2`,
+    'b'.repeat(64),
+    () => {},
+    () => controller.store.put('artifact', definition.id, 0, definition),
+  );
+  journal.phase(id('cmd'), 'command', 'intent', null);
+  journal.finish(
+    id('cmd'),
+    { state: 'unknown', reason: 'operation-ownership-unknown', next: null },
+    { outcome: 'blocked', reason: 'operation-ownership-unknown' },
+  );
+  const refusal = `This releases a thread held by a check CrewKite cannot confirm ended. If its process still runs, it can change files in the thread's copy. Add --confirm and --note "<what you checked>" to release it.\n`;
+  // An unquoted note and one over the bound refuse before anything is sent too.
+  for (const [args, line] of [
+    [['--confirm'], refusal],
+    [['--note', 'Nothing was running.'], refusal],
+    [['--confirm', '--note', 'Nothing', 'running.'], 'Quote a message that has spaces.\n'],
+    [['--confirm', '--note', 'x'.repeat(301)], 'A note is at most 300 bytes.\n'],
+  ] as const) {
+    const run = capture();
+    const code = await runCli(
+      ['thread', 'release-check', taskId, ...args, '--home', home],
+      run.output,
+    );
+    assert.equal(code, 2, args.join(' '));
+    assert.equal(run.io.err, line, args.join(' '));
+  }
+  assert.equal(journal.get(id('cmd'))?.state, 'unknown');
+  const released = capture();
+  assert.equal(
+    await runCli(
+      [
+        'thread',
+        'release-check',
+        taskId,
+        '--confirm',
+        '--note',
+        'Nothing was running.',
+        '--home',
+        home,
+      ],
+      released.output,
+    ),
+    0,
+    released.io.err,
+  );
+  assert.equal(released.io.out, "Released. CrewKite never confirmed the check's process ended.\n");
+  assert.equal(journal.get(id('cmd'))?.state, 'failed');
 });

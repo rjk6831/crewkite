@@ -6436,7 +6436,7 @@ test('an appointed native proposal is retained and applied once after every phas
           'local-owner',
         )
       ).reason,
-      passedReview ? 'git-identity-missing' : 'native-pilot-retain-only',
+      passedReview ? 'policy-identity' : 'native-pilot-retain-only',
     );
     controller = await context.restart();
     const intents = controller.store.intents().length;
@@ -8339,7 +8339,7 @@ test('google quota authority survives retries and restart while sharing one oper
   );
   assert.equal(controller.store.intents().length, 0);
   controller.store.transaction(() =>
-    controller.store.finishGoogleMetadata(setupId, null, context.clock.now()),
+    controller.store.finishGoogleMetadata(setupId, null, context.clock.now(), 'closed'),
   );
   const writer = {
     id: context.id('att'),
@@ -8420,17 +8420,17 @@ test('google quota authority survives retries and restart while sharing one oper
       { outcome: 'outcome-unknown', reason: 'usage-read-pending' },
     );
   });
+  const observedAt = controller.store.googleUsageReader().last_observed_at;
   await controller.close();
   const recoveryLaunches = launches;
+  // Startup probes the recorded group once with signal 0 and sends nothing else. ESRCH settles the
+  // read. Its result stays unknown and the earlier observations stay.
   const originalKill = process.kill;
-  let historicalProbes = 0;
-  process.kill = (pid, signal) => {
-    if (pid === -absentGroup) {
-      historicalProbes++;
-      throw new Error('A historical metadata group cannot establish stream closure.');
-    }
-    return originalKill(pid, signal);
-  };
+  const historicalProbes: Parameters<typeof process.kill>[] = [];
+  process.kill = ((...args: Parameters<typeof process.kill>) => {
+    if (args[0] === -absentGroup) historicalProbes.push(args);
+    return originalKill(...args);
+  }) as typeof process.kill;
   try {
     controller = new Controller({
       ...options,
@@ -8441,21 +8441,22 @@ test('google quota authority survives retries and restart while sharing one oper
   } finally {
     process.kill = originalKill;
   }
-  assert.equal(historicalProbes, 0);
+  assert.deepEqual(historicalProbes, [[-absentGroup, 0]]);
   assert.equal(
     controller.store.googleMetadataOperations().find((row) => row.command_id === closedCommand.key)
-      ?.state,
-    'unknown',
+      ?.settlement,
+    'owner-absent',
   );
+  assert.equal(controller.store.googleUsageReader().last_observed_at, observedAt);
+  // A retry of the settled command answers from its receipt and starts nothing.
   assert.equal(
     (await controller.execute(closedCommand, 'local-owner')).reason,
     'google-ownership-unknown',
   );
-  assert.equal(
-    (await controller.execute(refresh(), 'local-owner')).reason,
-    'google-ownership-unknown',
-  );
   assert.equal(launches, recoveryLaunches);
+  // The gate is free again, so a new read runs.
+  assert.equal((await controller.execute(refresh(), 'local-owner')).outcome, 'applied');
+  assert.equal(launches, recoveryLaunches + 1);
   await controller.close();
   const unknownHome = join(context.directory, 'unknown-home');
   controller = new Controller({
@@ -10320,7 +10321,10 @@ test('an acp scratch permission binds one live action and crash recovery cannot 
     controller = new Controller({ ...options, home: context.controller.home, now: clock.now, id });
     // Every recorded group is absent, so recovery settles the turn without inventing a
     // terminal response. The outcome stays unknown and the writer no longer holds the intent.
-    // The orphan setup operation above still blocks the gate on its own.
+    // The orphan setup step above recorded no group, so startup recovery leaves it holding the
+    // gate on its own: it may have spawned a process the journal cannot name.
+    assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'unknown');
+    assert.equal(controller.store.googleAcpSetup().state, 'unknown');
     assert.equal(controller.store.get<Attempt>('attempt', intent.attempt_id)?.state, 'unknown');
     assert.equal(controller.store.receipt(`native-acp-terminal:${intent.attempt_id}`), undefined);
     assert(controller.store.receipt(`native-unknown-settled:${intent.attempt_id}`));

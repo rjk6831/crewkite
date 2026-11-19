@@ -4,18 +4,18 @@
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(min(100%, 300px), 1fr));
   align-items: start;
-  gap: 14px;
+  gap: var(--space-7);
   color: var(--text);
   -webkit-font-smoothing: antialiased;
 }
 .usage-gauges-card {
   container: usage-card / inline-size;
   display: grid;
-  gap: 14px;
+  gap: var(--space-7);
   min-width: 0;
-  padding: 14px 16px 12px;
+  padding: var(--space-7) var(--space-8) var(--space-6);
   border: 1px solid var(--border);
-  border-radius: 14px;
+  border-radius: var(--radius-7);
   background:
     radial-gradient(
       120% 70% at 50% 0%,
@@ -23,14 +23,14 @@
       transparent 70%
     ),
     var(--surface);
-  box-shadow: inset 0 1px 0 #ffffff08;
+  box-shadow: var(--shadow-highlight);
 }
 .usage-gauges-card-header {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
   flex-wrap: wrap;
-  gap: 8px 14px;
+  gap: var(--space-4) var(--space-7);
 }
 .usage-gauges-card-header h3 {
   font-size: 14px;
@@ -39,7 +39,7 @@
   overflow-wrap: anywhere;
 }
 .usage-gauges-scope {
-  margin-top: 3px;
+  margin-top: var(--space-2);
   color: var(--text-dim);
   font-size: 11.5px;
   overflow-wrap: anywhere;
@@ -47,17 +47,17 @@
 .usage-gauges-tags {
   display: flex;
   flex-wrap: wrap;
-  gap: 6px;
+  gap: var(--space-3);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 .usage-gauges-tags li {
-  padding: 1px 7px;
+  padding: var(--space-1) var(--space-4);
   border: 1px solid var(--border-strong);
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   color: var(--text-muted);
-  font-family: "JetBrains Mono", monospace;
+  font-family: var(--font-code);
   font-size: 10px;
   line-height: 1.7;
   overflow-wrap: anywhere;
@@ -65,9 +65,9 @@
 .usage-gauges-notice {
   display: flex;
   align-items: flex-start;
-  gap: 7px;
-  padding: 6px 9px;
-  border-radius: 8px;
+  gap: var(--space-4);
+  padding: var(--space-3) var(--space-5);
+  border-radius: var(--radius-4);
   background: var(--surface-raised);
   color: var(--text-muted);
   font-size: 11px;
@@ -76,12 +76,12 @@
 }
 .usage-gauges-notice svg {
   flex-shrink: 0;
-  margin-top: 2px;
+  margin-top: var(--space-1);
 }
 .usage-gauges-empty {
-  padding: 22px 16px;
+  padding: var(--space-11) var(--space-8);
   border: 1px dashed var(--border-strong);
-  border-radius: 10px;
+  border-radius: var(--radius-5);
   color: var(--text-muted);
   font-size: 12.5px;
   text-align: center;
@@ -92,16 +92,16 @@
   align-items: start;
   grid-template-columns: repeat(auto-fit, minmax(min(100%, 110px), 1fr));
   justify-items: center;
-  gap: 12px;
+  gap: var(--space-6);
 }
 .usage-gauges-auxiliary,
 .usage-gauges-ledger {
-  padding-top: 16px;
+  padding-top: var(--space-8);
   border-top: 1px solid var(--border);
 }
 .usage-gauges-auxiliary h4,
 .usage-gauges-ledger h4 {
-  margin-bottom: 10px;
+  margin-bottom: var(--space-5);
   color: var(--text-dim);
   font-size: 10px;
   font-weight: 600;
@@ -113,14 +113,14 @@
   display: grid;
   justify-items: center;
   align-content: start;
-  gap: 8px;
+  gap: var(--space-4);
   width: 100%;
   min-width: 0;
   max-width: 280px;
   margin: 0;
-  padding: 12px 10px;
+  padding: var(--space-6) var(--space-5);
   border: 1px solid transparent;
-  border-radius: 14px;
+  border-radius: var(--radius-7);
   text-align: center;
 }
 .usage-gauge.tone-low {
@@ -150,7 +150,7 @@
   display: flex;
   flex-wrap: wrap;
   justify-content: center;
-  gap: 4px;
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -159,10 +159,10 @@
   --chip: var(--text-muted);
   display: inline-flex;
   align-items: center;
-  gap: 4px;
-  padding: 0 7px;
+  gap: var(--space-2);
+  padding: 0 var(--space-4);
   border: 1px solid color-mix(in srgb, var(--chip) 35%, var(--border));
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: color-mix(in srgb, var(--chip) 8%, transparent);
   color: color-mix(in srgb, var(--chip) 70%, var(--text));
   font-size: 10.5px;
@@ -284,7 +284,7 @@
 .usage-gauge-value {
   display: grid;
   justify-items: center;
-  gap: 1px;
+  gap: var(--space-1);
   margin: 0;
   line-height: 1;
 }
@@ -296,7 +296,6 @@
   font-variant-numeric: tabular-nums;
 }
 .usage-gauge-unit {
-  margin-left: 0.04em;
   color: var(--text-muted);
   font-size: 0.45em;
   font-weight: 500;
@@ -322,7 +321,7 @@
 }
 .usage-gauge-lines {
   display: grid;
-  gap: 2px;
+  gap: var(--space-1);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -346,9 +345,9 @@
 .usage-gauge-details summary {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
-  padding: 2px 6px;
-  border-radius: 6px;
+  gap: var(--space-3);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-3);
   list-style: none;
   color: var(--text-dim);
   cursor: pointer;
@@ -373,17 +372,17 @@
 }
 .usage-gauge-details dl {
   display: grid;
-  gap: 4px;
-  margin: 6px 0 0;
-  padding: 8px 10px;
-  border-radius: 8px;
+  gap: var(--space-2);
+  margin: var(--space-3) 0 0;
+  padding: var(--space-4) var(--space-5);
+  border-radius: var(--radius-4);
   background: color-mix(in srgb, var(--background) 60%, var(--surface));
   text-align: left;
 }
 .usage-gauge-details dl > div {
   display: grid;
   grid-template-columns: 72px minmax(0, 1fr);
-  gap: 8px;
+  gap: var(--space-4);
 }
 .usage-gauge-details dt {
   color: var(--text-dim);
@@ -397,7 +396,7 @@
   font-size: 10.5px;
 }
 .usage-gauges-ledger h4 + p {
-  margin: -6px 0 8px;
+  margin: calc(-1 * var(--space-3)) 0 var(--space-4);
   color: var(--text-dim);
   font-size: 11px;
 }
@@ -409,8 +408,8 @@
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto;
   align-items: start;
-  gap: 4px 16px;
-  padding: 8px 0;
+  gap: var(--space-2) var(--space-8);
+  padding: var(--space-4) 0;
   border-top: 1px solid var(--border);
   font-size: 12px;
 }
@@ -424,7 +423,7 @@
 .usage-gauges-ledger dd {
   display: grid;
   justify-items: end;
-  gap: 5px;
+  gap: var(--space-3);
   margin: 0;
   text-align: right;
   font-variant-numeric: tabular-nums;
@@ -440,7 +439,7 @@
   width: 120px;
   height: 4px;
   overflow: hidden;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: var(--surface-hover);
 }
 .usage-gauges-meter-fill {
@@ -455,7 +454,7 @@
   grid-template-columns: repeat(2, minmax(0, 1fr));
   align-items: start;
   justify-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .usage-gauges-cluster[data-featured] {
   grid-template-columns: minmax(0, 1fr) minmax(0, 0.8fr) minmax(0, 1fr);
@@ -478,19 +477,19 @@
   margin-top: 0;
 }
 .usage-gauge.is-clustered {
-  gap: 4px;
+  gap: var(--space-2);
   max-width: 176px;
   padding: 0;
 }
 .usage-gauge.is-clustered.is-constraining {
-  padding: 6px 4px;
+  padding: var(--space-3) var(--space-2);
 }
 @container usage-card (max-width: 340px) {
   .usage-gauge.is-clustered .usage-gauges-chip svg {
     display: none;
   }
   .usage-gauge.is-clustered.is-constraining {
-    padding: 6px 2px;
+    padding: var(--space-3) var(--space-1);
   }
 }
 /* More than two primaries fall back to a grid of dials at the cluster's size. */
@@ -516,7 +515,7 @@
 .usage-gauges-auxiliary > ul {
   display: grid;
   grid-template-columns: minmax(5.5em, 1.5fr) minmax(40px, 1fr) auto auto;
-  gap: 7px 10px;
+  gap: var(--space-4) var(--space-5);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -528,7 +527,7 @@
   grid-column: 1 / -1;
   grid-template-columns: subgrid;
   align-items: center;
-  row-gap: 3px;
+  row-gap: var(--space-2);
   font-size: 11.5px;
   line-height: 1.4;
   font-variant-numeric: tabular-nums;
@@ -549,7 +548,7 @@
 .usage-meter-bar {
   position: relative;
   height: 5px;
-  border-radius: 999px;
+  border-radius: var(--radius-pill);
   background: var(--surface-hover);
 }
 .usage-meter.is-unknown-value .usage-meter-bar {
@@ -571,8 +570,8 @@
   top: -3px;
   bottom: -3px;
   width: 2px;
-  margin-left: -1px;
-  border-radius: 1px;
+  translate: -50%;
+  border-radius: var(--radius-1);
   background: var(--amber);
 }
 .usage-meter-value {
@@ -596,14 +595,14 @@
   display: flex;
   flex-wrap: wrap;
   grid-column: 1 / -1;
-  gap: 4px;
+  gap: var(--space-2);
 }
 /* Each flag keeps the color of what it means, the same as the dial chips. */
 .usage-meter-flag {
   --flag: var(--text-muted);
-  padding: 0 6px;
+  padding: 0 var(--space-3);
   border: 1px solid color-mix(in srgb, var(--flag) 45%, var(--border));
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   color: color-mix(in srgb, var(--flag) 70%, var(--text));
   font-size: 10px;
   font-weight: 500;
@@ -648,11 +647,11 @@
   z-index: 2;
   width: max-content;
   max-width: 220px;
-  padding: 6px 9px;
+  padding: var(--space-3) var(--space-5);
   border: 1px solid var(--border-strong);
-  border-radius: 7px;
+  border-radius: var(--radius-4);
   background: var(--surface-raised);
-  box-shadow: 0 8px 24px #0004;
+  box-shadow: var(--shadow-tooltip);
   color: var(--text);
   font-size: 11px;
   font-weight: 400;
@@ -704,8 +703,8 @@
   flex-wrap: wrap;
   align-items: baseline;
   justify-content: space-between;
-  gap: 4px 12px;
-  padding-top: 9px;
+  gap: var(--space-2) var(--space-6);
+  padding-top: var(--space-5);
   border-top: 1px solid var(--border);
   color: var(--text-dim);
   font-size: 11px;
@@ -727,10 +726,10 @@
   margin-left: auto;
 }
 .usage-gauges-card-details section {
-  padding-top: 8px;
+  padding-top: var(--space-4);
 }
 .usage-gauges-card-details h4 {
-  margin: 0 0 2px;
+  margin: 0 0 var(--space-1);
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 600;
@@ -744,7 +743,7 @@
   position: absolute;
   width: 1px;
   height: 1px;
-  margin: -1px;
+  margin: calc(-1 * var(--space-1));
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;
@@ -831,7 +830,7 @@
   height: 28px;
   padding: 0;
   border: 1px solid var(--border);
-  border-radius: 7px;
+  border-radius: var(--radius-4);
   background: transparent;
   color: var(--text-muted);
   cursor: pointer;

@@ -213,6 +213,17 @@ export class RecoveryCommands {
             data: { kind: 'google-acp-setup', setup: next },
           });
       }
+      // Nothing runs a model refresh across a restart, so its outcome is unknown. Ready and the
+      // earlier catalog stay.
+      const refreshed = this.store.googleAcpSetup();
+      if (refreshed.modelRefresh?.outcome === 'running')
+        this.store.putGoogleAcpSetup(
+          GoogleAcpSetupSchema.parse({
+            ...refreshed,
+            revision: refreshed.revision + 1,
+            modelRefresh: { ...refreshed.modelRefresh, outcome: 'unknown' },
+          }),
+        );
       for (const group of this.store.combinedGroups()) {
         const manifest = this.combinedManifest(group);
         if (group.integration_maximum_minutes !== (manifest.input.integration?.maximumMinutes ?? 1))

@@ -1,3 +1,5 @@
+import { MAX_REVIEW_COMMENT_CHARS, MAX_REVIEW_COMMENTS } from '@crewkite/contracts';
+
 const MAX_METADATA_BYTES = 1024 * 1024;
 const MAX_DIAGNOSTIC_BYTES = 8192;
 const MAX_ARTIFACT_CHUNK_BYTES = 64 * 1024;
@@ -208,24 +210,39 @@ function clientEnvironment(client: GitHubExecutable, repository: GitHubRepositor
   };
 }
 
-function endpoint(...parts: string[]) {
+export function endpoint(...parts: string[]) {
   return `/${parts.map((part) => encodeURIComponent(part)).join('/')}`;
 }
 
-function apiArgv(repository: GitHubRepository, path: string, allowEscapeSequences = false) {
+/**
+ * One GitHub API call through gh. A write sends its JSON body from a file, so a long body never
+ * meets the per-argument limit and nothing in it is read as a gh field flag.
+ */
+export function githubApiArgv(
+  repository: GitHubRepository,
+  method: 'GET' | 'POST' | 'PATCH' | 'PUT',
+  path: string,
+  input?: string,
+): string[] {
   return [
     'api',
     '--method',
-    'GET',
+    method,
     '--hostname',
     repository.host,
     '--header',
     'Accept: application/vnd.github+json',
     '--header',
     'X-GitHub-Api-Version: 2022-11-28',
-    ...(allowEscapeSequences ? ['--allow-escape-sequences'] : []),
+    ...(input ? ['--input', input] : []),
     path,
-  ] as const;
+  ];
+}
+
+function apiArgv(repository: GitHubRepository, path: string, allowEscapeSequences = false) {
+  const argv = githubApiArgv(repository, 'GET', path);
+  if (allowEscapeSequences) argv.splice(-1, 0, '--allow-escape-sequences');
+  return argv as readonly string[];
 }
 
 function metadataPath(request: GitHubReadRequest) {
@@ -324,7 +341,7 @@ export async function* redactGitHubOutput(source: AsyncIterable<Uint8Array>) {
   if (!redacting) yield* boundedChunks(pending);
 }
 
-async function collectBounded(
+export async function collectBounded(
   source: AsyncIterable<Uint8Array>,
   limit: number,
 ): Promise<BoundedRead> {
@@ -370,6 +387,91 @@ function safeUrl(value: unknown, host: string) {
   } catch {
     return null;
   }
+}
+
+// The newest page of review comments, newest first. A pull request with more shows these and says
+// the list was cut. The limits are the contract's.
+
+export type ReviewComment = Readonly<{
+  id: string;
+  author: string;
+  body: string;
+  line: number | null;
+  createdAt: string;
+  inReplyTo: string | null;
+  url: string;
+}>;
+export type ReviewCommentFiles = Readonly<{
+  pullRequest: string;
+  headSha: string;
+  files: readonly Readonly<{ path: string; comments: readonly ReviewComment[] }>[];
+  truncated: boolean;
+}>;
+
+/** The arguments for the two reads behind `reviewCommentsByFile`. */
+export function reviewCommentsArgv(repository: GitHubRepository, pullRequest: string) {
+  const pull = `${endpoint('repos', repository.owner, repository.name)}${endpoint('pulls', pullRequest)}`;
+  return {
+    pull: githubApiArgv(repository, 'GET', pull),
+    comments: githubApiArgv(
+      repository,
+      'GET',
+      `${pull}/comments?sort=created&direction=desc&per_page=${MAX_REVIEW_COMMENTS}`,
+    ),
+  };
+}
+
+/**
+ * A pull request's review comments grouped by file, oldest first in each file. The pull request
+ * read must name the number asked for and, when a head is given, that head, so comments are never
+ * shown against a commit they were not read for. Null when either read does not fit.
+ */
+export function reviewCommentsByFile(
+  pull: unknown,
+  comments: unknown,
+  binding: { host: string; pullRequest: string; headSha: string | null },
+): ReviewCommentFiles | null {
+  if (!pull || typeof pull !== 'object' || !Array.isArray(comments)) return null;
+  const head = (pull as JsonObject).head;
+  const headSha = head && typeof head === 'object' ? string((head as JsonObject).sha) : null;
+  if (numericId((pull as JsonObject).number) !== binding.pullRequest || !headSha) return null;
+  if (binding.headSha !== null && headSha !== binding.headSha) return null;
+  const byPath = new Map<string, ReviewComment[]>();
+  for (const value of comments.slice(0, MAX_REVIEW_COMMENTS)) {
+    if (!value || typeof value !== 'object') return null;
+    const item = value as JsonObject;
+    const user = item.user && typeof item.user === 'object' ? (item.user as JsonObject) : {};
+    const id = numericId(item.id);
+    const path = string(item.path);
+    const author = string(user.login);
+    const body = string(item.body);
+    const createdAt = string(item.created_at);
+    const url = safeUrl(item.html_url, binding.host);
+    if (!id || !path || !author || body === null || !createdAt || !url) return null;
+    const line = item.line ?? item.original_line;
+    const list = byPath.get(path) ?? [];
+    list.push({
+      id,
+      author,
+      body: body.slice(0, MAX_REVIEW_COMMENT_CHARS),
+      line: typeof line === 'number' && Number.isSafeInteger(line) ? line : null,
+      createdAt,
+      inReplyTo: numericId(item.in_reply_to_id),
+      url,
+    });
+    byPath.set(path, list);
+  }
+  return {
+    pullRequest: binding.pullRequest,
+    headSha,
+    files: [...byPath.entries()]
+      .sort(([left], [right]) => left.localeCompare(right))
+      .map(([path, list]) => ({
+        path,
+        comments: list.sort((left, right) => left.createdAt.localeCompare(right.createdAt)),
+      })),
+    truncated: comments.length >= MAX_REVIEW_COMMENTS,
+  };
 }
 
 function remoteStatus(status: unknown, conclusion: unknown) {

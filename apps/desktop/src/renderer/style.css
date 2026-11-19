@@ -1,72 +1,17 @@
 @import "tailwindcss";
+@import "./tokens.css";
 
 :root {
-  font-family: Inter, -apple-system, BlinkMacSystemFont, sans-serif;
+  font-family: var(--font-ui);
   font-size: 13px;
   font-weight: 400;
   color-scheme: dark;
-  --background: #151718;
-  --sidebar: #111314;
-  --surface: #1b1e20;
-  --surface-raised: #222629;
-  --surface-hover: #292e31;
-  --border: #2b3033;
-  --border-strong: #3a4145;
-  --text: #e5e8e7;
-  --text-muted: #a1aaa8;
-  --text-dim: #8f9996;
-  --accent: #d0e7a1;
-  --accent-ink: #202a17;
-  --accent-soft: #d0e7a110;
-  --blue: #8fb9ec;
-  --amber: #e1be83;
-  --red: #ec9992;
-  --green: #9ed3ad;
-  --diff-add-text: var(--green);
-  --diff-del-text: var(--red);
-  /* The four kite panels, one per family: teal, coral, indigo and gold. Fills take the panel
-     colour as drawn; text takes a tint of it that reads at 4.5:1 on every surface. */
-  --family-openai-fill: #40b0a8;
-  --family-anthropic-fill: #e87860;
-  --family-google-fill: #4850a8;
-  --family-local-fill: #e0b860;
-  --family-openai: #5fcfc4;
-  --family-anthropic: #f0917c;
-  --family-google: #9aa2ec;
-  --family-local: #e8c56e;
-  --shadow: 0 24px 100px #0007;
   background: var(--background);
   color: var(--text);
 }
 
 :root[data-theme="light"] {
   color-scheme: light;
-  --background: #f7f8f5;
-  --sidebar: #eff1ed;
-  --surface: #fff;
-  /* Raised and hover fills stand clear of the sidebar and the page, and secondary text reads at
-     6:1 or better on every light surface. */
-  --surface-raised: #e6ebe1;
-  --surface-hover: #dde3d7;
-  --border: #d2d8cd;
-  --border-strong: #b5beaf;
-  --text: #1c241f;
-  --text-muted: #4a584e;
-  --text-dim: #4f5e53;
-  --accent: #426326;
-  --accent-ink: #fff;
-  --accent-soft: #4263260d;
-  --blue: #335f98;
-  --amber: #8e621c;
-  --red: #b64b44;
-  --green: #33744a;
-  --diff-add-text: #276040;
-  --diff-del-text: #9c3a34;
-  --family-openai: #1a6f69;
-  --family-anthropic: #b4482f;
-  --family-google: #3d45a0;
-  --family-local: #7a5d10;
-  --shadow: 0 24px 100px #34482d25;
 }
 
 * {
@@ -135,7 +80,7 @@ a:hover {
 code,
 pre,
 kbd {
-  font-family: "JetBrains Mono", monospace;
+  font-family: var(--font-code);
   font-size: 12px;
 }
 button svg,
@@ -176,12 +121,12 @@ textarea {
   width: 100%;
   background: var(--background);
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
   color: var(--text);
-  padding: 9px 10px;
+  padding: var(--space-5) var(--space-5);
 }
 .ck-select {
-  padding-right: 10px;
+  padding-right: var(--space-5);
 }
 textarea {
   resize: vertical;
@@ -190,7 +135,7 @@ textarea {
 label {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: var(--space-4);
   font-size: 12px;
   color: var(--text-muted);
 }
@@ -202,12 +147,12 @@ label textarea {
 label.check-row {
   flex-direction: row;
   align-items: flex-start;
-  gap: 10px;
+  gap: var(--space-5);
 }
 label.check-row input[type="checkbox"] {
   width: auto;
   flex: none;
-  margin: 3px 0 0;
+  margin: var(--space-2) 0 0;
 }
 fieldset {
   margin: 0;
@@ -224,10 +169,10 @@ th {
   text-align: left;
   font-weight: 400;
   font-size: 11px;
-  padding: 14px 0;
+  padding: var(--space-7) 0;
 }
 td {
-  padding: 13px 0;
+  padding: var(--space-7) 0;
   border-top: 1px solid var(--border);
   font-size: 12px;
 }
@@ -254,7 +199,7 @@ th:not(:first-child) {
   width: 28px;
   height: 28px;
   border: 0;
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   color: var(--text-muted);
   background: transparent;
   flex-shrink: 0;
@@ -267,13 +212,13 @@ th:not(:first-child) {
   display: inline-flex;
   justify-content: center;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   min-height: 34px;
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--radius-3);
   font-size: 12px;
   font-weight: 500;
-  padding: 8px 12px;
+  padding: var(--space-4) var(--space-6);
   white-space: nowrap;
 }
 .button.primary {
@@ -297,13 +242,13 @@ th:not(:first-child) {
   border-color: var(--border-strong);
 }
 .button.stop:hover:not(:disabled) {
-  background: #ec999210;
+  background: color-mix(in srgb, var(--red) 6%, transparent);
   border-color: var(--red);
 }
 .button-row {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .app-shell {
   display: flex;
@@ -315,14 +260,14 @@ th:not(:first-child) {
   flex-shrink: 0;
   background: var(--sidebar);
   border-right: 1px solid var(--border);
-  padding: 0 12px;
+  padding: 0 var(--space-6);
   display: flex;
   flex-direction: column;
 }
 .nav-head {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   flex-shrink: 0;
 }
 .nav-toggle {
@@ -333,11 +278,11 @@ th:not(:first-child) {
   min-width: 0;
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-5);
   height: 68px;
   background: transparent;
   border: 0;
-  padding: 0 8px;
+  padding: 0 var(--space-4);
   font-size: 15px;
   font-weight: 600;
   letter-spacing: -0.35px;
@@ -354,12 +299,12 @@ th:not(:first-child) {
 .prototype-tag {
   margin-left: auto;
   flex-shrink: 0;
-  font-family: "JetBrains Mono", monospace;
+  font-family: var(--font-code);
   font-size: 9px;
   letter-spacing: 0.3px;
   border: 1px solid var(--border-strong);
-  border-radius: 4px;
-  padding: 2px 5px;
+  border-radius: var(--radius-2);
+  padding: var(--space-1) var(--space-3);
   color: var(--text-muted);
 }
 .search-button {
@@ -367,11 +312,11 @@ th:not(:first-child) {
   flex-shrink: 0;
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 9px 8px;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-4);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   color: var(--text-dim);
   font-size: 10px;
 }
@@ -382,15 +327,15 @@ th:not(:first-child) {
 kbd {
   font-size: 9px;
   border: 1px solid var(--border-strong);
-  border-radius: 3px;
-  padding: 1px 4px;
+  border-radius: var(--radius-2);
+  padding: var(--space-1) var(--space-2);
   color: var(--text-dim);
 }
 .nav-label {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin: 20px 4px 4px 7px;
+  margin: var(--space-10) var(--space-2) var(--space-2) var(--space-4);
   color: var(--text-dim);
   font-size: 9px;
   letter-spacing: 1.15px;
@@ -398,8 +343,8 @@ kbd {
 .project-name {
   display: flex;
   align-items: center;
-  gap: 7px;
-  padding: 8px 4px;
+  gap: var(--space-4);
+  padding: var(--space-4) var(--space-2);
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -429,16 +374,16 @@ kbd {
 .task-link {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   width: 100%;
   background: transparent;
   border: 1px solid transparent;
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   font-size: 11px;
   text-align: left;
   color: var(--text-muted);
-  padding: 9px 10px;
-  margin: 3px 0;
+  padding: var(--space-5) var(--space-5);
+  margin: var(--space-2) 0;
 }
 .task-link > span:nth-child(2) {
   overflow: hidden;
@@ -488,31 +433,31 @@ kbd {
 .nav-empty {
   color: var(--text-dim);
   font-size: 11px;
-  padding: 10px 24px;
+  padding: var(--space-5) var(--space-12);
 }
 /* Projects and tasks scroll on their own, so the bottom controls stay reachable in short windows. */
 .nav-scroll {
   flex: 1 1 auto;
   min-height: 0;
-  margin-inline: -12px;
-  padding: 0 12px 8px;
+  margin-inline: calc(-1 * var(--space-6));
+  padding: 0 var(--space-6) var(--space-4);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
 .nav-bottom {
   flex-shrink: 0;
   margin-top: auto;
-  padding-bottom: 10px;
+  padding-bottom: var(--space-5);
 }
 .nav-item {
   display: flex;
   align-items: center;
-  gap: 9px;
+  gap: var(--space-5);
   width: 100%;
-  padding: 10px 8px;
+  padding: var(--space-5) var(--space-4);
   border: 0;
   background: transparent;
-  border-radius: 5px;
+  border-radius: var(--radius-3);
   color: var(--text-muted);
   font-size: 11px;
   text-align: left;
@@ -529,15 +474,15 @@ kbd {
    edge. */
 :root[data-theme="light"] .nav-item:hover,
 :root[data-theme="light"] .nav-item.active {
-  box-shadow: inset 0 0 0 1px var(--border-strong);
+  box-shadow: var(--shadow-ring-strong);
 }
 .connection-line {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--space-4);
   border-top: 1px solid var(--border);
-  margin-top: 8px;
-  padding: 10px 3px 0;
+  margin-top: var(--space-4);
+  padding: var(--space-5) var(--space-2) 0;
   color: var(--text-dim);
   font-size: 10px;
 }
@@ -551,7 +496,7 @@ kbd {
   display: flex;
   flex: 1;
   align-items: center;
-  gap: 7px;
+  gap: var(--space-4);
   min-width: 0;
 }
 
@@ -566,13 +511,13 @@ kbd {
   position: relative;
   z-index: 6;
   width: 60px;
-  padding-inline: 10px;
+  padding-inline: var(--space-5);
   align-items: center;
 }
 .navigation.is-collapsed .nav-head {
   flex-direction: column;
-  gap: 6px;
-  padding: 14px 0 10px;
+  gap: var(--space-3);
+  padding: var(--space-7) 0 var(--space-5);
 }
 .navigation.is-collapsed .brand {
   flex: none;
@@ -580,7 +525,7 @@ kbd {
   width: 40px;
   height: 40px;
   padding: 0;
-  border-radius: 8px;
+  border-radius: var(--radius-4);
 }
 .navigation.is-collapsed .brand:hover {
   background: var(--surface-hover);
@@ -597,7 +542,13 @@ kbd {
   background:
     linear-gradient(var(--sidebar), var(--sidebar)) 50% 0 / 1px 100% no-repeat,
     linear-gradient(var(--sidebar), var(--sidebar)) 0 40% / 100% 1px no-repeat,
-    conic-gradient(at 50% 40%, #e5b962 0 90deg, #ec7d62 0 180deg, #40b0ab 0 270deg, #4851ac 0);
+    conic-gradient(
+      at 50% 40%,
+      var(--family-local-fill) 0 90deg,
+      var(--family-anthropic-fill) 0 180deg,
+      var(--family-openai-fill) 0 270deg,
+      var(--family-google-fill) 0
+    );
 }
 .navigation.is-collapsed .nav-toggle,
 .navigation.is-collapsed .search-button,
@@ -607,10 +558,10 @@ kbd {
   height: 36px;
   padding: 0;
   gap: 0;
-  border-radius: 8px;
+  border-radius: var(--radius-4);
 }
 .navigation.is-collapsed .search-button {
-  margin-bottom: 4px;
+  margin-bottom: var(--space-2);
   color: var(--text-muted);
 }
 .navigation.is-collapsed .nav-item > svg:last-child:not(:first-child) {
@@ -620,7 +571,7 @@ kbd {
   position: absolute;
   width: 1px;
   height: 1px;
-  margin: -1px;
+  margin: calc(-1 * var(--space-1));
   overflow: hidden;
   clip-path: inset(50%);
   white-space: nowrap;
@@ -629,15 +580,15 @@ kbd {
   display: flex;
   flex-direction: column;
   align-items: center;
-  gap: 2px;
+  gap: var(--space-1);
   width: 100%;
 }
 .navigation.is-collapsed .connection-line {
   flex-direction: column;
-  gap: 6px;
+  gap: var(--space-3);
   width: 100%;
-  margin-top: 10px;
-  padding: 12px 0 0;
+  margin-top: var(--space-5);
+  padding: var(--space-6) 0 0;
 }
 .navigation.is-collapsed .connection-status {
   flex: none;
@@ -657,11 +608,11 @@ kbd {
   top: 50%;
   left: calc(100% + 12px);
   z-index: 1;
-  padding: 5px 8px;
+  padding: var(--space-3) var(--space-4);
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
   background: var(--surface-raised);
-  box-shadow: 0 8px 24px #0004;
+  box-shadow: var(--shadow-tooltip);
   color: var(--text);
   font-size: 11px;
   font-weight: 500;
@@ -692,9 +643,9 @@ kbd {
 .error-banner {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
   font-size: 11px;
-  padding: 9px 24px;
+  padding: var(--space-5) var(--space-12);
   flex-shrink: 0;
 }
 .preview-banner {
@@ -703,8 +654,8 @@ kbd {
   color: var(--text-muted);
 }
 .error-banner {
-  background: #ec999210;
-  border-bottom: 1px solid #ec999230;
+  background: color-mix(in srgb, var(--red) 6%, transparent);
+  border-bottom: 1px solid color-mix(in srgb, var(--red) 19%, transparent);
   color: var(--red);
 }
 .error-banner span {
@@ -713,20 +664,20 @@ kbd {
 .revision {
   margin-left: auto;
   color: var(--text-dim);
-  font-family: "JetBrains Mono", monospace;
+  font-family: var(--font-code);
   font-size: 9px;
 }
 .section-heading {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 14px;
-  margin-bottom: 17px;
+  gap: var(--space-7);
+  margin-bottom: var(--space-9);
 }
 .section-heading h2 {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .section-heading > span {
   color: var(--text-dim);
@@ -735,7 +686,7 @@ kbd {
 .empty {
   text-align: center;
   color: var(--text-muted);
-  padding: 60px 20px;
+  padding: var(--space-30) var(--space-10);
   max-width: 470px;
   margin: 0 auto;
 }
@@ -746,14 +697,14 @@ kbd {
   height: 48px;
   border: 1px solid var(--border);
   background: var(--surface);
-  border-radius: 12px;
-  margin: 0 auto 19px;
+  border-radius: var(--radius-6);
+  margin: 0 auto var(--space-10);
   color: var(--text-dim);
 }
 .empty h3 {
   color: var(--text);
   font-size: 14px;
-  margin-bottom: 9px;
+  margin-bottom: var(--space-5);
 }
 .empty p {
   font-size: 11px;
@@ -762,7 +713,7 @@ kbd {
   margin: auto;
 }
 .empty .button {
-  margin: 18px auto 0;
+  margin: var(--space-9) auto 0;
   display: flex;
   width: fit-content;
 }
@@ -774,10 +725,10 @@ kbd {
   justify-content: center;
 }
 .loading-workspace .empty {
-  padding-bottom: 20px;
+  padding-bottom: var(--space-10);
 }
 .timeline {
-  margin-left: 9px;
+  margin-left: var(--space-5);
   border-left: 1px solid var(--border-strong);
 }
 /* Each family class sets --family, so a dot, a mark or a thin bar can take the colour without
@@ -808,7 +759,7 @@ kbd {
   width: 16px;
   height: 16px;
   border: 1px solid color-mix(in srgb, var(--family-fill, currentColor) 45%, transparent);
-  border-radius: 4px;
+  border-radius: var(--radius-2);
   background: color-mix(in srgb, var(--family-fill, currentColor) 14%, transparent);
   font-size: 9.5px;
   font-weight: 600;
@@ -817,32 +768,32 @@ kbd {
 }
 .view-stack {
   display: grid;
-  gap: 16px;
+  gap: var(--space-8);
 }
 .card {
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 7px;
-  padding: 20px;
+  border-radius: var(--radius-4);
+  padding: var(--space-10);
 }
 .card > h2 {
-  margin-bottom: 13px;
+  margin-bottom: var(--space-7);
 }
 .card > p {
   font-size: 11px;
 }
 .card > .button {
-  margin-top: 15px;
+  margin-top: var(--space-8);
 }
 .facts-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: 18px 24px;
+  gap: var(--space-9) var(--space-12);
 }
 .fact {
   display: flex;
   flex-direction: column;
-  gap: 7px;
+  gap: var(--space-4);
   min-width: 0;
 }
 .fact > span {
@@ -858,14 +809,14 @@ kbd {
   font-size: 11px;
 }
 .source-card > p {
-  margin-top: 18px;
+  margin-top: var(--space-9);
   border-top: 1px solid var(--border);
-  padding-top: 13px;
+  padding-top: var(--space-7);
 }
 .route-choice {
   display: flex;
   align-items: center;
-  gap: 11px;
+  gap: var(--space-6);
 }
 .route-symbol {
   display: grid;
@@ -873,7 +824,7 @@ kbd {
   width: 31px;
   height: 31px;
   border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-  border-radius: 7px;
+  border-radius: var(--radius-4);
   background: color-mix(in srgb, currentColor 4%, transparent);
   font-size: 12px;
   font-weight: 600;
@@ -884,29 +835,29 @@ kbd {
   font-weight: 500;
 }
 .route-choice p {
-  margin-top: 4px;
+  margin-top: var(--space-2);
   color: var(--text-dim);
   font-size: 10px;
 }
 .chosen-label {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   margin-left: auto;
   color: var(--accent);
   font-size: 9px;
 }
 .rejected-routes {
-  margin-top: 17px;
-  padding-top: 12px;
+  margin-top: var(--space-9);
+  padding-top: var(--space-6);
   border-top: 1px solid var(--border);
   display: grid;
-  gap: 10px;
+  gap: var(--space-5);
 }
 .rejected-routes > div {
   display: grid;
   grid-template-columns: 75px 1fr;
-  gap: 10px;
+  gap: var(--space-5);
   font-size: 10px;
 }
 .rejected-routes span {
@@ -919,12 +870,12 @@ kbd {
 .notice {
   display: flex;
   align-items: center;
-  gap: 7px;
+  gap: var(--space-4);
   color: var(--amber);
   font-size: 11px;
-  padding: 12px;
+  padding: var(--space-6);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
 }
 .dialog {
   margin: auto;
@@ -933,14 +884,14 @@ kbd {
   color: var(--text);
   background: var(--background);
   border: 1px solid var(--border-strong);
-  border-radius: 10px;
+  border-radius: var(--radius-5);
   width: 540px;
   max-height: 88dvh;
   padding: 0;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-overlay);
 }
 .dialog::backdrop {
-  background: #050807b3;
+  background: var(--scrim);
   backdrop-filter: blur(3px);
 }
 .dialog-wide {
@@ -950,8 +901,8 @@ kbd {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  gap: 15px;
-  padding: 24px 24px 21px;
+  gap: var(--space-8);
+  padding: var(--space-12) var(--space-12) var(--space-11);
   border-bottom: 1px solid var(--border);
 }
 .dialog-heading h2 {
@@ -960,15 +911,15 @@ kbd {
   letter-spacing: -0.4px;
 }
 .dialog-heading .eyebrow {
-  margin-bottom: 8px;
+  margin-bottom: var(--space-4);
   font-size: 9px;
 }
 .dialog-footer {
   display: flex;
   justify-content: flex-end;
   align-items: center;
-  gap: 12px;
-  padding: 18px 24px;
+  gap: var(--space-6);
+  padding: var(--space-9) var(--space-12);
   border-top: 1px solid var(--border);
   background: var(--surface);
   position: sticky;
@@ -983,7 +934,7 @@ kbd {
 .help {
   display: inline-flex;
   vertical-align: middle;
-  margin-left: 4px;
+  margin-left: var(--space-2);
 }
 .help-button {
   display: inline-flex;
@@ -993,7 +944,7 @@ kbd {
   height: 24px;
   padding: 0;
   border: 0;
-  border-radius: 4px;
+  border-radius: var(--radius-2);
   color: var(--text-dim);
   background: transparent;
   cursor: help;
@@ -1011,18 +962,18 @@ kbd {
   width: 280px;
   max-width: calc(100dvw - 48px);
   margin: 0;
-  padding: 12px 14px;
+  padding: var(--space-6) var(--space-7);
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
   background: var(--surface);
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 400;
   line-height: 1.65;
-  box-shadow: var(--shadow);
+  box-shadow: var(--shadow-overlay);
 }
 .technical-details {
-  margin-top: 8px;
+  margin-top: var(--space-4);
   min-width: 0;
   font-size: 9px;
   color: var(--text-dim);
@@ -1032,7 +983,7 @@ kbd {
 }
 .technical-details code {
   display: block;
-  margin-top: 7px;
+  margin-top: var(--space-4);
   overflow-wrap: anywhere;
   white-space: normal;
 }
@@ -1042,25 +993,25 @@ kbd {
 }
 .checkout-count {
   display: block;
-  margin-top: 7px;
+  margin-top: var(--space-4);
   color: var(--text-dim);
   font-size: 10px;
 }
 .checkout-changes > p {
-  margin-top: 14px;
+  margin-top: var(--space-7);
 }
 .checkout-changes ul {
   list-style: none;
   padding: 0;
-  margin: 16px 0 0;
+  margin: var(--space-8) 0 0;
   display: grid;
-  gap: 11px;
+  gap: var(--space-6);
   max-height: 240px;
   overflow: auto;
 }
 .checkout-changes li {
   display: grid;
-  gap: 5px;
+  gap: var(--space-3);
   min-width: 0;
   font-size: 10px;
 }
@@ -1079,12 +1030,12 @@ kbd {
 .palette-search {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-5);
   height: 44px;
-  margin: 16px 16px 0;
-  padding: 0 12px;
+  margin: var(--space-8) var(--space-8) 0;
+  padding: 0 var(--space-6);
   border: 1px solid var(--border-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-4);
   background: var(--surface);
   color: var(--text-dim);
 }
@@ -1107,14 +1058,14 @@ kbd {
   color: var(--text-dim);
 }
 .palette-scope {
-  margin: 8px 18px 2px;
+  margin: var(--space-4) var(--space-9) var(--space-1);
   color: var(--text-dim);
   font-size: 10.5px;
   line-height: 1.5;
 }
 .palette-results {
   max-height: min(52dvh, 440px);
-  padding: 2px 10px 8px;
+  padding: var(--space-1) var(--space-5) var(--space-4);
   overflow-y: auto;
   overscroll-behavior: contain;
 }
@@ -1125,7 +1076,7 @@ kbd {
   border: 0;
 }
 .palette-group-label {
-  padding: 10px 8px 4px;
+  padding: var(--space-5) var(--space-4) var(--space-2);
   color: var(--text-dim);
   font-size: 9px;
   letter-spacing: 1.15px;
@@ -1134,12 +1085,12 @@ kbd {
 .palette-option {
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-6);
   width: 100%;
   min-height: 40px;
-  padding: 8px 10px;
+  padding: var(--space-4) var(--space-5);
   border: 1px solid transparent;
-  border-radius: 6px;
+  border-radius: var(--radius-3);
   background: transparent;
   color: var(--text-muted);
   font-size: 12px;
@@ -1171,13 +1122,13 @@ kbd {
   color: var(--text-dim);
 }
 .palette-option > .status-dot {
-  margin-inline: 5px;
+  margin-inline: var(--space-3);
 }
 .palette-option-text {
   display: flex;
   flex: 1;
   flex-direction: column;
-  gap: 2px;
+  gap: var(--space-1);
   min-width: 0;
 }
 .palette-option-text > span {
@@ -1191,17 +1142,17 @@ kbd {
   font-size: 10.5px;
 }
 .palette mark {
-  border-radius: 2px;
+  border-radius: var(--radius-1);
   background: color-mix(in srgb, var(--accent) 30%, transparent);
   color: var(--text);
 }
 .palette-empty {
   display: grid;
-  gap: 4px;
-  margin: 4px 16px 12px;
-  padding: 18px;
+  gap: var(--space-2);
+  margin: var(--space-2) var(--space-8) var(--space-6);
+  padding: var(--space-9);
   border: 1px dashed var(--border-strong);
-  border-radius: 8px;
+  border-radius: var(--radius-4);
   color: var(--text-muted);
   font-size: 12px;
   text-align: center;
@@ -1214,9 +1165,9 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-6);
   min-height: 42px;
-  padding: 6px 12px 6px 18px;
+  padding: var(--space-3) var(--space-6) var(--space-3) var(--space-9);
   border-top: 1px solid var(--border);
   color: var(--text-dim);
   font-size: 10.5px;
@@ -1224,19 +1175,19 @@ kbd {
 .palette-pages {
   display: flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   font-variant-numeric: tabular-nums;
 }
 .about-content {
-  padding: 23px 24px;
+  padding: var(--space-12) var(--space-12);
 }
 .about-content > p {
   font-size: 11px;
 }
 .about-attribution {
   display: grid;
-  gap: 5px;
-  margin-bottom: 18px;
+  gap: var(--space-3);
+  margin-bottom: var(--space-9);
 }
 .about-attribution strong {
   color: var(--text);
@@ -1249,46 +1200,46 @@ kbd {
 .about-build {
   display: flex;
   align-items: center;
-  gap: 10px;
+  gap: var(--space-5);
   font-size: 10px;
   color: var(--text-dim);
-  margin: 18px 0 26px;
+  margin: var(--space-9) 0 var(--space-13);
 }
 .about-build .prototype-tag {
   margin-left: 0;
 }
 .about-content h3 {
-  margin-top: 18px;
-  margin-bottom: 10px;
+  margin-top: var(--space-9);
+  margin-bottom: var(--space-5);
   font-size: 13px;
 }
 .credit-sources {
   display: grid;
-  gap: 12px;
-  margin: 20px 0;
+  gap: var(--space-6);
+  margin: var(--space-10) 0;
 }
 .credit-sources section {
-  padding: 14px;
+  padding: var(--space-7);
   background: var(--surface);
   border: 1px solid var(--border);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
 }
 .credit-sources :where(section) > div {
   display: flex;
   justify-content: space-between;
-  gap: 10px;
+  gap: var(--space-5);
   align-items: center;
 }
 .credit-sources a {
   display: inline-flex;
   align-items: center;
-  gap: 3px;
+  gap: var(--space-2);
   font-size: 10px;
 }
 .credit-sources p {
   color: var(--text-muted);
   font-size: 10px;
-  margin: 9px 0;
+  margin: var(--space-5) 0;
 }
 .credit-sources code {
   color: var(--text-dim);
@@ -1298,12 +1249,12 @@ kbd {
   display: flex;
   align-items: center;
   justify-content: flex-end;
-  gap: 10px;
+  gap: var(--space-5);
   font-size: 9px;
   color: var(--text-dim);
   border-top: 1px solid var(--border);
-  margin-top: 24px;
-  padding-top: 16px;
+  margin-top: var(--space-12);
+  padding-top: var(--space-8);
   flex-wrap: wrap;
 }
 .spin {
@@ -1354,8 +1305,8 @@ kbd {
 .recovery-banner {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 24px;
+  gap: var(--space-5);
+  padding: var(--space-5) var(--space-12);
   border-bottom: 1px solid var(--border);
   background: var(--surface);
   font-size: 12px;

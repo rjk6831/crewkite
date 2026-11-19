@@ -1,5 +1,6 @@
 import { chmodSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
+import { followWorkflow, sinceNextTurn, type WorkflowSource } from '@crewkite/client';
 import { connectController, createCommandKey, readControllerEndpoint } from '@crewkite/client/node';
 import {
   ChatCatalogReadSchema,
@@ -30,8 +31,6 @@ import {
 } from './workspace.ts';
 
 const actor = { id: 'terminal', kind: 'cli' } as const;
-const ended = (state: ChatTurn['state']) =>
-  state === 'done' || state === 'stopped' || state === 'failed';
 
 export const REVIEW_TEXT =
   'Review the current changes in the scratch copy against the base commit. List your findings, most severe first, with the file and line for each. End your reply with one line that reads exactly `Findings: N`, where N is the number of findings you listed, or `Findings: 0` when there are none.';
@@ -103,44 +102,6 @@ function connect(transport: Awaited<ReturnType<typeof connectController>>) {
       read('ReadChatThread', { taskId, limit: 200 }, ChatThreadReadSchema),
     changes: (taskId: string) => read('ReadChatChanges', { taskId }, ChatChangesReadSchema),
     catalog: () => read('ReadChatCatalog', {}, ChatCatalogReadSchema),
-  };
-}
-
-/** Settles each thread's turns from the event stream. One subscription serves the whole run. */
-async function watchTurns(transport: Awaited<ReturnType<typeof connectController>>) {
-  const finished = new Map<string, Map<string, ChatTurn>>();
-  const listeners = new Set<() => void>();
-  const stop = await transport.subscribe('0', (event) => {
-    if (event.type !== 'chat.turn' || !ended(event.payload.state)) return;
-    const turns = finished.get(event.payload.taskId) ?? new Map<string, ChatTurn>();
-    turns.set(event.payload.id, event.payload);
-    finished.set(event.payload.taskId, turns);
-    for (const listener of [...listeners]) listener();
-  });
-  return {
-    count: (taskId: string) => finished.get(taskId)?.size ?? 0,
-    /** Resolves with the turn that ended after `before` turns had ended, or null at the limit. */
-    next(taskId: string, before: number, limitMs: number): Promise<ChatTurn | null> {
-      return new Promise((resolve) => {
-        const check = () => {
-          const turns = finished.get(taskId);
-          if (!turns || turns.size <= before) return;
-          cleanup();
-          resolve([...turns.values()].at(-1) ?? null);
-        };
-        const timer = setTimeout(() => {
-          cleanup();
-          resolve(null);
-        }, limitMs);
-        const cleanup = () => {
-          clearTimeout(timer);
-          listeners.delete(check);
-        };
-        listeners.add(check);
-        check();
-      });
-    },
-    stop,
   };
 }
 
@@ -230,7 +191,6 @@ export async function runBench(options: RunOptions): Promise<RunReport> {
   process.env.GIT_CEILING_DIRECTORIES = ceiling;
   try {
     const api = connect(transport);
-    const watch = await watchTurns(transport);
     let blocked: Exclusion['detail'] | null = null;
     if (!options.scripted) {
       const entry = (await api.catalog()).families.find((value) => value.family === family);
@@ -247,12 +207,11 @@ export async function runBench(options: RunOptions): Promise<RunReport> {
       }
       current = task;
       report.results.push(
-        await runTask(task, options, api, watch, home, permissionPolicy, environment),
+        await runTask(task, options, api, transport, home, permissionPolicy, environment),
       );
       current = null;
       options.onProgress?.(report);
     }
-    watch.stop();
   } finally {
     transport.close();
     await runtime.close();
@@ -279,13 +238,13 @@ function preflight(task: Task, self: string): Pick<Exclusion, 'reason' | 'detail
 }
 
 type Api = ReturnType<typeof connect>;
-type Watch = Awaited<ReturnType<typeof watchTurns>>;
+type Transport = Awaited<ReturnType<typeof connectController>>;
 
 async function runTask(
   task: Task,
   options: RunOptions,
   api: Api,
-  watch: Watch,
+  transport: Transport,
   home: string,
   permissionPolicy: 'allow-edits' | 'allow-all',
   environment: NodeJS.ProcessEnv,
@@ -326,7 +285,7 @@ async function runTask(
     // limit and the turn is recorded as timed out.
     await api.run('ConfigureChatThread', { taskId: created.id, permissionPolicy });
 
-    const turn = await sendAndWait(api, watch, created.id, task.text, 'assistant', options);
+    const turn = await sendAndWait(api, transport, created.id, task.text, 'assistant', options);
     result.wallMs = turn.wallMs;
     result.turn = { state: turn.state, failure: turn.failure };
     result.tokensIn = turn.tokensIn;
@@ -339,7 +298,14 @@ async function runTask(
 
     result.changedFiles = (await api.changes(created.id)).files.length;
     if (options.review) {
-      const review = await sendAndWait(api, watch, created.id, REVIEW_TEXT, 'reviewer', options);
+      const review = await sendAndWait(
+        api,
+        transport,
+        created.id,
+        REVIEW_TEXT,
+        'reviewer',
+        options,
+      );
       result.review = {
         state: review.state,
         findings: findingsOf(review.text),
@@ -368,15 +334,33 @@ async function runTask(
   return result;
 }
 
+/**
+ * Sends one message and follows the thread until its whole workflow ends: the turn and anything it
+ * starts. The limit covers the whole workflow. A thread that waits for an answer nobody gives, or
+ * runs past the limit, has its open turn stopped.
+ */
 async function sendAndWait(
   api: Api,
-  watch: Watch,
+  transport: Transport,
   taskId: string,
   text: string,
   role: ChatRole,
   options: RunOptions,
 ) {
-  const before = watch.count(taskId);
+  const source: WorkflowSource = {
+    readThread: api.thread,
+    subscribe: (after, onEvent, onResync) => transport.subscribe(after, onEvent, onResync),
+  };
+  const clock = {
+    now: options.now,
+    after: (ms: number, fn: () => void) => {
+      const timer = setTimeout(fn, ms);
+      return () => clearTimeout(timer);
+    },
+  };
+  const first = await api.thread(taskId);
+  const since = sinceNextTurn(first);
+  const follow = followWorkflow(source, first, { since, deadlineMs: options.timeoutMs, clock });
   const began = options.now();
   const sent = await api.send('SendChatMessage', {
     taskId,
@@ -385,7 +369,8 @@ async function sendAndWait(
     selection: options.selection,
     files: [],
   });
-  if (sent.outcome !== 'applied')
+  if (sent.outcome !== 'applied') {
+    follow.stop();
     return {
       state: 'failed' as const,
       failure: { kind: 'refused', message: sent.next ?? sent.reason ?? sent.outcome },
@@ -394,30 +379,51 @@ async function sendAndWait(
       tokensOut: null,
       text: '',
     };
-  let turn = await watch.next(taskId, before, options.timeoutMs);
-  let timedOut = false;
-  // The wall time of a turn that hit the limit is the limit, not the wait for it to stop.
-  let limitWallMs = 0;
-  if (!turn) {
-    timedOut = true;
-    limitWallMs = Math.max(0, Math.round(options.now() - began));
+  }
+  const end = await follow.done.finally(follow.stop);
+  const timedOut = end.state === 'blocked' && end.reason === 'deadline';
+  // The wall time of a workflow that hit the limit is the limit, not the wait for it to stop.
+  const limitWallMs = Math.max(0, Math.round(options.now() - began));
+  if (end.state === 'waiting' || end.state === 'blocked') {
     const open = (await api.thread(taskId)).thread.activeTurnId;
-    if (open) await api.send('StopChatTurn', { taskId, turnId: open });
-    // A stopped turn settles quickly. If it does not, the record keeps the timeout without it.
-    turn = await watch.next(taskId, before, 60_000);
+    if (open) {
+      await api.send('StopChatTurn', { taskId, turnId: open });
+      // A stopped turn settles quickly. If it does not, the record keeps the outcome without it.
+      const settling = followWorkflow(source, await api.thread(taskId), {
+        since,
+        deadlineMs: 60_000,
+        clock,
+      });
+      await settling.done.finally(settling.stop).catch(() => undefined);
+    }
   }
   const wallMs = timedOut ? limitWallMs : Math.max(0, Math.round(options.now() - began));
   const read = await api.thread(taskId);
-  const settled = turn ? read.turns.find((value) => value.id === turn.id) : undefined;
+  const settled = read.turns.find((value) => value.sequence >= since && value.role === role);
   const message = settled
     ? read.messages.find((value) => value.id === settled.assistantMessageId)
     : undefined;
   const state: 'done' | 'stopped' | 'failed' | 'timed-out' = timedOut
     ? 'timed-out'
-    : ((settled?.state as 'done' | 'stopped' | 'failed') ?? 'failed');
+    : end.state === 'done' || end.state === 'stopped'
+      ? end.state
+      : 'failed';
+  const why =
+    end.state === 'failed'
+      ? `${end.step}: ${end.detail}`
+      : end.state === 'waiting' || end.state === 'blocked'
+        ? end.detail
+        : '';
+  const failure =
+    state === 'failed'
+      ? ((settled?.state === 'failed' ? failureOf(settled) : null) ?? {
+          kind: 'workflow',
+          message: why,
+        })
+      : null;
   return {
     state,
-    failure: settled ? failureOf(settled) : null,
+    failure,
     wallMs,
     tokensIn: settled?.stats?.tokensIn ?? null,
     tokensOut: settled?.stats?.tokensOut ?? null,

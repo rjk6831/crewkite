@@ -2565,7 +2565,7 @@ test('an acp setup whose stop timers run in one held pass still proves its group
   }
 });
 
-test('a Google setup step left unknown clears on an explicit stop once its group is gone', async () => {
+test('a Google setup step left unknown clears at restart or on an explicit stop once its group is gone', async () => {
   const f = fixture('complete');
   const started: string[] = [];
   const clock = createTestClock();
@@ -2658,24 +2658,29 @@ test('a Google setup step left unknown clears on an explicit stop once its group
       [[key, 'unknown', false]],
     );
     assert.equal(google.profiles[0].id, 'google-acp-v1');
-    // A restart keeps the row unknown: a historical group proves nothing without a person's Stop.
+    // A restart probes the recorded group once. ESRCH settles the step with its result unknown,
+    // and the setup goes back to Connect. Nothing runs again.
     await controller.close();
     controller = open();
-    assert.equal(controller.store.googleAcpSetup().state, 'unknown');
-    assert.equal(controller.store.googleMetadataOperations().at(-1)?.state, 'unknown');
+    assert.equal(controller.store.googleAcpSetup().state, 'blocked');
+    assert.equal(controller.store.googleAcpSetup().operationId, null);
+    assert.equal(controller.store.googleMetadataOperations().at(-1)?.settlement, 'owner-absent');
+    assert.ok(controller.store.receipt(`google-metadata-settled:${key}`));
 
+    // A person's Stop settles a step left unknown in a running controller the same way.
+    const left = stuck(controller, absent);
     const stop = (operationId: string) =>
       send(controller, 'StopGoogleAcpSetup', { profileId: 'google-acp-v1', operationId });
-    const cleared = await stop(key);
+    const cleared = await stop(left);
     assert.equal(cleared.outcome, 'applied');
     const setup = controller.store.googleAcpSetup();
     assert.equal(setup.state, 'blocked');
     assert.equal(setup.operationId, null);
     assert.deepEqual(
-      controller.store.googleMetadataOperations().map((row) => row.state),
-      ['quiescent'],
+      controller.store.googleMetadataOperations().map((row) => row.settlement),
+      ['owner-absent', 'owner-absent'],
     );
-    assert.ok(controller.store.receipt(`google-metadata-settled:${key}`));
+    assert.ok(controller.store.receipt(`google-metadata-settled:${left}`));
     assert.deepEqual(started, []);
 
     // A quota read in flight holds the step until it ends, then the step runs.
@@ -2701,7 +2706,7 @@ test('a Google setup step left unknown clears on an explicit stop once its group
     const hidden = stuck(controller, null);
     const refused = await stop(hidden);
     assert.equal(refused.reason, 'google-ownership-unknown');
-    assert.match(refused.next ?? '', /recorded no process group/);
+    assert.match(refused.next ?? '', /recorded no process identity/);
     assert.equal(controller.store.googleAcpSetup().state, 'unknown');
   } finally {
     await controller.close();

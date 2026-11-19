@@ -41,6 +41,23 @@ export type DependencyInventory = Readonly<{
   hash: string;
 }>;
 
+/** A copy that went over its entry or byte limit, as opposed to its deadline or an abort. */
+export class CopyLimitError extends Error {}
+/** An installed package whose version is not the one the lockfile resolved. */
+export class InstalledIdentityError extends Error {}
+
+/**
+ * What an installed tree is checked against. The default is the pnpm recipe: the pnpm project files
+ * and the manifest's own exact version. A caller with an npm or pnpm lockfile names its project
+ * files and says which version the lockfile resolved, so ranges in the manifest work.
+ */
+export type DependencyShape = Readonly<{
+  /** Root files that must be regular files. Workspace manifests are always added. */
+  files: readonly string[];
+  /** The version the lockfile resolved for a dependency of a workspace, or undefined if it has none. */
+  resolved: (workspace: string, name: string, spec: string) => string | undefined;
+}>;
+
 export function treeInventoryRecords(
   inventory: Pick<TreeInventory, 'entries' | 'files' | 'bytes'>,
 ): unknown[] {
@@ -129,8 +146,9 @@ async function file(root: string, path: string, budget: CopyBudget): Promise<Fil
   try {
     inside(root, await realpath(join(root, path)));
     const before = await handle.stat();
-    if (!before.isFile() || before.size > budget.maximumBytes)
-      throw new Error('Toolchain requires bounded regular files.');
+    if (!before.isFile()) throw new Error('Toolchain requires bounded regular files.');
+    if (before.size > budget.maximumBytes)
+      throw new CopyLimitError('Toolchain requires bounded regular files.');
     const hash = createHash('sha256');
     const buffer = Buffer.allocUnsafe(chunkBytes);
     let bytes = 0;
@@ -178,7 +196,8 @@ async function scan(
   async function visit(path: string) {
     check(budget);
     if (workspaces && path.startsWith('node_modules/') && excluded.has(basename(path))) return;
-    if (entries.length >= budget.maximumEntries) throw new Error('Toolchain entry limit exceeded.');
+    if (entries.length >= budget.maximumEntries)
+      throw new CopyLimitError('Toolchain entry limit exceeded.');
     const absolute = join(root, path);
     const state = await lstat(absolute);
     if (workspaces && path === 'node_modules/.pnpm-task-run-state-v1' && state.isDirectory())
@@ -246,6 +265,7 @@ export async function inspectInstalledDependencies(
   root: string,
   workspaces: readonly string[],
   budget: CopyBudget,
+  shape?: DependencyShape,
 ): Promise<DependencyInventory> {
   check(budget);
   root = await realpath(root);
@@ -253,10 +273,7 @@ export async function inspectInstalledDependencies(
   const paths = roots(workspaces);
   const projectFiles: FileEntry[] = [];
   for (const path of [
-    'package.json',
-    'pnpm-lock.yaml',
-    'pnpm-workspace.yaml',
-    '.npmrc',
+    ...(shape?.files ?? ['package.json', 'pnpm-lock.yaml', 'pnpm-workspace.yaml', '.npmrc']),
     ...workspaces.map((path) => `${path}/package.json`),
   ])
     projectFiles.push(await file(root, path, budget));
@@ -270,7 +287,7 @@ export async function inspectInstalledDependencies(
       ...manifest.dependencies,
       ...manifest.devDependencies,
     })) {
-      if (version === 'workspace:*') continue;
+      if (typeof version === 'string' && version.startsWith('workspace:')) continue;
       if (typeof version !== 'string' || !/^(?:@[a-z0-9._-]+\/)?[a-z0-9._-]+$/i.test(name))
         throw new Error('Invalid installed dependency identity.');
       const path = inside(
@@ -280,9 +297,12 @@ export async function inspectInstalledDependencies(
       const read = await text(root, path, budget);
       const installed = JSON.parse(read.value);
       manifests.push(read.entry);
-      if (installed.name !== name || installed.version !== version)
-        throw new Error(`Installed dependency identity changed: ${name}.`);
-      buildDependencies.push(Object.freeze({ name, version, manifest: read.entry.hash }));
+      const wanted = shape ? shape.resolved(workspace, name, version) : version;
+      if (installed.name !== name || wanted === undefined || installed.version !== wanted)
+        throw new InstalledIdentityError(`Installed dependency identity changed: ${name}.`);
+      buildDependencies.push(
+        Object.freeze({ name, version: installed.version, manifest: read.entry.hash }),
+      );
     }
   }
   const result = {
@@ -312,6 +332,10 @@ async function text(root: string, path: string, budget: CopyBudget) {
   const entry = await file(root, path, {
     ...budget,
     maximumBytes: Math.min(budget.maximumBytes, 1024 * 1024),
+  }).catch((error) => {
+    // A manifest over its own 1 MiB read cap is a bad manifest, not a tree over the copy limit.
+    if (error instanceof CopyLimitError) throw new Error('Toolchain manifest is too large.');
+    throw error;
   });
   const handle = await open(
     join(root, path),
@@ -347,6 +371,7 @@ export async function copyInstalledDependencies(
   candidate: string,
   expected: DependencyInventory,
   budget: CopyBudget,
+  shape?: DependencyShape,
 ): Promise<DependencyInventory> {
   check(budget);
   donor = await realpath(donor);
@@ -363,7 +388,7 @@ export async function copyInstalledDependencies(
     )
   )
     throw new Error('Toolchain copy roots overlap dependency trees.');
-  const pinned = await inspectInstalledDependencies(donor, expected.workspaces, budget);
+  const pinned = await inspectInstalledDependencies(donor, expected.workspaces, budget, shape);
   same(
     { ...pinned, projectFiles: [], buildDependencies: [], tree: { ...pinned.tree, entries: [] } },
     {
@@ -444,10 +469,10 @@ export async function copyInstalledDependencies(
     if (entry.kind === 'directory') await chmod(join(candidate, entry.path), entry.mode);
   }
   same(
-    (await inspectInstalledDependencies(donor, expected.workspaces, budget)).hash,
+    (await inspectInstalledDependencies(donor, expected.workspaces, budget, shape)).hash,
     expected.hash,
   );
-  const copied = await inspectInstalledDependencies(candidate, expected.workspaces, budget);
+  const copied = await inspectInstalledDependencies(candidate, expected.workspaces, budget, shape);
   same(copied.hash, expected.hash);
   return copied;
 }

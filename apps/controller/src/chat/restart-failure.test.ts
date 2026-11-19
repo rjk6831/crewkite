@@ -13,6 +13,16 @@ test('only the failures startup recovery writes read back as failed by a restart
       failure: restartFailure(2, 'groups 4242, 4243'),
       expected: true,
     },
+    {
+      name: 'a row 0.1.0 saved',
+      failure: chatFailure({
+        stage: 'finish',
+        kind: 'internal',
+        message:
+          'The provider process (group 4242) was still running when the controller restarted.',
+      }),
+      expected: true,
+    },
     { name: 'no failure', failure: null, expected: false },
     {
       name: 'client failure with its own text',

@@ -7,7 +7,9 @@ import {
   type CommandResult,
   CommandResultSchema,
   CommandSchema,
+  GOOGLE_RECOVERY_HOLD_COPY,
   GoogleAcpSetupSchema,
+  isOpenAiLocalEndpoint,
   LocalModelObservationSchema,
   type LocalSetup,
   LocalSetupSchema,
@@ -15,7 +17,7 @@ import {
   NativeProfileSchema,
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
-import { timed } from '../diagnostics/timing.ts';
+import { logTiming, timed } from '../diagnostics/timing.ts';
 import { groupAbsent } from '../host/worker.ts';
 import {
   ConnectionRecordSchema,
@@ -45,6 +47,7 @@ import {
   retainedSelection,
 } from '../providers/local/connection.ts';
 import { availableMemory, refreshAvailableMemory } from '../providers/local/hardware.ts';
+import { readOpenAiObservation } from '../providers/local/openai-compat.ts';
 import { startLocalDiscovery } from '../providers/local/replacement.ts';
 import { type LocalInputResult, startLocalSecretInput } from '../providers/local/secure-input.ts';
 import {
@@ -57,6 +60,7 @@ import {
   localTokenRefusal,
 } from '../providers/platform.ts';
 import type { Controller } from './controller.ts';
+import { recoverGoogleMetadata, SIGN_IN_RELEASED } from './google-recovery.ts';
 import { googleTermsAcknowledged } from './google-terms.ts';
 import {
   type AcpSetupCommand,
@@ -90,12 +94,14 @@ export function opensTokenWindow(
 ): boolean {
   return found === 'token-required' && !options.supplied && !options.unattended && !options.refused;
 }
+// A deliberate model refresh runs the discover step from Ready. It has no setup state of its own.
+type SetupCommand = AcpSetupCommand | Extract<Command, { command: 'RefreshGoogleAcpModels' }>;
 const profileReads = new WeakMap<object, { profiles?: NativeProfileResolution[] }>();
 
 export class ProviderCommands {
   executeAcpSetup(
     this: Controller,
-    command: AcpSetupCommand,
+    command: SetupCommand,
     principal: string,
   ): Promise<CommandResult> {
     // A quota read holds the Google journal for at most its 20 second deadline. The quota read
@@ -114,7 +120,7 @@ export class ProviderCommands {
 
   startAcpSetup(
     this: Controller,
-    command: AcpSetupCommand,
+    command: SetupCommand,
     principal: string,
   ): Promise<CommandResult> {
     const prior = this.acpSetupRuntime;
@@ -130,7 +136,8 @@ export class ProviderCommands {
           const journal = this.store
             .googleMetadataOperations()
             .find((row) => row.command_id === command.key);
-          const known = journal?.state === 'quiescent';
+          // A row recovery settled has no known result, so a replayed key stays unknown.
+          const known = journal?.state === 'quiescent' && journal.settlement !== 'owner-absent';
           if (!known) this.store.unknownGoogleMetadata(command.key);
           let setup = this.store.googleAcpSetup();
           if (setup.operationId === command.key) {
@@ -174,11 +181,7 @@ export class ProviderCommands {
     });
   }
 
-  applyAcpSetup(
-    this: Controller,
-    command: AcpSetupCommand,
-    effects: (() => void)[],
-  ): CommandResult {
+  applyAcpSetup(this: Controller, command: SetupCommand, effects: (() => void)[]): CommandResult {
     const setup = this.store.googleAcpSetup();
     if (command.command === 'StopGoogleAcpSetup') {
       if (
@@ -198,9 +201,11 @@ export class ProviderCommands {
         };
       const runtime = this.acpSetupRuntime;
       const live = runtime?.key === setup.operationId;
+      // A running step took its one revision at begin and publishes against it. Stopping it moves
+      // no revision, so the step's own completion still writes the stopped state.
       const next = GoogleAcpSetupSchema.parse({
         ...setup,
-        revision: setup.revision + 1,
+        revision: live ? setup.revision : setup.revision + 1,
         state: live ? 'stopping' : 'unknown',
       });
       this.store.putGoogleAcpSetup(next);
@@ -227,6 +232,14 @@ export class ProviderCommands {
         reason: 'consent-required',
         data: { kind: 'google-acp-setup', setup },
       };
+    const refresh = command.command === 'RefreshGoogleAcpModels';
+    // A refresh starts from a setup that holds a proof and no step. Anything else connects first.
+    if (refresh && (setup.state !== 'ready' || setup.operationId))
+      return {
+        outcome: 'blocked',
+        reason: 'acp-setup-not-current',
+        data: { kind: 'google-acp-setup', setup },
+      };
     const installBlocker = this.googleInstallationBlocker();
     if (installBlocker) return installBlocker;
     const blocker = this.store.googleOperationBlocker();
@@ -242,9 +255,11 @@ export class ProviderCommands {
     const operation =
       command.command === 'InitializeGoogleAcp'
         ? 'initialize'
-        : command.command === 'AuthenticateGoogleAcp'
-          ? 'authenticate'
-          : 'discover';
+        : refresh
+          ? 'discover'
+          : command.command === 'AuthenticateGoogleAcp'
+            ? 'authenticate'
+            : 'discover';
     let proof: AcpSetupProof | null = null;
     try {
       if (operation !== 'initialize') {
@@ -265,17 +280,40 @@ export class ProviderCommands {
       authenticate: 'authenticating',
       discover: 'discovering',
     }[operation];
-    const next = GoogleAcpSetupSchema.parse({
-      ...setup,
-      revision: setup.revision + 1,
-      state,
-      operationId: command.key,
-      reason: null,
-    });
+    // A refresh takes its one revision here and keeps Ready. The fence compares the row's revision
+    // with the live one, so nothing else writes setup until the result publishes.
+    const next = GoogleAcpSetupSchema.parse(
+      refresh
+        ? {
+            ...setup,
+            revision: setup.revision + 1,
+            modelRefresh: {
+              commandId: command.key,
+              at: this.now(),
+              outcome: 'running',
+              reason: null,
+              evidenceId: null,
+            },
+          }
+        : {
+            ...setup,
+            revision: setup.revision + 1,
+            state,
+            operationId: command.key,
+            reason: null,
+          },
+    );
     this.store.putGoogleAcpSetup(next);
     this.store.beginGoogleMetadata(command.key, `acp-${operation}`, next.revision, this.now());
+    this.store.recordLaunchIdentity(
+      'google-metadata',
+      command.key,
+      this.launchIdentity,
+      this.now(),
+    );
     effects.push(
-      () => void this.launchAcpSetup(command.key, next.revision, operation, proof, resolution),
+      () =>
+        void this.launchAcpSetup(command.key, next.revision, operation, proof, resolution, refresh),
     );
     return {
       outcome: 'outcome-unknown',
@@ -286,63 +324,31 @@ export class ProviderCommands {
 
   /**
    * An explicit Stop on a setup whose ownership is unknown, in a controller that holds no runtime
-   * for it. Process absence is the one fact the controller can prove afterwards, and only ESRCH
-   * counts, as for an unknown writer. A row that never recorded a group may hide a spawned
-   * process, so it proves nothing. Every Google metadata row this controller does not run and
-   * whose group is proven gone closes, since they share one gate, and a receipt keeps the proof.
-   * The setup goes to blocked with no operation, from where Connect starts the step again.
+   * for it. It runs the same recovery as Recover, so the step clears only when a current probe
+   * proves its group gone. The setup then goes to blocked with no operation, from where Connect
+   * starts the step again, or to the person's sign-in when the step was a sign-in.
    */
   clearUnknownAcpSetup(
     this: Controller,
     setup: ReturnType<typeof GoogleAcpSetupSchema.parse>,
   ): CommandResult {
-    const live = new Set([this.acpSetupRuntime?.key, this.usageRead?.key]);
-    const rows = this.store
-      .googleMetadataOperations()
-      .filter((row) => !live.has(row.command_id) && ['owned', 'unknown'].includes(row.state));
-    const own = rows.find((row) => row.command_id === setup.operationId);
-    const proven = (row: (typeof rows)[number]) =>
-      row.process_group !== null && groupAbsent(row.process_group);
-    if (!own || !proven(own))
+    const recovery = recoverGoogleMetadata(this, 'explicit');
+    const next = this.store.googleAcpSetup();
+    if (next.operationId !== setup.operationId)
       return {
-        outcome: 'blocked',
-        reason: 'google-ownership-unknown',
-        next: own?.process_group
-          ? `The Google client from this setup still runs as process group ${own.process_group}. Quit it, then clear again.`
-          : 'This setup recorded no process group, so CrewKite cannot prove it ended. Export diagnostics and report it.',
-        data: { kind: 'google-acp-setup', setup },
+        outcome: 'applied',
+        ...(recovery.settled.some((row) => row.operation === 'acp-authenticate')
+          ? { next: SIGN_IN_RELEASED }
+          : {}),
+        data: { kind: 'google-acp-setup', setup: next },
       };
-    const absentAt = this.now();
-    for (const row of rows.filter(proven)) {
-      const group = row.process_group as number;
-      this.store.finishGoogleMetadata(row.command_id, group, absentAt);
-      const record = this.nativeArtifact({
-        commandId: row.command_id,
-        kind: row.kind,
-        outcome: 'unknown',
-        groups: [group],
-        absentAt,
-      });
-      this.store.saveReceipt(
-        `google-metadata-settled:${row.command_id}`,
-        record.hash,
-        'local-owner',
-        {
-          outcome: 'applied',
-          entity: record,
-        },
-      );
-    }
-    const next = GoogleAcpSetupSchema.parse({
-      ...setup,
-      revision: setup.revision + 1,
-      state: 'blocked',
-      operationId: null,
-      reason: null,
-    });
-    this.store.putGoogleAcpSetup(next);
-    this.profiles = this.resolveProfiles();
-    return { outcome: 'applied', data: { kind: 'google-acp-setup', setup: next } };
+    const hold = recovery.held.find((row) => row.commandId === setup.operationId);
+    return {
+      outcome: 'blocked',
+      reason: 'google-ownership-unknown',
+      next: GOOGLE_RECOVERY_HOLD_COPY[hold?.reason ?? 'no-process-identity'],
+      data: { kind: 'google-acp-setup', setup: next },
+    };
   }
 
   /**
@@ -380,7 +386,10 @@ export class ProviderCommands {
         );
     } catch {}
     if (proof && setup.state === 'ready') return null;
-    if (proof?.auth.status === 'authenticated') return 'discover';
+    // Recovery of an interrupted sign-in marks the setup's sign-in unknown and keeps the older
+    // proof. Discover would act on that sign-in, so the person signs in again first.
+    if (proof?.auth.status === 'authenticated' && setup.auth.status === 'authenticated')
+      return 'discover';
     // A fresh initialize would bring the same proof back. The next step is the person's sign-in.
     if (proof && setup.state === 'authentication-required') return null;
     return 'initialize';
@@ -421,6 +430,7 @@ export class ProviderCommands {
     operation: 'initialize' | 'authenticate' | 'discover',
     priorProof: AcpSetupProof | null,
     resolution: AcpProfileResolution,
+    refresh = false,
   ) {
     const runtime = this.acpSetupRuntime;
     if (!runtime || runtime.key !== commandId || !resolution.client || !resolution.environment)
@@ -432,9 +442,13 @@ export class ProviderCommands {
       if (
         this.closed ||
         runtime.stopped ||
-        setup.operationId !== commandId ||
         setup.revision !== revision ||
-        !['initializing', 'authenticating', 'discovering'].includes(setup.state)
+        (refresh
+          ? setup.modelRefresh?.commandId !== commandId ||
+            setup.modelRefresh.outcome !== 'running' ||
+            setup.state !== 'ready'
+          : setup.operationId !== commandId ||
+            !['initializing', 'authenticating', 'discovering'].includes(setup.state))
       )
         throw Error('ACP setup authority changed.');
     };
@@ -461,7 +475,7 @@ export class ProviderCommands {
           },
           quiescent: (group) =>
             this.store.transaction(() =>
-              this.store.finishGoogleMetadata(commandId, group, this.now()),
+              this.store.finishGoogleMetadata(commandId, group, this.now(), 'closed'),
             ),
         },
       });
@@ -472,13 +486,29 @@ export class ProviderCommands {
         const journal = this.store
           .googleMetadataOperations()
           .find((row) => row.command_id === commandId);
-        const known = outcome.quiescent && journal?.state === 'quiescent';
+        // Only a normal close tells how the step ended. A row recovery settled stays unknown.
+        const known = outcome.quiescent && journal?.settlement === 'closed';
         if (!known) this.store.unknownGoogleMetadata(commandId);
+        if (refresh) {
+          result = this.settleModelRefresh(
+            commandId,
+            revision,
+            runtime,
+            outcome,
+            known,
+            resolution,
+          );
+          this.finishMetadataReceipt(commandId, result);
+          this.profiles = this.resolveProfiles();
+          return;
+        }
+        // The setup moves only while it still names this step at the revision the step began
+        // with. Anything newer, such as recovery's release, stays as it is.
+        const current = setup.operationId === commandId && setup.revision === revision;
+        // The fence reads the live authority inside this transaction, before the write below
+        // moves the revision.
         const revoked =
-          this.closed ||
-          runtime.stopped ||
-          setup.operationId !== commandId ||
-          setup.revision !== revision;
+          this.closed || runtime.stopped || !this.store.googleMetadataPublishable(commandId);
         let proofId = setup.proofId,
           client = setup.client,
           auth = setup.auth;
@@ -502,36 +532,38 @@ export class ProviderCommands {
           ready =
             !!proof.reviewMode && !!proof.configOptions && proof.auth.status === 'authenticated';
         }
-        setup = GoogleAcpSetupSchema.parse({
-          ...setup,
-          revision: setup.revision + 1,
-          state: !known
-            ? 'unknown'
-            : ready
-              ? 'ready'
-              : !revoked && !outcome.reason && operation === 'initialize' && !incomplete
-                ? 'authentication-required'
-                : !revoked &&
-                    !outcome.reason &&
-                    operation === 'authenticate' &&
-                    auth.status === 'authenticated'
-                  ? 'discovery-required'
-                  : 'blocked',
-          operationId: known ? null : commandId,
-          proofId,
-          client,
-          auth,
-          reason: ready
-            ? null
-            : !revoked && outcome.reason === 'deadline'
-              ? 'acp-setup-timeout'
-              : outcome.reason === 'authentication'
-                ? 'authentication-required'
-                : !revoked && (operation === 'discover' || incomplete)
-                  ? 'acp-capability-missing'
-                  : null,
-        });
-        this.store.putGoogleAcpSetup(setup);
+        if (current) {
+          setup = GoogleAcpSetupSchema.parse({
+            ...setup,
+            revision: setup.revision + 1,
+            state: !known
+              ? 'unknown'
+              : ready
+                ? 'ready'
+                : !revoked && !outcome.reason && operation === 'initialize' && !incomplete
+                  ? 'authentication-required'
+                  : !revoked &&
+                      !outcome.reason &&
+                      operation === 'authenticate' &&
+                      auth.status === 'authenticated'
+                    ? 'discovery-required'
+                    : 'blocked',
+            operationId: known ? null : commandId,
+            proofId,
+            client,
+            auth,
+            reason: ready
+              ? null
+              : !revoked && outcome.reason === 'deadline'
+                ? 'acp-setup-timeout'
+                : outcome.reason === 'authentication'
+                  ? 'authentication-required'
+                  : !revoked && (operation === 'discover' || incomplete)
+                    ? 'acp-capability-missing'
+                    : null,
+          });
+          this.store.putGoogleAcpSetup(setup);
+        }
         result = {
           outcome: !known ? 'outcome-unknown' : revoked || outcome.reason ? 'blocked' : 'applied',
           ...(!known || revoked || outcome.reason
@@ -558,27 +590,56 @@ export class ProviderCommands {
         this.finishMetadataReceipt(commandId, result);
         this.profiles = this.resolveProfiles();
       });
-    } catch {
+    } catch (error) {
       try {
         this.store.transaction(() => {
           const journal = this.store
             .googleMetadataOperations()
             .find((row) => row.command_id === commandId);
           if (beforeSpawn && journal?.state === 'intent')
-            this.store.finishGoogleMetadata(commandId, null, this.now());
+            this.store.finishGoogleMetadata(commandId, null, this.now(), 'closed');
           else if (journal?.state !== 'quiescent') this.store.unknownGoogleMetadata(commandId);
-          const known =
-            this.store.googleMetadataOperations().find((row) => row.command_id === commandId)
-              ?.state === 'quiescent';
+          const finished = this.store
+            .googleMetadataOperations()
+            .find((row) => row.command_id === commandId);
+          const known = finished?.state === 'quiescent' && finished.settlement !== 'owner-absent';
           const setup = this.store.googleAcpSetup();
-          const next = GoogleAcpSetupSchema.parse({
-            ...setup,
-            revision: setup.revision + 1,
-            state: known ? 'blocked' : 'unknown',
-            operationId: known ? null : commandId,
-            reason: null,
-          });
-          this.store.putGoogleAcpSetup(next);
+          // As at completion: only a setup that still names this step moves.
+          // A refresh is named on the setup by its model refresh record, which keeps Ready.
+          const current = refresh
+            ? setup.modelRefresh?.commandId === commandId && setup.revision === revision
+            : setup.operationId === commandId && setup.revision === revision;
+          const next = current
+            ? GoogleAcpSetupSchema.parse(
+                refresh
+                  ? {
+                      ...setup,
+                      revision: setup.revision + 1,
+                      modelRefresh: {
+                        ...setup.modelRefresh,
+                        outcome: known ? 'failed' : 'unknown',
+                        // A refresh that could not start keeps why, as a failed read does.
+                        evidenceId: known
+                          ? this.nativeArtifact({
+                              operation: 'model-refresh',
+                              commandId,
+                              reason: 'start',
+                              diagnostic:
+                                error instanceof Error ? error.message.slice(0, 1000) : null,
+                            }).id
+                          : null,
+                      },
+                    }
+                  : {
+                      ...setup,
+                      revision: setup.revision + 1,
+                      state: known ? 'blocked' : 'unknown',
+                      operationId: known ? null : commandId,
+                      reason: null,
+                    },
+              )
+            : setup;
+          if (current) this.store.putGoogleAcpSetup(next);
           result = {
             outcome: known ? 'blocked' : 'outcome-unknown',
             reason: known ? 'acp-setup-failed' : 'google-ownership-unknown',
@@ -604,10 +665,121 @@ export class ProviderCommands {
   }
 
   /**
+   * Publishes or records the end of a model refresh, inside the settling transaction. Ready and
+   * the earlier proof stay unless the new catalog publishes. A failure keeps its diagnostic as an
+   * artifact. A sign-in the client no longer honors is the one failure that leaves Ready, because
+   * the proof then describes a session that is gone.
+   */
+  settleModelRefresh(
+    this: Controller,
+    commandId: string,
+    revision: number,
+    runtime: { stopped: boolean },
+    outcome: Awaited<ReturnType<typeof startGoogleAcpSetup>['result']>,
+    known: boolean,
+    resolution: AcpProfileResolution,
+  ): CommandResult {
+    const setup = this.store.googleAcpSetup();
+    const named = setup.modelRefresh?.commandId === commandId && setup.revision === revision;
+    const refreshed = (rest: Partial<ReturnType<typeof GoogleAcpSetupSchema.parse>>) => {
+      const next = GoogleAcpSetupSchema.parse({ ...setup, ...rest, revision: setup.revision + 1 });
+      this.store.putGoogleAcpSetup(next);
+      return next;
+    };
+    const record = setup.modelRefresh;
+    if (!known) {
+      const next =
+        named && record ? refreshed({ modelRefresh: { ...record, outcome: 'unknown' } }) : setup;
+      return {
+        outcome: 'outcome-unknown',
+        reason: 'google-ownership-unknown',
+        data: { kind: 'google-acp-setup', setup: next },
+      };
+    }
+    // The fence reads the live authority before the write below moves the revision.
+    if (
+      this.closed ||
+      runtime.stopped ||
+      !named ||
+      !record ||
+      !this.store.googleMetadataPublishable(commandId)
+    )
+      return {
+        outcome: 'blocked',
+        reason: 'acp-setup-stopped',
+        data: { kind: 'google-acp-setup', setup },
+      };
+    let proof: AcpSetupProof | null = null;
+    if (!outcome.reason && outcome.metadata) {
+      try {
+        proof = validateAcpSetupProof(
+          outcome.metadata,
+          resolution.client as AcpClientIdentity,
+          this.options.googleAcp?.reviewMappings,
+        );
+      } catch {}
+    }
+    if (proof?.reviewMode && proof.configOptions && proof.auth.status === 'authenticated') {
+      const next = refreshed({
+        proofId: this.nativeArtifact(proof).id,
+        client: proof.client,
+        auth: proof.auth,
+        modelRefresh: {
+          commandId,
+          at: this.now(),
+          outcome: 'refreshed',
+          reason: null,
+          evidenceId: null,
+        },
+      });
+      return { outcome: 'applied', data: { kind: 'google-acp-setup', setup: next } };
+    }
+    const reason: 'acp-setup-timeout' | 'authentication-required' | 'acp-capability-missing' =
+      outcome.reason === 'deadline'
+        ? 'acp-setup-timeout'
+        : outcome.reason === 'authentication'
+          ? 'authentication-required'
+          : 'acp-capability-missing';
+    const evidence = this.nativeArtifact({
+      operation: 'model-refresh',
+      commandId,
+      reason: outcome.reason ?? 'no-review-mode',
+      diagnostic: outcome.diagnostic,
+      exitCode: outcome.exitCode,
+      signal: outcome.signal,
+      stderrSummary: outcome.stderrSummary,
+    });
+    const failed = {
+      commandId,
+      at: this.now(),
+      outcome: 'failed' as const,
+      reason,
+      evidenceId: evidence.id,
+    };
+    const next =
+      reason === 'authentication-required'
+        ? refreshed({
+            state: 'authentication-required',
+            auth: { method: 'oauth-personal', status: 'required' },
+            reason,
+            modelRefresh: failed,
+          })
+        : refreshed({ modelRefresh: failed });
+    return {
+      outcome: 'blocked',
+      reason: reason === 'acp-setup-timeout' ? 'acp-setup-timeout' : 'acp-setup-failed',
+      ...(reason === 'acp-setup-timeout'
+        ? { next: 'Reading the models timed out after 20 seconds. The earlier list is kept.' }
+        : {}),
+      data: { kind: 'google-acp-setup', setup: next },
+    };
+  }
+
+  /**
    * What the diagnostics bundle says about Google: the setup and install state, the newest client
    * operations with whether each recorded group still exists, and every Google profile's reason.
-   * A stuck connect reads from it: a row whose group is gone clears with Stop, one still present
-   * names the process to quit.
+   * A stuck connect reads from it: a row whose group is gone clears with Recover or Stop. A number
+   * that still answers may belong to another program by now, so nothing here asks anyone to end it.
    */
   googleDiagnostics(this: Controller) {
     const rows = this.store.googleMetadataOperations();
@@ -1274,7 +1446,10 @@ export class ProviderCommands {
     if (command.command === 'BeginLocalConnectionInput' && !this.connectLog.mode('local'))
       this.connectLog.begin('local', command.payload.unattended ? 'auto' : 'manual');
     if (command.command === 'ConfigureLocal') {
-      const authMode = command.payload.authMode ?? 'token';
+      // An OpenAI-compatible server takes no token here, so it never meets the macOS token rule.
+      const authMode = isOpenAiLocalEndpoint(command.payload.endpoint)
+        ? 'none'
+        : (command.payload.authMode ?? 'token');
       const refusal = authMode === 'token' ? this.localTokenRefusal() : null;
       if (refusal) return { outcome: 'blocked', reason: 'local-token-needs-macos', next: refusal };
       if (control.endpoint === command.payload.endpoint && control.authMode === authMode)
@@ -1322,6 +1497,17 @@ export class ProviderCommands {
           ),
           ...command.payload,
         }),
+      });
+      return applied();
+    }
+    // An OpenAI-compatible server is read in this process: no token window, no child process.
+    if (isOpenAiLocalEndpoint(control.endpoint)) {
+      if (command.command === 'RefreshLocalModels' && !this.localConnected(control))
+        return { outcome: 'blocked', reason: 'local-connection-required' };
+      const { endpoint, connectionRevision } = control;
+      this.saveLocal({ ...control, connectionFailed: false });
+      effects.push(() => {
+        this.openAiRead = this.readOpenAiLocal(endpoint, connectionRevision);
       });
       return applied();
     }
@@ -1388,10 +1574,77 @@ export class ProviderCommands {
     const quiet = command.command === 'BeginLocalConnectionInput' && !!command.payload.unattended;
     // Recorded once the command has committed, so a rolled back command leaves nothing behind.
     effects.push(() => {
+      // Time since the controller process started, so one reopen shows how long the desktop took
+      // to send the first connect.
+      logTiming(
+        `local connect command kind=${kind} unattended=${quiet ? 1 : 0} sinceStartMs=${Math.round(performance.now())}`,
+      );
       if (quiet) unattended(this).add(binding.operationId);
       this.launchLocalOperation(binding.operationId);
     });
     return applied();
+  }
+
+  /**
+   * Read an OpenAI-compatible server's models and keep them as the observation. A read that
+   * answers means the server is connected. One that fails leaves the last read on view, labelled.
+   * The result is dropped when the endpoint or the connection changed while the read ran.
+   */
+  async readOpenAiLocal(this: Controller, endpoint: string, connectionRevision: number) {
+    let next: Awaited<ReturnType<typeof readOpenAiObservation>> | null = null;
+    try {
+      next = await readOpenAiObservation(endpoint, this.options.localFetch);
+    } catch {}
+    if (this.closed) return;
+    this.store.transaction(() => {
+      const control = this.localControl();
+      if (
+        control.endpoint !== endpoint ||
+        control.connectionRevision !== connectionRevision ||
+        control.operation
+      )
+        return;
+      if (!next) {
+        this.saveLocal({
+          ...control,
+          connectedWithoutToken: undefined,
+          connectionFailed: true,
+          observationStale: !!control.observation,
+          selection: null,
+          setupHash: null,
+        });
+        return;
+      }
+      const eligible = next.models.filter((choice) => choice.state === 'loaded-eligible');
+      const kept =
+        retainedSelection(control.selectedModelKey, next, false) ??
+        (control.selectedModelKey === null && eligible.length === 1 ? eligible[0] : null);
+      const selection = kept
+        ? { selectionId: kept.selectionId, observationHash: next.observationHash }
+        : null;
+      this.saveLocal({
+        ...control,
+        connectedWithoutToken: true,
+        openProbeRevision: connectionRevision,
+        connectionFailed: false,
+        observation: next,
+        observedAt: this.now(),
+        observationStale: false,
+        selection,
+        selectedModelKey: kept?.identity.modelKey ?? null,
+        setupHash: selection
+          ? hashCanonical({
+              version: 2,
+              connectionHash: localConfiguredConnectionHash(
+                endpoint,
+                connectionRevision,
+                control.authMode,
+              ),
+              ...selection,
+            })
+          : null,
+      });
+    });
   }
 
   localOperationCurrent(this: Controller, operationId: string) {
@@ -1680,7 +1933,11 @@ export class ProviderCommands {
           let found: LocalProbe = 'timeout';
           for (const timeoutMs of LOCAL_PROBE_TIMEOUTS_MS) {
             if (runtime.stopped || this.closed) break;
+            const probeStarted = performance.now();
             found = await probe(endpoint, timeoutMs).catch((): LocalProbe => 'unavailable');
+            logTiming(
+              `local probe found=${found} budgetMs=${timeoutMs} ms=${Math.round(performance.now() - probeStarted)}`,
+            );
             if (found !== 'timeout') break;
           }
           return found;
@@ -1776,6 +2033,7 @@ export class ProviderCommands {
         // Read once per observation. The read is far shorter than discovery, so it lands first.
         void refreshAvailableMemory();
         const credentials = this.localCredentials();
+        const discoveryStarted = performance.now();
         const handle = startLocalDiscovery(
           {
             kind: 'discovery',
@@ -1814,7 +2072,15 @@ export class ProviderCommands {
           },
         );
         runtime.handle = handle;
-        void handle.result.then(finish, () => finish(null));
+        void handle.result.then(
+          (value) => {
+            logTiming(
+              `local discovery done ms=${Math.round(performance.now() - discoveryStarted)}`,
+            );
+            finish(value);
+          },
+          () => finish(null),
+        );
       }
       if (runtime.stopped || this.closed) runtime.handle?.stop();
     } catch {

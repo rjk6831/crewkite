@@ -456,6 +456,7 @@ export class CandidateCommands {
         directory,
         this.now(),
       );
+    this.store.recordLaunchIdentity('launch', attempt.id, this.launchIdentity, this.now());
     if (group && combinedPhase)
       this.store.admitCombinedDispatch(group.run_id, combinedPhase, attempt.id);
     this.store.db

@@ -241,7 +241,7 @@ const PERMISSION_OPTIONS: ChatPermissionOption[] = [
   { id: 'deny', label: 'Deny', kind: 'deny' },
 ];
 
-const SETTINGS_ACTION = 'Open LM Studio, load a model and connect Local in Settings.';
+const SETTINGS_ACTION = 'Start your local server, load a model and connect Local in Settings.';
 const SHORTEN_ACTION = 'Shorten the request or split it into smaller steps, then send again.';
 
 /**
@@ -250,6 +250,14 @@ const SHORTEN_ACTION = 'Shorten the request or split it into smaller steps, then
  */
 export const isLocalFitFailure = (failure: ChatFailure | null | undefined) =>
   failure?.kind === 'protocol' && failure.nextAction === SHORTEN_ACTION;
+
+// The stop reasons of a last round that end a Local turn as done. A reply cut at its output limit
+// is done too: the service offers Continue for it.
+const LOCAL_FINISHED: ReadonlySet<string> = new Set([
+  'eosFound',
+  'stopStringFound',
+  'maxPredictedTokensReached',
+]);
 
 // A turn whose tool results fill the window folds them into the rolling summary and goes on, at
 // most this many times. Past that the turn fails with the context it filled.
@@ -530,14 +538,14 @@ function connectFailure(error: unknown): ChatFailure {
     return chatFailure({
       stage: 'session',
       kind: 'model-unavailable',
-      message: 'LM Studio has no model loaded for Local.',
+      message: 'The local server has no model loaded for Local.',
       providerMessage,
       nextAction: SETTINGS_ACTION,
     });
   return chatFailure({
     stage: 'launch',
     kind: 'client-missing',
-    message: 'CrewKite could not connect to LM Studio.',
+    message: 'CrewKite could not connect to the local server.',
     providerMessage,
     nextAction: SETTINGS_ACTION,
   });
@@ -565,7 +573,7 @@ function streamFailure(error: unknown): ChatFailure {
     return chatFailure({
       stage: 'stream',
       kind: 'client-exit',
-      message: 'LM Studio closed the connection during the turn.',
+      message: 'The local server closed the connection during the turn.',
       providerMessage,
     });
   return chatFailure({
@@ -1358,7 +1366,7 @@ function startLocalTurn(
             ? chatFailure({
                 stage: 'session',
                 kind: 'attachment-rejected',
-                message: 'LM Studio did not accept the attached images.',
+                message: 'The local server did not accept the attached images.',
                 providerMessage: failure.providerMessage,
               })
             : failure,
@@ -1524,8 +1532,22 @@ function startLocalTurn(
           nextAction: SHORTEN_ACTION,
         }),
       );
+    // The model finished only when its last round found the end of its reply. Any other reason,
+    // or none, leaves CrewKite unable to say how far the work got. This is never a fit failure:
+    // a slice that ended this way does not move to another provider.
+    if (!last?.stopReason || !LOCAL_FINISHED.has(last.stopReason))
+      return finish(
+        'error',
+        chatFailure({
+          stage: 'finish',
+          kind: 'completion-unknown',
+          message: last?.stopReason
+            ? `The local server ended the turn with a reason CrewKite does not accept as finished (${String(last.stopReason).slice(0, 80)}).`
+            : 'The local server ended the turn without a reason CrewKite could read.',
+        }),
+      );
     // The service turns these counts into the output limit line and offers Continue.
-    if (last?.stopReason === 'maxPredictedTokensReached') {
+    if (last.stopReason === 'maxPredictedTokensReached') {
       const tokens = counted.at(-1) ?? counting;
       const predicted = last.predictedTokensCount ?? tokens.reasoning + tokens.reply;
       const reasoningTokens = Math.min(tokens.reasoning, predicted);

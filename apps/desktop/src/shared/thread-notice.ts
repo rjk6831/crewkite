@@ -3,13 +3,20 @@
 // checks the shape again on every call, because the renderer is not trusted, and writes the text
 // itself from the kind.
 
-export type ThreadNoticeKind = 'reply' | 'failed' | 'permission' | 'crew' | 'crew-stopped';
+export type ThreadNoticeKind =
+  | 'reply'
+  | 'failed'
+  | 'limit'
+  | 'permission'
+  | 'crew'
+  | 'crew-stopped';
 export type ThreadNotice = { taskId: string; title: string; kind: ThreadNoticeKind };
 export type ThreadAttention = { badge: number; notice: ThreadNotice | null };
 
 const KINDS: readonly ThreadNoticeKind[] = [
   'reply',
   'failed',
+  'limit',
   'permission',
   'crew',
   'crew-stopped',
@@ -23,6 +30,7 @@ export function noticeText(notice: ThreadNotice): string {
   const said = {
     reply: 'reply finished',
     failed: 'reply failed',
+    limit: 'stopped at a usage limit',
     permission: 'waiting for permission',
     crew: 'crew finished',
     'crew-stopped': 'crew stopped',

@@ -32,6 +32,7 @@ import type { LaunchIntent } from '../store/index.ts';
 import { deriveWindow } from '../usage/index.ts';
 import { remainingBudgets, remainingCombinedBudgets } from './budgets.ts';
 import type { Controller } from './controller.ts';
+import { googleMetadataHolds } from './google-recovery.ts';
 import {
   type ConversationModelFailureReason,
   localHardwareStatus,
@@ -57,6 +58,7 @@ export class ProjectCommands {
       localSetup: this.localSetup(),
       localHardware: localHardwareStatus(this.now()),
       googleAcpSetup: this.store.googleAcpSetup(),
+      googleMetadataHolds: googleMetadataHolds(this),
       usageReaders: [
         this.googleUsageReader(),
         this.openAiUsageReader(),
@@ -123,6 +125,7 @@ export class ProjectCommands {
         nativeProfiles: header.nativeProfiles,
         localSetup: header.localSetup,
         googleAcpSetup: header.googleAcpSetup,
+        googleMetadataHolds: header.googleMetadataHolds,
         usageReaders: header.usageReaders,
         nativeRuns: this.nativeRuns(taskIds ? runIds : undefined),
         candidateEvaluations: this.candidateEvaluations(taskIds ?? undefined),

@@ -15,24 +15,18 @@ import { Select } from '../select.tsx';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
 import { FamilyMark } from './family-mark.tsx';
-import { effortLevels, MODEL_ID, modelGroups, offLine, shownEffort } from './model-groups.ts';
+import {
+  effortLabel,
+  effortLevels,
+  MODEL_ID,
+  modelGroups,
+  offLine,
+  shownEffort,
+} from './model-groups.ts';
 
 type Entry = ChatCatalogRead['families'][number];
 
-const knownEffortLabels: Readonly<Record<string, string>> = {
-  minimal: 'Minimal',
-  low: 'Low',
-  medium: 'Medium',
-  high: 'High',
-  xhigh: 'Extra high',
-  ultra: 'Ultra',
-  max: 'Max',
-  default: 'Default',
-};
-/** The label of an effort. A level a client added since shows its own name, first letter up. */
-export const effortLabel = (effort: ChatEffort): string =>
-  knownEffortLabels[effort] ??
-  `${effort.charAt(0).toUpperCase()}${effort.slice(1).replaceAll(/[-_.]/g, ' ')}`;
+export { effortLabel };
 
 /**
  * The efforts one model offers. Every place that edits a selection uses it, so labels match. A

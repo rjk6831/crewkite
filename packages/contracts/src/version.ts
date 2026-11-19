@@ -3,4 +3,4 @@
  * the diagnostics bundle report. A test keeps every package.json equal to it. A release changes
  * it here and in those files together.
  */
-export const CREWKITE_VERSION = '0.1.0';
+export const CREWKITE_VERSION = '0.2.0';

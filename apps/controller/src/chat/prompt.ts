@@ -13,11 +13,17 @@ import {
   type ChatAttachment,
   type ChatFamily,
   type ChatRole,
+  MAX_PLAN_SLICES,
   PROJECT_NOTES_BYTES,
   PROJECT_NOTES_MAX,
   projectNotesBytes,
   renderProjectNotes,
+  WRITING_RULES,
+  WRITING_RULES_CATALOGUE_VERSION,
+  type WritingRuleSet,
+  type WritingRulesRead,
 } from '@crewkite/contracts';
+import { writingRuleDigest } from '@crewkite/contracts/hash';
 import { anthropicInstructionFile } from '../providers/anthropic/instructions.ts';
 import { googleInstructionFile } from '../providers/google/instructions.ts';
 import type { ChatHistoryEntry } from './adapter.ts';
@@ -33,9 +39,12 @@ export const familyName: Record<ChatFamily, string> = {
 // model: the person picked another model of the same family, which starts a new native session.
 // session: the turns since the family last ran do not fit its session, so a new one starts.
 // ask: a read-only side question to one family, which reads the thread from the packet.
+// schedule: a step of a scheduled run that the loop's limit for `from` held back, so `from`
+// never received it and no usage limit was reached there.
 export type HandoffReason =
   | 'manual'
   | 'limit'
+  | 'schedule'
   | 'steer'
   | 'rerun'
   | 'model'
@@ -43,7 +52,9 @@ export type HandoffReason =
   | 'ask'
   | 'plan';
 
-export function handoffReason(reason: HandoffReason): string {
+/** The reason a handoff gives, in the thread's line and in the packet. `from` is where it moved from. */
+export function handoffReason(reason: HandoffReason, from: ChatFamily): string {
+  if (reason === 'schedule') return `the loop's limit for ${familyName[from]}`;
   if (reason === 'rerun') return 'the person asked for the reply again';
   if (reason === 'steer') return 'the person sent a new message during the reply';
   if (reason === 'model') return 'model changed in the composer';
@@ -58,13 +69,16 @@ export function handoffReason(reason: HandoffReason): string {
  * sources and Local has no instruction loader, so those two get the project's instruction files
  * here. The OpenAI and Google clients read their own files from the working folder. Every family
  * gets the project's notes. The notes and the instruction files share 64 KiB: the notes come first
- * with at most 16 KiB, and the instruction files keep the rest.
+ * with at most 16 KiB, and the instruction files keep the rest. The writing rules, with the project's
+ * design system after them when it is delivered, come between the framing and the notes, and their
+ * bytes come out of the same 64 KiB.
  */
 export function systemContext(
   projectName: string,
   directory: string,
   family: ChatFamily,
   notes: readonly string[] = [],
+  rules = '',
 ): string {
   const framing = [
     `You are working on the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
@@ -75,9 +89,81 @@ export function systemContext(
   const section = notesSection(notes);
   const instructions =
     family === 'anthropic' || family === 'local'
-      ? projectInstructions(directory, INSTRUCTION_BYTES - Buffer.byteLength(section))
+      ? projectInstructions(
+          directory,
+          INSTRUCTION_BYTES - Buffer.byteLength(section) - Buffer.byteLength(rules),
+        )
       : [];
-  return [framing, ...(section ? [section] : []), ...instructions].join('\n\n');
+  return [framing, ...(rules ? [rules] : []), ...(section ? [section] : []), ...instructions].join(
+    '\n\n',
+  );
+}
+
+/**
+ * Obligations no switch removes. They ride with every writing turn, so turning the ladder off
+ * never drops them. Rules only add guidance. None of them grants a permission.
+ */
+export const MANDATORY_OBLIGATIONS =
+  'Whatever else applies, validate input at trust boundaries, handle errors so no data is lost, keep security and accessibility intact, stay inside the permissions this turn was given, and follow the architecture decisions the project records.';
+
+const RULES_HEAD = 'Writing rules for this work:';
+
+/** The rules a writing turn receives and the section that carries them. */
+export type WritingRuleTurn = Readonly<{ set: WritingRuleSet; section: string }>;
+
+/**
+ * The rule set for the next writing turn. It reads the catalogue, so the order is the
+ * catalogue's and an export-only rule never joins, whatever the stored rows say. A rule with no
+ * row takes its default.
+ */
+export function resolveWritingRules(
+  rows: readonly { ruleId: string; enabled: boolean }[] = [],
+): WritingRuleTurn {
+  const chosen = new Map(rows.map((row) => [row.ruleId, row.enabled]));
+  const picked = WRITING_RULES.filter(
+    (rule) => rule.surface === 'settings' && (chosen.get(rule.id) ?? rule.defaultEnabled),
+  );
+  const enabled = picked.map((rule) => rule.id);
+  const set = {
+    catalogueVersion: WRITING_RULES_CATALOGUE_VERSION,
+    enabled,
+    digest: writingRuleDigest(enabled),
+  };
+  const lines = picked.map((rule) => `- ${rule.text}`);
+  return { set, section: [RULES_HEAD, ...lines, MANDATORY_OBLIGATIONS].join('\n') };
+}
+
+/** What ReadWritingRules answers: every catalogue rule with the switch that applies now. */
+export function readWritingRules(
+  rows: readonly { ruleId: string; enabled: boolean }[],
+): WritingRulesRead {
+  const chosen = new Map(rows.map((row) => [row.ruleId, row.enabled]));
+  return {
+    rules: WRITING_RULES.map((rule) => ({
+      id: rule.id,
+      enabled: chosen.get(rule.id) ?? rule.defaultEnabled,
+      surface: rule.surface,
+      text: rule.text,
+      version: rule.version,
+    })),
+    digest: resolveWritingRules(rows).set.digest,
+  };
+}
+
+/**
+ * Refuses the turn when the rules, with any design system they carry, and the notes leave no room
+ * under the shared context limit. A required rule or a token is never cut to fit. Rules and notes
+ * alone stay well under the limit, so a large design system is what usually refuses.
+ */
+export function fitWritingRules(
+  rules: string,
+  notes: readonly string[],
+  limit = INSTRUCTION_BYTES,
+): void {
+  if (Buffer.byteLength(rules) + Buffer.byteLength(notesSection(notes)) > limit)
+    throw Error(
+      'The writing rules, design system and project notes do not fit the 64 KiB context limit. Shorten the design system, turn off its delivery or remove project notes.',
+    );
 }
 
 /**
@@ -118,6 +204,17 @@ const TURN_NOTES_LEAD =
   'CrewKite attaches the current notes for this project to the message below.';
 const TURN_NOTES_END = 'End of project notes.';
 const NO_NOTES = 'This project has no notes now.';
+const TURN_RULES_LEAD = 'CrewKite attaches the writing rules for this turn to the message below.';
+const TURN_RULES_END = 'End of writing rules.';
+
+/**
+ * A resumed session skips the system context, so the writing rules reach it in front of its
+ * message, and with them the design brief when the project delivers one. The block starts and
+ * ends on fixed lines, so `stripTurnNotes` can take it out when a new session starts.
+ */
+export function turnRulesBlock(rules: string): string {
+  return `${TURN_RULES_LEAD}\n\n${rules}\n\n${TURN_RULES_END}`;
+}
 
 /**
  * A resumed session skips the system context, so the notes reach it in front of its message. They
@@ -133,14 +230,22 @@ export function turnNotesBlock(notes: readonly string[], held: string | undefine
 }
 
 /**
- * The prompt without the block `turnNotesBlock` put in front of it. An adapter calls it when a
- * resume fails and a new session starts, because that session reads the notes in its system
+ * The prompt without the blocks `turnRulesBlock` and `turnNotesBlock` put in front of it. An adapter calls it when a
+ * resume fails and a new session starts, because that session reads both in its system
  * context and would otherwise see them twice.
  */
 export function stripTurnNotes(prompt: string): string {
-  if (!prompt.startsWith(`${TURN_NOTES_LEAD}\n\n`)) return prompt;
-  const end = prompt.indexOf(`\n\n${TURN_NOTES_END}\n\n`);
-  return end < 0 ? prompt : prompt.slice(end + TURN_NOTES_END.length + 4);
+  return stripBlock(
+    stripBlock(prompt, TURN_RULES_LEAD, TURN_RULES_END),
+    TURN_NOTES_LEAD,
+    TURN_NOTES_END,
+  );
+}
+
+function stripBlock(prompt: string, lead: string, trail: string): string {
+  if (!prompt.startsWith(`${lead}\n\n`)) return prompt;
+  const end = prompt.indexOf(`\n\n${trail}\n\n`);
+  return end < 0 ? prompt : prompt.slice(end + trail.length + 4);
 }
 
 /** Instruction files at the scratch root, in the order systemContext reads them. */
@@ -341,6 +446,94 @@ export function challengeContext(
   return [...lines, `The last answer:\n\n${text}`].join('\n');
 }
 
+/** What a report run adds to the orchestrator's brief. The controller refuses a slice that writes. */
+const REPORT_PLAN_RULES =
+  'This is a report run, so always reply with a plan, whatever the request asks, and never answer it yourself. Every slice only reads, so set readOnly to true on each one. Write each slice brief so the slice ends with its findings, one per line, each with the file and line it rests on. After the last slice a challenger argues against the findings, and you then write one message with the findings that stand.';
+
+/** The ending a read-only slice of a report run is told to give. */
+const REPORT_SLICE_ENDING =
+  'End with your findings, one per line, each with the file and line it rests on.';
+
+/** Brief for the challenger of a report run: argue against each finding the slices stated. */
+export function reportChallengeContext(
+  projectName: string,
+  directory: string,
+  family: ChatFamily,
+): string {
+  return [
+    `You are challenging the findings of a report in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    readOnlyRules(family, 'check a finding'),
+    'The message lists the findings of each slice, one per line, each with the file and line it rests on. Argue against every finding. Open the file at that line and say whether the finding stands, and why. Say so when a line does not hold what the finding claims, or when you could not verify it. Add no finding of your own.',
+  ].join('\n');
+}
+
+/** Brief for the orchestrator's closing turn of a report run: one message with what stands. */
+export function reportContext(projectName: string, directory: string, family: ChatFamily): string {
+  return [
+    `You are the orchestrator writing the report of a run in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
+    readOnlyRules(family, 'check a finding'),
+    "The message holds the findings of each slice and the challenger's answer to them. Write one message with the findings that stand, one per line, each with the file and line it rests on. Leave out a finding the challenger showed does not hold. End with a last line that reads Findings: followed by how many you listed, such as Findings: 3, or Findings: 0 when none stand.",
+  ].join('\n');
+}
+
+/** A chat message holds 65,536 bytes. The parts of a closing brief share what the framing leaves. */
+const REPORT_PART_BYTES = 56_000;
+const TRIMMED = ' [trimmed]';
+const utf8 = (text: string) => Buffer.byteLength(text, 'utf8');
+
+/** Cut text to `limit` UTF-8 bytes at a code point, and say so. */
+function fitted(text: string, limit: number): string {
+  if (utf8(text) <= limit) return text;
+  let kept = '';
+  let bytes = utf8(TRIMMED);
+  for (const point of text) {
+    bytes += utf8(point);
+    if (bytes > limit) break;
+    kept += point;
+  }
+  return `${kept}${TRIMMED}`;
+}
+
+/** What each slice of a report run answered, in plan order, within `limit` bytes in all. */
+function sliceFindings(
+  slices: readonly { id: number; title: string; findings: string }[],
+  limit: number,
+): string {
+  const share = Math.max(utf8(TRIMMED) + 1, Math.floor(limit / Math.max(1, slices.length)));
+  return slices
+    .map(
+      (slice) =>
+        `Slice ${slice.id}: ${slice.title}\n${fitted(slice.findings.trim() || 'It gave no findings.', share)}`,
+    )
+    .join('\n\n');
+}
+
+/** The message the challenger of a report run answers. */
+export function reportChallengeBrief(
+  slices: readonly { id: number; title: string; findings: string }[],
+): string {
+  return [
+    'Challenge the findings below. For each one, say whether it stands and why.',
+    sliceFindings(slices, REPORT_PART_BYTES),
+  ].join('\n\n');
+}
+
+/** The first words of the message the orchestrator answers to write the report. */
+export const REPORT_LEAD = 'Write the report. Keep the findings that stand after the challenge.';
+
+/** The message the orchestrator answers to write the report. */
+export function reportBrief(
+  slices: readonly { id: number; title: string; findings: string }[],
+  challenge: string,
+): string {
+  const half = REPORT_PART_BYTES / 2;
+  return [
+    REPORT_LEAD,
+    `Findings of each slice:\n\n${sliceFindings(slices, half)}`,
+    `The challenger's answer:\n\n${fitted(challenge.trim() || 'The challenger gave no answer.', half)}`,
+  ].join('\n\n');
+}
+
 /** The example in the orchestrator brief. A test parses it with the plan schema. */
 export const PLAN_EXAMPLE =
   '{"planId": "p1", "goal": "Add tax to the order total.", "slices": [{"id": 1, "title": "Add the tax rate", "brief": "Add TAX_RATE to src/config.ts and export it.", "files": ["src/config.ts"], "depends": [], "difficulty": "easy", "readOnly": false}, {"id": 2, "title": "Apply tax in totals", "brief": "Use TAX_RATE in orderTotal in src/totals.ts and round to the cent.", "files": ["src/totals.ts", "src/config.ts"], "depends": [1], "difficulty": "medium", "readOnly": false}]}';
@@ -354,19 +547,24 @@ export function orchestratorContext(
   projectName: string,
   directory: string,
   family: ChatFamily,
+  sliceCap: number = MAX_PLAN_SLICES,
+  report = false,
 ): string {
   return [
     `You are the orchestrator in a thread about the project ${projectName}. Its files are in a scratch copy at ${directory}.`,
     readOnlyRules(family, 'plan the work'),
-    'Answer a question, or a request that changes no file, yourself in plain sentences and write no plan block. A plan costs a turn per slice, so propose one only for work that changes files or splits into independent parts.',
-    'For that work, split the request into slices that one model can each finish in one turn. CrewKite checks the plan and assigns each slice inside the crew: every slice runs on the crew builder, and a hard slice runs on the crew fixer when the crew has one. No provider outside the crew takes a slice, and Local takes one only when a crew role is Local. When the crew builder reaches its usage limit and Continue on another provider is on, the handoff rule may still move a slice to another provider. A provider the person rules out in the message, such as "do not assign anything to Local", takes no slice, and CrewKite reads that from the message itself. Slices whose dependencies are done start together, each in its own copy of the project, with at most one turn per provider at a time. Each slice that changes files gets a review.',
+    // A report run always plans, so its brief opens with that and has no work to point back to.
+    report
+      ? REPORT_PLAN_RULES
+      : 'Answer a question, or a request that changes no file, yourself in plain sentences and write no plan block. A plan costs a turn per slice, so propose one only for work that changes files or splits into independent parts.',
+    `${report ? 'Split' : 'For that work, split'} the request into slices that one model can each finish in one turn. CrewKite checks the plan and assigns each slice inside the crew: every slice runs on the crew builder, and a hard slice runs on the crew fixer when the crew has one. No provider outside the crew takes a slice, and Local takes one only when a crew role is Local. When the crew builder reaches its usage limit and Continue on another provider is on, the handoff rule may still move a slice to another provider. A provider the person rules out in the message, such as "do not assign anything to Local", takes no slice, and CrewKite reads that from the message itself. Slices whose dependencies are done start together, each in its own copy of the project, with at most one turn per provider at a time. Each slice that changes files gets a review.`,
     'The slices are the parallel workers, and CrewKite starts them after your turn. Your own turn only reads and plans, so you start no agent to do the work. When the person asks for a number of agents or subagents, split the work into that many slices where it divides that way, leave the independent ones without depends, and say in your summary which slices run side by side.',
     'With a plan, reply with a short summary in plain sentences: what each slice does and which ones run side by side. The person sees the plan as a card, so the summary does not repeat its JSON or list its fields. End the reply with exactly one fenced code block whose opening line is ```json plan and which holds one JSON object of this shape:',
     PLAN_EXAMPLE,
     'Rules:',
     '- planId: letters, digits, dot, underscore or hyphen, at most 64 characters.',
     '- goal: at most 2,000 characters.',
-    '- slices: 1 to 8. Each id is a number from 1 to 8, used once.',
+    `- slices: 1 to ${sliceCap}. Each id is a number from 1 to ${sliceCap}, used once.`,
     '- title: at most 120 characters. brief: at most 4,000 characters, written so a model can do the slice without reading this reply.',
     '- files: at most 40 paths the slice reads or changes, relative to the root of the scratch copy, with forward slashes, no leading slash and no `..`. Name a file the slice creates by the path it will have.',
     '- depends: ids of the slices that must finish first. No cycles.',
@@ -400,6 +598,7 @@ export function sliceBrief(
   plan: { planId: string; goal: string; slices: readonly unknown[] },
   slice: { id: number; title: string; brief: string; files: readonly string[]; readOnly: boolean },
   assignment: string,
+  report = false,
 ): string {
   return [
     `Slice ${slice.id} of ${plan.slices.length} in plan ${plan.planId}: ${slice.title}`,
@@ -412,6 +611,7 @@ export function sliceBrief(
     slice.readOnly
       ? 'This slice only reads. Read and search the files it needs, change none of them, and report what you found.'
       : 'Do only this slice. Later slices cover the rest of the plan. Say which files you changed and why.',
+    report ? REPORT_SLICE_ENDING : '',
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -425,11 +625,13 @@ export function sliceBrief(
 export function localSliceBrief(
   plan: { goal: string },
   slice: { brief: string; files: readonly string[]; readOnly: boolean },
+  report = false,
 ): string {
   return [
     `Goal: ${plan.goal.replace(/\s+/g, ' ').trim()}`,
     `Task: ${slice.brief}${slice.readOnly ? ' Read only and change no file.' : ''}`,
     slice.files.length ? `Files:\n${slice.files.join('\n')}` : '',
+    report ? REPORT_SLICE_ENDING : '',
   ]
     .filter(Boolean)
     .join('\n\n');
@@ -540,12 +742,12 @@ export function handoffPacket(input: {
       : input.reason === 'plan'
         ? 'You are the orchestrator of this thread. The conversation below holds the earlier plans: the plan replies, the slice briefs and what each slice answered. The last plan and its results follow it.'
         : input.reason === 'rerun'
-          ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+          ? `This message runs again on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason, input.from)}.`
           : input.from === input.to && (input.reason === 'model' || input.reason === 'session')
-            ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason)}.`
+            ? `This thread continues on ${familyName[input.to]} in a new session. Reason: ${handoffReason(input.reason, input.from)}.`
             : input.from === input.to
-              ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason)}.`
-              : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason)}.`;
+              ? `The last reply on ${familyName[input.from]} was stopped before it finished. Reason: ${handoffReason(input.reason, input.from)}.`
+              : `This thread moved from ${familyName[input.from]} to ${familyName[input.to]}. Reason: ${handoffReason(input.reason, input.from)}.`;
   return [
     opening,
     'Earlier work is in the same scratch copy. Read files before you change them.',
@@ -720,7 +922,7 @@ export function deltaPacket(input: {
   const to = familyName[input.to];
   const opening =
     input.from && input.from !== input.to && input.reason
-      ? `This thread moved from ${familyName[input.from]} to ${to}. Reason: ${handoffReason(input.reason)}. This session holds the thread up to its last turn on ${to}.`
+      ? `This thread moved from ${familyName[input.from]} to ${to}. Reason: ${handoffReason(input.reason, input.from)}. This session holds the thread up to its last turn on ${to}.`
       : `Other providers took turns in this thread since its last turn on ${to}.`;
   return [
     opening,

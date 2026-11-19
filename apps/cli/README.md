@@ -97,23 +97,80 @@ pnpm crewkite thread permit <task-id> <request-id> [--thread]
 pnpm crewkite thread deny <task-id> <request-id>
 pnpm crewkite thread stop <task-id>
 pnpm crewkite thread accept <task-id> <branch> [--message text]
-pnpm crewkite thread push <task-id> [--remote origin] --confirm
+pnpm crewkite thread push <task-id> [--remote origin] [--commit sha] --confirm
 pnpm crewkite thread pr <task-id> [--title text] [--body text]
+pnpm crewkite thread merge-check <task-id> [--base branch] [--remote name]
 pnpm crewkite thread list
 pnpm crewkite thread show <task-id>
 pnpm crewkite thread changes <task-id> [--json]
+pnpm crewkite thread use-api <task-id> <connection-id> [--role role] --confirm
+pnpm crewkite thread use-api <task-id> --off [--role role]
+pnpm crewkite thread release-check <task-id> --confirm --note text
 pnpm crewkite -p "message" [--thread task-id | --project project-id | --register] [--model family[/model[:effort]]] [--permission-policy policy] [--file path ...]
 ```
 
 `--model` takes a family, which runs its default model, a family and model, or a family, model and effort. Without it the CLI uses the `selection` from `cli.json`, then the connected family with the most allowance left. `--file` attaches a file from disk.
 
-`permit` answers with allow once, or with allow for this thread when you add `--thread`. `push` without `--confirm` prints what it would push and sends nothing.
+`permit` answers with allow once, or with allow for this thread when you add `--thread`. `push` without `--confirm` prints the commit it would push and sends nothing. `--commit` names the commit the push sends, and the controller refuses it once the thread accepted another one; without it the push sends the commit the thread holds when it runs. `merge-check` fetches the base of the thread's pull request, or `--base`, from the remote the thread pushed to and merges the accepted commit onto it outside any checkout. It prints the controller's sentence: a clean merge, or the files that conflict. A conflict moves the merge into the thread's copy and starts the fixer, the way Resolve conflicts does in the desktop, and `thread accept` then takes the result. It pushes nothing.
 
-Print mode sends one message and streams the reply to stdout; tool lines, permission requests and failures go to stderr. Without `--thread` it starts a new thread in the registered project of the Git checkout you ran it in, found the way the interactive mode finds it, with every `GIT_` variable left out. It registers nothing on its own: a checkout the controller does not hold needs `--project`, or `--register` to register it, and the refusal names both. `-p` counts only before the first positional argument.
+`release-check` lets go of a thread held by a check whose process CrewKite lost track of. That happens when the controller stopped between journaling the check and recording its process group, so nothing in CrewKite proves that process gone. The release also covers a design preview pass, which runs in the thread's own copy, and a project command started for the thread, which runs in a folder of its own. CrewKite cannot check for you, and it signals nothing. Look for a leftover test or build process yourself first, then say what you checked in `--note`. The note stays with the check's record and the thread says you released it. Without `--confirm` and `--note` it explains the risk, sends nothing and exits 2. A check that is still running, or one whose recorded process is still present, keeps the thread held.
+
+Print mode sends one message and streams the reply to stdout. It then follows the thread until its whole workflow ends: the crew chain after the turn, plan slices, and the checks that run after a writing turn. It prints one line to stderr with how the workflow ended and the steps it saw. A checks question or a proposed plan that waits for you, and a thread that is blocked, a held queue or a process CrewKite cannot prove gone, end the run with status 2. A failed check or slice ends it with status 1. A permission request keeps the run waiting, as below. Print mode and `thread watch` follow the same way, and `thread watch --follow` streams without an end. `thread watch` follows whatever work is under way, from its start: an open plan from its first turn, an open crew chain from its builder turn, running turns, running checks and a queue that starts a message on its own. With none of these it says `Nothing is running in this thread.` and exits 0. tool lines, permission requests and failures go to stderr. Without `--thread` it starts a new thread in the registered project of the Git checkout you ran it in, found the way the interactive mode finds it, with every `GIT_` variable left out. It registers nothing on its own: a checkout the controller does not hold needs `--project`, or `--register` to register it, and the refusal names both. `-p` counts only before the first positional argument.
 
 `--permission-policy ask`, `allow-edits` or `allow-all` sets the new thread's policy for this run, and print mode prints the policy in use to stderr. A permission request waits for an answer from `thread permit` or `thread deny` in another terminal, the interactive mode or the desktop. When the connection to the controller drops, print mode and `thread watch` print `Lost the controller. Reconnecting for about a minute.` to stderr and keep trying. If it does not come back they say so and exit 1; the turn may still run in the controller. After a gap in the stream they read the thread again. `thread watch --follow` prints each later turn as its record arrives. `thread changes` prints one line for each changed file with its added and removed line counts, and with `--json` one `result` line that holds the same list without the patches. A thread ID or project ID that is not in the contract's shape is refused with one line and status 2 before the controller is asked anything. A new thread whose first message is refused, for example because an attached file is missing, is removed again, so a refusal leaves no empty thread behind.
 
 `crewkite --version`, `-v` and `crewkite version` print the version. `crewkite help` prints the same text as `--help`, and `crewkite usage` with no action lists the usage commands and exits 0.
+
+### Recipes
+
+```sh
+pnpm crewkite recipe list [--project project-id]
+pnpm crewkite recipe show <recipe>
+pnpm crewkite recipe run <recipe> "Tidy the next module" [--watch]
+```
+
+A recipe keeps the setup of a plan run: the crew, the flight mode, the permission policy, the handoff settings, the most slices the orchestrator may propose and the checks. It lives as one JSON file in the project, and the desktop's Recipes page writes it. `recipe list` shows each file in the picked folder and each recipe CrewKite saved, with the state of its file. `recipe show` prints the saved version. `<recipe>` is an ID, which starts with `rcp_`, then an exact path, then an exact name. Two matches at one step in one project refuse and ask for the path. A name or path that matches in more than one project refuses and asks for `--project`. Quote a name or a request that has spaces. Without `--project` the CLI looks in every registered project, and `recipe list` takes the only registered project.
+
+`recipe run` starts a new thread in the recipe's project and sends the request, the way you would after setting the thread up by hand. It runs only the version CrewKite saved. A file that changed on disk, a provider that is not connected or out of allowance with credit spending off, and a recipe whose checks do not fit in one thread each refuse with one sentence and status 2, and nothing is created. A run you start asks before it runs a check command, as any thread does. With `--watch` the command follows the new thread the way `thread watch` does. With `--json` each command writes one `result` line.
+
+### Loops
+
+```sh
+pnpm crewkite loop list [--project project-id]
+pnpm crewkite loop pause <recipe>
+pnpm crewkite loop resume <recipe>
+pnpm crewkite loop restart <recipe>
+```
+
+A recipe with a trigger is a loop, which the desktop's Recipes page arms when it saves. `loop list` prints one row for each loop with its state, next run, last result and the runs it has started. Times are UTC. A paused or stopped row, and an active row with no next run, are followed by a line that says why. Without `--project` it lists every registered project, and when the loops lie in more than one project a `PROJECT` column follows the recipe. The last line is always `Loops run while CrewKite is open.`, because the controller starts a loop's run only while a client is attached.
+
+`pause`, `resume` and `restart` take a recipe the way `recipe show` does and print `Paused.`, `Resumed. Next run {time}.` or `Restarted. Next run {time}.`. If the change went through and the read that finds the next run fails, the line comes without its second sentence and the command exits 0. A recipe with no loop, and a change the controller refuses, print the controller's sentence to stderr and exit 2. With `--json` each command writes one `result` line.
+
+### Results
+
+```sh
+pnpm crewkite results [--project project-id] [--recipe recipe]
+pnpm crewkite results --export results.json [--project project-id] [--recipe recipe]
+```
+
+`results` prints what the controller recorded for each step of a plan, as counts per recipe and per role and model. It ranks nothing and suggests nothing. The cells read as they do in the desktop's Results view: `None` for a count of nothing and `Unknown` for a value the controller never observed, which is the usual case for an allowance. A percent of one usage window never adds to a percent of another, so a recipe with more than one allowance prints each on its own line. `--export` writes a file and takes no `--json`. A project ID that no registered project holds is refused with `Choose a registered project.`, for the counts and the export. `--recipe` takes a name, path or ID the way `recipe show` does and limits the counts to that recipe. Without `--project` and `--recipe` the CLI takes the only registered project. The last line is `Counts from this device. Nothing here is uploaded.` With `--json` it writes one `result` line.
+
+`--export` writes every recorded step and run as one JSON file and prints `Wrote {n} records to {file}.`. A link at the path, symbolic or hard, is refused. A file already there is replaced, and a new file is created with mode 0600. A path that is a link, a folder, a pipe or a file the CLI cannot open prints `The file could not be written there. Choose another place.` and exits 2. Nothing leaves the device unless you move the file.
+
+### API connections
+
+```sh
+pnpm crewkite connections
+pnpm crewkite connections add openai|anthropic [--label text]
+pnpm crewkite connections check <connection-id>
+pnpm crewkite connections keep <connection-id> on|off
+pnpm crewkite connections disconnect <connection-id>
+pnpm crewkite connections forget <connection-id> --confirm
+```
+
+Each provider runs on your subscription. An API connection bills the provider's API rates to your own key, and only for the thread or role you assign it to. `connections add` makes the connection with its own client profile and prints the line that signs that profile in. Run the line in your terminal: the provider's client asks for the key there, so the key never passes through CrewKite. `connections check` then asks the client which mode the profile is signed in with. It takes up to 30 seconds, and the connection is ready only when the client reports API billing. `connections` lists each one with its state, Keep connected and spend, and the sign-in line again while it needs one. `keep on` restores the connection after a restart and starts no work. `disconnect` keeps the connection and its assignments, and turns on it are refused until the next check. `forget` without `--confirm` says what it removes and sends nothing.
+
+`thread use-api` assigns a ready connection to the thread, where it runs the turns on that connection's provider, or with `--role` to one crew role. Without `--confirm` it names the connection, says provider charges apply and sends nothing. It refuses a connection that is not ready, and one whose provider is not the role's. `--off` removes the choice. The desktop does the same from the Crew tab.
 
 ### Exit status
 
@@ -121,12 +178,12 @@ Every command, the task commands included, uses one table.
 
 | Status | Meaning |
 |--------|---------|
-| 0 | The request applied, or the followed turn finished |
-| 1 | It failed: an error, a failed read, a lost connection, an incomplete list, a followed turn that failed, or a value a task command rejects after reading its arguments |
+| 0 | The request applied, or the followed workflow finished |
+| 1 | It failed: an error, a failed read, a lost connection, an incomplete list, a followed workflow that failed, or a value a task command rejects after reading its arguments |
 | 2 | Nothing was done: arguments that do not parse, arguments a thread command or print mode rejects, or a request the controller refused, with its reason printed |
-| 3 | The followed turn was stopped |
+| 3 | The followed workflow was stopped |
 
-With `--json` every line is one object that `CliJsonLineSchema` in `packages/contracts/src/cli.ts` accepts. `kind` says which: `event` for a thread event (agent events, turn and thread records, stored messages), `result` for the controller's answer to a command with its reason and next step, `turn-end` with the status of the followed turn, `thread` for a thread read, `threads` for the list and `error`. Every line carries `v: 5`. That number names one fixed shape, the embedded thread, turn, message and event shapes included: the CLI's schema test pins a hash of the whole shape, so a change to any of them moves `v`.
+With `--json` every line is one object that `CliJsonLineSchema` in `packages/contracts/src/cli.ts` accepts. `kind` says which: `event` for a thread event (agent events, turn and thread records, stored messages), `result` for the controller's answer to a command with its reason and next step, `turn-end` with the status of the followed turn, `thread` for a thread read, `threads` for the list and `error`. Every line carries `v: 10`. A `result` line for a send also carries `admission`: `started` or `handed-on` with the turn ID, `queued` with the message ID, or `refused` with a reason, a message and the next step. A refused send exits 2 and never waits for a turn. That number names one fixed shape, the embedded thread, turn, message and event shapes included: the CLI's schema test pins a hash of the whole shape, so a change to any of them moves `v`.
 
 ### Usage analytics
 
@@ -248,11 +305,15 @@ pnpm crewkite native setup initialize --family google --consent --json
 pnpm crewkite native setup authenticate --family google --consent --json
 pnpm crewkite native setup discover --family google --consent --json
 pnpm crewkite native setup stop --family google --json
+pnpm crewkite native setup recover --family google --consent --json
+pnpm crewkite native setup refresh --family google --consent --json
 ```
 
 Each command performs only its named action. Initialization and discovery send no model prompt. Personal authentication can open a browser, contact Google and write native authentication state. CrewKite retains result codes and safe client proofs. Setup commands use the current persisted revision; Stop names the current operation. An uncertain command keeps its exact retry key. A fresh setup action does not replay it.
 
-Setup status returns `{ cursor, setup, profile }`. Import returns `{ imported, reason, client }`, with version, digest and signer team only. Authentication and configuration do not establish entitlement or route qualification. Missing verified review mappings keep launch unavailable even when discovery exposes model choices.
+Recover releases an interrupted metadata operation only when its recorded process group is gone, and with this explicit consent an interrupted sign-in. It sends no prompt and opens no browser, and a released operation's result stays unknown. Every other held operation keeps its reason. Refresh reads the model list again from Ready and keeps the earlier list if the read fails.
+
+Setup status returns `{ cursor, setup, profile, holds }`. Import returns `{ imported, reason, client }`, with version, digest and signer team only. Authentication and configuration do not establish entitlement or route qualification. Missing verified review mappings keep launch unavailable even when discovery exposes model choices.
 
 When setup is ready, prepare a committed file using IDs advertised by discovery:
 

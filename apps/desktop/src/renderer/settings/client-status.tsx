@@ -3,7 +3,7 @@ import { RefreshCw } from 'lucide-react';
 import type { ReactNode } from 'react';
 import { Fact } from '../components.tsx';
 import { usageReadLine, type Workspace } from '../source.ts';
-import { nativeUsageClients, readAgo } from '../usage-presentation.ts';
+import { nativeUsageClients } from '../usage-presentation.ts';
 import type { ProviderActions } from './provider-actions.ts';
 
 type Family = 'openai' | 'anthropic' | 'google';
@@ -52,11 +52,11 @@ export function ClientStatus({
   family: Family;
   header: WorkspaceState;
   now: number;
-  /** Google setup lists the same two facts itself. */
+  /** Google setup lists its coding readiness itself. */
   facts?: boolean;
   children: ReactNode;
 }) {
-  const { label, reader, codingReady, clientReady } = clientFor(header, family, now);
+  const { label, codingReady, clientReady } = clientFor(header, family, now);
   // While Google setup is still working, its client line would read as a failure. It shows once
   // discovery has ended.
   const googleState = header.googleAcpSetup?.state;
@@ -66,10 +66,6 @@ export function ClientStatus({
     (!!header.googleAcpSetup?.operationId ||
       !!header.googleAcpInstall?.operationId ||
       (googleState !== undefined && googleSettling.has(googleState)));
-  // The Anthropic report carries no time of its own, so its age runs from when CrewKite received it.
-  const lastRead =
-    readAgo(family === 'anthropic' ? reader?.reading?.receivedAt : reader?.lastObservedAt, now) ??
-    'Not read yet';
   return (
     <section className="st-block" aria-label={`${label} client status`}>
       <div className="st-subhead">
@@ -85,7 +81,6 @@ export function ClientStatus({
           {family !== 'anthropic' && (
             <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
           )}
-          <Fact label="Last read" value={lastRead} />
         </div>
       )}
       {children}

@@ -16,6 +16,7 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
+import { DEFAULT_REPOSITORY_POLICY } from '@crewkite/contracts';
 import { applyPublication, preparePublication } from '../host/publication.ts';
 import {
   blobToFile,
@@ -188,18 +189,21 @@ test('a volume that cannot clone and an edited checkout both fall back to writin
         repository: join(out, 'work'),
         base,
         tree,
+        policy: DEFAULT_REPOSITORY_POLICY,
+        destinationRef: 'refs/heads/feat/accepted',
         identity: { name: 'Fixture', email: 'fixture@example.invalid' },
         at: '2026-10-28T09:00:00.000Z',
+        message: 'feat: accept a large scratch copy\n',
       });
       applyPublication({
         source: root,
         pack: prepared.pack,
-        destinationRef: 'refs/heads/accepted',
+        destinationRef: 'refs/heads/feat/accepted',
         treeOid: prepared.treeOid,
         commitOid: prepared.commitOid,
         base,
       });
-      assert.equal(git(root, 'cat-file', '-s', 'accepted:big.bin'), String(BIG + 1));
+      assert.equal(git(root, 'cat-file', '-s', 'feat/accepted:big.bin'), String(BIG + 1));
       // Only the changed files were written. The tree holds the edit and keeps the base's links.
       const listing = git(root, 'ls-tree', '-r', base).split('\n');
       const baseOid = (path: string) =>

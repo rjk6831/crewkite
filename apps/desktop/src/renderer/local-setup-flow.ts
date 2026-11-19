@@ -269,7 +269,9 @@ export async function connectInPlace({
   }
   let discovered = false;
   for (let attempt = 0; attempt < attempts; attempt++) {
-    if (attempt > 0 || !setup.connected) await wait();
+    // The first read follows the command at once. The controller can finish a loopback probe in
+    // milliseconds, and a wait here would add its full length to every launch reconnect.
+    if (attempt > 0) await wait();
     if (!active()) return { kind: 'stopped' };
     const now = await read();
     if (!active() || !now) return { kind: 'stopped' };

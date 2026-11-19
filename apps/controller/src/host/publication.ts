@@ -2,7 +2,8 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { TimestampSchema } from '@crewkite/contracts';
+import { type RepositoryPolicy, TimestampSchema } from '@crewkite/contracts';
+import { checkCommit } from '../github/policy.ts';
 import {
   type FileContent,
   git,
@@ -25,10 +26,19 @@ export function validateIdentity(identity: GitIdentity): GitIdentity {
     throw new Error('Configure a valid Git name and email before acceptance.');
   return { name: identity.name.trim(), email: identity.email };
 }
-export function configuredIdentity(directory: string): GitIdentity | undefined {
+/**
+ * The name and email Git config gives. `global` reads the user's global file. `repository` reads
+ * what Git resolves inside the repository at `directory`: its own config over the user's, with
+ * its includes and conditional includes.
+ */
+export function configuredIdentity(
+  directory: string,
+  scope: 'global' | 'repository' = 'global',
+): GitIdentity | undefined {
+  const where = scope === 'global' ? ['--global'] : [];
   try {
     const read = (key: string) =>
-      execFileSync('git', ['config', '--global', '--includes', '--get', key], {
+      execFileSync('git', ['config', ...where, '--includes', '--get', key], {
         cwd: directory,
         timeout: 1000,
         maxBuffer: 1024,
@@ -46,6 +56,23 @@ export function configuredIdentity(directory: string): GitIdentity | undefined {
   }
 }
 
+/** What the controller is given: a fixed identity, or a reader of the user's global config. */
+export type GitIdentitySource = GitIdentity | (() => GitIdentity | undefined);
+
+/**
+ * Who a commit in this project is from. A fixed identity, as tests and the scripted controller
+ * pass, stands for every project. Otherwise the policy picks the config: the project's own, or
+ * the user's global config through the reader.
+ */
+export function commitIdentity(
+  policy: RepositoryPolicy,
+  root: string,
+  source: GitIdentitySource | undefined,
+): GitIdentity | undefined {
+  if (typeof source !== 'function') return source;
+  return policy.identity === 'repository' ? configuredIdentity(root, 'repository') : source();
+}
+
 type PublicationInput = {
   source: string;
   repository: string;
@@ -53,10 +80,19 @@ type PublicationInput = {
   files?: FileContent[];
   /** Base entries a chat scratch copy left out. They go into the tree unchanged. */
   kept?: readonly KeptEntry[];
-  identity: GitIdentity;
+  /** The project's policy. The commit, its identity and its branch must meet it. */
+  policy: RepositoryPolicy;
+  /** The branch the commit is for. `applyPublication` writes it. */
+  destinationRef: string;
+  /** Undefined when the policy's identity source resolved none. The policy refuses that. */
+  identity: GitIdentity | undefined;
   at: string;
-  /** Chat acceptance names the thread. Candidates keep the checked-candidate message. */
-  message?: string;
+  message: string;
+  /**
+   * The commit's parents, first parent first. Absent means `base` alone. A merge of the pull
+   * request's base names the accepted commit and the base.
+   */
+  parents?: readonly string[];
 };
 type Prepared = { treeOid: string; commitOid: string };
 
@@ -72,19 +108,28 @@ export function preparePublication(
 ): Prepared & { pack: Buffer | { file: string } } {
   if (input.base.length !== 40)
     throw new Error('Publication from this Git object format is unsupported in D0.');
-  const identity = validateIdentity(input.identity);
+  // Every commit CrewKite makes is built here, and the policy check runs before it. Providers
+  // cannot commit: chat scratch copies and run copies hold no .git, and the local tools refuse
+  // .git paths. A new way to commit calls this function, so no commit skips the policy.
+  const { message, identity } = checkCommit(input.policy, {
+    message: input.message,
+    destinationRef: input.destinationRef,
+    identity: input.identity && validateIdentity(input.identity),
+  });
   const at = TimestampSchema.parse(input.at);
   const treeOid = input.tree ?? treeFromFiles(input.repository, input.files ?? [], input.kept);
-  const parent = git(input.source, ['cat-file', 'commit', input.base]);
-  const copied = git(input.repository, ['hash-object', '-t', 'commit', '-w', '--stdin'], parent)
-    .toString()
-    .trim();
-  if (copied !== input.base) throw new Error('Source parent identity changed.');
+  const parents = input.parents ?? [input.base];
+  for (const parent of parents) {
+    const body = git(input.source, ['cat-file', 'commit', parent]);
+    const copied = git(input.repository, ['hash-object', '-t', 'commit', '-w', '--stdin'], body)
+      .toString()
+      .trim();
+    if (copied !== parent) throw new Error('Source parent identity changed.');
+  }
   const commitOid = git(
     input.repository,
-    ['commit-tree', treeOid, '-p', input.base],
-    input.message ??
-      `feat: apply checked task candidate\n\nApply the accepted candidate after its required checks.\n\nSigned-off-by: ${identity.name} <${identity.email}>\n`,
+    ['commit-tree', treeOid, ...parents.flatMap((parent) => ['-p', parent])],
+    message,
     { ...identity, at },
   )
     .toString()
@@ -141,12 +186,19 @@ export function applyPublication(input: {
   treeOid: string;
   commitOid: string;
   base: string;
+  /** The parents the commit must have. Absent means `base` alone. */
+  parents?: readonly string[];
+  /** The commit the branch must hold now. Absent means the branch must not exist. */
+  expected?: string;
 }) {
   const existing = refValue(input.source, input.destinationRef);
-  if (existing !== null) {
-    if (existing === input.commitOid) return;
-    throw new Error('The destination branch already exists. Choose an unused name.');
-  }
+  if (existing !== null && existing === input.commitOid) return;
+  if (existing !== (input.expected ?? null))
+    throw new Error(
+      input.expected
+        ? 'The destination branch moved since it was accepted.'
+        : 'The destination branch already exists. Choose an unused name.',
+    );
   if (Buffer.isBuffer(input.pack)) git(input.source, ['index-pack', '--stdin'], input.pack);
   else gitFromFile(input.source, ['index-pack', '--stdin'], input.pack.file);
   const tree = git(input.source, ['rev-parse', `${input.commitOid}^{tree}`])
@@ -158,13 +210,14 @@ export function applyPublication(input: {
     .split('\n\n')[0]
     .split('\n')
     .filter((line) => line.startsWith('parent '));
-  if (parents.length !== 1 || parents[0] !== `parent ${input.base}`)
+  const wanted = (input.parents ?? [input.base]).map((parent) => `parent ${parent}`);
+  if (parents.length !== wanted.length || parents.some((line, index) => line !== wanted[index]))
     throw new Error('Imported candidate parent identity changed.');
   git(input.source, [
     'update-ref',
     '--no-deref',
     input.destinationRef,
     input.commitOid,
-    '0'.repeat(input.commitOid.length),
+    input.expected ?? '0'.repeat(input.commitOid.length),
   ]);
 }

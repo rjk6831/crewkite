@@ -200,6 +200,15 @@ const scripts = {
     done('failed', given.error ?? limit),
   ],
   reply: () => [['item/completed', { ...ids(), item: message('message-1', 'Hello.') }], done()],
+  // A turn that reports a cost, and optionally a sign-in that changes under it.
+  priced: () => [
+    ['thread/tokenUsage/updated', { ...ids(), tokenUsage: { total: { totalTokens: 900 }, last: { totalTokens: 300, inputTokens: 200, outputTokens: 100, costUsd: 0.0125 }, modelContextWindow: 400000 } }],
+    ...(given.switched ? [['account/updated', { authMode: given.switched }]] : []),
+    ['item/completed', { ...ids(), item: message('message-1', 'Hello.') }],
+    done(),
+  ],
+  // A turn that ends on the turn value given, whatever its status or shape.
+  ending: () => [['item/completed', { ...ids(), item: message('message-1', 'Hello.') }], ['turn/completed', { threadId, turn: given.turn }]],
   // A server request CrewKite has no answer for, then the client's own stop on its denial limit.
   denials: () => [
     { id: 0, method: 'item/tool/requestUserInput', params: { ...ids(), itemId: 'command-1' } },
@@ -262,6 +271,7 @@ input.on('line', (line) => {
   // A hung client never answers the interrupt.
   if (value.method === 'turn/interrupt' && given.silent) return;
   let result = replies[value.method];
+  if (value.method === 'account/read' && given.account !== undefined) result = { account: given.account, requiresOpenaiAuth: true };
   if (value.method === 'account/rateLimits/read' && given.limits) result = given.limits;
   // Fields CrewKite does not read change shape between client builds.
   // A thread opened with a permission profile names it and a read-only sandbox, as 0.163 does.
@@ -355,7 +365,15 @@ function turn(
       lostThread?: boolean;
       /** The account/rateLimits/read result in place of the default. */
       limits?: Record<string, unknown>;
+      /** The turn an ending scenario completes with. */
+      turn?: unknown;
+      /** The account/read answer in place of the ChatGPT sign-in. */
+      account?: { type: string } | null;
+      /** The auth mode the priced scenario's sign-in changes to mid-turn. */
+      switched?: string;
     };
+    /** The connection the turn runs on. */
+    connection?: ChatTurnRequest['connection'];
     /** The person allowed credit spending for OpenAI. */
     creditSpending?: boolean;
     /** The message, when a test needs more than the default. */
@@ -387,6 +405,7 @@ function turn(
   const events: AgentEvent[] = [];
   const listeners: Array<(event: AgentEvent) => void> = [];
   const usage: OpenAiUsage[] = [];
+  const proofs: unknown[] = [];
   const environment = { HOME: home, PATH: process.env.PATH, ...options.environment };
   let args: string[] = [];
   let launchEnvironment: NodeJS.ProcessEnv = {};
@@ -398,6 +417,12 @@ function turn(
       environment,
     }),
     onUsage: (value) => usage.push(value),
+    // Like the controller, a proof that finds the sign-in gone stops every turn on the connection,
+    // this one included.
+    onAccountMode: (proof) => {
+      proofs.push(proof);
+      if (proof.mode === null) handle.stop();
+    },
     spawn: (path, clientArgs, spawnOptions) => {
       args = clientArgs;
       launchEnvironment = spawnOptions.env;
@@ -441,6 +466,7 @@ function turn(
     ...(options.title !== undefined ? { title: options.title } : {}),
     ...(options.allowanceLeft !== undefined ? { allowanceLeft: options.allowanceLeft } : {}),
     ...(options.creditSpending ? { creditSpending: true } : {}),
+    ...(options.connection ? { connection: options.connection } : {}),
   };
   const handle = adapter.startTurn(request, (event) => {
     events.push(event);
@@ -450,6 +476,7 @@ function turn(
     handle,
     events,
     usage,
+    proofs,
     home,
     scratch,
     work,
@@ -813,6 +840,27 @@ test('a turn Codex stops on its own says why, and so does a question CrewKite ca
       'Codex asked a question CrewKite cannot answer (item/tool/requestUserInput). The turn may stop.',
     ],
   );
+});
+
+test('a Codex turn is done only on a completed status, and a new, missing or unreadable status fails as completion-unknown', async () => {
+  const rows: Array<{ turn: unknown; expected: [string, string | null] }> = [
+    { turn: { id: 'turn-1', status: 'completed' }, expected: ['done', null] },
+    { turn: { id: 'turn-1', status: 'failed' }, expected: ['error', 'protocol'] },
+    // inProgress is in the client's list, and it never ends a turn.
+    { turn: { id: 'turn-1', status: 'inProgress' }, expected: ['error', 'completion-unknown'] },
+    { turn: { id: 'turn-1', status: 'paused' }, expected: ['error', 'completion-unknown'] },
+    { turn: { id: 'turn-1' }, expected: ['error', 'completion-unknown'] },
+    { turn: 'unreadable', expected: ['error', 'completion-unknown'] },
+  ];
+  for (const row of rows) {
+    const { stopReason, failure, assistantText } = await turn('ending', {
+      detail: { turn: row.turn },
+    }).settled();
+    const label = JSON.stringify(row.turn);
+    assert.deepEqual([stopReason, failure?.kind ?? null], row.expected, label);
+    // The reply so far stays with the turn, whatever its end.
+    assert.equal(assistantText, 'Hello.', label);
+  }
 });
 
 test('only a used-up plan ends the turn as a limit with the reset time, and only a turn that sent an image names it in a bad request', async () => {
@@ -1645,4 +1693,85 @@ test('a used-up plan runs on credits only when the switch is on and the provider
       );
     }
   }
+});
+
+const apiConnection = {
+  connectionId: 'con_01M51M322B2AEBXD9MA74CBCFM',
+  billingMode: 'api' as const,
+  profileId: 'openai-api-1',
+  proofGeneration: 3,
+};
+
+test('an API connection turn runs in its own Codex home on an API key sign-in and never reads plan usage', async () => {
+  const run = turn('reply', { connection: apiConnection, detail: { account: { type: 'apiKey' } } });
+  const result = await run.settled();
+  assert.equal(result.stopReason, 'done');
+  assert(
+    run.launchEnvironment().CODEX_HOME?.endsWith('/providers/openai/codex-profiles/openai-api-1'),
+  );
+  assert(!run.frames().some((frame) => frame.method === 'account/rateLimits/read'));
+  assert.deepEqual(run.proofs, [
+    { connectionId: apiConnection.connectionId, mode: 'api', proofGeneration: 3 },
+  ]);
+  // The family's own route keeps the default home.
+  const own = turn('reply');
+  await own.settled();
+  assert(own.launchEnvironment().CODEX_HOME?.endsWith('/providers/openai/codex-home'));
+});
+
+test('a sign-in whose mode is not the chosen one fails the turn before anything is sent', async () => {
+  // An account type CrewKite does not know is signed in, so it is never recorded as signed out.
+  // It proves nothing, and the turn still stops before anything is sent.
+  const rows = [
+    { connection: apiConnection, account: { type: 'chatgpt' }, mode: 'subscription' },
+    { connection: apiConnection, account: null, mode: null },
+    { connection: undefined, account: { type: 'apiKey' }, mode: 'api' },
+    { connection: apiConnection, account: { type: 'chatgptAuthTokens' }, mode: undefined },
+  ] as const;
+  for (const row of rows) {
+    const run = turn('reply', { connection: row.connection, detail: { account: row.account } });
+    const result = await run.settled();
+    assert.equal(result.failure?.kind, 'signed-out', `${row.mode}`);
+    assert(!run.frames().some((frame) => frame.method === 'thread/start'));
+    assert.equal(
+      run.proofs.length,
+      row.connection && row.mode !== undefined ? 1 : 0,
+      `${row.mode}`,
+    );
+    assert.equal(
+      (run.proofs[0] as { mode: string } | undefined)?.mode,
+      row.connection ? row.mode : undefined,
+    );
+    if (row.account?.type === 'chatgptAuthTokens')
+      assert.equal(
+        result.failure?.message,
+        'Codex reports an account type CrewKite does not know, so nothing was sent.',
+      );
+  }
+});
+
+test('a reported cost becomes the turn spend, and a sign-in that changes mid-turn ends the turn on any route', async () => {
+  const detail = { account: { type: 'apiKey' } };
+  const priced = turn('priced', { connection: apiConnection, detail });
+  assert.deepEqual((await priced.settled()).spend, {
+    reported: { amountMicros: 12_500, currency: 'USD' },
+    estimated: null,
+    unreportedTurns: 0,
+  });
+  const switched = turn('priced', {
+    connection: apiConnection,
+    detail: { ...detail, switched: 'chatgpt' },
+  });
+  const result = await switched.settled();
+  assert.deepEqual([result.stopReason, result.failure?.kind], ['error', 'signed-out']);
+  assert.equal(result.spend, undefined);
+  // A turn on the family's own route never reports spend.
+  const own = turn('priced');
+  assert.equal((await own.settled()).spend, undefined);
+  // A subscription turn whose sign-in becomes an API key mid-turn stops before it bills that way.
+  const keyed = await turn('priced', { detail: { switched: 'apikey' } }).settled();
+  assert.deepEqual(
+    [keyed.stopReason, keyed.failure?.kind, keyed.failure?.message],
+    ['error', 'signed-out', 'The ChatGPT sign-in changed during the turn, so it stopped.'],
+  );
 });

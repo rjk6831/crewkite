@@ -8,7 +8,7 @@ import {
   TimestampSchema,
 } from '@crewkite/contracts';
 import { z } from 'zod';
-import type { Store } from '../store/index.ts';
+import type { LaunchIdentity, Store } from '../store/index.ts';
 
 const phase = z
   .strictObject({
@@ -64,10 +64,18 @@ export class OperationStore {
   private readonly store: Store;
   private readonly now: () => string;
   private readonly changed?: (record: OperationRecord) => void;
-  constructor(store: Store, now: () => string, changed?: (record: OperationRecord) => void) {
+  /** Recorded with each phase intent. A journal without one records none. */
+  private readonly identity?: LaunchIdentity;
+  constructor(
+    store: Store,
+    now: () => string,
+    changed?: (record: OperationRecord) => void,
+    identity?: LaunchIdentity,
+  ) {
     this.store = store;
     this.now = now;
     this.changed = changed;
+    this.identity = identity;
   }
 
   get(id: string): OperationRecord | null {
@@ -109,6 +117,24 @@ export class OperationStore {
       if (!value) throw Error('Operation is unavailable.');
       return value;
     });
+  }
+
+  /**
+   * Every operation of the task that started and has not ended, oldest first. A hold reads these, so it cannot
+   * depend on how many operations came after the one that holds.
+   */
+  unresolved(taskId: string): OperationRecord[] {
+    TaskIdSchema.parse(taskId);
+    return this.store.db
+      .prepare(
+        "SELECT operation_id FROM task_operations WHERE task_id=? AND state IN ('running','stopping','unknown') ORDER BY operation_id",
+      )
+      .all(taskId)
+      .map((row) => {
+        const value = this.get(row.operation_id as string);
+        if (!value) throw Error('Operation is unavailable.');
+        return value;
+      });
   }
 
   create(input: Pick<OperationRecord, 'id' | 'taskId' | 'kind' | 'definition'>): OperationRecord {
@@ -235,8 +261,8 @@ export class OperationStore {
     state: 'intent' | 'owned' | 'closed',
     group: number | null,
   ): OperationRecord {
-    return this.store.transaction(() =>
-      this.update(id, (current) => {
+    return this.store.transaction(() => {
+      const value = this.update(id, (current) => {
         if ((current.kind === 'project-command') !== (name === 'command'))
           throw Error('Operation phase kind is invalid.');
         if (!['running', 'stopping'].includes(current.state))
@@ -256,6 +282,26 @@ export class OperationStore {
         const phases = current.phases.filter((item) => item.name !== name);
         phases.push({ name, state, group });
         return { ...current, phases };
+      });
+      // A later phase of the same operation replaces the observation of the one before it.
+      if (state === 'intent' && this.identity)
+        this.store.recordLaunchIdentity('operation', id, this.identity, value.observedAt);
+      return value;
+    });
+  }
+
+  /**
+   * Drops a phase journaled at intent whose spawn produced no process. The owned command calls
+   * its unlaunched callback before any group exists, so nothing can be running under it.
+   */
+  unlaunched(id: string, name: 'command' | 'metadata' | 'content'): OperationRecord {
+    return this.store.transaction(() =>
+      this.update(id, (current) => {
+        if (!['running', 'stopping'].includes(current.state))
+          throw Error('Operation is not active.');
+        if (current.phases.find((item) => item.name === name)?.state !== 'intent')
+          throw Error('Operation phase transition is invalid.');
+        return { ...current, phases: current.phases.filter((item) => item.name !== name) };
       }),
     );
   }
@@ -269,33 +315,94 @@ export class OperationStore {
       Partial<Pick<OperationRecord, 'stdout' | 'stderr' | 'result'>>,
     receipt: CommandResult,
   ): OperationRecord {
+    return this.store.transaction(() => this.settle(id, change, receipt));
+  }
+
+  /**
+   * Ends an operation whose phase never got past intent, on the person's word. Recovery left it
+   * unknown, or no owner is left to finish it, and no group was recorded, so nothing can prove its
+   * process gone and nothing is signaled. The caller checks that nothing in this process owns it.
+   * The phase goes and the operation fails with the person's reason. Runs inside the caller's
+   * transaction, beside the command that asked for it. It is only for a thread's check, preview
+   * pass or project command, and checks neither kind nor task. Keep its one caller, the thread
+   * checks' release, which picks those.
+   */
+  release(id: string, reason: string, receipt: CommandResult): OperationRecord {
+    if (!this.store.db.isTransaction) throw Error('A release runs inside its command.');
+    const current = this.get(id);
+    if (
+      !current ||
+      !['running', 'stopping', 'unknown'].includes(current.state) ||
+      !current.phases.some((item) => item.state === 'intent')
+    )
+      throw Error('Only an operation held at intent can be released.');
+    this.update(id, (value) => ({
+      ...value,
+      phases: value.phases.filter((item) => item.state !== 'intent'),
+    }));
+    return this.settle(id, { state: 'failed', reason, next: null }, receipt);
+  }
+
+  private settle(
+    id: string,
+    change: Parameters<OperationStore['finish']>[1],
+    receipt: CommandResult,
+  ): OperationRecord {
     if (
       receipt.outcome === 'outcome-unknown' ||
       (change.state === 'unknown' &&
         (receipt.outcome !== 'blocked' || receipt.reason !== 'operation-ownership-unknown'))
     )
       throw Error('Operation uncertainty must stay scoped to its owner.');
-    return this.store.transaction(() => {
-      const value = this.update(id, (current) => {
-        if (terminal.has(current.state)) throw Error('Operation is already complete.');
-        if (change.state !== 'unknown' && current.phases.some((item) => item.state !== 'closed'))
-          throw Error('Operation ownership remains unknown.');
-        return { ...current, ...change };
-      });
-      if (value.key) {
-        const prior = this.store.receipt(value.key);
-        if (
-          !prior ||
-          prior.hash !== value.requestHash ||
-          prior.principal !== 'local-owner' ||
-          !['operation-pending', 'operation-ownership-unknown'].includes(prior.result.reason ?? '')
-        )
-          throw Error('Operation receipt binding changed.');
-        this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(value.key);
-        this.store.saveReceipt(value.key, prior.hash, 'local-owner', receipt);
-      }
-      return value;
+    const value = this.update(id, (current) => {
+      if (terminal.has(current.state)) throw Error('Operation is already complete.');
+      if (change.state !== 'unknown' && current.phases.some((item) => item.state !== 'closed'))
+        throw Error('Operation ownership remains unknown.');
+      return { ...current, ...change };
     });
+    if (value.key) {
+      const prior = this.store.receipt(value.key);
+      if (
+        !prior ||
+        prior.hash !== value.requestHash ||
+        prior.principal !== 'local-owner' ||
+        !['operation-pending', 'operation-ownership-unknown'].includes(prior.result.reason ?? '')
+      )
+        throw Error('Operation receipt binding changed.');
+      this.store.db.prepare('DELETE FROM receipts WHERE command_key=?').run(value.key);
+      this.store.saveReceipt(value.key, prior.hash, 'local-owner', receipt);
+    }
+    return value;
+  }
+
+  /**
+   * Settles one unresolved row the way recovery would, inside the caller's transaction: only when
+   * every phase is closed or owned by a group now absent. The caller makes sure nothing in this
+   * process owns the row. Returns whether it settled it.
+   */
+  settleProven(id: string, absent: (group: number) => boolean): boolean {
+    if (!this.store.db.isTransaction) throw Error('A settle runs inside its command.');
+    const saved = this.get(id);
+    if (!saved || !['running', 'stopping', 'unknown'].includes(saved.state)) return false;
+    if (!provenGone(saved, absent)) return false;
+    this.interrupt(saved.id);
+    return true;
+  }
+
+  private interrupt(id: string) {
+    this.update(id, (current) => ({
+      ...current,
+      phases: current.phases.map((item) => ({ ...item, state: 'closed' as const })),
+    }));
+    this.settle(
+      id,
+      {
+        state: 'failed',
+        reason: 'operation-interrupted',
+        next: 'The previous operation stopped. Prepare a new explicit operation.',
+      },
+      { outcome: 'blocked', reason: 'operation-interrupted' },
+    );
   }
 
   // Recovery observes historical groups without signaling them or replaying an intent.
@@ -312,40 +419,30 @@ export class OperationStore {
         if (active.has(after)) continue;
         const saved = this.get(after);
         if (!saved) throw Error('Operation is unavailable.');
-        const known = saved.phases.every(
-          (item) =>
-            item.state === 'closed' ||
-            (item.state === 'owned' && item.group !== null && absent(item.group)),
-        );
-        if (!known) {
-          if (saved.state !== 'unknown' || saved.reason !== 'operation-ownership-unknown')
-            this.finish(
-              saved.id,
-              {
-                state: 'unknown',
-                reason: 'operation-ownership-unknown',
-                next: 'Resolve the previous process before starting more work. It will not replay.',
-              },
-              { outcome: 'blocked', reason: 'operation-ownership-unknown' },
-            );
+        if (provenGone(saved, absent)) {
+          this.store.transaction(() => this.interrupt(saved.id));
           continue;
         }
-        this.store.transaction(() =>
-          this.update(saved.id, (current) => ({
-            ...current,
-            phases: current.phases.map((item) => ({ ...item, state: 'closed' as const })),
-          })),
-        );
-        this.finish(
-          saved.id,
-          {
-            state: 'failed',
-            reason: 'operation-interrupted',
-            next: 'The previous operation stopped. Prepare a new explicit operation.',
-          },
-          { outcome: 'blocked', reason: 'operation-interrupted' },
-        );
+        if (saved.state !== 'unknown' || saved.reason !== 'operation-ownership-unknown')
+          this.finish(
+            saved.id,
+            {
+              state: 'unknown',
+              reason: 'operation-ownership-unknown',
+              next: 'Resolve the previous process before starting more work. It will not replay.',
+            },
+            { outcome: 'blocked', reason: 'operation-ownership-unknown' },
+          );
       }
     }
   }
+}
+
+/** Recovery's rule: every phase is closed, or owned by a recorded group that is now absent. */
+function provenGone(record: OperationRecord, absent: (group: number) => boolean): boolean {
+  return record.phases.every(
+    (item) =>
+      item.state === 'closed' ||
+      (item.state === 'owned' && item.group !== null && absent(item.group)),
+  );
 }

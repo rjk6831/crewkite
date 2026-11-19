@@ -1,5 +1,5 @@
 import type { ChatChangeEntry, ChatHunk } from '@crewkite/contracts';
-import { type FormEvent, useState } from 'react';
+import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { lineClass } from './cards.tsx';
 import { commentChange, decideHunk, discardHunk, type ThreadSource } from './commands.ts';
 import { type HunkLine as Line, patchBlocks, pickedRange } from './hunk-lines.ts';
@@ -15,6 +15,7 @@ export function HunkView({
   file,
   running,
   onChanged,
+  focusLine = null,
 }: {
   source: ThreadSource;
   taskId: string;
@@ -22,10 +23,19 @@ export function HunkView({
   running: boolean;
   /** A decision or a discard changed what Changes shows. */
   onChanged: () => void;
+  /** A copy line to mark and scroll to, such as the line a design finding names. */
+  focusLine?: number | null;
 }) {
   const blocks = patchBlocks(file.patch ?? '', file.hunks);
+  const shown =
+    focusLine !== null && blocks.some((lines) => lines.some((line) => line.next === focusLine));
   return (
     <div className="th-hunks">
+      {focusLine !== null && !shown && (
+        <p className="th-muted th-hunk-note">
+          Line {focusLine} is outside the changed lines of this file.
+        </p>
+      )}
       {file.decided && (
         <p className="th-muted th-hunk-note">
           Accept to branch takes only the accepted hunks of this file. The rest stay in the copy.
@@ -41,6 +51,7 @@ export function HunkView({
           lines={blocks[index] ?? []}
           running={running}
           onChanged={onChanged}
+          focusLine={focusLine}
         />
       ))}
     </div>
@@ -55,6 +66,7 @@ function HunkBlock({
   lines,
   running,
   onChanged,
+  focusLine,
 }: {
   source: ThreadSource;
   taskId: string;
@@ -63,7 +75,13 @@ function HunkBlock({
   lines: Line[];
   running: boolean;
   onChanged: () => void;
+  focusLine: number | null;
 }) {
+  const target = useRef<HTMLButtonElement>(null);
+  useEffect(() => {
+    if (focusLine === null) return;
+    target.current?.scrollIntoView?.({ block: 'center' });
+  }, [focusLine]);
   const [busy, setBusy] = useState(false);
   const [refusal, setRefusal] = useState<string | null>(null);
   const [confirming, setConfirming] = useState(false);
@@ -174,7 +192,8 @@ function HunkBlock({
               // biome-ignore lint/suspicious/noArrayIndexKey: hunk lines have no identity beyond their position
               key={index}
               type="button"
-              className={`th-hunk-line ${lineClass(line.text)}${picked ? ' is-picked' : ''}`}
+              ref={line.next !== null && line.next === focusLine ? target : undefined}
+              className={`th-hunk-line ${lineClass(line.text)}${picked ? ' is-picked' : ''}${line.next !== null && line.next === focusLine ? ' is-target' : ''}`}
               aria-pressed={Boolean(picked)}
               aria-label={`Pick ${line.next === null ? `base line ${line.old}` : `line ${line.next}`} for a comment`}
               onClick={(event) => {

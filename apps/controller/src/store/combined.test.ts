@@ -1090,7 +1090,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
                 {
                   taskId: parent.id,
                   candidateId: candidate.id,
-                  destinationRef: 'refs/heads/combined',
+                  destinationRef: 'refs/heads/feat/combined',
                 },
                 rev(),
               ),
@@ -1099,7 +1099,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
           ).outcome,
           'blocked',
         );
-        assert.equal(refValue(context.source.directory, 'refs/heads/combined'), null);
+        assert.equal(refValue(context.source.directory, 'refs/heads/feat/combined'), null);
         continue;
       }
       assert.equal(phase()?.phase, 'awaiting-review', JSON.stringify(phase()));
@@ -1183,7 +1183,11 @@ test('combined tasks share seven real dispatches and require a separate full bar
       const ask = await controller.execute(
         command(
           'AcceptCandidate',
-          { taskId: parent.id, candidateId: candidate.id, destinationRef: 'refs/heads/combined' },
+          {
+            taskId: parent.id,
+            candidateId: candidate.id,
+            destinationRef: 'refs/heads/feat/combined',
+          },
           rev(),
         ),
         'local-owner',
@@ -1233,7 +1237,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
         );
       }
 
-      const acceptedHead = refValue(context.source.directory, 'refs/heads/combined');
+      const acceptedHead = refValue(context.source.directory, 'refs/heads/feat/combined');
       assert(acceptedHead);
       assert.equal(
         git(context.source.directory, ['show', `${acceptedHead}:src/a.mjs`]).toString(),
@@ -1246,7 +1250,7 @@ test('combined tasks share seven real dispatches and require a separate full bar
       assert.equal((await controller.execute(accept, 'local-owner')).outcome, 'already-applied');
       controller = await context.restart();
       assert.equal(controller.snapshot().combinedRuns[0]?.phase, 'accepted');
-      assert.equal(refValue(context.source.directory, 'refs/heads/combined'), acceptedHead);
+      assert.equal(refValue(context.source.directory, 'refs/heads/feat/combined'), acceptedHead);
     }
   };
   // Synchronous acceptance and restart work must not consume a sibling fixture's read deadline.

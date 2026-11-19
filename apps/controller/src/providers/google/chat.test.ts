@@ -852,12 +852,48 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
   });
   const declared = { image: true, audio: true, embeddedContext: true };
   const none = { image: false, audio: false, embeddedContext: false };
+  // The max_tokens scenario, ending on another stop reason.
+  const ending = (reason: string) =>
+    rewrite(`(line)=>[line.replace('"max_tokens"',${JSON.stringify(reason)})]`);
   for (const row of [
+    // Only end_turn is done. A known limit stopped the agent partway, and any other end leaves
+    // CrewKite unable to say how far it got.
     {
       scenario: 'chat-max-tokens',
-      stopReason: 'done',
-      failure: null,
+      stopReason: 'error',
+      failure: { kind: 'incomplete', method: 'session/prompt', code: null, resetsAt: null },
       notice: 'The reply stopped at the model output limit.',
+    },
+    {
+      scenario: 'chat-max-tokens',
+      prelude: ending('"max_turn_requests"'),
+      stopReason: 'error',
+      failure: { kind: 'incomplete', method: 'session/prompt', code: null, resetsAt: null },
+      notice: 'The agent stopped at its limit of steps for one turn.',
+    },
+    {
+      scenario: 'chat-max-tokens',
+      prelude: ending('"paused"'),
+      stopReason: 'error',
+      failure: {
+        kind: 'completion-unknown',
+        method: 'session/prompt',
+        code: null,
+        resetsAt: null,
+      },
+      notice: 'The Google client ended the turn with an unrecognized reason: paused.',
+    },
+    {
+      scenario: 'chat-max-tokens',
+      prelude: ending('7'),
+      stopReason: 'error',
+      failure: {
+        kind: 'completion-unknown',
+        method: 'session/prompt',
+        code: null,
+        resetsAt: null,
+      },
+      notice: 'The Google client ended the turn with an unrecognized reason: unreadable.',
     },
     {
       // Each file goes in the richest block the agent declared. Text files embed as text.
@@ -1013,7 +1049,7 @@ test('the end of a prompt becomes a stop reason, a quota error carries its reset
       failure: { kind: 'protocol', method: 'session/prompt', code: -32603, resetsAt: null },
     },
   ] as const) {
-    const f = rig(row.scenario);
+    const f = rig(row.scenario, 'prelude' in row ? row.prelude : '');
     try {
       const files = row.files?.(f) ?? [];
       const model = (row as { model?: string }).model ?? 'fixture-model';

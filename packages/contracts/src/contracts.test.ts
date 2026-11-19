@@ -2060,7 +2060,7 @@ test('process boundaries reject unknown fields and invalid command identity', ()
     reason: 'qualification-pending',
     googleTerms: null,
   };
-  assert.deepEqual(GoogleAcpSetupSchema.parse(setup), setup);
+  assert.deepEqual(GoogleAcpSetupSchema.parse(setup), { ...setup, modelRefresh: null });
   assert(ReadDataSchema.safeParse({ kind: 'google-acp-setup', setup }).success);
   for (const change of [
     { proofId: null },
@@ -3675,13 +3675,19 @@ test('the chat schemas accept the shapes the renderer sends and reject the ones 
     [
       'a confirmed push is accepted',
       PushChatBranchPayloadSchema,
-      { taskId, branch, confirmed: true },
+      { taskId, branch, commit: 'a'.repeat(40), confirmed: true },
       true,
     ],
     [
       'a push that was not confirmed is refused',
       PushChatBranchPayloadSchema,
-      { taskId, branch, confirmed: false },
+      { taskId, branch, commit: 'a'.repeat(40), confirmed: false },
+      false,
+    ],
+    [
+      'a push that does not name the accepted commit is refused',
+      PushChatBranchPayloadSchema,
+      { taskId, branch, confirmed: true },
       false,
     ],
     [

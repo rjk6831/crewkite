@@ -1,15 +1,50 @@
+import type { BillingMode } from '@crewkite/contracts';
 import { z } from 'zod';
 import type { DiscoveryEnvelope } from './discovery.ts';
 import type { NativeLaunch, NativeTranscript } from './native-discovery.ts';
-import { startNativeTask } from './native-discovery.ts';
-import { initializeParams, loginCancelParams, loginStartParams } from './protocol.ts';
+import { crewKiteCodexHome, startNativeTask } from './native-discovery.ts';
+import {
+  accountReadParams,
+  initializeParams,
+  loginCancelParams,
+  loginStartParams,
+} from './protocol.ts';
 
 // Sign-in and sign-out of CrewKite's own Codex home, through the app-server's account methods.
 // Codex keeps the sign-in in that home and refreshes the token itself, so CrewKite never reads
 // or copies an auth file.
 
-export type AccountStep = 'sign-in' | 'sign-out';
-export type AccountResult = { success: boolean; error: string | null };
+export type AccountStep = 'sign-in' | 'sign-out' | 'read';
+export type AccountResult = {
+  success: boolean;
+  error: string | null;
+  /**
+   * A read step only: the billing mode the client's sign-in has, null when signed out, and
+   * undefined for an account type CrewKite cannot place.
+   */
+  mode?: BillingMode | null;
+};
+
+/**
+ * The billing mode of the account the client reports: null when it reports no account, and
+ * undefined for an account of a type CrewKite does not know. That one is signed in, so it is
+ * never read as signed out, and it admits nothing either.
+ */
+export function openAiAccountMode(type: string | null | undefined): BillingMode | null | undefined {
+  if (type === null || type === undefined) return null;
+  if (type === 'chatgpt') return 'subscription';
+  return type.toLowerCase() === 'apikey' ? 'api' : undefined;
+}
+
+/**
+ * The line a person runs in their own terminal to put an API key into the provider's login for
+ * one API connection. The client reads the key itself. CrewKite never sees it, stores it or puts
+ * it in an argument, and checks the result with a read step afterward.
+ */
+export function openAiApiLoginLine(environment: NodeJS.ProcessEnv, profileId: string): string {
+  const home = crewKiteCodexHome({ ...environment, CREWKITE_CODEX_PROFILE: profileId });
+  return `CODEX_HOME='${home.replaceAll("'", "'\\''")}' codex login --with-api-key`;
+}
 
 const MAX_LINE_BYTES = 65_536;
 const loginStarted = z.object({
@@ -20,6 +55,7 @@ const loginStarted = z.object({
     .max(2048)
     .refine((value) => value.startsWith('https://'), 'The sign-in page must use https.'),
 });
+const accountRead = z.object({ account: z.object({ type: z.string().max(40) }).nullable() });
 const loginCompleted = z.object({
   loginId: z.string().max(200).nullable().optional(),
   success: z.boolean(),
@@ -62,6 +98,7 @@ export class CodexAccountTranscript implements NativeTranscript<AccountResult> {
   get pendingRequest() {
     if (this.sent === 0) return 'initialize' as const;
     if (this.result) return 'complete' as const;
+    if (this.step === 'read') return 'account/read' as const;
     return this.step === 'sign-in' ? ('account/login/start' as const) : ('account/logout' as const);
   }
   get lastEnvelope() {
@@ -79,9 +116,11 @@ export class CodexAccountTranscript implements NativeTranscript<AccountResult> {
     this.submitted = true;
     return encode(
       { method: 'initialized' },
-      this.step === 'sign-in'
-        ? { id: 2, method: 'account/login/start', params: loginStartParams() }
-        : { id: 2, method: 'account/logout' },
+      this.step === 'read'
+        ? { id: 2, method: 'account/read', params: accountReadParams() }
+        : this.step === 'sign-in'
+          ? { id: 2, method: 'account/login/start', params: loginStartParams() }
+          : { id: 2, method: 'account/logout' },
     );
   }
 
@@ -126,6 +165,15 @@ export class CodexAccountTranscript implements NativeTranscript<AccountResult> {
       return;
     }
     if (value.id === 1) return;
+    if (this.step === 'read') {
+      const read = accountRead.parse(value.result);
+      this.result = {
+        success: true,
+        error: null,
+        mode: openAiAccountMode(read.account === null ? null : read.account.type),
+      };
+      return;
+    }
     if (this.step === 'sign-out') {
       this.result = { success: true, error: null };
       return;

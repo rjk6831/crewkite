@@ -1,10 +1,10 @@
 /* The Checks card in the thread and the checks list in the Crew tab. */
 .th-checks {
   display: grid;
-  gap: 8px;
-  padding: 12px 14px;
+  gap: var(--space-4);
+  padding: var(--space-6) var(--space-7);
   border: 1px solid var(--border-strong);
-  border-radius: 12px;
+  border-radius: var(--radius-6);
   background: var(--surface);
   font-size: 13px;
 }
@@ -12,7 +12,7 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-6);
 }
 .th-checks-head h3 {
   font-size: 13px;
@@ -20,7 +20,7 @@
 }
 .th-checks-runs {
   display: grid;
-  gap: 10px;
+  gap: var(--space-5);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -29,7 +29,7 @@
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 4px 10px;
+  gap: var(--space-2) var(--space-5);
 }
 .th-checks-label {
   font-weight: 600;
@@ -50,10 +50,10 @@
 }
 .th-checks-tail {
   max-height: 160px;
-  margin: 4px 0;
-  padding: 8px;
+  margin: var(--space-2) 0;
+  padding: var(--space-4);
   overflow: auto;
-  border-radius: 8px;
+  border-radius: var(--radius-4);
   background: var(--surface-raised);
   font-family: ui-monospace, monospace;
   font-size: 12px;
@@ -62,7 +62,7 @@
 }
 .th-checks-settings {
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
   min-width: 0;
   margin: 0;
   padding: 0;
@@ -74,7 +74,7 @@
 }
 .th-checks-settings ul {
   display: grid;
-  gap: 6px;
+  gap: var(--space-3);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -83,32 +83,32 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px 10px;
+  gap: var(--space-2) var(--space-5);
 }
 .th-checks-add {
   display: flex;
   flex-wrap: wrap;
   align-items: flex-end;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .th-checks-add label {
   display: grid;
   flex: 1 1 200px;
-  gap: 4px;
+  gap: var(--space-2);
 }
 
 .th-checks-ask {
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
   min-width: 0;
   margin: 0;
-  padding: 8px 10px;
+  padding: var(--space-4) var(--space-5);
   border: 1px solid var(--border);
-  border-radius: 8px;
+  border-radius: var(--radius-4);
 }
 .th-checks-ask ul {
   display: grid;
-  gap: 4px;
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -116,17 +116,31 @@
 .th-checks-empty {
   display: grid;
   justify-items: start;
-  gap: 8px;
+  gap: var(--space-4);
 }
-/* Run tests: the button and what it runs, or why it waits. */
-.th-checks-run {
+/* The thread's dependency copy when it is not ready, with Prepare dependencies. */
+.th-checks-copy {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 10px;
-  margin: 4px 0 8px;
+  gap: var(--space-3) var(--space-5);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--amber);
+  border-radius: var(--radius-3);
 }
-.th-checks-run .th-muted {
+.th-checks-copy p {
+  flex: 1 1 240px;
+}
+/* Run tests: the button and what it runs, or why it waits. */
+.th-run-tests {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3) var(--space-5);
+  margin: var(--space-2) 0 var(--space-4);
+}
+.th-run-tests .th-muted {
   flex: 1 1 200px;
   font-size: 11.5px;
 }

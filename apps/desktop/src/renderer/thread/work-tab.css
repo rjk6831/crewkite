@@ -1,0 +1,195 @@
+/* The Work tab: what holds the thread, then the plan's slices as a list the keyboard moves
+   through, with a small diagram of the same slices above it. */
+.th-work {
+  display: grid;
+  gap: var(--space-8);
+  font-size: 12px;
+}
+.th-work h3 {
+  margin-bottom: var(--space-4);
+  color: var(--text-dim);
+  font-size: 12px;
+  font-weight: 400;
+}
+.th-work-holds ul {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-work-holds li {
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-left: 2px solid var(--amber);
+  border-radius: var(--radius-3);
+  background: var(--surface);
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.th-work-action {
+  color: var(--text-muted);
+}
+.th-work-step {
+  display: block;
+  margin-top: var(--space-3);
+}
+.th-work-release {
+  display: grid;
+  gap: var(--space-4);
+  margin: var(--space-4) 0 0;
+  padding: 0;
+  border: 0;
+}
+.th-work-release legend {
+  padding: 0;
+  margin-bottom: var(--space-3);
+  font-weight: 600;
+}
+.th-work-release label {
+  display: grid;
+  gap: var(--space-2);
+}
+.th-work-release-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+.th-work-release-actions .th-button {
+  margin-top: 0;
+}
+.th-work-holds > .th-prepare-status {
+  margin-top: var(--space-4);
+}
+.th-work-plan {
+  display: grid;
+  gap: var(--space-4);
+}
+.th-work-plan h3 {
+  margin-bottom: 0;
+}
+.th-work-summary {
+  color: var(--text-muted);
+}
+/* The diagram keeps its drawn size and shrinks with a narrow panel. */
+.th-work-graph {
+  max-width: 100%;
+  height: auto;
+}
+.th-work-edge {
+  fill: none;
+  stroke: var(--border-strong);
+  stroke-dasharray: 3 3;
+}
+.th-work-edge.is-met {
+  stroke: var(--green);
+  stroke-dasharray: none;
+}
+.th-work-node circle {
+  fill: var(--surface);
+  stroke: var(--border-strong);
+}
+.th-work-node text {
+  fill: var(--text-muted);
+  font-size: 10px;
+}
+.th-work-node.is-running circle {
+  stroke: var(--accent);
+}
+.th-work-node.is-done circle {
+  stroke: var(--green);
+}
+.th-work-node.is-waiting circle {
+  stroke: var(--amber);
+}
+.th-work-node:is(.is-failed, .is-blocked) circle {
+  stroke: var(--red);
+}
+.th-work-node:is(.is-running, .is-done, .is-waiting, .is-failed, .is-blocked) text {
+  fill: var(--text);
+}
+.th-work-slices {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.th-work-slice {
+  display: grid;
+  gap: var(--space-2);
+  width: 100%;
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-5);
+  background: none;
+  color: var(--text);
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.th-work-slice:hover {
+  background: var(--surface-hover);
+}
+.th-work-slice[aria-disabled="true"] {
+  cursor: default;
+}
+.th-work-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+}
+.th-work-id {
+  display: inline-grid;
+  flex-shrink: 0;
+  place-items: center;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--surface-hover);
+  color: var(--text-muted);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.th-work-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+/* The status keeps one line, so the title wraps beside it. */
+.th-work-status {
+  flex-shrink: 0;
+  color: var(--text-muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+}
+.th-work-status.is-running {
+  color: var(--accent);
+}
+.th-work-status.is-done {
+  color: var(--green);
+}
+.th-work-status.is-waiting {
+  color: var(--amber);
+}
+.th-work-status:is(.is-failed, .is-blocked) {
+  color: var(--red);
+}
+.th-work-meta,
+.th-work-evidence {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-5);
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
+}
+.th-work-evidence {
+  color: var(--text-dim);
+}
+.th-work-evidence .is-running {
+  color: var(--accent);
+}
+.th-work-evidence :is(.is-failed, .is-unknown) {
+  color: var(--red);
+}

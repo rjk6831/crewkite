@@ -8,6 +8,7 @@ import {
   Folder,
   FolderPlus,
   Info,
+  ListChecks,
   Moon,
   PanelLeftClose,
   PanelLeftOpen,
@@ -23,6 +24,7 @@ import { useCallback, useEffect, useId, useLayoutEffect, useRef, useState } from
 import wordmark from './assets/crewkite-wordmark.png';
 import inverseWordmark from './assets/crewkite-wordmark-inverse.png';
 import { Dialog, short, titleCase } from './components.tsx';
+import { DesignSystemHost } from './design/system-sheet.tsx';
 import { CrashBanner } from './diagnostics.tsx';
 import { Empty, WorkspaceEmpty } from './empty-state.tsx';
 import { ExternalLink } from './external-link.tsx';
@@ -40,6 +42,10 @@ import { focusSection } from './palette/focus-section.ts';
 import { selectedOption } from './palette/select.ts';
 import { DeleteThreadDialog, RailThread, useThreadAttention } from './rail.tsx';
 import { RailSearch } from './rail-search.tsx';
+import { onRecipeDraft, type ThreadDraft } from './recipes/draft-bus.ts';
+import { RecipesPage, type RecipesView } from './recipes/recipes-page.tsx';
+import { ResultsView } from './recipes/results-view.tsx';
+import { SchedulesView } from './recipes/schedules-view.tsx';
 import { loadCrews } from './settings/crew-store.ts';
 import { onFamilyDefaults, readFamilyDefaults } from './settings/preferences.ts';
 import { SettingsPage } from './settings/settings-page.tsx';
@@ -515,7 +521,12 @@ export function App() {
       : connection === 'offline'
         ? 'Controller offline'
         : titleCase(connection);
-  const [page, setPage] = useState<'tasks' | 'settings'>('tasks');
+  const [page, setPage] = useState<'tasks' | 'settings' | 'recipes'>('tasks');
+  // A recipe drafted from a finished plan thread opens the Recipes page on that draft. Each draft
+  // counts, so a second one opens a fresh page even from the same thread.
+  const [recipeDraft, setRecipeDraft] = useState<(ThreadDraft & { seq: number }) | null>(null);
+  // The Project setup card in Settings opens the Recipes page on its project and one view.
+  const [recipesAt, setRecipesAt] = useState<{ projectId: string; view: RecipesView } | null>(null);
   const [selected, setSelected] = useState<string | null>(null);
   const onboarding = useOnboarding(workspace);
   useLocalReconnect(workspace);
@@ -602,14 +613,49 @@ export function App() {
     if (selectedProjectId && !taskPages[selectedProjectId])
       void workspace.loadTasks(selectedProjectId);
   }, [selectedProjectId, taskPages, workspace.loadTasks]);
+  // The Recipes page holds an unsaved draft in its own state. While it is open, the rail, the
+  // shortcuts, the palette, a notification and the Schedules view's run link change the page
+  // through `away`, which asks that page first, and a draft from a thread asks it through the
+  // guard below. Buttons on the other pages cannot be reached while it is open.
+  const recipesGuard = useRef<((go: () => void, late?: boolean) => void) | null>(null);
+  const away = (go: () => void) =>
+    page === 'recipes' && recipesGuard.current ? recipesGuard.current(go) : go();
+  // The rail button and the palette open the page the same way. Already open, it stays as it
+  // is, a draft from a thread included.
+  const openRecipes = () => {
+    if (page === 'recipes') return;
+    away(() => {
+      setRecipeDraft(null);
+      setRecipesAt(null);
+      setPage('recipes');
+    });
+  };
+  // A draft can arrive after the person moved on, even onto the Recipes page with edits of their
+  // own, so it goes through the page's ask like every other way onto it. The page holds its guard
+  // only while it is open, and drops a draft that lands while it already asks about another way.
+  useEffect(
+    () =>
+      onRecipeDraft((draft) => {
+        const open = () => {
+          setRecipeDraft((current) => ({ ...draft, seq: (current?.seq ?? 0) + 1 }));
+          setRecipesAt(null);
+          setPage('recipes');
+        };
+        if (recipesGuard.current) recipesGuard.current(open, true);
+        else open();
+      }),
+    [],
+  );
   function startThread(projectId?: string) {
-    setNewThread(projectId ?? task?.projectId ?? projects[0]?.id ?? '');
-    setPage('tasks');
+    away(() => {
+      setNewThread(projectId ?? task?.projectId ?? projects[0]?.id ?? '');
+      setPage('tasks');
+    });
   }
   // The wordmark leads home: a new thread in the current project, out of Settings.
   function goHome() {
     if (header) startThread();
-    else setPage('tasks');
+    else away(() => setPage('tasks'));
   }
   // A project the person just added is selected in the rail, and its New thread opens with the
   // cursor in the message box.
@@ -634,18 +680,25 @@ export function App() {
   }
   // A history search result the open thread scrolls to. Opening a thread any other way clears it.
   const [find, setFind] = useState<HistoryFind | null>(null);
-  function openThread(id: string, first?: FirstSend) {
-    // A thread in view means the person is under way, so the welcome ends.
-    if (onboarding.view.visible) onboarding.finish();
+  // Selects a thread and leaves the page alone.
+  function selectThread(id: string, first?: FirstSend) {
     setFind(null);
     setFirstSend(first ?? null);
     setNewThread(null);
     setSelected(id);
-    setPage('tasks');
+  }
+  function openThread(id: string, first?: FirstSend, found?: HistoryFind) {
+    away(() => {
+      // A thread in view means the person is under way, so the welcome ends.
+      if (onboarding.view.visible) onboarding.finish();
+      selectThread(id, first);
+      // Set in the same step, so it survives the Recipes page asking first.
+      if (found) setFind(found);
+      setPage('tasks');
+    });
   }
   function openFind(next: HistoryFind) {
-    openThread(next.taskId);
-    setFind(next);
+    openThread(next.taskId, undefined, next);
   }
   const titles = new Map(
     Object.values(taskPages).flatMap((page) => page.tasks.map((row) => [row.id, row.title])),
@@ -669,8 +722,11 @@ export function App() {
     attention.forget(id);
     setDeleting(null);
     if (selected !== id) return;
-    if (next) openThread(next);
-    else setSelected(null);
+    if (!next) setSelected(null);
+    // On the Recipes page the selection moves under the page, so a delete never asks about a
+    // recipe draft.
+    else if (page === 'recipes') selectThread(next);
+    else openThread(next);
   }
   removedRef.current = (id) => {
     if (!removed.has(id)) threadDeleted(id);
@@ -723,7 +779,7 @@ export function App() {
   keys.current = {
     open: openThread,
     start: () => startThread(),
-    settings: () => setPage('settings'),
+    settings: () => away(() => setPage('settings')),
     order: projects.flatMap((project) => railTasks(project.id).map((row) => row.id)),
     current: page === 'tasks' && newThread === null ? (task?.id ?? null) : null,
   };
@@ -756,7 +812,7 @@ export function App() {
   }, []);
   const inThread = !!header && page === 'tasks' && (newThread !== null || !!task);
   const threadSource = workspace.source;
-  return (
+  const shell = (
     <div className="app-shell">
       <aside
         id="workspace-navigation"
@@ -921,7 +977,10 @@ export function App() {
           {workspace.navigationStale && (
             <p className="nav-empty" role="status">
               Navigation changed. Refresh to continue.{' '}
-              <button type="button" onClick={() => void workspace.refresh().catch(() => {})}>
+              <button
+                type="button"
+                onClick={() => void workspace.refreshNavigation().catch(() => {})}
+              >
                 Refresh navigation
               </button>
             </p>
@@ -941,16 +1000,27 @@ export function App() {
           <RailUsage
             source={threadSource}
             header={header}
-            onOpenSettings={() => setPage('settings')}
+            onOpenSettings={() => away(() => setPage('settings'))}
             refresh={workspace.refresh}
           />
         )}
         <div className="nav-bottom">
           <button
             type="button"
+            className={`nav-item ${page === 'recipes' ? 'active' : ''}`}
+            aria-current={page === 'recipes' ? 'page' : undefined}
+            onClick={openRecipes}
+            data-tooltip="Recipes"
+          >
+            <ListChecks size={16} aria-hidden="true" />
+            <span className="nav-text">Recipes</span>
+            <ChevronRight size={13} aria-hidden="true" />
+          </button>
+          <button
+            type="button"
             className={`nav-item ${page === 'settings' ? 'active' : ''}`}
             aria-current={page === 'settings' ? 'page' : undefined}
-            onClick={() => setPage('settings')}
+            onClick={() => away(() => setPage('settings'))}
             data-tooltip="Settings"
           >
             <Settings size={16} aria-hidden="true" />
@@ -1035,6 +1105,11 @@ export function App() {
             </button>
           </div>
         )}
+        {connection === 'offline' && workspace.offlineReason && (
+          <p className="recovery-banner" role="status">
+            {workspace.offlineReason}
+          </p>
+        )}
         {workspace.detailStale && (
           <p className="recovery-banner" role="status">
             Reconnecting thread detail. Displayed state is stale; controls resume after refresh.
@@ -1057,6 +1132,39 @@ export function App() {
               Retry connection
             </button>
           </div>
+        ) : page === 'recipes' && workspace.source ? (
+          <RecipesPage
+            source={workspace.source}
+            projects={projects}
+            projectId={recipesAt?.projectId ?? task?.projectId ?? projects[0]?.id ?? null}
+            view={recipesAt?.view}
+            catalogChanged={header}
+            key={recipeDraft ? `draft-${recipeDraft.seq}` : 'recipes'}
+            threadDraft={recipeDraft}
+            schedules={(props) => (
+              <SchedulesView
+                {...props}
+                hasThread={(id) => !removed.has(id)}
+                onOpenThread={openThread}
+              />
+            )}
+            results={(props) =>
+              workspace.source && <ResultsView source={workspace.source} {...props} />
+            }
+            registerGuard={(guard) => {
+              recipesGuard.current = guard;
+            }}
+            onOpenThread={(id) => {
+              // The page already asked before it called this.
+              recipesGuard.current = null;
+              openThread(id);
+            }}
+            onClose={() => {
+              setRecipeDraft(null);
+              setRecipesAt(null);
+              setPage('tasks');
+            }}
+          />
         ) : page === 'settings' ? (
           <SettingsPage
             workspace={workspace}
@@ -1065,6 +1173,14 @@ export function App() {
             onTheme={setThemeMode}
             threadId={task?.id}
             onClose={() => setPage('tasks')}
+            onOpenThread={openThread}
+            onOpenRecipes={(projectId, view) =>
+              away(() => {
+                setRecipeDraft(null);
+                setRecipesAt({ projectId, view });
+                setPage('recipes');
+              })
+            }
             onShowWelcome={() => {
               onboarding.restart();
               setNewThread(null);
@@ -1151,11 +1267,13 @@ export function App() {
           <CommandPalette
             commands={buildPaletteCommands({
               newThread: () => startThread(),
-              openSettings: () => setPage('settings'),
-              openSettingsSection: (id) => {
-                setPage('settings');
-                focusSection(id);
-              },
+              openSettings: () => away(() => setPage('settings')),
+              openSettingsSection: (id) =>
+                away(() => {
+                  setPage('settings');
+                  focusSection(id);
+                }),
+              openRecipes,
               about: () => setAbout(true),
               switchThread: (step) => {
                 const next = adjacentThread(keys.current.order, keys.current.current, step);
@@ -1180,6 +1298,12 @@ export function App() {
         </Dialog>
       )}
     </div>
+  );
+  // The design system editor opens over any page, so its host wraps the whole shell.
+  return (
+    <DesignSystemHost source={workspace.source} projects={projects}>
+      {shell}
+    </DesignSystemHost>
   );
 }
 

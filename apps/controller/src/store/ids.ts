@@ -12,7 +12,8 @@ export type IdPrefix =
   | 'hnd'
   | 'evt'
   | 'cmd'
-  | 'msg';
+  | 'msg'
+  | 'rfx';
 const alphabet = '0123456789ABCDEFGHJKMNPQRSTVWXYZ';
 export function createIds(now: () => string): (prefix: IdPrefix) => string {
   return (prefix) => {

@@ -204,9 +204,14 @@ function run(
     plant?: (path: string) => void;
     /** CrewKite's reading of the tightest window when the turn starts. */
     allowanceLeft?: number | null;
+    /** The API connection the turn was assigned. */
+    connection?: ChatTurnRequest['connection'];
+    /** The environment the controller resolved for the turn. */
+    environment?: NodeJS.ProcessEnv;
   } = {},
 ) {
-  const root = mkdtempSync(join(tmpdir(), 'crewkite-chat-'));
+  // The state folder check refuses a path that goes through a link, as /var does on macOS.
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-chat-')));
   mkdirSync(join(root, 'scratch'));
   mkdirSync(join(root, 'work'));
   const steps = typeof script === 'function' ? script(join(root, 'scratch')) : script;
@@ -219,6 +224,7 @@ function run(
     config: null as { path: string; mode: number; text: string } | null,
   };
   const usage: unknown[] = [];
+  const proofs: unknown[] = [];
   const spawn: Spawn = (executable, argv, options) => {
     launched.argv = argv;
     launched.env = options.env;
@@ -256,7 +262,8 @@ function run(
     permissionPolicy,
     permissionGrants,
     deadlineMs: 60_000,
-    environment: { HOME: root, PATH: '/usr/bin:/bin' },
+    environment: { HOME: root, PATH: '/usr/bin:/bin', ...extra.environment },
+    ...(extra.connection ? { connection: extra.connection } : {}),
     now: () => Date.parse('2026-10-23T00:00:00.000Z'),
     files,
     readOnly: extra.readOnly,
@@ -273,6 +280,7 @@ function run(
     threadTools: extra.threadTools,
     spawn,
     onUsage: (reading) => usage.push(reading),
+    onAccountMode: (proof) => proofs.push(proof),
   }).startTurn(request, (event) => {
     events.push(AgentEventSchema.parse(event));
     waiting.get(event.type)?.(event);
@@ -287,6 +295,7 @@ function run(
     events,
     launched,
     usage,
+    proofs,
     next,
     work: join(root, 'work'),
     cleanup: () => rmSync(root, { recursive: true }),
@@ -558,6 +567,105 @@ test('stop ends a running turn as stopped and leaves no process behind', async (
   });
   assert.equal(turn.handle.groups.length, 1);
   assert.equal(groupAbsent(turn.handle.groups[0] ?? 0), true);
+});
+
+test('a turn stops before its first request on an API key source and runs on a subscription source', async (t) => {
+  for (const [source, stops] of [
+    ['ANTHROPIC_API_KEY', true],
+    ['apiKeyHelper', true],
+    ['user', true],
+    ['none', false],
+    ['somethingNew', false],
+  ] as const) {
+    const turn = run(
+      stops
+        ? ['read', { out: { ...init(), apiKeySource: source } }, 'hold']
+        : ['read', { out: { ...init(), apiKeySource: source } }, { out: done() }, { exit: 0 }],
+    );
+    t.after(turn.cleanup);
+    const result = await turn.handle.result;
+    const started = turn.events.some((event) => event.type === 'turn.started');
+    assert.equal(started, !stops, source);
+    if (stops) {
+      assert.equal(result.stopReason, 'error', source);
+      assert.equal(result.failure?.kind, 'signed-out', source);
+      assert.equal(result.failure?.method, 'system/init', source);
+      assert.match(result.failure?.message ?? '', /would bill an API key/, source);
+    } else {
+      assert.equal(result.failure, null, source);
+    }
+  }
+});
+
+const apiConnection = {
+  connectionId: 'con_00000000000000000000000001',
+  billingMode: 'api',
+  profileId: 'anthropic-api-1',
+  proofGeneration: 3,
+} as const;
+
+test('an API connection turn runs in its own configuration folder and its reported cost becomes the spend', async (t) => {
+  const priced = { ...done(), total_cost_usd: 0.0123 };
+  const turn = run(
+    ['read', { out: { ...init(), apiKeySource: 'user' } }, { out: priced }, { exit: 0 }],
+    null,
+    [],
+    'ask',
+    'default',
+    [],
+    prompt,
+    { connection: apiConnection, environment: { CLAUDE_CONFIG_DIR: '/people/own' } },
+  );
+  t.after(turn.cleanup);
+  const result = await turn.handle.result;
+  assert.equal(result.failure, null);
+  assert(
+    turn.launched.env.CLAUDE_CONFIG_DIR?.endsWith(
+      '/providers/anthropic/claude-profiles/anthropic-api-1',
+    ),
+  );
+  assert.deepEqual(turn.proofs, [
+    { connectionId: apiConnection.connectionId, mode: 'api', proofGeneration: 3 },
+  ]);
+  assert.deepEqual(result.spend, {
+    reported: { amountMicros: 12_300, currency: 'USD' },
+    estimated: null,
+    unreportedTurns: 0,
+  });
+  // The family's own route keeps the default folder and carries no spend, even when priced.
+  const own = run(['read', { out: init() }, { out: priced }, { exit: 0 }]);
+  t.after(own.cleanup);
+  const ownResult = await own.handle.result;
+  assert.equal(own.launched.env.CLAUDE_CONFIG_DIR, undefined);
+  assert.equal(ownResult.spend, undefined);
+});
+
+test('a client whose sign-in mode is not the chosen one stops the turn before anything is sent', async (t) => {
+  for (const [source, connection] of [
+    ['none', apiConnection],
+    [undefined, apiConnection],
+    ['somethingNew', apiConnection],
+    ['user', undefined],
+  ] as const) {
+    const turn = run(
+      ['read', { out: { ...init(), apiKeySource: source } }, 'hold'],
+      null,
+      [],
+      'ask',
+      'default',
+      [],
+      prompt,
+      { connection },
+    );
+    t.after(turn.cleanup);
+    const result = await turn.handle.result;
+    assert.equal(result.failure?.kind, 'signed-out', String(source));
+    assert.equal(
+      turn.events.some((event) => event.type === 'turn.started'),
+      false,
+      String(source),
+    );
+  }
 });
 
 test('a client that exits without a result is reported with its last stderr line', async (t) => {
@@ -1123,7 +1231,14 @@ test('an unknown event goes to the turn trace and never the thread, routine syst
   assert.equal(result.assistantText, 'Still here.');
 });
 
-test("a request or a result with a subtype CrewKite does not know ends the turn as a failure in the client's words", async (t) => {
+test("a subtype CrewKite does not know ends the turn in the client's words, a result is read as a limit only under a documented subtype, and the documented turn limit fails as incomplete", async (t) => {
+  const ending = (frame: Record<string, unknown>): Step[] => [
+    'read',
+    { out: init() },
+    { out: { type: 'result', ...frame } },
+    'drain',
+  ];
+  const unknown = /does not know/;
   const cases = [
     {
       script: [
@@ -1138,8 +1253,9 @@ test("a request or a result with a subtype CrewKite does not know ends the turn 
         },
         'hold',
       ] as Step[],
-      method: 'control_request/elicitation',
+      expected: ['error', 'protocol', 'control_request/elicitation'],
       said: 'Pick a colour for the chart.',
+      message: unknown,
     },
     {
       script: [
@@ -1156,19 +1272,45 @@ test("a request or a result with a subtype CrewKite does not know ends the turn 
         },
         'drain',
       ] as Step[],
-      method: 'result/success_with_notes',
+      expected: ['error', 'completion-unknown', 'result/success_with_notes'],
       said: 'Finished, with two notes.',
+      message: unknown,
+    },
+    // Words that read as a limit decide nothing under a subtype the client does not document.
+    {
+      script: ending({ subtype: 'error_paused', is_error: true, result: 'Usage limit reached.' }),
+      expected: ['error', 'completion-unknown', 'result/error_paused'],
+      said: 'Usage limit reached.',
+      message: unknown,
+    },
+    {
+      script: ending({ is_error: false, result: 'Finished.' }),
+      expected: ['error', 'completion-unknown', 'result/unnamed'],
+      said: 'Finished.',
+      message: unknown,
+    },
+    // The documented turn limit is a known step limit: the work is incomplete.
+    {
+      script: ending({ subtype: 'error_max_turns', is_error: true, result: 'Stopped early.' }),
+      expected: ['error', 'incomplete', 'result/error_max_turns'],
+      said: 'Stopped early.',
+      message: /turn limit/,
+    },
+    {
+      script: ending({ subtype: 'success', is_error: true, result: 'Usage limit reached.' }),
+      expected: ['limit', 'usage-limit', 'result/success'],
+      said: 'Usage limit reached.',
+      message: /usage limit/,
     },
   ];
-  for (const { script, method, said } of cases) {
+  for (const { script, expected, said, message } of cases) {
     const turn = run(script);
     t.after(turn.cleanup);
-    const result = await turn.handle.result;
-    assert.equal(result.stopReason, 'error', method);
-    assert.equal(result.failure?.kind, 'protocol', method);
-    assert.equal(result.failure?.method, method, method);
-    assert.equal(result.failure?.providerMessage, said, method);
-    assert.match(result.failure?.message ?? '', /does not know/, method);
+    const { stopReason, failure } = await turn.handle.result;
+    const label = expected[2];
+    assert.deepEqual([stopReason, failure?.kind, failure?.method], expected, label);
+    assert.equal(failure?.providerMessage, said, label);
+    assert.match(failure?.message ?? '', message, label);
   }
 });
 

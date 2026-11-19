@@ -7,6 +7,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -214,7 +215,19 @@ test('a client finds the controller socket through the home record, and refuses 
   assert.ok(server.socketPath.startsWith(`${first}/`));
   assert.notEqual(dirname(server.socketPath), join(first, `crewkite-${uid}`));
   assert.equal(lstatSync(dirname(server.socketPath)).mode & 0o777, 0o700);
-  assert.equal(readFileSync(join(real, 'home', 'control-socket'), 'utf8'), server.socketPath);
+  // The record also names the schema the controller runs: one version per bundled migration.
+  assert.deepEqual(JSON.parse(readFileSync(join(real, 'home', 'control-socket'), 'utf8')), {
+    socketPath: server.socketPath,
+    schema: readdirSync(new URL('../../../apps/controller/migrations/', import.meta.url)).filter(
+      (name) => name.endsWith('.sql'),
+    ).length,
+  });
+  // A field a later controller adds is ignored, so the schema still decides which side is older.
+  const record = join(real, 'home', 'control-socket');
+  const written = readFileSync(record, 'utf8');
+  writeFileSync(record, JSON.stringify({ ...JSON.parse(written), added: 'later' }));
+  assert.equal(readControllerEndpoint(home).socketPath, server.socketPath);
+  writeFileSync(record, written);
   // A client whose temporary directory differs, and one that names the home by its real path,
   // find the same socket.
   process.env.TMPDIR = second;
@@ -233,4 +246,7 @@ test('a client finds the controller socket through the home record, and refuses 
   // A cleaner took the socket file while the controller ran.
   unlinkSync(server.socketPath);
   assert.throws(() => readControllerEndpoint(home), /Restart CrewKite/);
+  // A controller that stops takes its record with it.
+  await server.close();
+  assert.equal(existsSync(join(real, 'home', 'control-socket')), false);
 });

@@ -1,0 +1,960 @@
+/* The Recipes page. Every color, space, radius and shadow comes from tokens.css. State words carry
+   their meaning as text, and color only supports them. */
+
+.recipes-page {
+  flex: 1;
+  min-height: 0;
+  padding: var(--space-14) var(--space-16) var(--space-28);
+  overflow-y: auto;
+  container-type: inline-size;
+}
+.rc-frame {
+  display: grid;
+  gap: var(--space-8);
+  max-width: 1320px;
+  margin: 0 auto;
+}
+.rc-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-6);
+}
+.rc-top h1 {
+  font-size: 22px;
+  letter-spacing: -0.5px;
+}
+.rc-views {
+  display: inline-flex;
+  margin-right: auto;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-3);
+  overflow: hidden;
+}
+.rc-views button {
+  min-height: 32px;
+  padding: var(--space-3) var(--space-7);
+  border: 0;
+  color: var(--text-muted);
+  background: transparent;
+  font-size: 12px;
+}
+.rc-views button + button {
+  border-left: 1px solid var(--border-strong);
+}
+.rc-views button[aria-selected="true"] {
+  color: var(--text);
+  background: var(--surface-raised);
+}
+.rc-project,
+.rc-path,
+.rc-version {
+  display: inline-flex;
+  flex-direction: row;
+  flex-wrap: nowrap;
+  align-items: center;
+  gap: var(--space-4);
+  color: var(--text-dim);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.rc-project .ck-select {
+  width: 220px;
+}
+
+.rc-columns {
+  display: grid;
+  grid-template-columns: 264px minmax(0, 1fr);
+  gap: var(--space-8);
+  align-items: start;
+}
+.rc-side {
+  display: grid;
+  gap: var(--space-5);
+  padding: var(--space-7);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-5);
+  background: var(--surface);
+}
+.rc-list {
+  display: grid;
+  gap: var(--space-1);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rc-list-item {
+  display: grid;
+  gap: var(--space-1);
+  width: 100%;
+  padding: var(--space-4) var(--space-5);
+  border: 0;
+  border-radius: var(--radius-3);
+  color: var(--text);
+  background: transparent;
+  text-align: left;
+}
+.rc-list-item:hover {
+  background: var(--surface-hover);
+}
+.rc-list-item[aria-current="true"] {
+  background: var(--surface-raised);
+  box-shadow: var(--shadow-mark);
+}
+.rc-list-name {
+  overflow: hidden;
+  font-size: 13px;
+  font-weight: 500;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.rc-list-meta {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.rc-list-file {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 600;
+}
+.rc-folder {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.rc-folder span {
+  overflow-wrap: anywhere;
+}
+.rc-folder input {
+  flex: 1;
+  min-width: 0;
+}
+
+.rc-detail {
+  display: grid;
+  gap: var(--space-7);
+  min-width: 0;
+  padding: var(--space-9) var(--space-10) var(--space-11);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-5);
+  background: var(--surface);
+  container-type: inline-size;
+}
+.rc-head {
+  display: grid;
+  gap: var(--space-4);
+}
+.rc-title {
+  display: flex;
+  align-items: center;
+  gap: var(--space-5);
+}
+/* Three classes outrank the field rule below, which reads two classes and an element. */
+.rc-detail .rc-title .rc-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: -0.2px;
+}
+.rc-edited {
+  padding: var(--space-1) var(--space-4);
+  border-radius: var(--radius-pill);
+  color: var(--text);
+  box-shadow: var(--shadow-ring-strong);
+  font-size: 11px;
+}
+.rc-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-5);
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.rc-actions {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+}
+.rc-actions .ck-select {
+  width: 150px;
+}
+.rc-path {
+  display: flex;
+}
+.rc-path input {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-code);
+  font-size: 12px;
+}
+.rc-status {
+  min-height: 16px;
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+
+.rc-detail input:is([type="text"], [type="number"], [type="datetime-local"]),
+.rc-side input[type="text"],
+.rc-text {
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-3);
+  color: var(--text);
+  background: var(--background);
+  font-size: 12px;
+}
+.rc-detail input[aria-invalid="true"],
+.rc-text[aria-invalid="true"] {
+  border-color: var(--red);
+}
+/* A read-only picker reads like a read-only field. The shared select fades a disabled one, which
+   drops its text below a readable contrast in the light theme. */
+.rc-detail :is(input, textarea):disabled,
+.rc-detail .ck-select:disabled {
+  color: var(--text-muted);
+  opacity: 1;
+}
+.rc-text {
+  width: 100%;
+  resize: vertical;
+  line-height: 1.5;
+}
+.rc-number {
+  width: 76px;
+}
+.rc-command {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-code);
+}
+.rc-unit {
+  align-self: center;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.rc-banner,
+.rc-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4) var(--space-6);
+  margin: 0;
+  padding: var(--space-5) var(--space-6);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-4);
+  color: var(--text);
+  background: var(--surface-raised);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rc-banner.is-warn {
+  border-color: var(--amber);
+}
+.rc-banner.is-stop {
+  border-color: var(--red);
+}
+.rc-strip.is-active {
+  border-color: var(--green);
+}
+.rc-strip.is-paused {
+  border-color: var(--amber);
+}
+.rc-strip.is-stopped {
+  border-color: var(--red);
+}
+.rc-banner p,
+.rc-strip p {
+  flex-basis: 100%;
+  margin: 0;
+}
+
+.rc-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.15fr);
+  gap: var(--space-12);
+  align-items: start;
+}
+.rc-left,
+.rc-right {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-10);
+  min-width: 0;
+}
+.rc-detail h3 {
+  margin: 0 0 var(--space-3);
+  font-size: 13px;
+  font-weight: 600;
+}
+.rc-detail h4 {
+  margin: 0 0 var(--space-2);
+  font-size: 12px;
+  font-weight: 600;
+}
+.rc-note {
+  margin: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.rc-note.is-warn {
+  color: var(--text);
+}
+.rc-problem {
+  flex-basis: 100%;
+  margin: 0;
+  color: var(--diff-del-text);
+  font-size: 11px;
+  line-height: 1.5;
+}
+
+/* The Graph heading and its line stand over the Steps and Crew columns below them. */
+.rc-graph {
+  display: grid;
+  gap: var(--space-2);
+}
+.rc-graph h3 {
+  margin: 0;
+}
+.rc-steps {
+  display: grid;
+  gap: var(--space-5);
+}
+.rc-steps h4 {
+  margin: 0;
+}
+.rc-step-list {
+  display: grid;
+  gap: var(--space-4);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rc-step-list li {
+  display: flex;
+  gap: var(--space-5);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rc-step-list li.rc-slice {
+  display: grid;
+  gap: var(--space-3);
+  margin-left: var(--space-5);
+  padding-left: var(--space-6);
+  border-left: 1px solid var(--border-strong);
+}
+.rc-slice-title {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.rc-step-number {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  box-shadow: var(--shadow-ring-strong);
+  font-size: 11px;
+  line-height: 20px;
+  text-align: center;
+}
+.rc-step-body {
+  display: grid;
+  gap: var(--space-1);
+  min-width: 0;
+}
+.rc-step-model {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-3);
+  color: var(--text-muted);
+  font-size: 11px;
+}
+.rc-step-model .family-mark {
+  width: 16px;
+  height: 16px;
+  border-radius: var(--radius-2);
+  font-size: 10px;
+}
+
+.rc-form {
+  display: grid;
+  gap: var(--space-10);
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.rc-section {
+  display: grid;
+  gap: var(--space-5);
+}
+.rc-row {
+  display: grid;
+  grid-template-columns: 124px minmax(0, 1fr);
+  gap: var(--space-3) var(--space-6);
+  align-items: center;
+}
+.rc-row.is-check {
+  grid-template-columns: minmax(0, 1fr);
+}
+.rc-row > :is(.rc-note, .rc-problem, .rc-text, .rc-command) {
+  grid-column: 2;
+}
+.rc-row.is-check > :is(.rc-note, .rc-problem) {
+  grid-column: 1;
+}
+.rc-label {
+  color: var(--text);
+  font-size: 12px;
+}
+.rc-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-4);
+  min-width: 0;
+}
+/* A model and its effort sit on one line. The model takes the room the effort leaves. */
+.rc-controls .ck-select {
+  flex: 1 1 96px;
+  width: auto;
+  min-width: 0;
+  max-width: 260px;
+}
+.rc-controls .ck-select.effort-select {
+  flex: 0 0 auto;
+  min-width: 96px;
+}
+/* A crew row keeps four columns: role, model, effort and remove. Every model picker ends at one
+   edge and every effort picker at the next, whether or not the row has either of the last two. */
+.rc-row.is-member {
+  grid-template-columns: 124px minmax(0, 1fr) 112px 28px;
+  min-inline-size: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.rc-row.is-member > .rc-controls {
+  display: contents;
+}
+.rc-row.is-member .ck-select {
+  grid-column: 2;
+  width: 100%;
+  max-width: none;
+}
+.rc-row.is-member .ck-select.effort-select {
+  grid-column: 3;
+  min-width: 0;
+}
+.rc-row.is-member .icon-button {
+  grid-column: 4;
+}
+.rc-row.is-member > :is(.rc-note, .rc-problem) {
+  grid-column: 2 / -1;
+}
+.rc-adds {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-4);
+}
+
+.rc-panel {
+  display: grid;
+  gap: var(--space-6);
+  padding: var(--space-8);
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-4);
+  background: var(--surface-raised);
+}
+.rc-panel:focus {
+  outline: none;
+}
+.rc-panel p {
+  margin: 0;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rc-changes {
+  display: grid;
+  gap: var(--space-3);
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.rc-changes li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-6);
+  padding: var(--space-3) 0;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rc-changes li:first-child {
+  border-top: 0;
+}
+.rc-changes span {
+  overflow-wrap: anywhere;
+}
+.rc-banner .rc-changes {
+  flex-basis: 100%;
+}
+.rc-schedule-block {
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-6);
+  border-radius: var(--radius-3);
+  background: var(--surface);
+}
+.rc-schedule-block ul {
+  margin: 0;
+  padding-left: var(--space-9);
+  font-family: var(--font-code);
+  font-size: 11px;
+  line-height: 1.6;
+}
+.rc-panel-actions {
+  display: flex;
+  gap: var(--space-4);
+}
+.rc-field {
+  display: grid;
+  gap: var(--space-1);
+  font-size: 12px;
+}
+.rc-field small {
+  color: var(--text-dim);
+  font-size: 11px;
+}
+
+.rc-runs table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.rc-runs :is(th, td) {
+  padding: var(--space-4) var(--space-4) var(--space-4) 0;
+  border-top: 1px solid var(--border);
+  text-align: left;
+  vertical-align: top;
+}
+/* The app's tables right-align every cell after the first, and that rule loads later. */
+.rc-runs :is(th, td):not(:first-child) {
+  text-align: left;
+}
+.rc-runs th {
+  border-top: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+}
+.rc-run-state small {
+  display: block;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.rc-run-state:is(.is-failed, .is-stopped) {
+  color: var(--diff-del-text);
+}
+.rc-run-state:is(.is-asked, .is-ready) {
+  font-weight: 600;
+}
+.rc-run-state.is-accepted {
+  color: var(--diff-add-text);
+}
+.rc-foot {
+  display: flex;
+  justify-content: flex-end;
+  padding-top: var(--space-6);
+  border-top: 1px solid var(--border);
+}
+/* The Forget dialog's text, spaced as the app's other confirm dialogs space theirs. */
+.rc-forget {
+  display: grid;
+  gap: var(--space-5);
+  padding: var(--space-10) var(--space-12);
+  font-size: 13px;
+  line-height: 1.6;
+}
+.rc-forget p {
+  margin: 0;
+}
+.rc-sr {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+
+.rc-empty {
+  display: grid;
+  justify-items: start;
+  gap: var(--space-5);
+  max-width: 560px;
+  padding: var(--space-12);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-5);
+  background: var(--surface);
+}
+.rc-empty h2 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.rc-empty p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+
+/* The Schedules view. One table, one tbody per schedule, so a row and the line under it stay
+   together when the view turns into blocks. */
+.rc-sched {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+  padding: var(--space-9) var(--space-10) var(--space-11);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-5);
+  background: var(--surface);
+  container-type: inline-size;
+}
+.rc-sched h2 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.rc-sched-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.rc-sched table {
+  font-size: 12px;
+}
+.rc-sched :is(th, td) {
+  padding: var(--space-5) var(--space-6) var(--space-3) 0;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  vertical-align: top;
+}
+/* The app's tables right-align every cell after the first, and that rule loads later. */
+.rc-sched :is(th, td):not(:first-child) {
+  text-align: left;
+}
+.rc-sched thead :is(th, td) {
+  border-top: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+}
+.rc-sched-open {
+  padding: 0;
+  border: 0;
+  color: var(--text);
+  background: none;
+  font-weight: 500;
+  text-align: left;
+  text-decoration: underline;
+  text-decoration-color: var(--border-strong);
+  text-underline-offset: 3px;
+}
+.rc-sched-open:hover {
+  text-decoration-color: currentColor;
+}
+.rc-sched :is(.rc-sched-short, .rc-sched-state) {
+  white-space: nowrap;
+}
+.rc-sched-last small {
+  display: block;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.rc-sched .rc-sched-state {
+  font-weight: 600;
+}
+.rc-sched .rc-sched-state.is-active {
+  color: var(--diff-add-text);
+}
+.rc-sched .rc-sched-state.is-paused {
+  color: var(--amber);
+}
+.rc-sched .rc-sched-state.is-stopped {
+  color: var(--diff-del-text);
+}
+.rc-sched .rc-sched-actions {
+  padding-right: 0;
+}
+.rc-sched .button[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.rc-sched .rc-sched-more td {
+  padding: 0;
+  border-top: 0;
+}
+.rc-sched-more p {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.rc-sched-more p:not(:empty) {
+  padding-bottom: var(--space-3);
+}
+.rc-sched-status:not(:empty) {
+  color: var(--text);
+}
+
+/* The Results view. Two tables of counts. Every figure left-aligns as the runs table's do, and
+   an allowance with several windows puts each on its own line. */
+.rc-results {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+  padding: var(--space-9) var(--space-10) var(--space-11);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-5);
+  background: var(--surface);
+  container-type: inline-size;
+}
+.rc-results h2 {
+  font-size: 15px;
+  font-weight: 600;
+}
+.rc-results h2:focus {
+  outline: none;
+}
+.rc-results-part {
+  display: grid;
+  gap: var(--space-3);
+}
+.rc-results h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 600;
+}
+.rc-results-empty {
+  margin: 0;
+  color: var(--text-muted);
+  font-size: 12px;
+}
+.rc-results table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 12px;
+}
+.rc-results table :is(th, td) {
+  padding: var(--space-5) var(--space-6) var(--space-3) 0;
+  border-top: 1px solid var(--border);
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 400;
+  line-height: 1.5;
+  text-align: left;
+  vertical-align: top;
+}
+/* The app's tables right-align every cell after the first, and that rule loads later. */
+.rc-results table :is(th, td):not(:first-child) {
+  text-align: left;
+}
+.rc-results table thead :is(th, td) {
+  border-top: 0;
+  color: var(--text-dim);
+  font-size: 11px;
+  font-weight: 500;
+}
+.rc-results tbody th {
+  font-weight: 500;
+}
+.rc-results td small {
+  display: block;
+  color: var(--text-dim);
+  font-size: 11px;
+}
+.rc-results-line {
+  display: block;
+}
+.rc-results .button[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+.rc-results-status {
+  margin: 0;
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+}
+/* An empty status line stays in the page so a screen reader hears its first words, and takes no
+   room or gap while it waits. */
+.rc-results-status:empty {
+  position: absolute;
+}
+
+/* Narrow. Each query reads the nearest container: the page for the list beside the recipe, the
+   recipe for its own two columns. So a window at its smallest still shows the list beside a
+   one-column recipe. */
+@container (max-width: 759px) {
+  .rc-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+@container (max-width: 719px) {
+  .rc-body {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .rc-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .rc-row > :is(.rc-note, .rc-problem, .rc-text, .rc-command) {
+    grid-column: 1;
+  }
+  /* The role goes above its pickers, which keep their three columns. */
+  .rc-row.is-member {
+    grid-template-columns: minmax(0, 1fr) 112px 28px;
+  }
+  .rc-row.is-member > .rc-label,
+  .rc-row.is-member > :is(.rc-note, .rc-problem) {
+    grid-column: 1 / -1;
+  }
+  .rc-row.is-member .ck-select {
+    grid-column: 1;
+  }
+  .rc-row.is-member .ck-select.effort-select {
+    grid-column: 2;
+  }
+  .rc-row.is-member .icon-button {
+    grid-column: 3;
+  }
+  .rc-runs table,
+  .rc-runs tbody,
+  .rc-runs tr,
+  .rc-runs td {
+    display: block;
+  }
+  .rc-runs thead {
+    display: none;
+  }
+  .rc-runs tr {
+    padding: var(--space-4) 0;
+    border-top: 1px solid var(--border);
+  }
+  .rc-runs td {
+    padding: 0;
+    border: 0;
+  }
+  .rc-runs td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--text-dim);
+  }
+}
+/* The schedules turn into blocks before the table would wrap a project name or stack a row's
+   actions, which on the longest preview row starts under 898 px. The figure keeps 20 px for type
+   that sets a little wider. A block holds the name and the state on one line, the cells as label
+   and value pairs, then the line and the actions. */
+@container (max-width: 919px) {
+  .rc-sched table,
+  .rc-sched tr {
+    display: block;
+  }
+  /* The headers leave the screen and stay with assistive technology. */
+  .rc-sched thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .rc-sched tbody {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: var(--space-2) var(--space-6);
+    padding: var(--space-6) 0;
+    border-top: 1px solid var(--border);
+  }
+  .rc-sched tbody tr {
+    display: contents;
+  }
+  .rc-sched tbody :is(th, td),
+  .rc-sched .rc-sched-more td {
+    grid-column: 1 / -1;
+    padding: 0;
+    border: 0;
+  }
+  .rc-sched tbody th {
+    grid-column: 1;
+  }
+  .rc-sched tbody td.rc-sched-state {
+    grid-row: 1;
+    grid-column: 2;
+  }
+  .rc-sched td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--text-dim);
+  }
+  .rc-sched td[data-label]:empty {
+    display: none;
+  }
+  .rc-sched-last small {
+    display: inline;
+    margin-left: var(--space-3);
+  }
+  .rc-sched .rc-sched-actions {
+    order: 1;
+    padding-top: var(--space-3);
+  }
+}
+/* The tables turn into blocks before nine columns would wrap a model name. A block holds the row's
+   name, then the cells as label and value pairs in column order. The headers leave the screen and
+   stay with assistive technology. */
+@container (max-width: 1039px) {
+  .rc-results table,
+  .rc-results tbody,
+  .rc-results tr {
+    display: block;
+  }
+  .rc-results thead {
+    position: absolute;
+    width: 1px;
+    height: 1px;
+    overflow: hidden;
+    clip-path: inset(50%);
+    white-space: nowrap;
+  }
+  .rc-results tbody tr {
+    display: grid;
+    gap: var(--space-2);
+    padding: var(--space-6) 0;
+    border-top: 1px solid var(--border);
+  }
+  .rc-results table tbody tr :is(th, td) {
+    padding: 0;
+    border: 0;
+  }
+  .rc-results td[data-label]::before {
+    content: attr(data-label) ": ";
+    color: var(--text-dim);
+  }
+  .rc-results td small {
+    display: inline;
+    margin-left: var(--space-3);
+  }
+}

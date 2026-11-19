@@ -25,7 +25,10 @@ import { basename, dirname, join } from 'node:path';
 import { type TestContext, test } from 'node:test';
 import { fileURLToPath } from 'node:url';
 import type {
+  AcceptanceAttempt,
   AgentEvent,
+  Artifact,
+  BillingMode,
   ChatAttachment,
   ChatCatalogRead,
   ChatCheckRun,
@@ -39,8 +42,13 @@ import type {
   ChatTurn,
   ChatTurnEventsRead,
   CommandResult,
+  Connection,
+  ConnectionAssignment,
+  DependencyPreparation,
+  DesignSystem,
   Event,
   Project,
+  RemoteEffect,
   Task,
 } from '@crewkite/contracts';
 import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/testkit';
@@ -51,12 +59,22 @@ import {
 } from '@crewkite/testkit/chat-adapter';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
-import type { Controller } from '../commands/controller.ts';
+import { Controller } from '../commands/controller.ts';
+import { liveOperations } from '../commands/live-operations.ts';
+import { OperationStore } from '../commands/operation-store.ts';
+import type {
+  OwnedProjectCommandRunner,
+  OwnedProjectCommandTerminal,
+} from '../commands/project-command.ts';
+import { designBrief } from '../design/brief.ts';
+import { DesignSystems } from '../design/service.ts';
+import { RemoteEffects } from '../github/effects.ts';
+import { DependencyPreparer, detectDependencies } from '../host/dependencies.ts';
 import { git } from '../host/source.ts';
 import { localChatAdapter } from '../providers/local/chat.ts';
 import { fakeModel } from '../providers/local/chat-fake.ts';
-import { setup } from '../store/controller-fixture.ts';
-import { Store } from '../store/index.ts';
+import { installedTools, setup } from '../store/controller-fixture.ts';
+import { type LaunchIdentity, Store } from '../store/index.ts';
 import {
   type ChatAdapter,
   type ChatTurnRequest,
@@ -64,9 +82,11 @@ import {
   chatFailure,
 } from './adapter.ts';
 import { deleteThreadBaseRef, threadBaseRef } from './changes.ts';
+import { Connections } from './connections.ts';
 import { detectType } from './files.ts';
 import { McpRegistry } from './mcp-servers.ts';
 import { parsePlan } from './plan.ts';
+import { stripTurnNotes } from './prompt.ts';
 import { chatScratchDirectory } from './scratch-folder.ts';
 import { ChatService, type ChatServiceDeps } from './service.ts';
 import { redact } from './thread-reader.ts';
@@ -75,9 +95,13 @@ import { AskingTurnError, answer } from './thread-tools/broker.ts';
 const selection = { family: 'openai', model: 'fixture-model', effort: 'default' } as const;
 
 async function open<Adapter extends ChatAdapter>(t: TestContext, adapter: Adapter) {
+  // A push runs git from a PATH that holds git alone, so no installed gh is ever found.
+  const tools = mkdtempSync(join(tmpdir(), 'ck-chat-git-'));
+  t.after(() => rmSync(tools, { recursive: true, force: true }));
   const context = await setup(t, {
     chatAdapters: new Map([['openai', adapter]]),
     identity: { name: 'Fixture owner', email: 'owner@example.invalid' },
+    gitEnvironment: { HOME: tools, PATH: installedTools(tools, 'git') },
   });
   const { controller, command, source } = context;
   const task = (await controller.execute(context.draft, 'local-owner')).entity as Task;
@@ -311,6 +335,15 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
       projectPath: () => repository.directory,
       resolveSelection: (_taskId, value) => value ?? null,
       catalog: () => ({ families: [] }),
+      remoteEffects: new RemoteEffects({
+        store,
+        home: directory,
+        now: clock.now,
+        id: () => ids('rfx'),
+        projectPath: () => repository.directory,
+        // An ssh configuration that maps every name to itself, so no real one is read.
+        sshHost: (alias) => alias,
+      }),
       ...deps,
     });
   const service = start();
@@ -343,7 +376,7 @@ function standalone(t: TestContext, deps: Partial<ChatServiceDeps> = {}) {
 /** A catalog entry with one model and one weekly window. */
 function familyEntry(
   family: ChatFamily,
-  percent: number,
+  percent: number | null,
   resetsAt: string | null,
   observedAt: string,
 ): ChatCatalogRead['families'][number] {
@@ -390,8 +423,34 @@ test('startup recovery fails a turn whose controller stopped before it finished'
   assert.deepEqual(thread.messages.at(-1)?.author, { kind: 'system', turnId: turn.id });
 });
 
-// The test replaces the process table and the boot instant, so no group number is signaled for
-// real.
+test('recovery removes the folders one-off turns left behind and leaves a linked folder alone', (t) => {
+  for (const linked of ['nothing', 'one-turns', 'chat'] as const) {
+    const home = mkdtempSync(join(tmpdir(), 'crewkite-home-'));
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    // A folder outside the home shaped like the one the sweep removes.
+    const outside = mkdtempSync(join(tmpdir(), 'crewkite-outside-'));
+    t.after(() => rmSync(outside, { recursive: true, force: true }));
+    mkdirSync(join(outside, 'one-turns', 'x'), { recursive: true });
+    writeFileSync(join(outside, 'one-turns', 'x', 'file'), 'kept');
+    const chat = join(home, 'chat');
+    const root = join(chat, 'one-turns');
+    if (linked === 'nothing') {
+      mkdirSync(join(root, 'trn_left', 'scratch'), { recursive: true });
+      writeFileSync(join(root, 'trn_left', 'scratch', 'file'), 'left');
+    } else if (linked === 'one-turns') {
+      mkdirSync(chat);
+      symlinkSync(join(outside, 'one-turns'), root);
+    } else symlinkSync(outside, chat);
+
+    standalone(t, { home }).service.recover();
+
+    if (linked === 'nothing') assert.equal(existsSync(root), false);
+    else if (linked === 'one-turns') assert.equal(readlinkSync(root), join(outside, 'one-turns'));
+    else assert.equal(readFileSync(join(outside, 'one-turns', 'x', 'file'), 'utf8'), 'kept');
+  }
+});
+
+// The test replaces the process table, so no group number is signaled for real.
 test('a provider process that outlives its turn blocks the thread until a later check finds it gone', {
   timeout: 30000,
 }, async (t) => {
@@ -399,7 +458,6 @@ test('a provider process that outlives its turn blocks the thread until a later 
   const reused = 4300;
   const present = new Set([group]);
   const signals: string[] = [];
-  let booted = new Date(0).toISOString();
   const thread = standalone(t, {
     adapters: new Map([
       [
@@ -419,7 +477,6 @@ test('a provider process that outlives its turn blocks the thread until a later 
       setImmediate(work);
       return () => {};
     },
-    bootedAt: () => booted,
   });
   const { store, taskId } = thread;
   // The second group has exited by the time the turn row first saves its groups. Later in the
@@ -439,7 +496,7 @@ test('a provider process that outlives its turn blocks the thread until a later 
     [turn.failure?.message, turn.failure?.nextAction],
     [
       'The provider process (group 4242) did not exit.',
-      'Quit process group 4242, then send again.',
+      'CrewKite checks again before the next command. If it stays, export diagnostics before taking further action.',
     ],
   );
   assert.deepEqual(turn.groups, [group]);
@@ -451,11 +508,17 @@ test('a provider process that outlives its turn blocks the thread until a later 
   );
   assert.deepEqual(
     [accept.reason, accept.next],
-    ['ownership-unknown', 'Quit process group 4242, then accept.'],
+    [
+      'ownership-unknown',
+      'CrewKite cannot confirm that provider process group 4242 ended. This process number may now belong to another program. Other threads still work. Export diagnostics from Settings, under General, before taking further action.',
+    ],
   );
+  // Preparing the copy's dependencies waits the same way, since the process may still use them.
+  const prepare = store.transaction(() => thread.service.preparationRefusal(taskId));
+  assert.deepEqual([prepare?.reason, prepare?.next], [accept.reason, accept.next]);
 
   // A message sent meanwhile waits. A restart while the group is present keeps the block and
-  // starts nothing.
+  // starts nothing, after a reboot too: a clock comparison never proves a process ended.
   assert.equal(thread.send('Again.').outcome, 'applied');
   const restarted = thread.start();
   restarted.recover();
@@ -480,19 +543,6 @@ test('a provider process that outlives its turn blocks the thread until a later 
     ['And again.'],
   );
   await idle;
-
-  // No process survives a reboot, so a group saved before one is gone even when its number is
-  // in use again.
-  present.add(group);
-  const held = turnReaches(thread, 'failed');
-  thread.send('Once more.', selection, restarted);
-  assert.deepEqual((await held).groups, [group]);
-  booted = thread.clock.advance(60_000);
-  const rebooted = thread.start();
-  rebooted.recover();
-  const clear = thread.read(rebooted);
-  assert.equal(clear.thread.ownershipUnknown, undefined);
-  assert.equal(clear.turns.at(-1)?.groups, undefined);
 });
 
 // The first turn parks on a permission request, so later messages have a turn to wait behind. Each
@@ -1222,7 +1272,8 @@ test('a usage limit writes a system line, and auto handoff runs the same message
   // with the full packet, and the thread says why.
   await answer('Think harder.', { ...pick('google'), effort: 'high' });
   assert.equal(google[3].session?.sessionId, `session-${off.read().turns.at(-2)?.id}`);
-  assert.equal(google[3].prompt, 'Think harder.');
+  // The resumed message carries only the writing rules block in front of it.
+  assert.equal(stripTurnNotes(google[3].prompt), 'Think harder.');
   await answer('Try the new model.', { ...pick('google'), model: 'google-model-2' });
   assert.equal(google[4].session, null);
   assert.match(
@@ -1584,15 +1635,15 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   ];
   const before = checkout();
   const base = before[0];
-  const branch = 'refs/heads/crewkite/fix-rounding';
-  const accept = () => run('AcceptChatChanges', { branch: 'crewkite/fix-rounding' }, task.revision);
+  const branch = 'refs/heads/feat/fix-rounding';
+  const accept = () => run('AcceptChatChanges', { branch: 'feat/fix-rounding' }, task.revision);
 
   const result = await accept();
   assert.equal(result.outcome, 'applied');
   const commit = repo('rev-parse', branch);
   assert.deepEqual(result.data, {
     kind: 'chat-acceptance',
-    branch: 'crewkite/fix-rounding',
+    branch: 'feat/fix-rounding',
     commit,
     fileCount: 1,
   });
@@ -1606,31 +1657,34 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   );
   assert.equal(
     repo('log', '-1', '--format=%s|%an <%ae>', branch),
-    `CrewKite: ${task.title}|Fixture owner <owner@example.invalid>`,
+    // The title's plain first word goes to lower case, as the Changes tab suggests it.
+    'feat: add netMinor(subtotalMinor, discountMinor)|Fixture owner <owner@example.invalid>',
   );
   assert.deepEqual(checkout(), before);
   assert.equal(pinned(), commit);
   const thread = await read();
   assert.equal(thread.thread.lastAcceptance?.commit, commit);
-  assert.equal(thread.messages.at(-1)?.text, 'Accepted 1 file to branch crewkite/fix-rounding.');
+  assert.equal(thread.messages.at(-1)?.text, 'Accepted 1 file to branch feat/fix-rounding.');
 
   assert.equal((await accept()).reason, 'branch-exists');
   assert.equal(repo('rev-parse', branch), commit);
 
-  // The push runs outside the command transaction and still journals the thread.
+  // The push runs outside the command transaction and still journals the thread. Fetches name a
+  // github.com repository and pushes go to a local bare one, so no network is used.
   const remote = join(source.directory, '..', 'remote.git');
   git(source.directory, ['init', '--quiet', '--bare', remote]);
-  repo('remote', 'add', 'origin', remote);
+  repo('remote', 'add', 'origin', 'git@github.com:crew-kite/demo-shop.git');
+  repo('remote', 'set-url', '--push', 'origin', remote);
   const pushed = await run(
     'PushChatBranch',
-    { branch: 'crewkite/fix-rounding', confirmed: true },
+    { branch: 'feat/fix-rounding', commit, confirmed: true },
     task.revision,
   );
   assert.equal(pushed.outcome, 'applied');
   assert.equal(git(remote, ['rev-parse', branch]).toString('utf8').trim(), commit);
   const after = await read();
   assert.equal(after.thread.lastPush?.commit, commit);
-  assert.equal(after.messages.at(-1)?.text, 'Pushed crewkite/fix-rounding to origin.');
+  assert.equal(after.messages.at(-1)?.text, 'Pushed feat/fix-rounding to origin.');
 
   // The base advanced to the accepted commit, so Changes is empty and the next Accept stacks on it.
   // Every read loads the thread record from the store, so a restarted controller sees the same base.
@@ -1652,24 +1706,26 @@ test('accept commits the scratch edit on the base as a new branch and leaves the
   advance(repo('rev-parse', 'HEAD^{tree}'));
   const moved = checkout();
   appendFileSync(join(scratch, 'net.mjs'), '// second\n');
-  const second = await run('AcceptChatChanges', { branch: 'crewkite/second' }, task.revision);
+  const second = await run('AcceptChatChanges', { branch: 'feat/second' }, task.revision);
   const note = `The branch starts at this thread's base commit ${commit.slice(0, 7)}. HEAD stays where it is.`;
   assert.deepEqual([second.outcome, second.next], ['applied', note]);
-  const stacked = repo('rev-parse', 'refs/heads/crewkite/second');
-  assert.equal(repo('rev-parse', 'refs/heads/crewkite/second^'), commit);
+  const stacked = repo('rev-parse', 'refs/heads/feat/second');
+  assert.equal(repo('rev-parse', 'refs/heads/feat/second^'), commit);
   assert.equal(repo('diff', '--name-only', commit, stacked), 'net.mjs');
   assert.deepEqual(checkout(), moved);
   const last = await read();
   assert.equal(last.thread.base, stacked);
   assert.equal(pinned(), stacked);
-  assert.equal(last.messages.at(-1)?.text, `Accepted 1 file to branch crewkite/second. ${note}`);
+  assert.equal(last.messages.at(-1)?.text, `Accepted 1 file to branch feat/second. ${note}`);
   // Thread delete removes the ref and nothing else.
   deleteThreadBaseRef(source.directory, task.id);
   assert.equal(repo('for-each-ref', 'refs/crewkite/'), '');
   assert.deepEqual(checkout(), moved);
 });
 
-test('accept and discard are refused while a turn is running', { timeout: 30000 }, async (t) => {
+test('accept, discard and a dependency preparation are refused while a turn is running', {
+  timeout: 30000,
+}, async (t) => {
   const { controller, task, run, send } = await chat(t, [
     [{ kind: 'text', itemId: 'reply', chunks: ['Working'], complete: false }, { kind: 'wait' }],
   ]);
@@ -1684,6 +1740,13 @@ test('accept and discard are refused while a turn is running', { timeout: 30000 
   assert.deepEqual([result.outcome, result.reason], ['blocked', 'turn-running']);
   const discard = await run('DiscardChatChange', { path: 'net.mjs' }, task.revision);
   assert.deepEqual([discard.outcome, discard.reason], ['blocked', 'turn-running']);
+  // Preparing would remove the copy's node_modules under the turn.
+  const prepare = await run(
+    'PrepareDependencies',
+    { scope: 'thread', scopeKey: task.id, consent: 'explicit' },
+    task.revision,
+  );
+  assert.deepEqual([prepare.outcome, prepare.reason], ['blocked', 'thread-busy']);
 });
 
 test('discard restores, removes or recovers one path and refuses links and entries the copy never held', {
@@ -1814,7 +1877,7 @@ test('discard restores, removes or recovers one path and refuses links and entri
         appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
       },
       listed: 'Link replaced',
-      accept: 'crewkite/link-replaced',
+      accept: 'feat/link-replaced',
       line: 'Restored the link NOTES.md from the base commit',
       check: relinked,
     },
@@ -1825,7 +1888,7 @@ test('discard restores, removes or recovers one path and refuses links and entri
         appendFileSync(join(scratch, 'net.mjs'), '// changed\n');
       },
       listed: 'Link removed',
-      accept: 'crewkite/link-removed',
+      accept: 'feat/link-removed',
       line: 'Restored the link NOTES.md from the base commit',
       check: relinked,
     },
@@ -1947,8 +2010,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       gate: true,
       turns: [
         ['assistant', 'openai'],
-        ['reviewer', 'anthropic'],
         ['fixer', 'openai'],
+        ['reviewer', 'anthropic'],
         ['fixer', 'openai'],
         ['reviewer', 'anthropic'],
         ['challenger', 'google'],
@@ -1964,8 +2027,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       edit: true,
       turns: [
         ['assistant', 'openai'],
-        ['reviewer', 'anthropic'],
         ['fixer', 'openai'],
+        ['reviewer', 'anthropic'],
         ['fixer', 'openai'],
         ['reviewer', 'anthropic'],
         ['challenger', 'google'],
@@ -2163,7 +2226,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       const now = createTestClock().now();
       const planned = 'plan' in row;
       // The gate script lives in the scratch copy, as a project's own script would. It fails the
-      // first time it runs and passes after, so the first fix does not satisfy it. The row turns
+      // first time it runs, after the builder, and passes after the fixer it sends. Its marker
+      // sits outside the copy, because a check that changes the copy cannot pass. The row turns
       // the check on when the builder starts, once the copy exists.
       let begun: ((scratch: string) => void) | undefined;
       let fixers = 0;
@@ -2238,7 +2302,7 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
             join(scratch, 'gate.mjs'),
             [
               "import { existsSync, writeFileSync } from 'node:fs';",
-              "const marker = new URL('ran', import.meta.url);",
+              `const marker = ${JSON.stringify(join(dirname(thread.root), 'gate-ran'))};`,
               'if (existsSync(marker)) process.exit(0);',
               "writeFileSync(marker, 'x');",
               "console.log('gate: expected 3 got 2');",
@@ -2300,13 +2364,14 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       } else thread.send('Fix the rounding.', pick('openai'));
       if ('edit' in row) {
         // The fixer changed the script the person turned on, so Glide asks even with Allow all.
+        // Only the gate after the builder ran before the question.
         const raised = (
           await next(
             thread,
             (event) => event.type === 'chat.thread' && !!(event.payload as ChatThread).checks?.ask,
           )
         ).payload as ChatThread;
-        assert.equal(raised.checks?.runs.length, 0, row.name);
+        assert.equal(raised.checks?.runs.length, 1, row.name);
         assert.deepEqual(raised.checks?.ask?.changed, ['node gate.mjs'], row.name);
         assert.deepEqual(
           raised.checks?.ask?.commands,
@@ -2469,17 +2534,19 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
       // The person's pick stays on the builder whatever the crew borrowed.
       assert.equal(read.thread.selection?.family, 'openai', row.name);
       if ('gate' in row) {
+        // The gate after the builder fails, and its fixer runs on the output before any review.
         const requests = adapters.get('openai')?.requests ?? [];
-        assert.equal(requests[2]?.role, 'fixer');
-        assert.match(requests[2]?.prompt ?? '', /^The project checks failed in the scratch copy\./);
-        assert.match(requests[2]?.prompt ?? '', /gate: expected 3 got 2/);
-        // The second fix is the last one the chain allows, and the second run passes.
+        assert.equal(requests[1]?.role, 'fixer');
+        assert.match(requests[1]?.prompt ?? '', /^The project checks failed in the scratch copy\./);
+        assert.match(requests[1]?.prompt ?? '', /gate: expected 3 got 2/);
+        // The gate runs again after each fix and passes. The review's fix is the second and last.
         const runs = read.thread.checks?.runs ?? [];
         assert.deepEqual(
           runs.map((run) => [run.status, run.exitCode, run.reason, run.trigger]),
           [
-            ['failed', 1, 'Exit code 1.', 'fix'],
-            ['passed', 0, null, 'fix'],
+            ['failed', 1, 'Exit code 1.', 'after-write'],
+            ['passed', 0, null, 'after-write'],
+            ['passed', 0, null, 'after-write'],
           ],
         );
         assert.equal(runs[0].tail, 'gate: expected 3 got 2');
@@ -2488,7 +2555,8 @@ test('the crew chain runs review, fix, second review and challenger, and stops w
           files.read(runs[0].stdout?.hash ?? '').toString('utf8'),
           'gate: expected 3 got 2\n',
         );
-        // Only the edited script asked, and the second fix ran on the pin the answer renewed.
+        // Only the edited script asked, and the gate after the second fix ran on the pin the
+        // answer renewed.
         assert.equal(asks.length, 'edit' in row ? 1 : 0, row.name);
         const lines = read.messages.map((message) => message.text);
         assert.ok(lines.some((line) => line.startsWith('Checks failed: node ')));
@@ -3419,6 +3487,89 @@ test('send now stops the running turn and starts the queued message with its pac
   assert.match(packet, /^OpenAI ended its last turn early\. Reason: stopped by the person\.$/m);
   assert.match(packet, /New message from the person:\nThird\.$/);
   assert.equal(scripted.requests[2].prompt, 'Second.');
+
+  // A kept Anthropic session gets the writing rules and a large design brief in front of Send
+  // now's full packet. The block's bytes come off the packet's cap, so the whole prompt stays
+  // inside it however long the thread is.
+  const reply = (n: number) => [
+    { kind: 'text' as const, itemId: 'r', chunks: [`${n} ${'w'.repeat(8000)}`] },
+  ];
+  const anthropic = createScriptedChatAdapter({
+    family: 'anthropic',
+    turns: [
+      ...Array.from({ length: 6 }, (_, n) => reply(n)),
+      [{ kind: 'text', itemId: 'reply', chunks: ['Half'], complete: false }, { kind: 'wait' }],
+      [{ kind: 'text', itemId: 'reply', chunks: ['Done.'] }],
+    ],
+  });
+  const kept = standalone(t, {
+    adapters: new Map([['anthropic', anthropic]]),
+    writingRules: () => [],
+  });
+  const tokens = Object.fromEntries(
+    Array.from({ length: 200 }, (_, n) => [
+      `shade${n}`,
+      {
+        $type: 'color' as const,
+        $value: '#2f6feb',
+        $description: `Shade ${n}. ${'For one state of one control, and only that one. '.repeat(3)}`,
+      },
+    ]),
+  );
+  const system: DesignSystem = {
+    schema: 1,
+    tokens: { color: tokens, type: {}, spacing: {}, radius: {}, shadow: {}, motion: {} },
+    components: [],
+    rules: [],
+  };
+  const saved = kept.store.transaction(() =>
+    new DesignSystems({
+      store: kept.store,
+      now: kept.clock.now,
+      projectPath: () => kept.root,
+    }).save({
+      projectId: (kept.store.get<Task>('task', kept.taskId) as Task).projectId,
+      path: 'design-system.json',
+      body: system,
+      expectedVersion: 0,
+      confirm: 'explicit',
+    }),
+  );
+  assert.ok('record' in saved);
+  const on = { family: 'anthropic', model: 'anthropic-model', effort: 'default' } as const;
+  for (let n = 0; n < 6; n++) {
+    const done = settles(kept);
+    kept.send(`Turn ${n}.`, on);
+    await done;
+  }
+  // A large change in the copy fills the packet's patch share.
+  writeFileSync(
+    join(chatScratchDirectory(dirname(kept.root), kept.taskId), 'big.txt'),
+    Array.from({ length: 2000 }, (_, n) => `line ${n} of a long generated file`).join('\n'),
+  );
+  const half = next(
+    kept,
+    (event) => event.type === 'agent.event' && event.payload.type === 'text.delta',
+  );
+  kept.send('Stop here.', on);
+  await half;
+  kept.send('Then this.', on);
+  const [queued] = kept.read().thread.queued;
+  const finished = settles(kept);
+  const nowEffects: (() => void)[] = [];
+  assert.equal(
+    kept.store.transaction(() =>
+      kept.service.steer({ taskId: kept.taskId, messageId: queued.id }, nowEffects),
+    ).outcome,
+    'applied',
+  );
+  for (const effect of nowEffects) effect();
+  await finished;
+  const sent = anthropic.requests.at(-1);
+  assert.notEqual(sent?.session, null);
+  assert.ok(sent?.prompt.includes(designBrief(system)));
+  assert.ok(sent?.prompt.includes('line 0 of a long generated file'));
+  assert.ok(Buffer.byteLength(sent?.prompt ?? '') <= 96 * 1024);
 });
 
 /** Run one service command in its own transaction, then its effects, as the controller does. */
@@ -4008,9 +4159,31 @@ test('a file is stored once by its hash, and its path reaches every turn that ru
 test('rename sets the thread title, and delete removes the thread, its scratch copy and files for good', {
   timeout: 30000,
 }, async (t) => {
-  const scripted = createScriptedChatAdapter({ family: 'openai', turns: [[{ kind: 'wait' }]] });
-  const { store, service, taskId, start, send, root } = standalone(t, {
+  const scripted = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [[{ kind: 'wait' }], [{ kind: 'wait' }]],
+  });
+  // The project has a package to copy, so a delete can meet a preparation of the thread's copy.
+  const late: { preparer?: DependencyPreparer } = {};
+  const preparer = () => late.preparer as DependencyPreparer;
+  // The process table the services read. A group is present only while the test says so.
+  const present = new Set<number>();
+  const { store, service, taskId, start, send, root, clock } = standalone(t, {
     adapters: new Map([['openai', scripted]]),
+    groupAbsent: (value) => !present.has(value),
+    dependencies: {
+      prepare: (...input) => preparer().prepare(...input),
+      environment: (...input) => preparer().environment(...input),
+      preparing: (taskId) => preparer().preparing(taskId),
+    },
+  });
+  installTiny(root);
+  late.preparer = new DependencyPreparer({
+    store,
+    home: dirname(root),
+    now: clock.now,
+    id: () => `prp_${'0'.repeat(25)}1`,
+    projectPath: () => root,
   });
   const pasted = { name: 'note.txt', mimeType: 'text/plain', base64: 'aGVsbG8=' };
   const imported = { taskId, source: pasted };
@@ -4030,6 +4203,35 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   const stopped = turnReaches({ store }, 'stopped');
   act(store, (effects) => service.stopTurn({ taskId, turnId: turn.id }, effects));
   await stopped;
+  // A side question runs beside the thread's own turn and sets none, so a delete waits for it too
+  // and removes nothing. Once it ends, the delete at the end of this test goes through.
+  const asking = turnReaches({ store }, 'running');
+  const asked = next(
+    { store },
+    (event) => event.type === 'agent.event' && event.payload.type === 'turn.started',
+  );
+  act(store, (effects) =>
+    service.ask(
+      { taskId, family: 'openai', model: selection.model, question: 'What does this do?' },
+      effects,
+    ),
+  );
+  const question = await asking;
+  await asked;
+  const beside = remove();
+  assert.deepEqual(
+    [beside.reason, beside.next],
+    [
+      'turn-running',
+      'A turn of this thread is still running. Stop it or wait for it, then delete the thread.',
+    ],
+  );
+  assert.ok(store.get<Task>('task', taskId));
+  const rows = store.db.prepare('SELECT count(*) AS n FROM chat_turns WHERE task_id=?');
+  assert.equal(rows.get(taskId)?.n, 2);
+  const answered = turnReaches({ store }, 'stopped');
+  act(store, (effects) => service.stopTurn({ taskId, turnId: question.id }, effects));
+  await answered;
 
   const rename = (title: string) =>
     store.transaction(() => service.renameThread({ taskId, title }));
@@ -4072,11 +4274,241 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
     }
   });
 
+  // A record in each table a thread holds alone. An Accept still checking and a push whose result
+  // is unknown keep the thread. Once they settle, every record goes with it.
+  const stamp = '2026-11-18T09:00:00.000Z';
+  const recordId = (prefix: string) => `${prefix}_01JB7Q0V2N8W3X4Y5Z6A7B8C9D`;
+  const connectionId = recordId('con');
+  const checking: AcceptanceAttempt = {
+    id: recordId('acc'),
+    taskId,
+    state: 'checking',
+    baseCommit: 'e'.repeat(40),
+    candidateTree: 'a'.repeat(40),
+    commandsDigest: 'b'.repeat(64),
+    choicesDigest: 'f'.repeat(64),
+    preparationId: recordId('prp'),
+    requiredChecks: [],
+    mutatedPaths: [],
+    mutatedCount: 0,
+    refusal: null,
+    branch: 'feat/sales-chart',
+    commit: null,
+  };
+  const unknownPush: RemoteEffect = {
+    id: recordId('rfx'),
+    taskId,
+    kind: 'push',
+    state: 'unknown',
+    target: {
+      repo: { host: 'github.com', owner: 'crew-kite', name: 'demo-shop' },
+      branch: 'feat/sales-chart',
+      pr: null,
+      headSha: 'd'.repeat(40),
+      baseRef: null,
+    },
+    request: { kind: 'push', remote: 'origin', commit: 'd'.repeat(40), expectedRemote: null },
+    confirmation: { at: stamp, by: 'person' },
+    observed: null,
+    reason: null,
+  };
+  store.transaction(() => {
+    store.putDependencyPreparation(
+      {
+        id: recordId('prp'),
+        taskId,
+        scope: 'thread',
+        scopeKey: taskId,
+        state: 'preparing',
+        layout: 'none',
+        inputs: {
+          manifestDigests: {},
+          lockfileDigest: null,
+          workspaceDigest: null,
+          runtime: 'node@24.22.0',
+          packageManager: null,
+          platform: 'darwin',
+          arch: 'arm64',
+        },
+        treeDigest: null,
+        bytes: null,
+        limitBytes: 1024,
+        reason: null,
+        preparedAt: null,
+      },
+      stamp,
+    );
+    store.putAcceptanceAttempt(checking, stamp);
+    store.putConnection(
+      {
+        connectionId,
+        family: 'openai',
+        backend: 'native-client',
+        billingMode: 'api',
+        profileId: 'openai-api',
+        keepConnected: false,
+        readiness: 'ready',
+        proofGeneration: 1,
+        observedMode: 'api',
+        observedAt: stamp,
+      },
+      stamp,
+    );
+    store.putConnectionAssignment({ taskId, role: 'builder', connectionId }, stamp);
+    store.putDesignFinding(
+      {
+        id: recordId('dsf'),
+        taskId,
+        file: 'src/chart.css',
+        line: 3,
+        rule: 'raw-color',
+        found: '#3b82f6',
+        nearestToken: 'color.accent',
+        state: 'open',
+        reason: null,
+        versionHash: 'c'.repeat(64),
+      },
+      (store.get<Task>('task', taskId) as Task).projectId,
+      stamp,
+    );
+    store.putRemoteEffect(unknownPush, stamp);
+  });
+  const held = remove();
+  assert.deepEqual(
+    [held.reason, held.next],
+    [
+      'work-in-flight',
+      'Wait for the push, pull request or acceptance to settle, or reconcile it, then delete the thread.',
+    ],
+  );
+  store.transaction(() =>
+    store.putAcceptanceAttempt({ ...checking, state: 'refused', refusal: 'check-failed' }, stamp),
+  );
+  assert.equal(remove().reason, 'work-in-flight');
+  store.transaction(() =>
+    store.putRemoteEffect(
+      {
+        ...unknownPush,
+        state: 'applied',
+        observed: { at: stamp, result: 'applied', created: { sha: 'd'.repeat(40) } },
+      },
+      stamp,
+    ),
+  );
+  // A copy being prepared writes into the thread's folder until it ends, so it keeps the thread too.
+  const preparing = preparer().prepare(taskId, 'thread', taskId);
+  assert.deepEqual(
+    [remove().reason, remove().next],
+    ['work-in-flight', 'Wait for the dependency preparation to finish, then delete the thread.'],
+  );
+  const prepared = await preparing;
+  assert.equal(prepared && prepared !== 'busy' && prepared.state, 'prepared');
+
+  // A thread that ran checks deletes with their records, and an unresolved check keeps it. The
+  // settled check's row, launch identity, receipt and artifacts go with the thread, and so does a
+  // command that was prepared and never started. A check left at intent refuses with the hold's
+  // sentence until the person releases it.
+  const identity: LaunchIdentity = {
+    boot: { source: 'darwin-boot-session-v1', digest: '1'.repeat(64) },
+    machine: null,
+  };
+  const output = {
+    id: `art_${'9'.padStart(26, '0')}`,
+    ...artifacts.publish(Buffer.from('ok 1')),
+    mediaType: 'text/plain; charset=utf-8',
+  };
+  store.transaction(() => store.put('artifact', output.id, 0, output));
+  const ran = settledCheck(store, clock.now, taskId, 1, { identity, stdout: output });
+  const lost = journaledCheck(store, clock.now, taskId, 2);
+  // A command prepared and never started has no process, and nothing ends it.
+  const draft = {
+    id: `art_${'3'.padStart(26, '0')}`,
+    hash: 'a'.repeat(64),
+    bytes: 0,
+    mediaType: 'application/json',
+  };
+  store.transaction(() => {
+    store.put('artifact', draft.id, 0, draft);
+    new OperationStore(store, clock.now).create({
+      id: `cmd_${'3'.padStart(26, '0')}`,
+      taskId,
+      kind: 'project-command',
+      definition: draft,
+    });
+  });
+  // Its run ended without proof that the process did, so the record reads unknown.
+  new OperationStore(store, clock.now).finish(
+    lost,
+    { state: 'unknown', reason: 'operation-ownership-unknown', next: null },
+    { outcome: 'blocked', reason: 'operation-ownership-unknown' },
+  );
+  const unresolved = remove();
+  assert.deepEqual(
+    [unresolved.reason, unresolved.next],
+    [
+      'ownership-unknown',
+      'A check recorded no process identity, so CrewKite cannot confirm it ended. Other threads still work. Export diagnostics from Settings, under General, before taking further action.',
+    ],
+  );
+  const released = act(store, (effects) =>
+    service.releaseCheck({ taskId, confirm: 'explicit', note: 'Nothing was running.' }, effects),
+  );
+  assert.equal(released.outcome, 'applied');
+  const keys = [ran, lost].map((id) => new OperationStore(store, clock.now).get(id)?.key as string);
+  // A check this process still runs answers with the checks' own refusal until it ends.
+  const owned = journaledCheck(store, clock.now, taskId, 4);
+  liveOperations.add(owned);
+  const busy = remove();
+  assert.deepEqual(
+    [busy.reason, busy.next],
+    ['checks-running', 'Wait for the checks to finish or stop them, then try again.'],
+  );
+  liveOperations.delete(owned);
+  const journal = new OperationStore(store, clock.now);
+  journal.unlaunched(owned, 'command');
+  journal.finish(
+    owned,
+    { state: 'failed', reason: 'operation-failed', next: null },
+    { outcome: 'blocked', reason: 'operation-failed' },
+  );
+  // A check left a child in its group and ended unknown, so the thread is held while it runs.
+  const child = 4242;
+  present.add(child);
+  const orphan = journaledCheck(store, clock.now, taskId, 5, child);
+  journal.finish(
+    orphan,
+    { state: 'unknown', reason: 'operation-ownership-unknown', next: null },
+    { outcome: 'blocked', reason: 'operation-ownership-unknown' },
+  );
+  store.db
+    .prepare(
+      "UPDATE chat_threads SET body=json_set(body,'$.ownershipUnknown',json('true')) WHERE task_id=?",
+    )
+    .run(taskId);
+  assert.equal(remove().reason, 'ownership-unknown');
+  // With no hold on the thread, the presence check the delete settles by still finds the child,
+  // so the record stays and the delete refuses.
+  store.db
+    .prepare("UPDATE chat_threads SET body=json_remove(body,'$.ownershipUnknown') WHERE task_id=?")
+    .run(taskId);
+  assert.equal(remove().reason, 'ownership-unknown');
+  // The child exits. The hold lifts, and the delete settles the record as recovery would.
+  present.delete(child);
+  // The settled check ran in a folder of its own, and another record names its output's bytes.
+  const workFolder = join(dirname(root), 'operations', ran);
+  mkdirSync(join(workFolder, 'environment'), { recursive: true });
+  const elsewhere = { ...output, id: `art_${'98'.padStart(26, '0')}` };
+  store.transaction(() => store.put('artifact', elsewhere.id, 0, elsewhere));
+
   // The controller stops after the delete commits and before its folder goes. Startup finishes it.
   const folder = dirname(scripted.requests[0].scratch.directory);
   const ref = `refs/crewkite/threads/${taskId}`;
   git(root, ['update-ref', ref, scripted.requests[0].scratch.base]);
-  assert.equal(store.transaction(() => service.deleteThread({ taskId }, [])).outcome, 'applied');
+  const afterCommit: (() => void)[] = [];
+  assert.equal(
+    store.transaction(() => service.deleteThread({ taskId }, afterCommit)).outcome,
+    'applied',
+  );
   assert.deepEqual(
     store
       .eventsAfter('0')
@@ -4095,12 +4527,48 @@ test('rename sets the thread title, and delete removes the thread, its scratch c
   );
   assert.throws(() => artifacts.read(outputs[0].hash), /ENOENT/);
   assert.equal(artifacts.read(kept.hash).toString(), 'shared');
-  for (const table of ['conversation_entries', 'chat_turns', 'chat_threads', 'events'])
+  for (const table of [
+    'conversation_entries',
+    'chat_turns',
+    'chat_threads',
+    'events',
+    'dependency_preparations',
+    'acceptance_attempts',
+    'connection_assignments',
+    'design_findings',
+    'remote_effects',
+  ])
     assert.equal(
       store.db.prepare(`SELECT count(*) AS rows FROM ${table} WHERE task_id=?`).get(taskId)?.rows,
       0,
       table,
     );
+  assert.equal(
+    store.db.prepare('SELECT count(*) AS rows FROM task_operations WHERE task_id=?').get(taskId)
+      ?.rows,
+    0,
+  );
+  assert.equal(
+    store.db
+      .prepare("SELECT count(*) AS rows FROM launch_identity WHERE owner_kind='operation'")
+      .get()?.rows,
+    0,
+  );
+  assert.deepEqual(
+    keys.map((key) => store.receipt(key)),
+    [undefined, undefined],
+  );
+  // The definitions are named like their operations.
+  assert.deepEqual(
+    [ran.replace('cmd_', 'art_'), lost.replace('cmd_', 'art_'), draft.id, output.id].map((id) =>
+      store.get('artifact', id),
+    ),
+    [undefined, undefined, undefined, undefined],
+  );
+  // The step after commit removes the operation's folder and keeps a file another record names.
+  for (const effect of afterCommit) effect();
+  assert.equal(existsSync(workFolder), false);
+  assert.equal(artifacts.read(output.hash).toString(), 'ok 1');
   assert.equal(remove(restarted).reason, 'task-not-found');
 });
 
@@ -4244,7 +4712,8 @@ const textReply = (text: string): ChatScriptStep[] => [
 
 // Claim: Stop ends an open project check and the chain, a message sent meanwhile waits and then
 // runs, and a check process the journal cannot prove gone keeps the thread from taking a turn
-// until it is gone. A restart reads the open check as failed with the reason.
+// until it is gone. A restart reads the open check as failed with the reason and stops the chain
+// that waited on it.
 test('stop during a check keeps the queue, and an orphan check holds the thread', {
   timeout: 60000,
 }, async (t) => {
@@ -4309,10 +4778,10 @@ test('stop during a check keeps the queue, and an orphan check holds the thread'
   const open = next(thread, running('running'));
   thread.send('Fix the rounding.', pick('openai'));
   await open;
-  // The thread takes no turn while the check runs.
+  // The gate after the builder runs the check, and the thread takes no turn meanwhile.
   assert.equal(thread.send('One more thing.', pick('openai')).outcome, 'applied');
   assert.equal(thread.read().thread.queued.length, 1);
-  assert.equal(thread.read().turns.length, 3);
+  assert.equal(thread.read().turns.length, 1);
 
   const stoppedLine = next(
     thread,
@@ -4339,29 +4808,36 @@ test('stop during a check keeps the queue, and an orphan check holds the thread'
   );
   const [first] = after.thread.checks?.runs ?? [];
   assert.deepEqual([first.status, first.reason], ['stopped', 'You stopped it.']);
-  // The queued message runs after the chain stopped, and its own chain reaches the check again.
+  // The queued message runs after the chain stopped, and its own gate runs the check again.
   await second;
   const again = thread.read();
   assert.deepEqual(
     again.turns.map((turn) => turn.role),
-    ['assistant', 'reviewer', 'fixer', 'assistant', 'reviewer', 'fixer'],
+    ['assistant', 'assistant'],
   );
   assert.equal(again.thread.queued.length, 0);
 
   // The controller stops with that check open. Its process is alive, so the journal cannot prove
-  // it gone: the thread takes no turn, and the open run reads as failed with the reason.
+  // it gone: the thread takes no turn, and the open run reads as unknown with the reason.
   present = true;
   const restarted = thread.start();
   restarted.recover();
   const held = thread.read(restarted);
   assert.equal(held.thread.ownershipUnknown, true);
+  // The second builder's gate held its fresh chain, so the restart stops it with a line and no
+  // review waits on a gate that will never end.
+  assert.equal(held.thread.crewChain?.step, 'stopped');
+  assert.equal(
+    held.messages.filter((message) => message.text.startsWith('Crew stopped')).at(-1)?.text,
+    'Crew stopped: CrewKite restarted.',
+  );
   const [, orphan] = held.thread.checks?.runs ?? [];
-  assert.equal(orphan.status, 'failed');
+  assert.equal(orphan.status, 'unknown');
   assert.match(orphan.reason ?? '', /^CrewKite restarted while this check ran\./);
   // A message waits in the queue while the hold stands.
   assert.equal(thread.send('Go on.', pick('openai'), restarted).outcome, 'applied');
   assert.equal(thread.read(restarted).thread.queued.length, 1);
-  assert.equal(thread.read(restarted).turns.length, 6);
+  assert.equal(thread.read(restarted).turns.length, 2);
   // Once the process table shows the group gone, the next command lifts the hold and the queue
   // runs.
   present = false;
@@ -4372,7 +4848,7 @@ test('stop during a check keeps the queue, and an orphan check holds the thread'
   const last = thread.read(restarted);
   assert.equal(last.thread.ownershipUnknown, undefined);
   assert.deepEqual(
-    last.turns.slice(6).map((turn) => turn.state),
+    last.turns.slice(2).map((turn) => turn.state),
     ['done', 'done'],
   );
   // The check of the first service is still running; closing it ends the process.
@@ -4381,7 +4857,8 @@ test('stop during a check keeps the queue, and an orphan check holds the thread'
 
 // Claim: a check is plain words the controller resolves itself. Balanced asks before every run,
 // naming the exact commands, and a no skips the checks. Glide runs them when its policy covers
-// commands and asks again when the script changed. The same checks run on a merged copy.
+// commands and asks again when the script changed. The same checks run on a merged copy, and
+// Manual runs none there and asks nothing.
 test('checks refuse shell lines, ask before running and run on a merged copy', {
   timeout: 30000,
 }, async (t) => {
@@ -4440,9 +4917,21 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
     assert.equal(result.outcome, 'applied');
     return ask;
   };
-  // Manual and Balanced ask, whatever the policy. The question names the exact command.
+  // Manual runs nothing on its own, whatever the policy.
   configure({ permissionPolicy: 'allow-all' });
   const first = merged('first', false);
+  assert.deepEqual(await service.runCombinedChecks(taskId, first), {
+    outcome: 'held',
+    cause: 'the thread is in manual mode',
+    runs: [],
+    brief: null,
+  });
+  assert.equal(thread.read().thread.checks?.ask, null);
+  // Balanced asks, whatever the policy. The question names the exact command.
+  configure({
+    crew: { name: 'Solo', members: [{ role: 'builder', selection }] },
+    flightMode: 'balanced',
+  });
   const refused = service.runCombinedChecks(taskId, first);
   const ask = answer('deny');
   assert.deepEqual(ask.commands, [{ label: 'node gate.mjs', resolved: 'node gate.mjs' }]);
@@ -4452,10 +4941,7 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
   assert.equal(thread.read().thread.checks?.ask, null);
 
   // Glide with Allow all runs without a question.
-  configure({
-    crew: { name: 'Solo', members: [{ role: 'builder', selection }] },
-    flightMode: 'glide',
-  });
+  configure({ flightMode: 'glide' });
   const quiet = service.runCombinedChecks(taskId, merged('second', true));
   assert.equal(thread.read().thread.checks?.ask, null);
   assert.equal((await quiet).outcome, 'passed');
@@ -4486,6 +4972,2314 @@ test('checks refuse shell lines, ask before running and run on a merged copy', {
   assert.equal(configure({ checks: { remove: 'custom:1' } }).outcome, 'applied');
   service.close();
   await assert.rejects(service.runCombinedChecks(taskId, first), /closed/);
+});
+
+/** A thread with a scratch copy, in Glide with Allow all, so a check runs without a question. */
+async function checkCopy(
+  t: TestContext,
+  setup: {
+    /** The scripted replies, the first one to "Build it.". */
+    turns?: ChatScriptStep[][];
+    deps?: Partial<ChatServiceDeps>;
+    /** Runs on the new thread before its first turn copies the project. */
+    before?: (thread: ReturnType<typeof standalone>) => void;
+  } = {},
+) {
+  const thread = standalone(t, {
+    adapters: new Map([
+      [
+        'openai',
+        createScriptedChatAdapter({
+          family: 'openai',
+          turns: setup.turns ?? [textReply('Built.')],
+        }),
+      ],
+    ]),
+    ...setup.deps,
+  });
+  setup.before?.(thread);
+  const done = turnReaches(thread, 'done');
+  thread.send('Build it.');
+  const built = await done;
+  const configure = (patch: object) =>
+    thread.store.transaction(() => thread.service.configure({ taskId: thread.taskId, ...patch }));
+  configure({
+    crew: { name: 'Solo', members: [{ role: 'builder', selection }] },
+    flightMode: 'glide',
+    permissionPolicy: 'allow-all',
+  });
+  const scratch = realpathSync(chatScratchDirectory(dirname(thread.root), thread.taskId));
+  return { ...thread, built, configure, scratch };
+}
+
+// Claim: a check whose process CrewKite cannot confirm ended reads as unknown, never as a pass,
+// and the thread takes no turn meanwhile. No later check starts in the copy that process may
+// still write.
+test('a check that leaves a process behind reads as unknown and holds the thread', {
+  timeout: 30000,
+}, async (t) => {
+  const { service, taskId, scratch, configure, read } = await checkCopy(t);
+  // The check exits and leaves a process in its group, so it did not end on its own.
+  writeFileSync(
+    join(scratch, 'linger.mjs'),
+    "import { spawn } from 'node:child_process';\nspawn(process.execPath, ['-e', 'setTimeout(() => {}, 20000)'], { stdio: 'ignore' }).unref();\n",
+  );
+  configure({ checks: { add: 'node linger.mjs' } });
+  configure({ checks: { add: 'node --version' } });
+  assert.equal((await service.runCombinedChecks(taskId, scratch)).outcome, 'failed');
+  const after = read();
+  assert.deepEqual(
+    after.thread.checks?.runs.map((run) => [run.label, run.status, run.reason, run.exitCode]),
+    [
+      [
+        'node linger.mjs',
+        'unknown',
+        'CrewKite could not confirm the process exited. It checks again before the next turn.',
+        0,
+      ],
+      [
+        'node --version',
+        'failed',
+        'A check before this one may still be running in the copy, so this one did not start.',
+        null,
+      ],
+    ],
+  );
+  assert.equal(after.thread.ownershipUnknown, true);
+});
+
+// Claim: an allow covers the commands the question showed. A script that changed before the
+// answer runs nothing, and a fresh question shows what would run now.
+test('a check script changed between the question and the answer does not run', {
+  timeout: 30000,
+}, async (t) => {
+  const { store, service, taskId, scratch, configure, read, built } = await checkCopy(t);
+  writeFileSync(join(scratch, 'gate.mjs'), 'process.exit(0);\n');
+  configure({ flightMode: 'balanced', checks: { add: 'node gate.mjs' } });
+  const answer = (requestId: string, choice: 'allow' | 'deny') =>
+    act(store, (effects) =>
+      service.resolvePermission({ taskId, turnId: built.id, requestId, choice }, effects),
+    ).outcome;
+  const pending = service.runCombinedChecks(taskId, scratch);
+  const first = read().thread.checks?.ask;
+  assert.deepEqual(first?.changed, []);
+  writeFileSync(join(scratch, 'gate.mjs'), 'process.exit(1);\n');
+  assert.equal(answer(first?.requestId ?? '', 'allow'), 'applied');
+  const fresh = read().thread.checks?.ask;
+  assert.notEqual(fresh?.requestId, first?.requestId);
+  assert.deepEqual(fresh?.changed, ['node gate.mjs']);
+  assert.equal(read().thread.checks?.runs.length, 0);
+  assert.equal(answer(fresh?.requestId ?? '', 'deny'), 'applied');
+  assert.equal((await pending).outcome, 'denied');
+  assert.equal(read().thread.checks?.runs.length, 0);
+});
+
+// Claim: nothing publishes or changes the copy while a check runs in it, its dependencies included.
+test('accept, discard, the hunk commands and a dependency preparation refuse while a check runs in the copy', {
+  timeout: 30000,
+}, async (t) => {
+  const { store, service, taskId, scratch, configure } = await checkCopy(t);
+  writeFileSync(join(scratch, 'block.mjs'), 'setInterval(() => {}, 60_000);\n');
+  configure({ checks: { add: 'node block.mjs' } });
+  const running = service.runCombinedChecks(taskId, scratch);
+  const hunk = 'a'.repeat(64);
+  const identity = { name: 'Fixture owner', email: 'owner@example.invalid' };
+  const attempts: [string, () => CommandResult][] = [
+    ['accept', () => service.accept({ taskId, branch: 'crewkite/checked' }, identity)],
+    [
+      'accept a hunk',
+      () => service.decideHunk({ taskId, path: 'block.mjs', hunk, decision: 'accepted' }),
+    ],
+    ['discard a hunk', () => service.discardHunk({ taskId, path: 'block.mjs', hunk })],
+    ['discard', () => service.discardChange({ taskId, path: 'block.mjs' })],
+    [
+      'prepare the dependencies',
+      () => service.preparationRefusal(taskId) ?? { outcome: 'applied' },
+    ],
+  ];
+  for (const [name, attempt] of attempts) {
+    const result = store.transaction(attempt);
+    assert.deepEqual(
+      [result.outcome, result.reason, result.next],
+      ['blocked', 'checks-running', 'Wait for the checks to finish or stop them, then try again.'],
+      name,
+    );
+  }
+  assert.equal(service.stopCombinedChecks(taskId), true);
+  assert.equal((await running).outcome, 'stopped');
+});
+
+// Claim: a check that changes the files Accept would publish cannot pass, whatever it exits
+// with. The run names the files, and they stay for the person to review.
+test('a check that writes into the copy fails, names the files and leaves them', {
+  timeout: 30000,
+}, async (t) => {
+  const { service, taskId, scratch, configure, read } = await checkCopy(t);
+  writeFileSync(
+    join(scratch, 'format.mjs'),
+    [
+      "import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';",
+      "mkdirSync('out');",
+      "writeFileSync('out/report.txt', 'ok\\n');",
+      "appendFileSync('net.mjs', '// formatted\\n');",
+    ].join('\n'),
+  );
+  configure({ checks: { add: 'node format.mjs' } });
+  assert.equal((await service.runCombinedChecks(taskId, scratch)).outcome, 'failed');
+  const run = read().thread.checks?.runs.at(-1);
+  assert.deepEqual(
+    [run?.status, run?.exitCode, run?.reason, run?.changedPaths, run?.changedCount],
+    [
+      'failed',
+      0,
+      'This check changed files in the copy. Review the changes before running it again.',
+      ['net.mjs', 'out/report.txt'],
+      2,
+    ],
+  );
+  assert.equal(readFileSync(join(scratch, 'out/report.txt'), 'utf8'), 'ok\n');
+  assert.match(readFileSync(join(scratch, 'net.mjs'), 'utf8'), /\/\/ formatted\n$/);
+});
+
+/** Only git and node on PATH, so nothing a test runs can find gh or a provider client. */
+function lockPath(t: TestContext) {
+  const tools = mkdtempSync(join(tmpdir(), 'ck-locked-path-'));
+  const saved = process.env.PATH;
+  process.env.PATH = installedTools(tools, 'git', 'node');
+  t.after(() => {
+    process.env.PATH = saved;
+    rmSync(tools, { recursive: true, force: true });
+  });
+}
+
+/**
+ * A check command the journal opened, the way a controller leaves it when it stops between the
+ * intent and the spawn, or with `group` once the spawn recorded one. Returns the operation's id.
+ */
+function journaledCheck(
+  store: Store,
+  now: () => string,
+  taskId: string,
+  n: number,
+  group?: number,
+): string {
+  const id = (prefix: string, value: number) => `${prefix}_${String(value).padStart(26, '0')}`;
+  const definition = {
+    id: id('art', n),
+    hash: 'a'.repeat(64),
+    bytes: 0,
+    mediaType: 'application/json',
+  };
+  const journal = new OperationStore(store, now);
+  journal.createAndBegin(
+    { id: id('cmd', n), taskId, kind: 'project-command', definition },
+    id('cmd', n + 100),
+    'b'.repeat(64),
+    () => {},
+    () => store.put('artifact', definition.id, 0, definition),
+  );
+  journal.phase(id('cmd', n), 'command', 'intent', null);
+  if (group !== undefined) journal.phase(id('cmd', n), 'command', 'owned', group);
+  return id('cmd', n);
+}
+
+/**
+ * A check command that ran and ended: intent, its group, the group closed and a pass. `stdout`
+ * names an output artifact the caller stored. Returns the operation's id.
+ */
+function settledCheck(
+  store: Store,
+  now: () => string,
+  taskId: string,
+  n: number,
+  options: { identity?: LaunchIdentity; stdout?: Artifact } = {},
+): string {
+  const id = (prefix: string, value: number) => `${prefix}_${String(value).padStart(26, '0')}`;
+  const definition = {
+    id: id('art', n),
+    hash: 'a'.repeat(64),
+    bytes: 0,
+    mediaType: 'application/json',
+  };
+  const journal = new OperationStore(store, now, undefined, options.identity);
+  journal.createAndBegin(
+    { id: id('cmd', n), taskId, kind: 'project-command', definition },
+    id('cmd', n + 100),
+    'b'.repeat(64),
+    () => {},
+    () => store.put('artifact', definition.id, 0, definition),
+  );
+  journal.phase(id('cmd', n), 'command', 'intent', null);
+  journal.phase(id('cmd', n), 'command', 'owned', 4000 + n);
+  journal.phase(id('cmd', n), 'command', 'closed', 4000 + n);
+  journal.finish(
+    id('cmd', n),
+    { state: 'succeeded', reason: 'exit-zero', next: null, stdout: options.stdout ?? null },
+    { outcome: 'applied' },
+  );
+  return id('cmd', n);
+}
+
+const RELEASED_LINE =
+  "You released this thread. CrewKite never confirmed the check's process ended.";
+
+// Claim: a check journaled at intent never recorded its process group, so nothing can prove its
+// process gone. A restart holds the thread, and only the person's release lets it go. The record
+// fails with their note, the run says they released it, the thread gets one line, the message
+// that waited starts and the thread can be deleted. Nothing reads a process table for it.
+test('a check that crashed before its process was recorded holds the thread until a person releases it', {
+  timeout: 30000,
+}, async (t) => {
+  lockPath(t);
+  const thread = await checkCopy(t, {
+    turns: [textReply('Built.'), textReply('Went on.')],
+    deps: { groupAbsent: () => assert.fail('No process table is read for this release.') },
+  });
+  const { store, taskId, clock, configure } = thread;
+  configure({ checks: { add: 'node --version' } });
+  const operation = journaledCheck(store, clock.now, taskId, 1);
+  // The old controller had saved the run as running before it stopped.
+  const saved = thread.read().thread;
+  const run: ChatCheckRun = {
+    id: `chk_${'1'.repeat(32)}`,
+    checkId: 'custom:1',
+    label: 'node --version',
+    command: 'node --version',
+    trigger: 'manual',
+    status: 'running',
+    reason: null,
+    startedAt: clock.now(),
+    durationMs: null,
+    exitCode: null,
+    tail: '',
+    stdout: null,
+    stderr: null,
+  };
+  store.db
+    .prepare('UPDATE chat_threads SET body=? WHERE task_id=?')
+    .run(JSON.stringify({ ...saved, checks: { ...saved.checks, runs: [run] } }), taskId);
+  const restarted = thread.start();
+  restarted.recover();
+  assert.equal(thread.read(restarted).thread.ownershipUnknown, true);
+  assert.equal(thread.read(restarted).thread.checks?.runs[0].status, 'unknown');
+  assert.equal(thread.send('Go on.', selection, restarted).outcome, 'applied');
+  assert.equal(thread.read(restarted).thread.queued.length, 1);
+  const identity = { name: 'Fixture owner', email: 'owner@example.invalid' };
+  const accept = store.transaction(() =>
+    restarted.accept({ taskId, branch: 'crewkite/held' }, identity),
+  );
+  assert.deepEqual([accept.outcome, accept.reason], ['blocked', 'ownership-unknown']);
+  const remove = () => act(store, (effects) => restarted.deleteThread({ taskId }, effects));
+  const held = remove();
+  assert.deepEqual([held.outcome, held.reason], ['blocked', 'ownership-unknown']);
+
+  const started = turnReaches(thread, 'done');
+  const note = 'No test or build process was left in Activity Monitor.';
+  const released = act(store, (effects) =>
+    restarted.releaseCheck({ taskId, confirm: 'explicit', note }, effects),
+  );
+  assert.deepEqual(released, {
+    outcome: 'applied',
+    data: { kind: 'chat-check-released', taskId, released: 1, held: false },
+  });
+  const record = new OperationStore(store, clock.now).get(operation);
+  assert.deepEqual(
+    [record?.state, record?.reason, record?.phases],
+    ['failed', `operation-released-by-person: ${note}`, []],
+  );
+  assert.equal(store.receipt(record?.key ?? '')?.result.reason, 'operation-released-by-person');
+  const after = thread.read(restarted);
+  assert.deepEqual(
+    [after.thread.checks?.runs[0].status, after.thread.checks?.runs[0].reason],
+    ['failed', "Released by you. CrewKite never confirmed this check's process ended."],
+  );
+  assert.equal(after.thread.ownershipUnknown, undefined);
+  assert.deepEqual(after.messages.filter((message) => message.text === RELEASED_LINE).length, 1);
+  assert.equal((await started).state, 'done');
+  assert.equal(thread.read(restarted).turns.length, 2);
+  // The hold no longer refuses the delete.
+  assert.notEqual(remove().reason, 'ownership-unknown');
+});
+
+// Claim: the hold reads every check that has not ended, so no number of later checks lifts it.
+// Run tests on a held thread refuses with the hold's sentence before it opens an operation. The
+// release reads the same checks, so a recorded group older than any page of the journal still
+// refuses it.
+test('a hold outlasts any number of later checks, and Run tests refuses on a held thread', {
+  timeout: 30000,
+}, async (t) => {
+  lockPath(t);
+  const group = 4242;
+  const thread = await checkCopy(t, {
+    // A stand-in process table: only the recorded group below is present, and nothing else is
+    // looked up.
+    deps: {
+      groupAbsent: (value) => (value === group ? false : assert.fail('Only the group is read.')),
+    },
+  });
+  const { store, taskId, clock, scratch, configure } = thread;
+  writeFileSync(join(scratch, 'package.json'), '{"scripts":{"test":"node --version"}}');
+  configure({ checks: { refresh: true } });
+  journaledCheck(store, clock.now, taskId, 1);
+  // More checks ran and ended after it than any page of the journal holds.
+  for (let n = 2; n <= 30; n++) settledCheck(store, clock.now, taskId, n);
+  const restarted = thread.start();
+  restarted.recover();
+  const count = () =>
+    store.db.prepare('SELECT count(*) AS rows FROM task_operations WHERE task_id=?').get(taskId)
+      ?.rows;
+  const before = count();
+  const sentence =
+    'A check recorded no process identity, so CrewKite cannot confirm it ended. Other threads still work. Export diagnostics from Settings, under General, before taking further action.';
+  const tests = act(store, (effects) => restarted.runTests({ taskId }, effects));
+  assert.deepEqual(
+    [tests.outcome, tests.reason, tests.next],
+    ['blocked', 'ownership-unknown', sentence],
+  );
+  assert.equal(count(), before);
+  const removed = act(store, (effects) => restarted.deleteThread({ taskId }, effects));
+  assert.deepEqual([removed.reason, removed.next], ['ownership-unknown', sentence]);
+  assert.equal(thread.read(restarted).thread.ownershipUnknown, true);
+  // The oldest check of all recorded a group that is still present.
+  journaledCheck(store, clock.now, taskId, 0, group);
+  const release = act(store, (effects) =>
+    restarted.releaseCheck({ taskId, confirm: 'explicit', note: 'I looked.' }, effects),
+  );
+  assert.deepEqual([release.outcome, release.reason], ['blocked', 'check-process-recorded']);
+});
+
+// Claim: a release is a thread command like the others. A retried key answers from its receipt
+// and releases nothing again, and a new key finds nothing left to release.
+test('a repeated release key answers from its receipt and releases nothing twice', {
+  timeout: 30000,
+}, async (t) => {
+  lockPath(t);
+  const tools = mkdtempSync(join(tmpdir(), 'ck-chat-git-'));
+  t.after(() => rmSync(tools, { recursive: true, force: true }));
+  const options = { gitEnvironment: { HOME: tools, PATH: installedTools(tools, 'git') } };
+  const context = await setup(t, options);
+  const task = (await context.controller.execute(context.draft, 'local-owner')).entity as Task;
+  journaledCheck(context.controller.store, context.clock.now, task.id, 1);
+  await context.controller.close();
+  const controller = new Controller({
+    ...options,
+    home: context.controller.home,
+    now: context.clock.now,
+    id: context.id,
+    routes: context.fixtures.snapshot.routes,
+    observations: context.fixtures.snapshot.usage.map((window) => window.observation),
+  });
+  t.after(() => controller.close());
+  const payload = { taskId: task.id, confirm: 'explicit', note: 'Nothing was left running.' };
+  const release = context.command('ReleaseChatCheck', payload, 0);
+  const first = await controller.execute(release, 'local-owner');
+  assert.deepEqual(first, {
+    outcome: 'applied',
+    data: { kind: 'chat-check-released', taskId: task.id, released: 1, held: false },
+  });
+  assert.deepEqual(await controller.execute(release, 'local-owner'), {
+    ...first,
+    outcome: 'already-applied',
+  });
+  const fresh = await controller.execute(
+    context.command('ReleaseChatCheck', payload, 0),
+    'local-owner',
+  );
+  assert.deepEqual([fresh.outcome, fresh.reason], ['blocked', 'check-release-not-needed']);
+  const read = (
+    await controller.execute(
+      context.command('ReadChatThread', { taskId: task.id, limit: 100 }),
+      'local-owner',
+    )
+  ).data as ChatThreadRead;
+  assert.equal(read.messages.filter((message) => message.text === RELEASED_LINE).length, 1);
+});
+
+// Claim: a release answers by what holds the thread. Nothing held, even with a check running,
+// answers that nothing holds it. A check open in this process, a recorded group still present and
+// a hold that is only a provider process each refuse with the reason and the sentence for the
+// person, and the journal stays as it was. A check left at intent with no owner is released, and
+// the line and the result say whether a provider process still holds the thread.
+test('a release answers by what holds the thread and says whether a provider process still holds it', {
+  timeout: 60000,
+}, async (t) => {
+  lockPath(t);
+  const group = 4242;
+  const provider = 4343;
+  // Ends a running row's check once the release has answered.
+  let ending = () => {};
+  const runner: OwnedProjectCommandRunner = {
+    launch(request, lifecycle) {
+      lifecycle.intent(request);
+      lifecycle.owned(group);
+      const none = async function* (): AsyncGenerator<Uint8Array> {};
+      const terminal = Promise.withResolvers<OwnedProjectCommandTerminal>();
+      ending = () => {
+        lifecycle.quiescent(group);
+        terminal.resolve({ code: 0, signal: null, quiescent: true, reason: 'exit' });
+      };
+      return { stdout: none(), stderr: none(), terminal: terminal.promise, stop: () => {} };
+    },
+  };
+  type Thread = Awaited<ReturnType<typeof checkCopy>>;
+  // The thread's first turn left a provider process the stand-in process table still shows.
+  const providerHold = ({ store, taskId }: Thread) =>
+    store.db
+      .prepare("UPDATE chat_turns SET body=json_set(body,'$.groups',json(?)) WHERE task_id=?")
+      .run(JSON.stringify([provider]), taskId);
+  const running = async (thread: Thread) => {
+    thread.configure({ checks: { add: 'node --version' } });
+    const open = next(
+      thread,
+      (event) =>
+        event.type === 'chat.thread' &&
+        (event.payload as ChatThread).checks?.runs.at(-1)?.status === 'running',
+    );
+    const run = thread.service.runCombinedChecks(thread.taskId, thread.scratch);
+    await open;
+    return {
+      service: thread.service,
+      done: () => {
+        ending();
+        return run;
+      },
+    };
+  };
+  const rows: {
+    name: string;
+    reason?: string;
+    next?: string;
+    /** For a release that applies: whether a provider process still holds the thread. */
+    held?: boolean;
+    /** The answer also clears a flag nothing stands behind. */
+    cleared?: true;
+    deps?: Partial<ChatServiceDeps>;
+    hold?: (thread: Thread) => Promise<{ service: ChatService; done?: () => Promise<unknown> }>;
+  }[] = [
+    {
+      name: 'a thread nothing holds',
+      reason: 'check-release-not-needed',
+      next: 'Nothing holds this thread.',
+    },
+    {
+      name: 'a flag left set with nothing holding',
+      reason: 'check-release-not-needed',
+      next: 'Nothing holds this thread.',
+      cleared: true,
+      hold: async (thread) => {
+        thread.store.db
+          .prepare(
+            "UPDATE chat_threads SET body=json_set(body,'$.ownershipUnknown',json('true')) WHERE task_id=?",
+          )
+          .run(thread.taskId);
+        return { service: thread.service };
+      },
+    },
+    {
+      name: 'a running check and nothing held',
+      reason: 'check-release-not-needed',
+      next: 'Nothing holds this thread.',
+      deps: { groupAbsent: () => true, checkRunner: runner },
+      hold: running,
+    },
+    {
+      name: 'a running check beside a held one',
+      reason: 'check-running',
+      next: 'A check is running in this thread. Stop it, then try again.',
+      deps: { groupAbsent: () => true, checkRunner: runner },
+      hold: async (thread) => {
+        journaledCheck(thread.store, thread.clock.now, thread.taskId, 1);
+        return running(thread);
+      },
+    },
+    {
+      name: 'a recorded process that is still present',
+      reason: 'check-process-recorded',
+      next: 'A check process CrewKite recorded is still running. The thread stays held until it ends.',
+      deps: { groupAbsent: (value) => value !== group },
+      hold: async ({ store, clock, taskId, start }) => {
+        journaledCheck(store, clock.now, taskId, 1, group);
+        // A check that never recorded its group sits beside it, and still nothing is released.
+        journaledCheck(store, clock.now, taskId, 2);
+        const service = start();
+        service.recover();
+        return { service };
+      },
+    },
+    {
+      name: 'only a provider process',
+      reason: 'hold-not-releasable',
+      next: 'A provider process holds this thread. CrewKite checks again with each message, and the hold lifts when the process ends.',
+      deps: { groupAbsent: (value) => value !== provider },
+      hold: async (thread) => {
+        providerHold(thread);
+        return { service: thread.service };
+      },
+    },
+    {
+      name: 'a check left running with no owner',
+      held: false,
+      hold: async ({ store, clock, taskId, service }) => {
+        // A journal write failed after the intent, and the run that owned it has ended.
+        journaledCheck(store, clock.now, taskId, 1);
+        return { service };
+      },
+    },
+    {
+      name: 'a check with a provider process left',
+      held: true,
+      deps: { groupAbsent: (value) => value !== provider },
+      hold: async (thread) => {
+        providerHold(thread);
+        journaledCheck(thread.store, thread.clock.now, thread.taskId, 1);
+        return { service: thread.service };
+      },
+    },
+  ];
+  for (const row of rows) {
+    const thread = await checkCopy(t, { deps: row.deps });
+    const { service, done } = (await row.hold?.(thread)) ?? { service: thread.service };
+    const before = thread.store.db
+      .prepare('SELECT operation_id,state,revision FROM task_operations ORDER BY operation_id')
+      .all();
+    const answer = act(thread.store, (effects) =>
+      service.releaseCheck(
+        { taskId: thread.taskId, confirm: 'explicit', note: 'I looked.' },
+        effects,
+      ),
+    );
+    const lines = thread
+      .read(service)
+      .messages.filter((message) => message.text.startsWith('You released'))
+      .map((message) => message.text);
+    if (row.held !== undefined) {
+      assert.deepEqual(
+        answer,
+        {
+          outcome: 'applied',
+          data: { kind: 'chat-check-released', taskId: thread.taskId, released: 1, held: row.held },
+        },
+        row.name,
+      );
+      assert.deepEqual(
+        thread.store.db
+          .prepare('SELECT state FROM task_operations')
+          .all()
+          .map((value) => value.state),
+        ['failed'],
+        row.name,
+      );
+      assert.deepEqual(
+        lines,
+        [
+          row.held
+            ? 'You released the check. A provider process still holds this thread.'
+            : RELEASED_LINE,
+        ],
+        row.name,
+      );
+      continue;
+    }
+    assert.deepEqual(answer, { outcome: 'blocked', reason: row.reason, next: row.next }, row.name);
+    assert.deepEqual(
+      thread.store.db
+        .prepare('SELECT operation_id,state,revision FROM task_operations ORDER BY operation_id')
+        .all(),
+      before,
+      row.name,
+    );
+    assert.deepEqual(lines, [], row.name);
+    if (row.cleared)
+      assert.equal(thread.read(service).thread.ownershipUnknown, undefined, row.name);
+    await done?.();
+  }
+});
+
+const pick = (family: ChatFamily): ChatModelSelection => ({
+  family,
+  model: `${family}-model`,
+  effort: 'default',
+});
+
+/**
+ * A thread for the gate after a writing turn, with Allow all. The builder and the fixer write on
+ * OpenAI, and a review runs on Anthropic when the row has one. The row's scripts go into the copy
+ * and its checks are added as the first turn starts, once the copy exists, the way a project's
+ * own scripts would be there. `scripts` gets the project folder.
+ */
+function gated(
+  t: TestContext,
+  row: {
+    flightMode: 'manual' | 'balanced' | 'glide';
+    writes: string[];
+    reviews?: string[];
+    scripts?: (project: string) => Record<string, string>;
+    checks: string[];
+    deps?: Partial<ChatServiceDeps>;
+  },
+) {
+  const now = createTestClock().now();
+  const openai = createScriptedChatAdapter({ family: 'openai', turns: row.writes.map(textReply) });
+  const reviewer = createScriptedChatAdapter({
+    family: 'anthropic',
+    turns: (row.reviews ?? []).map(textReply),
+  });
+  const thread = standalone(t, {
+    adapters: new Map([
+      [
+        'openai',
+        {
+          ...openai,
+          startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+            if (openai.requests.length === 0) {
+              for (const [name, text] of Object.entries(row.scripts?.(thread.root) ?? {}))
+                writeFileSync(join(request.scratch.directory, name), text);
+              for (const add of row.checks) configure({ checks: { add } });
+            }
+            return openai.startTurn(request, emit);
+          },
+        },
+      ],
+      ['anthropic', reviewer],
+    ] as const),
+    catalog: () => ({
+      families: [familyEntry('openai', 10, null, now), familyEntry('anthropic', 50, null, now)],
+    }),
+    ...row.deps,
+  });
+  const configure = (patch: object) =>
+    thread.store.transaction(() => thread.service.configure({ taskId: thread.taskId, ...patch }));
+  configure({
+    crew: {
+      name: row.reviews ? 'Tandem' : 'Solo',
+      members: [
+        { role: 'builder', selection: pick('openai') },
+        ...(row.reviews ? [{ role: 'reviewer', selection: pick('anthropic') } as const] : []),
+      ],
+    },
+    flightMode: row.flightMode,
+    permissionPolicy: 'allow-all',
+  });
+  /** The text of the next thread line the pattern matches. */
+  const line = (pattern: RegExp) =>
+    next(
+      thread,
+      (event) =>
+        event.type === 'conversation.entry' &&
+        pattern.test((event.payload as { text: string }).text),
+    ).then((event) => (event.payload as { text: string }).text);
+  /** The thread's lines about checks and the crew, in order. */
+  const lines = () =>
+    thread
+      .read()
+      .messages.map((message) => message.text)
+      .filter((text) => /^(Checks|Crew) /.test(text));
+  return { ...thread, openai, line, lines };
+}
+
+// Claim: when the step after a builder turn cannot be opened, the chain stops with a line. A chain
+// left as it was would read as one that never opened, and anything that follows the thread,
+// such as the CLI's watch, would wait for it forever.
+test('a chain whose next step cannot open stops with a line', { timeout: 30000 }, async (t) => {
+  const now = createTestClock().now();
+  const openai = createScriptedChatAdapter({ family: 'openai', turns: [textReply('Built it.')] });
+  const thread = standalone(t, {
+    adapters: new Map([
+      ['openai', openai],
+      ['anthropic', createScriptedChatAdapter({ family: 'anthropic', turns: [] })],
+    ] as const),
+    catalog: () => ({
+      families: [familyEntry('openai', 10, null, now), familyEntry('anthropic', 50, null, now)],
+    }),
+    // Opening the review fails inside the step's own transaction, as a store error would.
+    resolveSelection: (_taskId, value) => {
+      if (value?.family === 'anthropic') throw new Error('The selection could not be read.');
+      return value ?? null;
+    },
+  });
+  thread.store.transaction(() =>
+    thread.service.configure({
+      taskId: thread.taskId,
+      crew: {
+        name: 'Tandem',
+        members: [
+          { role: 'builder', selection: pick('openai') },
+          { role: 'reviewer', selection: pick('anthropic') },
+        ],
+      },
+      flightMode: 'balanced',
+      permissionPolicy: 'allow-all',
+    }),
+  );
+  const done = turnReaches(thread, 'done');
+  thread.send('Build it.', pick('openai'));
+  const builder = await done;
+  await new Promise((resolve) => setImmediate(resolve));
+  const read = thread.read();
+  assert.deepEqual(
+    [read.thread.crewChain?.builderTurnId, read.thread.crewChain?.step],
+    [builder.id, 'stopped'],
+  );
+  assert.equal(
+    read.messages.at(-1)?.text,
+    'Crew stopped: the next step could not start. The selection could not be read.',
+  );
+});
+
+// Claim: in Balanced the gate after a builder turn asks first, then runs the enabled checks in the
+// copy as after-write runs. Each failure goes to the fixer once, the gate runs again after each
+// fix, and after two fixes the chain goes on to the review with no more repair.
+test('a builder turn in Balanced runs the gate, each failure goes to the fixer once, and two fixes is the most', {
+  timeout: 30000,
+}, async (t) => {
+  const thread = gated(t, {
+    flightMode: 'balanced',
+    writes: ['Built it.', 'Fixed one.', 'Fixed two.'],
+    reviews: ['Totals skip tax.\nFindings: 1'],
+    scripts: () => ({
+      'gate.mjs': "console.log('gate: expected 3 got 2');\nprocess.exitCode = 1;\n",
+    }),
+    checks: ['node gate.mjs'],
+  });
+  const { store, service, taskId } = thread;
+  const asks = new Set<string>();
+  store.subscribe((event) => {
+    const ask = event.type === 'chat.thread' ? (event.payload as ChatThread).checks?.ask : null;
+    if (ask) asks.add(ask.requestId);
+  });
+  const asked = next(
+    thread,
+    (event) => event.type === 'chat.thread' && !!(event.payload as ChatThread).checks?.ask,
+  );
+  const ended = thread.line(/^Crew (finished|stopped)/);
+  thread.send('Fix the rounding.', pick('openai'));
+  const ask = ((await asked).payload as ChatThread).checks?.ask;
+  assert.equal(ask?.trigger, 'after-write');
+  assert.deepEqual(thread.read().thread.checks?.runs, [], 'nothing runs before the answer');
+  const answered = act(store, (effects) =>
+    service.resolvePermission(
+      {
+        taskId,
+        turnId: thread.read().turns[0].id,
+        requestId: ask?.requestId ?? '',
+        choice: 'allow-thread',
+      },
+      effects,
+    ),
+  );
+  assert.equal(answered.outcome, 'applied');
+  assert.equal(await ended, 'Crew finished: 1 review round, 2 fixes.');
+
+  const read = thread.read();
+  assert.deepEqual(
+    read.turns.map((turn) => turn.role),
+    ['assistant', 'fixer', 'fixer', 'reviewer'],
+  );
+  assert.equal(asks.size, 1, 'one allow for the thread covers the gate after each fix');
+  assert.deepEqual(
+    read.thread.checks?.runs.map((run) => [run.trigger, run.status]),
+    [
+      ['after-write', 'failed'],
+      ['after-write', 'failed'],
+      ['after-write', 'failed'],
+    ],
+  );
+  for (const fix of thread.openai.requests.slice(1)) {
+    assert.equal(fix.role, 'fixer');
+    assert.match(fix.prompt, /^The project checks failed in the scratch copy\./);
+    assert.match(fix.prompt, /gate: expected 3 got 2/);
+  }
+  assert.deepEqual(thread.lines(), [
+    'Checks failed: node gate.mjs. The fixer runs on their output.',
+    'Checks failed: node gate.mjs. The fixer runs on their output.',
+    'Checks failed: node gate.mjs. They still fail after 2 fixes, so the chain goes on.',
+    'Crew finished: 1 review round, 2 fixes.',
+  ]);
+});
+
+// Claim: the checks after one writing turn get fifteen minutes in all. When the time runs out the
+// open check stops through its runner, and nothing goes on until the runner reports the process
+// closed. The checks left never start. A proven close fails the gate into the fixer. A close that
+// cannot be proven stops the chain and holds the thread.
+test('the gate total stops the open check and nothing goes on until its process is closed', {
+  timeout: 60000,
+}, async (t) => {
+  for (const proven of [true, false])
+    await t.test(proven ? 'a proven close' : 'an unknown close', { timeout: 30000 }, async (t) => {
+      const group = 4242;
+      const timers: { work: () => void; ms: number }[] = [];
+      const launches: {
+        stops: number;
+        close: (quiescent: boolean, code: number | null) => void;
+      }[] = [];
+      const runner: OwnedProjectCommandRunner = {
+        launch(request, lifecycle) {
+          lifecycle.intent(request);
+          lifecycle.owned(group);
+          const terminal = Promise.withResolvers<OwnedProjectCommandTerminal>();
+          const none = async function* (): AsyncGenerator<Uint8Array> {};
+          const launch = {
+            stops: 0,
+            close: (quiescent: boolean, code: number | null) => {
+              if (quiescent) lifecycle.quiescent(group);
+              terminal.resolve({
+                code,
+                signal: null,
+                quiescent,
+                reason: code === 0 ? 'exit' : 'stopped',
+              });
+            },
+          };
+          launches.push(launch);
+          // The gate after the fix passes at once.
+          if (launches.length > 1) launch.close(true, 0);
+          return {
+            stdout: none(),
+            stderr: none(),
+            terminal: terminal.promise,
+            stop: () => {
+              launch.stops += 1;
+            },
+          };
+        },
+      };
+      const thread = gated(t, {
+        flightMode: 'glide',
+        writes: ['Built it.', 'Fixed it.'],
+        checks: ['node first.mjs', 'node second.mjs'],
+        deps: {
+          schedule: (work, ms) => {
+            timers.push({ work, ms });
+            return () => {};
+          },
+          checkRunner: runner,
+          groupAbsent: (value) => proven || value !== group,
+        },
+      });
+      const running = next(
+        thread,
+        (event) =>
+          event.type === 'chat.thread' &&
+          (event.payload as ChatThread).checks?.runs.at(-1)?.status === 'running',
+      );
+      thread.send('Build it.', pick('openai'));
+      await running;
+      assert.equal(launches.length, 1);
+      const total = timers.find((timer) => timer.ms === 15 * 60_000);
+      assert.ok(total, 'the gate set its total');
+      total.work();
+      assert.equal(launches[0].stops, 1);
+      // A stop only asks the process to end. The run stays open, and no step starts until the
+      // runner reports the process closed.
+      await new Promise((resolve) => setImmediate(resolve));
+      assert.equal(thread.read().thread.checks?.runs.at(-1)?.status, 'running');
+      assert.deepEqual(thread.lines(), []);
+      assert.equal(thread.read().turns.length, 1);
+
+      const ended = thread.line(/^Crew (finished|stopped)/);
+      launches[0].close(proven, null);
+      const over =
+        'The checks after this turn reached their 15-minute total, so this one did not finish.';
+      if (proven) {
+        assert.equal(await ended, 'Crew finished: 0 review rounds, 1 fix.');
+        const read = thread.read();
+        assert.deepEqual(
+          read.thread.checks?.runs.map((run) => [run.label, run.status, run.reason]),
+          [
+            ['node first.mjs', 'failed', over],
+            ['node second.mjs', 'failed', over],
+            ['node first.mjs', 'passed', null],
+            ['node second.mjs', 'passed', null],
+          ],
+        );
+        assert.equal(launches.length, 3, 'the first gate never started its second check');
+        assert.deepEqual(
+          read.turns.map((turn) => turn.role),
+          ['assistant', 'fixer'],
+        );
+        assert.match(thread.openai.requests[1]?.prompt ?? '', /reached their 15-minute total/);
+        // The finished chain stays on the record and holds nothing, so Run tests starts.
+        const scratch = chatScratchDirectory(dirname(thread.root), thread.taskId);
+        writeFileSync(join(scratch, 'package.json'), '{"scripts":{"test":"node first.mjs"}}');
+        thread.store.transaction(() =>
+          thread.service.configure({ taskId: thread.taskId, checks: { refresh: true } }),
+        );
+        const tested = thread.line(/^Tests (passed|failed)/);
+        const runTests = act(thread.store, (effects) =>
+          thread.service.runTests({ taskId: thread.taskId }, effects),
+        );
+        assert.equal(runTests.outcome, 'applied', runTests.next);
+        assert.equal(await tested, 'Tests passed: npm run test (exit 0).');
+        return;
+      }
+      assert.equal(await ended, 'Crew stopped: a check process may still be running.');
+      const read = thread.read();
+      assert.deepEqual(
+        read.thread.checks?.runs.map((run) => [run.label, run.status]),
+        [
+          ['node first.mjs', 'unknown'],
+          ['node second.mjs', 'failed'],
+        ],
+      );
+      assert.equal(launches.length, 1);
+      assert.equal(read.thread.ownershipUnknown, true);
+      // No turn starts while the process may still write the copy.
+      assert.equal(thread.send('Go on.', pick('openai')).outcome, 'applied');
+      assert.equal(thread.read().thread.queued.length, 1);
+      assert.deepEqual(
+        thread.read().turns.map((turn) => turn.role),
+        ['assistant'],
+      );
+    });
+});
+
+// Claim: when the copy's dependencies must be prepared again and the preparation produces nothing,
+// the gate runs nothing. Checks on the old dependencies would fail for a reason that is not in
+// the code and send that failure to the fixer.
+test('a copy that needs preparing and whose preparation fails runs no checks and sends nothing to the fixer', {
+  timeout: 30000,
+}, async (t) => {
+  const late: { preparer?: DependencyPreparer } = {};
+  const thread = gated(t, {
+    flightMode: 'glide',
+    writes: ['Built it.', 'Fixed it.'],
+    // The copy gains a manifest the prepared record never saw, so the copy moved.
+    scripts: () => ({
+      'package.json': JSON.stringify({ name: 'shop', dependencies: { tiny: '^1.0.0' } }),
+      'gate.mjs': "console.log('Cannot find module tiny');\nprocess.exitCode = 1;\n",
+    }),
+    checks: ['node gate.mjs'],
+    deps: {
+      dependencies: {
+        prepare: async () => {
+          throw new Error('The copy could not be prepared.');
+        },
+        preparing: () => false,
+        environment: (...input) => (late.preparer as DependencyPreparer).environment(...input),
+      },
+    },
+  });
+  const { store, taskId, root, clock } = thread;
+  const id = `prp_${'0'.repeat(25)}2`;
+  late.preparer = new DependencyPreparer({
+    store,
+    home: dirname(root),
+    now: clock.now,
+    id: () => id,
+    projectPath: () => root,
+  });
+  const at = clock.now();
+  store.transaction(() =>
+    store.putDependencyPreparation(
+      {
+        id,
+        taskId,
+        scope: 'thread',
+        scopeKey: taskId,
+        state: 'prepared',
+        layout: 'none',
+        inputs: detectDependencies(root).inputs,
+        treeDigest: null,
+        bytes: null,
+        limitBytes: 1024 * 1024,
+        reason: null,
+        preparedAt: at,
+      },
+      at,
+    ),
+  );
+  const ended = thread.line(/^(Crew (finished|stopped)|Checks passed)/);
+  thread.send('Build it.', pick('openai'));
+  assert.equal(
+    await ended,
+    'Crew stopped: the checks could not run. Dependencies need preparation.',
+  );
+  const read = thread.read();
+  assert.deepEqual(read.thread.checks?.runs ?? [], []);
+  assert.deepEqual(
+    read.turns.map((turn) => turn.role),
+    ['assistant'],
+  );
+});
+
+// Claim: the gate runs only in a current dependency copy. A copy nobody prepared is prepared by
+// the gate, and the checks run with it. A copy whose preparation finds it stale, or one gone
+// stale while the question waited, stops the chain with its line and runs nothing. A copy that
+// turns stale while the checks run leaves their result saying nothing, so a failed check goes to
+// no fixer, and the line names what changed. A read of the copy that throws counts as not ready.
+test('a stale dependency copy blocks the gate with its line and starts no repair', {
+  timeout: 90000,
+}, async (t) => {
+  const lock = (version: string) =>
+    JSON.stringify({
+      lockfileVersion: 3,
+      packages: { '': {}, 'node_modules/tiny': { version } },
+    });
+  const rows = [
+    {
+      // The project installs tiny 1.2.3 and the copy's lockfile asks for 1.2.4, so preparing the
+      // copy finds it stale.
+      name: 'stale before the gate',
+      npm: lock('1.2.4'),
+      line: 'Crew stopped: the checks could not run. Dependencies need preparation. The lockfile changed.',
+      runs: [],
+      record: ['stale', 'stale-lockfile'],
+    },
+    {
+      // The copy asks for what the project installed, so the gate prepares it and the check
+      // finds tiny in the copy.
+      name: 'unprepared before the gate',
+      npm: lock('1.2.3'),
+      line: 'Checks passed: node gate.mjs.',
+      runs: ['passed'],
+      record: ['prepared', null],
+    },
+    {
+      name: 'stale while the checks run',
+      line: 'Crew stopped: the dependencies changed while the checks ran. Dependencies need preparation. A package.json changed.',
+      runs: ['failed'],
+    },
+    {
+      name: 'stale while the question waits',
+      asks: true,
+      line: 'Crew stopped: the checks could not run. Dependencies need preparation. A package.json changed.',
+      runs: [],
+    },
+    {
+      name: 'a read that throws before the gate',
+      throws: 'always',
+      line: 'Crew stopped: the checks could not run. Dependencies need preparation.',
+      runs: [],
+    },
+    {
+      name: 'a read that throws after the checks',
+      throws: 'after',
+      line: 'Crew stopped: the dependencies changed while the checks ran. Dependencies need preparation.',
+      runs: ['failed'],
+    },
+  ] as const;
+  for (const row of rows)
+    await t.test(row.name, { timeout: 30000 }, async (t) => {
+      const late: { preparer?: DependencyPreparer } = {};
+      const preparer = () => late.preparer as DependencyPreparer;
+      // The check writes the project's package.json, so its presence says the check has run.
+      const throws = () =>
+        'throws' in row &&
+        (row.throws === 'always' || existsSync(join(thread.root, 'package.json')));
+      const manifest = JSON.stringify({ name: 'shop', dependencies: { tiny: '^1.0.0' } });
+      const thread = gated(t, {
+        flightMode: 'asks' in row ? 'balanced' : 'glide',
+        writes: ['Built it.', 'Unused.'],
+        // An npm row's copy holds the manifest and its lockfile, and the check passes only when
+        // tiny resolves from the copy. Any other row's check fails, so a current copy would send
+        // it to the fixer, and it writes a package.json into the project, which moves what the
+        // copy was prepared from.
+        scripts: (project): Record<string, string> =>
+          'npm' in row
+            ? {
+                'package.json': manifest,
+                'package-lock.json': row.npm,
+                'gate.mjs': [
+                  "import { createRequire } from 'node:module';",
+                  "console.log(createRequire(process.cwd() + '/').resolve('tiny'));",
+                ].join('\n'),
+              }
+            : {
+                'gate.mjs': [
+                  "import { writeFileSync } from 'node:fs';",
+                  `writeFileSync(${JSON.stringify(join(project, 'package.json'))}, '{"name":"shop"}');`,
+                  "console.log('gate: expected 3 got 2');",
+                  'process.exitCode = 1;',
+                ].join('\n'),
+              },
+        checks: ['node gate.mjs'],
+        deps: {
+          dependencies: {
+            prepare: (...input) => preparer().prepare(...input),
+            preparing: (taskId) => preparer().preparing(taskId),
+            environment: (...input) => {
+              if (throws()) throw new Error('The preparation record could not be read.');
+              return preparer().environment(...input);
+            },
+          },
+        },
+      });
+      const { store, taskId, root, clock } = thread;
+      const id = `prp_${'0'.repeat(25)}1`;
+      late.preparer = new DependencyPreparer({
+        store,
+        home: dirname(root),
+        now: clock.now,
+        id: () => id,
+        projectPath: () => root,
+      });
+      if ('npm' in row) {
+        // The project installs tiny 1.2.3, and nobody prepared the thread's copy.
+        writeFileSync(join(root, 'package.json'), manifest);
+        writeFileSync(join(root, 'package-lock.json'), lock('1.2.3'));
+        mkdirSync(join(root, 'node_modules/tiny'), { recursive: true });
+        writeFileSync(
+          join(root, 'node_modules/tiny/package.json'),
+          JSON.stringify({ name: 'tiny', version: '1.2.3' }),
+        );
+        writeFileSync(join(root, 'node_modules/tiny/index.js'), 'module.exports = 1;\n');
+      } else {
+        const at = clock.now();
+        const copy: DependencyPreparation = {
+          id,
+          taskId,
+          scope: 'thread',
+          scopeKey: taskId,
+          state: 'prepared',
+          layout: 'none',
+          inputs: detectDependencies(root).inputs,
+          treeDigest: null,
+          bytes: null,
+          limitBytes: 1024 * 1024,
+          reason: null,
+          preparedAt: at,
+        };
+        store.transaction(() => store.putDependencyPreparation(copy, at));
+      }
+      const ended = thread.line(/^(Crew (finished|stopped)|Checks passed)/);
+      const asked = next(
+        thread,
+        (event) => event.type === 'chat.thread' && !!(event.payload as ChatThread).checks?.ask,
+      );
+      thread.send('Build it.', pick('openai'));
+      if ('asks' in row) {
+        // The project's manifest moves while the question waits, and the allow comes after.
+        const ask = ((await asked).payload as ChatThread).checks?.ask;
+        writeFileSync(join(root, 'package.json'), '{"name":"shop"}');
+        const answer = act(store, (effects) =>
+          thread.service.resolvePermission(
+            {
+              taskId,
+              turnId: thread.read().turns[0].id,
+              requestId: ask?.requestId ?? '',
+              choice: 'allow',
+            },
+            effects,
+          ),
+        );
+        assert.equal(answer.outcome, 'applied');
+      }
+      assert.equal(await ended, row.line);
+      const read = thread.read();
+      assert.deepEqual(
+        read.thread.checks?.runs.map((run) => run.status),
+        row.runs,
+      );
+      assert.deepEqual(
+        read.turns.map((turn) => turn.role),
+        ['assistant'],
+      );
+      if ('record' in row) {
+        const record = store
+          .dependencyPreparations(taskId)
+          .find((value) => value.scope === 'thread');
+        assert.deepEqual([record?.state, record?.reason], row.record);
+      }
+    });
+});
+
+// Claim: only Balanced and Glide run the gate after a writing turn. Manual runs nothing after a
+// reply, whatever checks are on.
+test('the gate runs after a writing turn in Glide and never in Manual', {
+  timeout: 60000,
+}, async (t) => {
+  for (const flightMode of ['manual', 'glide'] as const)
+    await t.test(flightMode, { timeout: 30000 }, async (t) => {
+      const thread = gated(t, { flightMode, writes: ['Built it.'], checks: ['node --version'] });
+      const done = turnReaches(thread, 'done');
+      const passed = thread.line(/^Checks passed/);
+      thread.send('Build it.', pick('openai'));
+      await done;
+      if (flightMode === 'glide') await passed;
+      const read = thread.read();
+      assert.deepEqual(
+        read.thread.checks?.runs.map((run) => [run.trigger, run.status]),
+        flightMode === 'glide' ? [['after-write', 'passed']] : [],
+      );
+      assert.equal(read.thread.checks?.ask, null);
+      // A Solo crew whose gate passed has no chain to show.
+      assert.equal(read.thread.crewChain, null);
+      assert.deepEqual(
+        thread.lines(),
+        flightMode === 'glide' ? ['Checks passed: node --version.'] : [],
+      );
+    });
+});
+
+/** A turn that writes one file. */
+const writes = (path: string, content: string): ChatScriptStep[] => [
+  {
+    kind: 'tool',
+    callId: `w-${path}`,
+    toolKind: 'edit',
+    title: `Write ${path}`,
+    write: { path, content },
+  },
+];
+
+/**
+ * A plan thread in Glide over a project that installs one npm package, with Allow all unless the
+ * row allows edits only. The base commits the manifest, the lockfile and `gate.mjs`, and
+ * `node gate.mjs` is the one check on. The thread copy is prepared before the plan, the way a
+ * person prepares it, unless the row says nobody did. Slice 1 is medium and builds on OpenAI.
+ * Slice 2 is hard, so the crew's fixer on Local builds it beside slice 1, or after it when the
+ * row says so, and Local runs every fix in a lane. Local offers Allow for this thread on its
+ * questions, and a row can leave it unconnected. The check prints where it ran and where `tiny`
+ * resolved from, then runs the row's gate body, which gets the controller home.
+ */
+async function lanePlan(
+  t: TestContext,
+  row: {
+    slices: 1 | 2;
+    gate: (home: string) => string;
+    openai: ChatScriptStep[][];
+    local?: ChatScriptStep[][];
+    prepared?: false;
+    policy?: 'allow-edits';
+    after?: true;
+    unplugged?: true;
+  },
+) {
+  const now = createTestClock().now();
+  const slices = [1, 2].slice(0, row.slices).map((id) => ({
+    id,
+    title: `Part ${id}`,
+    brief: `Do part ${id}.`,
+    files: [],
+    depends: id === 2 && row.after ? [1] : [],
+    difficulty: id === 1 ? 'medium' : 'hard',
+    readOnly: false,
+  }));
+  const plan = textReply(
+    `\`\`\`json plan\n${JSON.stringify({ planId: 'p1', goal: 'Split it.', slices })}\n\`\`\``,
+  );
+  const openai = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [textReply('Read it.'), plan, ...row.openai],
+  });
+  const local = createScriptedChatAdapter({ family: 'local', turns: row.local ?? [] });
+  const allowThread = {
+    id: 'allow-thread',
+    label: 'Allow for this thread',
+    kind: 'allow-thread',
+  } as const;
+  const offering = {
+    ...local,
+    startTurn(request: ScriptedChatRequest, emit: (event: AgentEvent) => void) {
+      return local.startTurn(request, (event) =>
+        emit(
+          event.type === 'permission.requested'
+            ? { ...event, options: [...event.options, allowThread] }
+            : event,
+        ),
+      );
+    },
+  } as typeof local;
+  const late: { preparer?: DependencyPreparer } = {};
+  const preparer = () => late.preparer as DependencyPreparer;
+  const thread = standalone(t, {
+    adapters: new Map([
+      ['openai', openai],
+      ...(row.unplugged ? [] : [['local', offering] as const]),
+    ] as const),
+    catalog: () => ({
+      families: [familyEntry('openai', 10, null, now), familyEntry('local', 90, null, now)],
+    }),
+    localContext: () => 32_768,
+    localSliceFits: () => true,
+    dependencies: {
+      prepare: (...input) => preparer().prepare(...input),
+      environment: (...input) => preparer().environment(...input),
+      preparing: (taskId) => preparer().preparing(taskId),
+    },
+  });
+  const { store, service, taskId, root, clock } = thread;
+  const home = dirname(root);
+  let records = 0;
+  late.preparer = new DependencyPreparer({
+    store,
+    home,
+    now: clock.now,
+    id: () => `prp_${String(++records).padStart(26, '0')}`,
+    projectPath: () => root,
+  });
+  const files: Record<string, string> = {
+    'package.json': JSON.stringify({ name: 'shop', dependencies: { tiny: '^1.0.0' } }),
+    'package-lock.json': JSON.stringify({
+      lockfileVersion: 3,
+      packages: { '': {}, 'node_modules/tiny': { version: '1.2.3' } },
+    }),
+    '.gitignore': 'node_modules\n',
+    'gate.mjs': [
+      "import { existsSync, writeFileSync } from 'node:fs';",
+      "import { createRequire } from 'node:module';",
+      "console.log(process.cwd(), createRequire(process.cwd() + '/').resolve('tiny'));",
+      row.gate(home),
+    ].join('\n'),
+  };
+  for (const [path, text] of Object.entries(files)) writeFileSync(join(root, path), text);
+  mkdirSync(join(root, 'node_modules/tiny'), { recursive: true });
+  writeFileSync(
+    join(root, 'node_modules/tiny/package.json'),
+    JSON.stringify({ name: 'tiny', version: '1.2.3' }),
+  );
+  writeFileSync(join(root, 'node_modules/tiny/index.js'), 'module.exports = 1;\n');
+  const paths = Object.keys(files);
+  git(root, ['add', '--', ...paths]);
+  git(root, ['commit', '-q', '-m', 'Add the package.', '--', ...paths], undefined, {
+    name: 'Fixture',
+    email: 'fixture@example.invalid',
+    at: '2026-10-15T18:00:00Z',
+  });
+  const read = turnReaches(thread, 'done');
+  thread.send('Read the project.', pick('openai'));
+  await read;
+  if (row.prepared !== false) {
+    const prepared = await preparer().prepare(taskId, 'thread', taskId);
+    assert.equal(prepared && prepared !== 'busy' ? prepared.state : prepared, 'prepared');
+  }
+  store.transaction(() =>
+    service.configure({
+      taskId,
+      crew: {
+        name: 'Plan crew',
+        members: [
+          { role: 'builder', selection: pick('openai') },
+          { role: 'fixer', selection: pick('local') },
+          { role: 'orchestrator', selection: pick('openai') },
+        ],
+      },
+      flightMode: 'glide',
+      permissionPolicy: row.policy ?? 'allow-all',
+      checks: { add: 'node gate.mjs' },
+    }),
+  );
+  const ended = next(
+    thread,
+    (event) =>
+      event.type === 'conversation.entry' &&
+      /^(Crew finished|Plan stopped)/.test((event.payload as { text: string }).text),
+  ).then((event) => (event.payload as { text: string }).text);
+  thread.send('Split the work.', pick('openai'));
+  const scratch = realpathSync(chatScratchDirectory(home, taskId));
+  const copy = (id: number) =>
+    realpathSync(join(home, 'chat', taskId, 'slices', String(id), 'copy'));
+  /** Each run as its trigger, its status and its first output line: the folder and `tiny`. */
+  const runs = () =>
+    (thread.read().thread.checks?.runs ?? []).map(
+      (run) => [run.trigger, run.status, run.tail.split('\n')[0]] as const,
+    );
+  const lines = () =>
+    thread
+      .read()
+      .messages.map((message) => message.text)
+      .filter((text) => /^(Checks|Plan|Crew|Slice \d+ finished)/.test(text));
+  const lanes = () =>
+    store
+      .dependencyPreparations(taskId)
+      .filter((record) => record.scope === 'lane')
+      .map((record) => [record.scopeKey, record.state, record.reason, record.id] as const)
+      .sort();
+  const threadCopy = () =>
+    store.dependencyPreparations(taskId).find((record) => record.scope === 'thread')?.state ?? null;
+  const tiny = (folder: string) => `${folder} ${join(folder, 'node_modules/tiny/index.js')}`;
+  /** Resolves once the thread reads as `ok`, now or after a later event. */
+  const until = (ok: (read: ChatThreadRead) => boolean) =>
+    ok(thread.read())
+      ? Promise.resolve()
+      : next(thread, () => ok(thread.read())).then(() => undefined);
+  /** Answer the open checks question. */
+  const answer = (choice: 'allow' | 'allow-thread') =>
+    act(store, (effects) =>
+      service.resolvePermission(
+        {
+          taskId,
+          turnId: thread.read().turns[0].id,
+          requestId: thread.read().thread.checks?.ask?.requestId ?? '',
+          choice,
+        },
+        effects,
+      ),
+    ).outcome;
+  return {
+    ...thread,
+    openai,
+    local,
+    ended,
+    scratch,
+    copy,
+    runs,
+    lines,
+    lanes,
+    threadCopy,
+    tiny,
+    until,
+    answer,
+  };
+}
+
+// Claim: a slice's writing turn passes its gate in the slice's own copy, with the slice's own
+// prepared dependencies, before anything of it merges. A failure goes to the slice's fixer with
+// the checks' output within the crew's two fixes. A slice that still fails stops the plan as
+// failed, and nothing of it reaches the thread copy. A thread copy nobody prepared is prepared
+// before the checks after the first merge, so they run with its dependencies.
+test("a slice's gate runs in its own copy before the merge, and a failure repairs within the bound or fails the slice", {
+  timeout: 60000,
+}, async (t) => {
+  const failing = "console.log('gate: expected 3 got 2');\nprocess.exitCode = 1;";
+  const rows = [
+    {
+      name: 'a failure the first fix repairs',
+      // Nobody prepared the thread copy before the plan.
+      prepared: false,
+      // It fails once, after the builder. Its marker sits outside every copy.
+      gate: (home: string) =>
+        `const marker = ${JSON.stringify(join(home, 'gate-ran'))};\nif (!existsSync(marker)) {\nwriteFileSync(marker, 'x');\n${failing}\n}`,
+      local: [textReply('Fixed it.')],
+      lines: [
+        'Checks failed in slice 1: node gate.mjs. The fixer runs on their output.',
+        'Checks passed in slice 1: node gate.mjs.',
+        'Slice 1 finished: 1 file merged.',
+        'Checks passed after slice 1 merged: node gate.mjs.',
+        'Crew finished: 1 slice, 0 reviews, 1 fix.',
+      ],
+      card: ['finished', 'done'],
+      runs: [
+        ['after-write', 'failed', 1],
+        ['after-write', 'passed', 1],
+        ['combined', 'passed', 0],
+      ],
+      merged: 'one\n',
+    },
+    {
+      name: 'a failure that outlasts two fixes',
+      gate: () => failing,
+      local: [textReply('Fixed one.'), textReply('Fixed two.')],
+      lines: [
+        'Checks failed in slice 1: node gate.mjs. The fixer runs on their output.',
+        'Checks failed in slice 1: node gate.mjs. The fixer runs on their output.',
+        'Plan stopped at slice 1: node gate.mjs still failed after 2 fixes. Run slice 1 again from the plan card.',
+      ],
+      card: ['stopped', 'failed'],
+      runs: [
+        ['after-write', 'failed', 1],
+        ['after-write', 'failed', 1],
+        ['after-write', 'failed', 1],
+      ],
+      merged: null,
+    },
+  ] as const;
+  for (const row of rows)
+    await t.test(row.name, { timeout: 30000 }, async (t) => {
+      const plan = await lanePlan(t, {
+        slices: 1,
+        gate: row.gate,
+        openai: [writes('a.txt', 'one\n')],
+        local: [...row.local],
+        ...('prepared' in row ? { prepared: row.prepared } : {}),
+      });
+      await plan.ended;
+      assert.deepEqual(plan.lines(), row.lines);
+      assert.equal(plan.threadCopy(), 'prepared');
+      const read = plan.read();
+      assert.deepEqual(
+        [read.thread.plan?.phase, ...(read.thread.plan?.slices.map((slice) => slice.status) ?? [])],
+        row.card,
+      );
+      // Each gate ran in the slice's copy and found `tiny` in the slice's own prepared tree.
+      const where = (folder: number) =>
+        folder ? plan.tiny(plan.copy(1)) : plan.tiny(plan.scratch);
+      assert.deepEqual(
+        plan.runs(),
+        row.runs.map(([trigger, status, folder]) => [trigger, status, where(folder)]),
+      );
+      assert.deepEqual(
+        plan.lanes().map(([key, state]) => [key, state]),
+        [['1', 'prepared']],
+      );
+      for (const fix of plan.local.requests) {
+        assert.equal(fix.role, 'fixer');
+        assert.ok(fix.scratch.directory.endsWith(join('slices', '1', 'copy')));
+        assert.match(fix.prompt, /^The project checks failed in the scratch copy\./);
+        assert.match(fix.prompt, /gate: expected 3 got 2/);
+      }
+      assert.equal(plan.local.requests.length, row.local.length);
+      const merged = join(plan.scratch, 'a.txt');
+      assert.equal(existsSync(merged) ? readFileSync(merged, 'utf8') : null, row.merged);
+    });
+});
+
+// Claim: each merge runs the checks on the thread copy, so two slices that pass alone and break
+// together are caught at the second merge. The plan stops there with the slice named, and the
+// slice shows failed on its builder turn, where Retry runs it again. Each run names the slice it
+// checked. A plan that stops in the same step that merged runs no check after that merge.
+test('the checks after a merge catch a break each slice passed alone and stop the plan naming the slice', {
+  timeout: 60000,
+}, async (t) => {
+  await t.test('two slices that clash', { timeout: 30000 }, async (t) => {
+    const plan = await lanePlan(t, {
+      slices: 2,
+      gate: () =>
+        "if (existsSync('a.txt') && existsSync('b.txt')) {\nconsole.log('a.txt and b.txt clash');\nprocess.exitCode = 1;\n}",
+      openai: [writes('a.txt', 'one\n')],
+      local: [writes('b.txt', 'two\n')],
+    });
+    assert.equal(
+      await plan.ended,
+      'Plan stopped after slice 2 merged: node gate.mjs failed. Run slice 2 again from the plan card.',
+    );
+    const read = plan.read();
+    assert.deepEqual(
+      [read.thread.plan?.phase, ...(read.thread.plan?.slices.map((slice) => slice.status) ?? [])],
+      ['stopped', 'done', 'failed'],
+    );
+    const built = read.turns.find((turn) => turn.slice === 2 && turn.role === 'assistant');
+    assert.equal(read.thread.plan?.slices[1].turnId, built?.id);
+    const runs = plan.runs();
+    assert.deepEqual(
+      runs.filter(([trigger]) => trigger === 'after-write').map(([, status]) => status),
+      ['passed', 'passed'],
+    );
+    assert.deepEqual(
+      runs.filter(([trigger]) => trigger === 'combined'),
+      [
+        ['combined', 'passed', plan.tiny(plan.scratch)],
+        ['combined', 'failed', plan.tiny(plan.scratch)],
+      ],
+    );
+    // A lane's runs name its slice, and so do the runs after that slice merged.
+    assert.deepEqual(
+      (read.thread.checks?.runs ?? []).map((run) => `${run.trigger} ${run.slice}`).sort(),
+      ['after-write 1', 'after-write 2', 'combined 1', 'combined 2'],
+    );
+    // Each lane's own pass lands when that lane finishes, so only the merges are in a fixed order.
+    const merges = plan.lines().filter((line) => !line.startsWith('Checks passed in slice'));
+    assert.deepEqual(merges, [
+      'Slice 1 finished: 1 file merged.',
+      'Checks passed after slice 1 merged: node gate.mjs.',
+      'Slice 2 finished: 1 file merged.',
+      'Plan stopped after slice 2 merged: node gate.mjs failed. Run slice 2 again from the plan card.',
+    ]);
+    assert.match(read.thread.checks?.runs.at(-1)?.tail ?? '', /a\.txt and b\.txt clash$/);
+  });
+  await t.test('a plan that stops in the step that merged', { timeout: 30000 }, async (t) => {
+    // Slice 2 waits for slice 1 and its provider is not connected, so the step that merges
+    // slice 1 also stops the plan when slice 2 cannot start.
+    const plan = await lanePlan(t, {
+      slices: 2,
+      after: true,
+      unplugged: true,
+      gate: () => '',
+      openai: [writes('a.txt', 'one\n')],
+    });
+    assert.equal(
+      await plan.ended,
+      'Plan stopped: slice 2 could not start. Connect this provider in Settings or pick another.',
+    );
+    // A merge check would have started its run within this turn of the event loop.
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(plan.runs(), [['after-write', 'passed', plan.tiny(plan.copy(1))]]);
+    const read = plan.read();
+    assert.deepEqual(
+      [read.thread.plan?.phase, ...(read.thread.plan?.slices.map((slice) => slice.status) ?? [])],
+      ['stopped', 'done', 'failed'],
+    );
+    assert.equal(readFileSync(join(plan.scratch, 'a.txt'), 'utf8'), 'one\n');
+  });
+});
+
+// Claim: slices that run at once each gate in their own copy with their own preparation of the
+// dependencies. Neither lane reads the other's copy or its prepared tree. A grant one lane's turn
+// adds while the other lane's checks run leaves those checks standing.
+test('two slices in parallel gate in their own copies with their own dependency preparations', {
+  timeout: 30000,
+}, async (t) => {
+  const plan = await lanePlan(t, {
+    slices: 2,
+    policy: 'allow-edits',
+    // The check holds until the test releases it, so slice 2's question lands while it runs.
+    gate: (home) =>
+      [
+        `const release = ${JSON.stringify(join(home, 'release'))};`,
+        'const end = Date.now() + 20000;',
+        'while (!existsSync(release) && Date.now() < end)',
+        '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);',
+      ].join('\n'),
+    openai: [writes('a.txt', 'one\n')],
+    local: [
+      [
+        { kind: 'permission', requestId: 'p-cmd', question: 'Run the tests?' },
+        { kind: 'tool', callId: 'c-cmd', toolKind: 'command', title: 'npm test' },
+        ...writes('b.txt', 'two\n'),
+      ],
+    ],
+  });
+  // The thread allows edits only, so the checks ask once and Allow for this thread covers the rest.
+  await plan.until((read) => !!read.thread.checks?.ask);
+  assert.equal(plan.answer('allow-thread'), 'applied');
+  const asking = (read: ChatThreadRead) =>
+    read.turns.find((turn) => turn.slice === 2 && turn.state === 'waiting-permission');
+  await plan.until(
+    (read) => !!asking(read) && !!read.thread.checks?.runs.some((run) => run.status === 'running'),
+  );
+  const granted = act(plan.store, (effects) =>
+    plan.service.resolvePermission(
+      {
+        taskId: plan.taskId,
+        turnId: asking(plan.read())?.id ?? '',
+        requestId: 'p-cmd',
+        choice: 'allow-thread',
+      },
+      effects,
+    ),
+  );
+  assert.equal(granted.outcome, 'applied');
+  assert.deepEqual(plan.read().thread.permissionGrants, ['command']);
+  writeFileSync(join(dirname(plan.root), 'release'), '');
+  assert.equal(await plan.ended, 'Crew finished: 2 slices, 0 reviews, 0 fixes.');
+  const runs = plan.runs();
+  assert.deepEqual(
+    runs
+      .filter(([trigger]) => trigger === 'after-write')
+      .map(([, status, where]) => [status, where])
+      .sort(),
+    [
+      ['passed', plan.tiny(plan.copy(1))],
+      ['passed', plan.tiny(plan.copy(2))],
+    ].sort(),
+  );
+  const lanes = plan.lanes();
+  assert.deepEqual(
+    lanes.map(([key, state]) => [key, state]),
+    [
+      ['1', 'prepared'],
+      ['2', 'prepared'],
+    ],
+  );
+  assert.notEqual(lanes[0][3], lanes[1][3]);
+  assert.deepEqual(
+    [1, 2].map((id) => ['a.txt', 'b.txt'].filter((name) => existsSync(join(plan.copy(id), name)))),
+    [['a.txt'], ['b.txt']],
+  );
+});
+
+// Claim: a slice's checks run only outside Manual and in a current preparation of the slice's own
+// copy. A lockfile the builder or a fixer rewrote in the slice, or one that moved in the project
+// while the checks' question waited, stops the plan with the preparation line. A switch to Manual
+// while the question waited stops it too. No check runs after that, no further fix starts and
+// nothing of the slice merges.
+test('a stale slice preparation or a switch to Manual stops that slice with its line and starts no repair', {
+  timeout: 120000,
+}, async (t) => {
+  const moved = JSON.stringify({
+    lockfileVersion: 3,
+    packages: { '': {}, 'node_modules/tiny': { version: '1.2.4' } },
+  });
+  const stale =
+    'Plan stopped at slice 1: the checks could not run. Dependencies need preparation. The lockfile changed.';
+  type Plan = Awaited<ReturnType<typeof lanePlan>>;
+  const rows: {
+    name: string;
+    policy?: 'allow-edits';
+    gate?: (home: string) => string;
+    openai: ChatScriptStep[][];
+    local?: ChatScriptStep[][];
+    waits?: (plan: Plan) => void;
+    line: string;
+    runs: string[];
+    lane: (string | null)[];
+  }[] = [
+    {
+      name: 'the builder rewrites the lockfile',
+      openai: [writes('package-lock.json', moved)],
+      line: stale,
+      runs: [],
+      lane: ['stale', 'stale-lockfile'],
+    },
+    {
+      name: 'a fixer rewrites the lockfile',
+      // The check fails once, so the fixer runs. The gate after the fix finds the slice's own
+      // lockfile moved since the build's preparation.
+      gate: (home) =>
+        `const marker = ${JSON.stringify(join(home, 'gate-ran'))};\nif (!existsSync(marker)) {\nwriteFileSync(marker, 'x');\nprocess.exitCode = 1;\n}`,
+      openai: [writes('a.txt', 'one\n')],
+      local: [writes('package-lock.json', moved)],
+      line: stale,
+      runs: ['failed'],
+      lane: ['stale', 'stale-lockfile'],
+    },
+    {
+      name: 'the project lockfile moves while the question waits',
+      policy: 'allow-edits',
+      openai: [writes('a.txt', 'one\n')],
+      waits: (plan) => writeFileSync(join(plan.root, 'package-lock.json'), moved),
+      line: stale,
+      runs: [],
+      lane: ['stale', 'stale-lockfile'],
+    },
+    {
+      name: 'a switch to Manual while the question waits',
+      policy: 'allow-edits',
+      openai: [writes('a.txt', 'one\n')],
+      waits: (plan) =>
+        plan.store.transaction(() =>
+          plan.service.configure({ taskId: plan.taskId, flightMode: 'manual' }),
+        ),
+      line: 'Plan stopped at slice 1: the thread is in manual mode.',
+      runs: [],
+      lane: ['prepared', null],
+    },
+  ];
+  for (const row of rows)
+    await t.test(row.name, { timeout: 30000 }, async (t) => {
+      const plan = await lanePlan(t, {
+        slices: 1,
+        gate: row.gate ?? (() => ''),
+        openai: row.openai,
+        local: row.local,
+        ...(row.policy ? { policy: row.policy } : {}),
+      });
+      if (row.waits) {
+        await plan.until((read) => !!read.thread.checks?.ask);
+        row.waits(plan);
+        assert.equal(plan.answer('allow'), 'applied');
+      }
+      assert.equal(await plan.ended, row.line);
+      const read = plan.read();
+      assert.deepEqual(
+        [read.thread.plan?.phase, ...(read.thread.plan?.slices.map((slice) => slice.status) ?? [])],
+        ['stopped', 'failed'],
+      );
+      assert.deepEqual(
+        plan.runs().map(([, status]) => status),
+        row.runs,
+      );
+      assert.equal(plan.local.requests.length, row.local?.length ?? 0);
+      assert.deepEqual(
+        plan.lanes().map(([key, state, reason]) => [key, state, reason]),
+        [['1', ...row.lane]],
+      );
+      assert.notEqual(readFileSync(join(plan.scratch, 'package-lock.json'), 'utf8'), moved);
+      assert.equal(existsSync(join(plan.scratch, 'a.txt')), false);
+    });
+});
+
+/** A thread ready for a checked Accept, with what the tests read back from it. */
+/** A committed npm manifest and lockfile, with the one package they name installed. */
+function installTiny(root: string) {
+  const files = {
+    'package.json': JSON.stringify({ name: 'shop', dependencies: { tiny: '^1.0.0' } }),
+    'package-lock.json': JSON.stringify({
+      lockfileVersion: 3,
+      packages: { '': {}, 'node_modules/tiny': { version: '1.2.3' } },
+    }),
+    '.gitignore': 'node_modules\n',
+  };
+  for (const [path, body] of Object.entries(files)) writeFileSync(join(root, path), body);
+  mkdirSync(join(root, 'node_modules/tiny'), { recursive: true });
+  writeFileSync(
+    join(root, 'node_modules/tiny/package.json'),
+    JSON.stringify({ name: 'tiny', version: '1.2.3' }),
+  );
+  writeFileSync(join(root, 'node_modules/tiny/index.js'), 'module.exports = 1;\n');
+  const paths = Object.keys(files);
+  git(root, ['add', '--', ...paths]);
+  git(root, ['commit', '--quiet', '--message', 'Add the manifest.', '--', ...paths], undefined, {
+    name: 'Fixture',
+    email: 'fixture@example.invalid',
+    at: '2026-10-15T18:00:00Z',
+  });
+}
+
+/**
+ * A thread ready for a checked Accept, with what the tests read back from it. `plan` makes the
+ * first reply an orchestrator's plan, left proposed. `dependencies` gives the project an installed
+ * npm package and the service the dependency copy.
+ */
+async function acceptCopy(
+  t: TestContext,
+  options: { turns?: ChatScriptStep[][]; plan?: boolean; dependencies?: boolean } = {},
+) {
+  // The copy needs the thread's store, which exists only once the thread does.
+  let preparer: DependencyPreparer | undefined;
+  const prepared = () => preparer as DependencyPreparer;
+  const thread = await checkCopy(t, {
+    turns: options.turns,
+    deps: options.dependencies
+      ? {
+          dependencies: {
+            prepare: (...args) => prepared().prepare(...args),
+            environment: (...args) => prepared().environment(...args),
+            preparing: (taskId) => prepared().preparing(taskId),
+          },
+        }
+      : {},
+    before: (start) => {
+      if (options.dependencies) {
+        installTiny(start.root);
+        const ids = createTestIds(start.clock.now(), 1000n);
+        preparer = new DependencyPreparer({
+          store: start.store,
+          home: dirname(start.root),
+          now: start.clock.now,
+          id: () => `prp_${ids('msg').slice(4)}`,
+          projectPath: () => start.root,
+        });
+      }
+      if (options.plan)
+        start.store.transaction(() =>
+          start.service.configure({
+            taskId: start.taskId,
+            crew: {
+              name: 'Planned',
+              members: [
+                { role: 'orchestrator', selection },
+                { role: 'builder', selection },
+              ],
+            },
+            flightMode: 'balanced',
+          }),
+        );
+    },
+  });
+  const { taskId, root } = thread;
+  const identity = { name: 'Fixture owner', email: 'owner@example.invalid' };
+  const accept = (branch: string, on = thread.service) =>
+    act(thread.store, (effects) => on.accept({ taskId, branch }, identity, effects));
+  const acceptance = (on = thread.service) => {
+    const read = on.readAcceptance({ taskId });
+    assert(read.data?.kind === 'acceptance');
+    return read.data;
+  };
+  /** Resolves once no attempt holds the thread. Subscribe before the step that ends it. */
+  const settled = (on = thread.service) =>
+    next(thread, (event) => event.type === 'chat.thread' && !on.accepting(taskId));
+  /** Resolves once an Accept's check runs. Subscribe before the Accept. */
+  const running = () =>
+    next(thread, (event) => {
+      const run = event.type === 'chat.thread' && (event.payload as ChatThread).checks?.runs.at(-1);
+      return !!run && run.trigger === 'accept' && run.status === 'running';
+    });
+  const branch = (name: string) => {
+    try {
+      return git(root, ['rev-parse', '--verify', `refs/heads/${name}`])
+        .toString('utf8')
+        .trim();
+    } catch {
+      return null;
+    }
+  };
+  const tree = (commit: string) =>
+    git(root, ['rev-parse', `${commit}^{tree}`])
+      .toString('utf8')
+      .trim();
+  // Each attempt's copy and repository sit beside the scratch copy.
+  const folder = dirname(thread.scratch);
+  // A check that waits for a file outside its copy, so a test can act while it runs.
+  const signal = join(mkdtempSync(join(tmpdir(), 'crewkite-signal-')), 'go');
+  t.after(() => rmSync(dirname(signal), { recursive: true, force: true }));
+  writeFileSync(
+    join(thread.scratch, 'wait.mjs'),
+    [
+      "import { existsSync } from 'node:fs';",
+      `const wait = () => (existsSync(${JSON.stringify(signal)}) ? undefined : setTimeout(wait, 10));`,
+      'wait();',
+    ].join('\n'),
+  );
+  const release = () => writeFileSync(signal, '');
+  const hold = () => rmSync(signal, { force: true });
+  return {
+    ...thread,
+    hold,
+    accept,
+    acceptance,
+    settled,
+    running,
+    branch,
+    tree,
+    folder,
+    release,
+    preparer: prepared,
+  };
+}
+
+// Claim: with a check on, Accept freezes the candidate, runs the check in a copy of exactly that
+// tree, never in the scratch copy, and publishes the frozen tree once the check passes. The thread
+// is held meanwhile: a plan cannot start, and a message waits and starts once the branch is written.
+test('accept runs the required checks in a copy of the frozen tree and publishes it when they pass', {
+  timeout: 30000,
+}, async (t) => {
+  const slice = (id: number) => ({
+    id,
+    title: `Part ${id}`,
+    brief: `Do part ${id}.`,
+    files: [],
+    depends: [],
+    difficulty: 'medium',
+    readOnly: false,
+  });
+  const plan = { planId: 'p1', goal: 'Split it.', slices: [slice(1), slice(2)] };
+  const thread = await acceptCopy(t, {
+    plan: true,
+    turns: [textReply(`\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``), textReply('Next.')],
+  });
+  const { store, service, taskId, scratch, configure, accept, acceptance, settled, branch } =
+    thread;
+  const { tree, folder, read, send } = thread;
+  assert.equal(read().thread.plan?.phase, 'proposed');
+  writeFileSync(join(scratch, 'where.mjs'), 'console.log(process.cwd());\n');
+  appendFileSync(join(scratch, 'net.mjs'), '// checked\n');
+  configure({ checks: { add: 'node where.mjs' } });
+  const done = settled();
+  const answered = turnReaches(thread, 'done');
+  const started = accept('feat/checked');
+  assert.equal(send('Next step.').outcome, 'applied');
+  assert.equal(read().thread.queued.length, 1);
+  const planned = act(store, (effects) => service.runPlan({ taskId, planId: 'p1' }, effects));
+  assert.deepEqual([planned.outcome, planned.reason], ['blocked', 'turn-running']);
+  assert(started.data?.kind === 'acceptance');
+  const frozen = started.data.current as AcceptanceAttempt;
+  assert.deepEqual(
+    [frozen.state, frozen.requiredChecks.map((check) => [check.checkId, check.status])],
+    ['checking', [['custom:1', 'pending']]],
+  );
+  assert.equal(branch('feat/checked'), null);
+  await done;
+  const { current, last } = acceptance();
+  const run = read().thread.checks?.runs.at(-1);
+  assert.equal(current, null);
+  assert.deepEqual(
+    [last?.id, last?.state, last?.requiredChecks],
+    [
+      frozen.id,
+      'published',
+      [{ checkId: 'custom:1', label: 'node where.mjs', runId: run?.id, status: 'passed' }],
+    ],
+  );
+  // The check ran in the attempt's own copy, which goes once the branch is written.
+  assert.deepEqual([run?.trigger, run?.tail], ['accept', join(folder, `accept-${frozen.id}`)]);
+  assert.deepEqual(
+    readdirSync(folder).filter((name) => name.startsWith('accept-')),
+    [],
+  );
+  const commit = branch('feat/checked') as string;
+  assert.equal(last?.commit, commit);
+  assert.equal(tree(commit), frozen.candidateTree);
+  assert.equal(read().thread.base, commit);
+  await answered;
+  assert.deepEqual(
+    read()
+      .messages.slice(-3)
+      .map((message) => message.text),
+    ['Accepted 3 files to branch feat/checked.', 'Next step.', 'Next.'],
+  );
+  assert.equal(read().thread.queued.length, 0);
+});
+
+// Claim: a check that fails refuses the attempt, and so does one that changes a publishable file
+// even when it exits zero. The refusal names the file, the change stays out of every branch, and
+// the next Accept publishes the tree the person reviewed.
+test('a failing check refuses check-failed, and a check that writes a file refuses check-mutated without publishing it', {
+  timeout: 30000,
+}, async (t) => {
+  const { scratch, configure, accept, acceptance, settled, branch, tree, folder, read } =
+    await acceptCopy(t);
+  writeFileSync(join(scratch, 'gate.mjs'), 'process.exit(1);\n');
+  writeFileSync(
+    join(scratch, 'format.mjs'),
+    [
+      "import { appendFileSync, mkdirSync, writeFileSync } from 'node:fs';",
+      "mkdirSync('out');",
+      "writeFileSync('out/report.txt', 'ok\\n');",
+      "appendFileSync('net.mjs', '// formatted\\n');",
+    ].join('\n'),
+  );
+  configure({ checks: { add: 'node gate.mjs' } });
+  let done = settled();
+  accept('feat/checked');
+  await done;
+  const failed = acceptance().last;
+  assert.deepEqual(
+    [failed?.state, failed?.refusal, failed?.requiredChecks.map((check) => check.status)],
+    ['refused', 'check-failed', ['failed']],
+  );
+  assert.equal(
+    read().messages.at(-1)?.text,
+    'Accept to feat/checked stopped. node gate.mjs did not pass. Nothing was published.',
+  );
+
+  configure({ checks: { remove: 'custom:1' } });
+  configure({ checks: { add: 'node format.mjs' } });
+  done = settled();
+  accept('feat/checked');
+  await done;
+  const mutated = acceptance().last as AcceptanceAttempt;
+  assert.deepEqual(
+    [
+      mutated.state,
+      mutated.refusal,
+      mutated.requiredChecks[0].status,
+      mutated.mutatedPaths,
+      mutated.mutatedCount,
+    ],
+    ['refused', 'check-mutated', 'mutated', ['net.mjs', 'out/report.txt'], 2],
+  );
+  assert.equal(branch('feat/checked'), null);
+  // The change stays in the attempt's copy for review. The scratch copy never sees it.
+  const kept = join(folder, `accept-${mutated.id}`);
+  assert.equal(readFileSync(join(kept, 'out/report.txt'), 'utf8'), 'ok\n');
+  assert.equal(existsSync(join(scratch, 'out')), false);
+  assert.doesNotMatch(readFileSync(join(scratch, 'net.mjs'), 'utf8'), /formatted/);
+
+  // With the check off, Accept publishes the very tree the refused attempt checked.
+  assert.equal(configure({ checks: { remove: 'custom:1' } }).outcome, 'applied');
+  assert.equal(accept('feat/checked').outcome, 'applied');
+  assert.equal(acceptance().last?.state, 'published');
+  assert.equal(tree(branch('feat/checked') as string), mutated.candidateTree);
+  assert.equal(existsSync(kept), false);
+});
+
+// Claim: Accept publishes only what the person chose and what the checks ran with. While its
+// checks run, an edit to the copy waits. A hunk decision made meanwhile, or a dependency copy that
+// goes stale or is prepared again meanwhile, refuses the attempt as a changed choice, though every
+// check passed.
+test('a hunk decision or dependency change while the checks run refuses choice-changed', {
+  timeout: 30000,
+}, async (t) => {
+  const thread = await acceptCopy(t, { dependencies: true });
+  const { store, service, taskId, scratch, configure, accept, acceptance, branch, root } = thread;
+  appendFileSync(join(scratch, 'net.mjs'), '// checked\n');
+  configure({ checks: { add: 'node wait.mjs' } });
+  let started = thread.running();
+  let done = thread.settled();
+  accept('feat/checked');
+  await started;
+  const changes = service.readChanges({ taskId, limit: 500 });
+  const hunk = 'files' in changes ? changes.files[0]?.hunks[0] : undefined;
+  assert.equal('files' in changes && changes.files[0]?.path, 'net.mjs');
+  assert(hunk);
+  const discard = store.transaction(() =>
+    service.discardHunk({ taskId, path: 'net.mjs', hunk: hunk.key }),
+  );
+  assert.deepEqual([discard.outcome, discard.reason], ['blocked', 'checks-running']);
+  const decided = store.transaction(() =>
+    service.decideHunk({ taskId, path: 'net.mjs', hunk: hunk.key, decision: 'accepted' }),
+  );
+  assert.equal(decided.outcome, 'applied');
+  thread.release();
+  await done;
+  const { last } = acceptance();
+  assert.deepEqual(
+    [last?.state, last?.refusal, last?.requiredChecks.map((check) => check.status)],
+    ['refused', 'choice-changed', ['passed']],
+  );
+  assert.match(last?.preparationId ?? '', /^prp_/);
+
+  // The person installs a newer package while the checks run. The copy they ran with no longer
+  // matches, and the attempt still settles.
+  thread.hold();
+  started = thread.running();
+  done = thread.settled();
+  accept('feat/checked');
+  await started;
+  const lock = join(root, 'package-lock.json');
+  writeFileSync(lock, readFileSync(lock, 'utf8').replace('1.2.3', '1.2.4'));
+  thread.release();
+  await done;
+  const stale = acceptance().last;
+  assert.deepEqual(
+    [stale?.state, stale?.refusal, stale?.requiredChecks.map((check) => check.status)],
+    ['refused', 'choice-changed', ['passed']],
+  );
+  assert.notEqual(stale?.preparationId, last?.preparationId);
+  assert.equal(branch('feat/checked'), null);
+
+  // The copy is prepared again while the checks run. It keeps its record and its inputs, but the
+  // tree the checks ran with is gone, so the attempt refuses all the same.
+  writeFileSync(lock, readFileSync(lock, 'utf8').replace('1.2.4', '1.2.3'));
+  thread.hold();
+  started = thread.running();
+  done = thread.settled();
+  accept('feat/checked');
+  await started;
+  const checking = acceptance().current as AcceptanceAttempt;
+  thread.clock.advance(1000);
+  const again = await thread.preparer().prepare(taskId, 'acceptance', checking.id);
+  thread.release();
+  await done;
+  assert.equal(again && again !== 'busy' && again.id, checking.preparationId);
+  assert.deepEqual(
+    [acceptance().last?.state, acceptance().last?.refusal],
+    ['refused', 'choice-changed'],
+  );
+  assert.equal(branch('feat/checked'), null);
+});
+
+// Claim: an attempt that does not finish its checks never publishes. Cancel stops its check, a
+// controller that stops mid-check leaves it unknown at startup, and only a new Accept, which runs
+// the checks again, writes the branch.
+test('a cancelled attempt and one cut off by a restart never publish, and a new Accept checks again', {
+  timeout: 30000,
+}, async (t) => {
+  const thread = await acceptCopy(t);
+  const { store, service, taskId, scratch, configure, accept, acceptance, branch, read } = thread;
+  appendFileSync(join(scratch, 'net.mjs'), '// checked\n');
+  configure({ checks: { add: 'node wait.mjs' } });
+  const stopped = () =>
+    next(
+      thread,
+      (event) =>
+        event.type === 'chat.thread' &&
+        (event.payload as ChatThread).checks?.runs.at(-1)?.status === 'stopped',
+    );
+  let started = thread.running();
+  accept('feat/checked');
+  await started;
+  const cancelled = acceptance().current as AcceptanceAttempt;
+  let ended = stopped();
+  const cancel = store.transaction(() => service.cancelAcceptance({ attemptId: cancelled.id }));
+  assert.equal(cancel.outcome, 'applied');
+  await ended;
+  assert.equal(
+    read().messages.at(-1)?.text,
+    'Accept to feat/checked stopped: you cancelled it. Nothing was published.',
+  );
+
+  started = thread.running();
+  accept('feat/checked');
+  await started;
+  const cut = acceptance().current as AcceptanceAttempt;
+  // The controller stops mid-check. The check stops with it and the attempt is left as it was.
+  ended = stopped();
+  service.close();
+  await ended;
+  assert.equal(acceptance().current?.state, 'checking');
+  const restarted = thread.start();
+  t.after(() => restarted.close());
+  restarted.recover();
+  assert.deepEqual([acceptance(restarted).current, acceptance(restarted).last?.id], [null, cut.id]);
+  assert.deepEqual(
+    readdirSync(thread.folder).filter((name) => name.startsWith(`accept-${cut.id}`)),
+    [],
+  );
+  assert.equal(branch('feat/checked'), null);
+
+  thread.release();
+  const done = thread.settled(restarted);
+  accept('feat/checked', restarted);
+  await done;
+  const attempts = store.acceptanceAttempts(taskId);
+  const runs = read(restarted).thread.checks?.runs.filter((run) => run.trigger === 'accept');
+  assert.deepEqual(
+    attempts.map((attempt) => [attempt.state, attempt.commit !== null]),
+    [
+      ['cancelled', false],
+      ['unknown', false],
+      ['published', true],
+    ],
+  );
+  assert.deepEqual(
+    runs?.map((run) => run.status),
+    ['stopped', 'stopped', 'passed'],
+  );
+  assert.equal(attempts[2].requiredChecks[0].runId, runs?.[2].id);
+  assert.equal(branch('feat/checked'), attempts[2].commit);
+});
+
+// Claim: with a saved design system, Accept runs the design check first and refuses while a value
+// in a changed file goes around the system. A value the person allowed no longer holds it back.
+test('a value outside the saved design system refuses Accept until the person settles it', {
+  timeout: 30000,
+}, async (t) => {
+  const { controller, adapter, task, run, send, command, draft, source } = await chat(t, [
+    textReply('Styled the card.'),
+  ]);
+  const { projectId } = draft.payload as { projectId: string };
+  const execute = (name: string, payload: object, revision?: number) =>
+    controller.execute(command(name, payload, revision), 'local-owner');
+  const system = {
+    schema: 1,
+    tokens: {
+      color: { accent: { $type: 'color', $value: '#2f6feb' } },
+      type: {},
+      spacing: {},
+      radius: {},
+      shadow: {},
+      motion: {},
+    },
+    components: [],
+    rules: [],
+  };
+  const saved = await execute(
+    'SaveDesignSystem',
+    {
+      projectId,
+      path: 'design-system.json',
+      body: system,
+      expectedVersion: 0,
+      confirm: 'explicit',
+    },
+    0,
+  );
+  assert.equal(saved.outcome, 'applied', saved.next);
+  const done = turnReaches(controller, 'done');
+  await send('Style the card.');
+  await done;
+  writeFileSync(
+    join(adapter.requests[0].scratch.directory, 'card.css'),
+    '.card { color: #ff0000; }\n',
+  );
+  const accept = () => run('AcceptChatChanges', { branch: 'feat/card' }, task.revision);
+  const acceptance = async () => {
+    const read = await run('ReadAcceptance', {});
+    assert(read.data?.kind === 'acceptance');
+    return read.data;
+  };
+
+  const refused = await accept();
+  assert.deepEqual(
+    [refused.outcome, refused.reason, refused.next],
+    [
+      'blocked',
+      'design-system-findings',
+      '1 value goes around the design system. Settle the values under Design, then accept. Nothing was published.',
+    ],
+  );
+  const first = (await acceptance()).last;
+  assert.deepEqual(
+    [
+      first?.state,
+      first?.refusal,
+      first?.requiredChecks.map((check) => [check.checkId, check.status]),
+    ],
+    ['refused', 'design-system-findings', [['design-system', 'failed']]],
+  );
+  assert.throws(() => git(source.directory, ['rev-parse', '--verify', 'refs/heads/feat/card']));
+
+  const findings = await run('ReadDesignFindings', {});
+  assert(findings.data?.kind === 'design-findings');
+  const allowed = await execute(
+    'ResolveDesignFinding',
+    {
+      findingId: findings.data.findings[0].id,
+      action: 'allow-once',
+      reason: 'The brand red stays.',
+    },
+    task.revision,
+  );
+  assert.equal(allowed.outcome, 'applied');
+  const published = await accept();
+  assert.equal(published.data?.kind, 'chat-acceptance');
+  const second = (await acceptance()).last;
+  assert.deepEqual(
+    [second?.state, second?.requiredChecks.map((check) => [check.checkId, check.status])],
+    ['published', [['design-system', 'passed']]],
+  );
 });
 
 test('startup recovery lets a queued message start, and any other failed turn still holds the queue', {
@@ -4715,6 +7509,157 @@ test('a Local slice that cannot fit goes to the crew builder in balanced and gli
   }
 });
 
+// Claim: a turn whose completion is unknown fails once and keeps what it wrote. Nothing moves on
+// from it: no retry, no handoff, no crew step and no plan step. A Local slice that ended this way
+// is no fit failure, so the builder does not take it over.
+test('a turn whose completion is unknown fails once, keeps its files and starts nothing after it', {
+  timeout: 60000,
+}, async (t) => {
+  const pick = (family: ChatFamily): ChatModelSelection => ({
+    family,
+    model: `${family}-model`,
+    effort: 'default',
+  });
+  const reply = (text: string): ChatScriptStep[] => [{ kind: 'text', itemId: 'r', chunks: [text] }];
+  const plan = {
+    planId: 'p1',
+    goal: 'Add tax to the order total.',
+    slices: [
+      {
+        id: 1,
+        title: 'Apply tax',
+        brief: 'Use TAX_RATE in orderTotal.',
+        files: [],
+        depends: [],
+        difficulty: 'hard',
+        readOnly: false,
+      },
+    ],
+  };
+  const rows = [
+    {
+      name: 'a Local builder turn in a crew',
+      members: [{ role: 'builder', selection: pick('local') }] as ChatCrew['members'],
+      send: pick('local'),
+      expected: [['assistant', 'local', null, 'failed']],
+      // OpenAI, Anthropic and Google requests.
+      requests: [0, 0, 0],
+      line: null,
+    },
+    {
+      name: 'a Local plan slice',
+      // Local is the fixer, so it takes the hard slice, and the builder is on another family.
+      members: [
+        { role: 'builder', selection: pick('openai') },
+        { role: 'fixer', selection: pick('local') },
+        { role: 'orchestrator', selection: pick('openai') },
+      ] as ChatCrew['members'],
+      send: pick('openai'),
+      expected: [
+        ['orchestrator', 'openai', null, 'done'],
+        ['assistant', 'local', 1, 'failed'],
+      ],
+      requests: [1, 0, 0],
+      line: 'Plan stopped: slice 1 failed. Run it again from the plan card.',
+    },
+  ] as const;
+  for (const row of rows) {
+    const now = createTestClock().now();
+    // The Local model writes a file, then its last round reports no stop reason.
+    const { model } = fakeModel(
+      [
+        { steps: [{ call: 'write', args: { path: 'a.txt', content: 'half done\n' } }], stats: {} },
+        { steps: [{ text: 'Part of it is in.' }], stats: { stopReason: undefined } },
+      ],
+      { now: Date.parse(now) },
+    );
+    const scratches: string[] = [];
+    const local = localChatAdapter({
+      connect: async (request) => {
+        scratches.push(request.scratch.directory);
+        return {
+          model,
+          contextLength: 8192,
+          modelKey: 'local-model',
+          fellBack: false,
+          vision: false,
+          files: { prepareImageBase64: async () => ({}) as never },
+          dispose: async () => {},
+        };
+      },
+    });
+    const openai = createScriptedChatAdapter({
+      family: 'openai',
+      turns: [reply(`\`\`\`json plan\n${JSON.stringify(plan)}\n\`\`\``)],
+    });
+    const anthropic = createScriptedChatAdapter({
+      family: 'anthropic',
+      turns: [reply('Clean.\nFindings: 0')],
+    });
+    const google = createScriptedChatAdapter({ family: 'google', turns: [reply('It holds.')] });
+    const adapters = new Map<ChatFamily, ChatAdapter>([
+      ['openai', openai],
+      ['anthropic', anthropic],
+      ['google', google],
+      ['local', local],
+    ]);
+    const families = [
+      familyEntry('openai', 10, null, now),
+      familyEntry('anthropic', 50, null, now),
+      familyEntry('google', 50, null, now),
+      familyEntry('local', 90, null, now),
+    ];
+    const thread = standalone(t, {
+      adapters,
+      catalog: () => ({ families }),
+      localContext: () => 8192,
+      localSliceFits: () => true,
+    });
+    const { store, service, taskId } = thread;
+    const crew: ChatCrew = {
+      name: 'Crew',
+      members: [...row.members, { role: 'reviewer', selection: pick('anthropic') }],
+    };
+    // Glide turns automatic handoff on, so a limit here would move the work. Local writes inside
+    // its copy without asking under allow-edits.
+    store.transaction(() =>
+      service.configure({ taskId, crew, flightMode: 'glide', permissionPolicy: 'allow-edits' }),
+    );
+    const settled = next(thread, (event) => {
+      if (event.type !== 'chat.turn') return false;
+      const value = event.payload as ChatTurn;
+      return value.selection.family === 'local' && ['done', 'failed'].includes(value.state);
+    });
+    thread.send('Add tax.', row.send);
+    const turn = (await settled).payload as ChatTurn;
+    // Every step after a settled turn runs before the turn's event reaches this test.
+    const read = thread.read();
+    assert.equal(read.thread.autoHandoff, true, row.name);
+    assert.deepEqual(
+      read.turns.map((value) => [
+        value.role,
+        value.selection.family,
+        value.slice ?? null,
+        value.state,
+      ]),
+      row.expected,
+      row.name,
+    );
+    assert.equal(turn.failure?.kind, 'completion-unknown', row.name);
+    assert.equal(read.thread.activeTurnId, null, row.name);
+    const lines = read.messages.map((message) => message.text);
+    assert.ok(lines.includes(`${turn.failure?.message} ${turn.failure?.nextAction}`), row.name);
+    if (row.line) assert.equal(lines.at(-1), row.line, row.name);
+    assert.deepEqual(
+      [openai, anthropic, google].map((adapter) => adapter.requests.length),
+      row.requests,
+      row.name,
+    );
+    assert.equal(scratches.length, 1, row.name);
+    assert.equal(readFileSync(join(scratches[0], 'a.txt'), 'utf8'), 'half done\n', row.name);
+  }
+});
+
 /** A catalog entry with a credit reading and the Allow credit spending switch. */
 function creditEntry(
   family: ChatFamily,
@@ -4747,7 +7692,7 @@ test('an exhausted family with credit spending off hands the turn on before it s
 }, async (t) => {
   const now = createTestClock().now();
   const paused =
-    'OpenAI is out of included allowance and credit spending is off. Turn it on in Settings or pick another provider.';
+    'OpenAI is out of included allowance and credit spending is off. Turn credit spending on in Settings or pick another provider.';
   const pick = (family: ChatFamily): ChatModelSelection => ({
     family,
     model: `${family}-model`,
@@ -4819,6 +7764,27 @@ test('an exhausted family with credit spending off hands the turn on before it s
   }
 });
 
+// Claim: a send that opens no turn answers blocked with the refusal's reason and next step, so a
+// caller never waits for a turn that will not come.
+test('a send whose only provider has credit spending off is refused and opens no turn', async (t) => {
+  const now = createTestClock().now();
+  const thread = standalone(t, {
+    adapters: creditAdapters(),
+    catalog: () => ({ families: [creditEntry('openai', 0, false, now)] }),
+  });
+  const result = thread.send('Fix the rounding.', {
+    family: 'openai',
+    model: 'openai-model',
+    effort: 'default',
+  });
+  assert.equal(result.outcome, 'blocked');
+  assert.equal(result.reason, 'credits-paused');
+  assert.equal(result.next, 'Turn credit spending on in Settings or pick another provider.');
+  const read = thread.read();
+  assert.deepEqual(read.turns, []);
+  assert.equal(read.thread.activeTurnId, null);
+});
+
 test('a crew step on a family whose credits are paused runs on the next family', {
   timeout: 30000,
 }, async (t) => {
@@ -4884,7 +7850,7 @@ test('a crew step on a family whose credits are paused runs on the next family',
   assert.equal(read.thread.selection?.family, 'openai');
 });
 
-test('a turn that spent credits with the switch off finishes, says so, and the next turn moves', {
+test('a turn that ends with its allowance used up and credits off says so and the next turn moves', {
   timeout: 30000,
 }, async (t) => {
   const now = createTestClock().now();
@@ -4914,7 +7880,7 @@ test('a turn that spent credits with the switch off finishes, says so, and the n
       .map((message) => message.text),
     [
       'openai answered.',
-      'OpenAI used credits to finish this turn. Credit spending is off, so the next turn moves to another provider.',
+      'OpenAI reached its included allowance during this turn. Credit spending is off, so the next turn moves to another provider.',
     ],
   );
   const second = turnReaches(thread, 'done');
@@ -4927,6 +7893,22 @@ test('a turn that spent credits with the switch off finishes, says so, and the n
       ['done', 'google'],
     ],
   );
+});
+
+test('a writing rule switch round trips through its command', { timeout: 30000 }, async (t) => {
+  const { controller, command } = await chat(t, []);
+  const enabled = async () => {
+    const read = await controller.execute(command('ReadWritingRules', {}), 'local-owner');
+    assert(read.data?.kind === 'writing-rules');
+    return read.data.rules.find((rule) => rule.id === 'search-first')?.enabled;
+  };
+  assert.equal(await enabled(), true);
+  const set = await controller.execute(
+    command('SetWritingRule', { ruleId: 'search-first', enabled: false }, 0),
+    'local-owner',
+  );
+  assert.equal(set.outcome, 'applied', set.reason);
+  assert.equal(await enabled(), false);
 });
 
 test('the credit spending switch is off by default and round trips through its command', {
@@ -5039,6 +8021,67 @@ test('an automatic handoff starts on the thread or Settings model, never silentl
     ['google', 'google-model', 'high'],
     'the thread keeps its own Google model',
   );
+});
+
+// Claim: the handoff ranks a family on the model that will run there. A used-up default model must
+// not drop a family whose running model has allowance, and a default with room must not keep a
+// family whose running model is used up.
+test('an automatic handoff ranks each family on the model that will run', {
+  timeout: 30000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const window = (windowId: string, percent: number) => ({
+    windowId,
+    label: windowId,
+    percent,
+    resetsAt: null,
+    observedAt: now,
+  });
+  const google = (running: number, other: number) =>
+    ({
+      ...creditEntry('google', 50, undefined, now),
+      models: [
+        { model: 'google-flash', label: 'Flash', efforts: ['default'], defaultEffort: 'default' },
+        { model: 'google-argon', label: 'Argon', efforts: ['default'], defaultEffort: 'default' },
+      ],
+      defaultModel: 'google-flash',
+      remaining: [window('flash-weekly', other), window('argon-weekly', running)],
+    }) as ChatCatalogRead['families'][number];
+  const cases = [
+    {
+      claim: 'a used-up default does not drop the running model',
+      running: 60,
+      other: 0,
+      family: 'google',
+    },
+    {
+      claim: 'a default with room does not rescue a used-up running model',
+      running: 0,
+      other: 60,
+      family: 'local',
+    },
+  ];
+  for (const row of cases) {
+    const thread = standalone(t, {
+      adapters: creditAdapters(),
+      catalog: () => ({
+        families: [
+          creditEntry('openai', 0, false, now),
+          google(row.running, row.other),
+          familyEntry('local', 10, null, now),
+        ],
+      }),
+      familyModel: () => ({ model: 'google-argon' }),
+    });
+    const done = turnReaches(thread, 'done');
+    thread.send('Fix the rounding.', {
+      family: 'openai',
+      model: 'openai-model',
+      effort: 'default',
+    });
+    await done;
+    assert.equal(thread.read().turns[0]?.selection.family, row.family, row.claim);
+  }
 });
 
 // Claim: a plan slice passes the credit switch the way a single turn does. A slice whose family is
@@ -5344,4 +8387,523 @@ test('run tests explains when it cannot start', { timeout: 30000 }, async (t) =>
   const refused = act(store, (fx) => service.runTests({ taskId }, fx));
   assert.deepEqual([refused.outcome, refused.reason], ['blocked', 'no-test-command']);
   assert.match(refused.next ?? '', /Add one under Project checks/);
+});
+
+// A start at reset waits for the recorded reset time, which the test clock and a captured timer
+// stand in for. Usage reads come from the test, so the window opens only when the test says so.
+function resetThread(t: TestContext, later: ChatScriptStep[][] = []) {
+  const limit = chatFailure({
+    stage: 'stream',
+    kind: 'usage-limit',
+    message: 'The weekly limit is reached.',
+  });
+  const stop: ChatScriptStep[] = [{ kind: 'fail', stopReason: 'limit', failure: limit }];
+  const adapters = new Map([
+    [
+      'anthropic',
+      createScriptedChatAdapter({
+        family: 'anthropic',
+        turns: [stop, ...later, [{ kind: 'text', itemId: 'reply', chunks: ['Back at it.'] }]],
+      }),
+    ],
+  ] as const);
+  const now = createTestClock().now();
+  const inHours = (count: number) => new Date(Date.parse(now) + count * 3_600_000).toISOString();
+  const reading = { percent: 0 as number | null, resetsAt: inHours(5) as string | null };
+  const timers: { work: () => void; ms: number; cancelled: boolean }[] = [];
+  const refreshed: ChatFamily[] = [];
+  const on = standalone(t, {
+    adapters,
+    catalog: () => ({
+      families: [familyEntry('anthropic', reading.percent, reading.resetsAt, now)],
+    }),
+    schedule: (work, ms) => {
+      const timer = { work, ms, cancelled: false };
+      timers.push(timer);
+      return () => {
+        timer.cancelled = true;
+      };
+    },
+    refreshUsage: async (family) => {
+      refreshed.push(family);
+    },
+  });
+  const anthropic = { family: 'anthropic', model: 'anthropic-model', effort: 'default' } as const;
+  const stopped = turnReaches(on, 'failed');
+  on.send('Fix the rounding.', anthropic);
+  const schedule = (startAtReset: boolean) =>
+    on.store.transaction(() => on.service.configure({ taskId: on.taskId, startAtReset }));
+  return { ...on, reading, timers, refreshed, inHours, stopped, schedule };
+}
+
+test('a limit stop runs again at its recorded reset once usage reads open, and a restart keeps the wait', {
+  timeout: 30000,
+}, async (t) => {
+  const on = resetThread(t);
+  await on.stopped;
+  const [first] = on.read().turns;
+  assert.equal(on.schedule(true).outcome, 'applied');
+  assert.deepEqual(on.read().thread.startAt, {
+    turnId: first.id,
+    family: 'anthropic',
+    at: on.reading.resetsAt,
+  });
+
+  // The controller restarts. The wait is in the thread record, so the new service arms it again.
+  const restarted = on.start();
+  restarted.recover();
+  const timer = on.timers.at(-1);
+  assert.equal(timer?.ms, 5 * 3_600_000);
+
+  on.clock.advance(5 * 3_600_000);
+  on.reading.percent = 80;
+  const done = turnReaches(on, 'done');
+  timer?.work();
+  const second = await done;
+  const thread = on.read(restarted);
+  assert.deepEqual(on.refreshed, ['anthropic']);
+  assert.equal(thread.thread.startAt, undefined);
+  assert.equal(second.selection.family, 'anthropic');
+  // The same message ran again. The thread holds it once.
+  assert.equal(second.userMessageId, first.userMessageId);
+  assert.equal(thread.messages.filter((message) => message.text === 'Fix the rounding.').length, 1);
+});
+
+// Claim: a side question runs beside the thread and leaves its waiting start alone. When the
+// reset comes, the message the limit stopped runs again.
+test('a side question asked while a start waits for the reset leaves the start in place', {
+  timeout: 30000,
+}, async (t) => {
+  const on = resetThread(t, [[{ kind: 'text', itemId: 'side', chunks: ['It rounds half up.'] }]]);
+  await on.stopped;
+  const [first] = on.read().turns;
+  assert.equal(on.schedule(true).outcome, 'applied');
+  const answered = turnReaches(on, 'done');
+  const asked = act(on.store, (effects) =>
+    on.service.ask(
+      { taskId: on.taskId, family: 'anthropic', model: 'anthropic-model', question: 'Why?' },
+      effects,
+    ),
+  );
+  assert.equal(asked.outcome, 'applied', JSON.stringify(asked));
+  assert.equal((await answered).role, 'ask');
+  assert.equal(on.read().thread.startAt?.turnId, first.id);
+
+  on.clock.advance(5 * 3_600_000);
+  on.reading.percent = 80;
+  const rerun = turnReaches(on, 'done');
+  on.timers.at(-1)?.work();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    on.read().messages.filter((message) => /start cancelled/.test(message.text)),
+    [],
+  );
+  const second = await rerun;
+  assert.equal(second.userMessageId, first.userMessageId);
+  assert.equal(on.read().thread.startAt, undefined);
+});
+
+// Claim: a usage reading that cannot be had says so once and tries again every 15 minutes, for a
+// day at most. It never writes a line per try, and after a day the wait ends with one line.
+test('an unreadable usage reading at the reset says so once and gives up after a day', {
+  timeout: 30000,
+}, async (t) => {
+  const on = resetThread(t);
+  await on.stopped;
+  assert.equal(on.schedule(true).outcome, 'applied');
+  on.reading.percent = null;
+  on.reading.resetsAt = null;
+  on.clock.advance(5 * 3_600_000);
+  const fire = async () => {
+    on.timers.at(-1)?.work();
+    await new Promise((resolve) => setImmediate(resolve));
+  };
+  // Four tries an hour, for two hours.
+  for (let index = 0; index < 8; index++) {
+    await fire();
+    assert.equal(on.timers.at(-1)?.ms, 15 * 60_000);
+    on.clock.advance(15 * 60_000);
+  }
+  const lines = () =>
+    on
+      .read()
+      .messages.map((message) => message.text)
+      .filter((text) => /reopened|could not be read|could not read|start cancelled/.test(text));
+  assert.deepEqual(lines(), [
+    "Anthropic's usage could not be read. CrewKite reads it again every 15 minutes, for a day at most.",
+  ]);
+  assert.equal(on.read().thread.startAt?.turnId, on.read().turns[0]?.id);
+  on.clock.advance(24 * 3_600_000);
+  await fire();
+  assert.equal(on.read().thread.startAt, undefined);
+  assert.deepEqual(lines().slice(1), [
+    "Anthropic start cancelled. CrewKite could not read Anthropic's usage for a day. Send the message again when it can run.",
+  ]);
+  assert.equal(on.read().turns.length, 1);
+});
+
+test('a reset that usage does not confirm starts nothing, and Cancel removes the wait', {
+  timeout: 30000,
+}, async (t) => {
+  const on = resetThread(t);
+  await on.stopped;
+  on.reading.resetsAt = null;
+  const refused = on.schedule(true);
+  assert.equal(refused.outcome, 'blocked');
+  assert.equal((refused as { reason: string }).reason, 'no-reset-time');
+
+  on.reading.resetsAt = on.inHours(5);
+  on.schedule(true);
+  // The window reads zero when the time comes, with a later reset. Nothing starts and the wait moves.
+  on.clock.advance(5 * 3_600_000);
+  on.reading.resetsAt = on.inHours(10);
+  on.timers.at(-1)?.work();
+  await new Promise((resolve) => setImmediate(resolve));
+  const waiting = on.read();
+  assert.equal(waiting.turns.length, 1);
+  assert.equal(waiting.thread.startAt?.at, on.inHours(10));
+  assert.equal(on.timers.at(-1)?.ms, 5 * 3_600_000);
+
+  const armed = on.timers.at(-1);
+  on.schedule(false);
+  assert.equal(on.read().thread.startAt, undefined);
+  assert.equal(armed?.cancelled, true);
+
+  // An API connection assigned while the start waits would bill the message per token. The
+  // window opens, and the wait ends with nothing sent.
+  assert.equal(on.schedule(true).outcome, 'applied');
+  assignConnection(
+    on.store,
+    on.taskId,
+    'thread',
+    apiConnection('con_01KA0000000000000000000005', 'anthropic', on.clock.now()),
+  );
+  on.clock.advance(5 * 3_600_000);
+  on.reading.percent = 80;
+  on.timers.at(-1)?.work();
+  await new Promise((resolve) => setImmediate(resolve));
+  const ended = on.read();
+  assert.equal(ended.turns.length, 1);
+  assert.equal(ended.thread.startAt, undefined);
+  assert.match(
+    ended.messages.at(-1)?.text ?? '',
+    /^Anthropic start cancelled\. .*assigned connection/,
+  );
+});
+
+/** An API connection, ready on its last proof unless the change says otherwise. */
+function apiConnection(
+  connectionId: string,
+  family: ChatFamily,
+  at: string,
+  change: Partial<Connection> = {},
+): Connection {
+  return {
+    connectionId,
+    family,
+    backend: 'native-client',
+    billingMode: 'api',
+    profileId: `${family}-api`,
+    keepConnected: false,
+    readiness: 'ready',
+    proofGeneration: 1,
+    observedMode: 'api',
+    observedAt: at,
+    ...change,
+  };
+}
+
+function assignConnection(
+  store: Store,
+  taskId: string,
+  role: ConnectionAssignment['role'],
+  connection: Connection,
+) {
+  store.transaction(() => {
+    store.putConnection(connection, connection.observedAt ?? '2026-10-23T09:00:00.000Z');
+    store.putConnectionAssignment(
+      { taskId, role, connectionId: connection.connectionId },
+      '2026-10-23T09:00:00.000Z',
+    );
+  });
+}
+
+// Claim: a subscription limit never moves work onto API billing, even where the thread has a ready
+// API connection on the family the ranking puts first. A fixer's limit that moves the thread's own
+// pick checks the builder's slot too, since the builder runs there next. A turn that ran on an API
+// connection never moves to another connection on its own, and never waits for a reset.
+test('a limit never moves work onto an API connection, and a turn on one never moves on its own', {
+  timeout: 30000,
+}, async (t) => {
+  const on = limitThread(t, { autoHandoff: true, resetsAt: null });
+  const now = createTestClock().now();
+  // Google ranks first after OpenAI stops, and this thread uses API billing there.
+  assignConnection(
+    on.store,
+    on.taskId,
+    'thread',
+    apiConnection('con_01KA0000000000000000000001', 'google', now),
+  );
+  const moved = turnReaches(on, 'done');
+  on.send('Fix the rounding.');
+  await moved;
+  assert.deepEqual(
+    on.read().turns.map((turn) => [turn.state, turn.selection.family, turn.connectionId ?? null]),
+    [
+      ['failed', 'openai', null],
+      ['done', 'anthropic', null],
+    ],
+  );
+  assert.equal(on.adapters.get('google')?.requests.length, 0);
+
+  // A fixer on the thread's own family stops on a limit, so the thread moves. Google ranks first,
+  // and only the builder runs there on API billing.
+  const fixer = limitThread(t, { autoHandoff: true, resetsAt: null });
+  assignConnection(
+    fixer.store,
+    fixer.taskId,
+    'builder',
+    apiConnection('con_01KA0000000000000000000004', 'google', now),
+  );
+  const openaiPick = { family: 'openai', model: 'openai-model', effort: 'default' } as const;
+  fixer.store.transaction(() =>
+    fixer.service.configure({ taskId: fixer.taskId, selection: openaiPick }),
+  );
+  const fixed = turnReaches(fixer, 'done');
+  act(fixer.store, (effects) =>
+    fixer.service.sendMessage(
+      {
+        taskId: fixer.taskId,
+        text: 'Fix the review findings.',
+        role: 'fixer',
+        selection: openaiPick,
+        attachments: [],
+        files: [],
+      },
+      effects,
+    ),
+  );
+  await fixed;
+  assert.deepEqual(
+    fixer.read().turns.map((turn) => [turn.state, turn.selection.family]),
+    [
+      ['failed', 'openai'],
+      ['done', 'anthropic'],
+    ],
+  );
+  assert.equal(fixer.adapters.get('google')?.requests.length, 0);
+
+  // A builder on OpenAI API billing stops on a limit. Google has allowance and handoff is on.
+  const limit = chatFailure({ stage: 'stream', kind: 'usage-limit', message: 'Rate limit.' });
+  const openai = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [[{ kind: 'fail', stopReason: 'limit', failure: limit }]],
+  });
+  const google = createScriptedChatAdapter({
+    family: 'google',
+    turns: [[{ kind: 'text', itemId: 'r', chunks: ['Not chosen.'] }]],
+  });
+  const pinned = standalone(t, {
+    adapters: new Map<ChatFamily, ChatAdapter>([
+      ['openai', { ...openai, connectionModes: ['api'] }],
+      ['google', google],
+    ]),
+    // OpenAI's own window resets in an hour. It is not the connection's limit.
+    catalog: () => ({
+      families: [
+        familyEntry('openai', 90, new Date(Date.parse(now) + 3_600_000).toISOString(), now),
+        familyEntry('google', 80, null, now),
+      ],
+    }),
+  });
+  pinned.store.transaction(() =>
+    pinned.service.configure({ taskId: pinned.taskId, autoHandoff: true }),
+  );
+  assignConnection(
+    pinned.store,
+    pinned.taskId,
+    'builder',
+    apiConnection('con_01KA0000000000000000000002', 'openai', now),
+  );
+  const failed = turnReaches(pinned, 'failed');
+  pinned.send('Fix the rounding.', { family: 'openai', model: 'openai-model', effort: 'default' });
+  await failed;
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(
+    pinned.read().turns.map((turn) => [turn.state, turn.connectionId]),
+    [['failed', 'con_01KA0000000000000000000002']],
+  );
+  assert.equal(google.requests.length, 0);
+  assert.deepEqual(
+    pinned.store.transaction(() =>
+      pinned.service.configure({ taskId: pinned.taskId, startAtReset: true }),
+    ),
+    {
+      outcome: 'blocked',
+      reason: 'assigned-connection',
+      next: 'This message ran on an assigned connection, which has no reset time CrewKite reads. Send it again when the connection can run.',
+    },
+  );
+});
+
+// Claim: a turn assigned to an API connection starts only while the mode its client last proved is
+// the mode the person chose, and the controller checks again right before the adapter sends. A
+// turn running on it stops when the person disconnects or forgets it. An API turn that reported no
+// cost counts as unreported, never as free.
+test('a turn on an API connection starts only on a proven matching mode, and its cost is never zero', {
+  timeout: 30000,
+}, async (t) => {
+  const now = createTestClock().now();
+  const connectionId = 'con_01KA0000000000000000000003';
+  const pick = { family: 'openai', model: 'openai-model', effort: 'default' } as const;
+  const refused = (message: string) => ({
+    outcome: 'blocked',
+    reason: 'provider-not-ready',
+    next: 'Reconnect it in Settings, or clear its assignment for this thread or role.',
+    message,
+  });
+  const rows: {
+    claim: string;
+    change: Partial<Connection>;
+    modes: BillingMode[];
+    message: string;
+  }[] = [
+    {
+      claim: 'the client reported another mode',
+      change: { readiness: 'needs-attention', observedMode: 'subscription' },
+      modes: ['api'],
+      message: 'Sign-in changed. Reconnect this API connection.',
+    },
+    {
+      claim: 'no proof since a restart',
+      change: { readiness: 'needs-attention', observedMode: null, observedAt: null },
+      modes: ['api'],
+      message: 'API billing has not confirmed its billing mode.',
+    },
+    {
+      claim: 'the person disconnected it',
+      change: { readiness: 'disconnected', observedMode: null, observedAt: null },
+      modes: ['api'],
+      message: 'API billing is disconnected.',
+    },
+    {
+      claim: 'the adapter cannot run API billing on its own profile',
+      change: {},
+      modes: [],
+      message: 'Provider API billing is not verified for this client.',
+    },
+  ];
+  for (const row of rows) {
+    const adapter = createScriptedChatAdapter({ family: 'openai', turns: [] });
+    const thread = standalone(t, {
+      adapters: new Map([['openai', { ...adapter, connectionModes: row.modes }]]),
+    });
+    assignConnection(
+      thread.store,
+      thread.taskId,
+      'thread',
+      apiConnection(connectionId, 'openai', now, row.change),
+    );
+    const result = thread.send('Fix the rounding.', pick);
+    const { message, ...answer } = refused(row.message);
+    assert.deepEqual(result, answer, row.claim);
+    const read = thread.read();
+    assert.deepEqual(read.turns, [], row.claim);
+    assert.equal(read.messages.at(-1)?.text, `${message} ${answer.next}`, row.claim);
+    assert.equal(adapter.requests.length, 0, row.claim);
+  }
+
+  // A matching proof starts the turn on the connection, with no credit switch or allowance of
+  // the family's own route.
+  const adapter = createScriptedChatAdapter({
+    family: 'openai',
+    turns: [[{ kind: 'text', itemId: 'r', chunks: ['Done.'] }]],
+  });
+  const thread = standalone(t, {
+    adapters: new Map([['openai', { ...adapter, connectionModes: ['api'] as BillingMode[] }]]),
+    catalog: () => ({ families: [creditEntry('openai', 50, true, now)] }),
+  });
+  assignConnection(
+    thread.store,
+    thread.taskId,
+    'thread',
+    apiConnection(connectionId, 'openai', now),
+  );
+  const done = turnReaches(thread, 'done');
+  assert.equal(thread.send('Fix the rounding.', pick).outcome, 'applied');
+  await done;
+  const [request] = adapter.requests as unknown as ChatTurnRequest[];
+  assert.deepEqual(request.connection, {
+    connectionId,
+    billingMode: 'api',
+    profileId: 'openai-api',
+    proofGeneration: 1,
+  });
+  assert.equal(request.creditSpending, undefined);
+  assert.equal(request.allowanceLeft, null);
+  const [turn] = thread.read().turns;
+  assert.equal(turn.connectionId, connectionId);
+  // The client reported no cost, so the turn stays unreported and the connection's sum says so.
+  assert.deepEqual(turn.spend, { reported: null, estimated: null, unreportedTurns: 1 });
+  const connections = new Connections({
+    store: thread.store,
+    now: () => now,
+    id: () => connectionId,
+    client: {
+      prepare: () => {},
+      loginLine: () => 'sign in',
+      readMode: async () => undefined,
+      signOut: async () => {},
+    },
+  });
+  assert.deepEqual(connections.read().spend, [
+    { connectionId, spend: { reported: null, estimated: null, unreportedTurns: 1 } },
+  ]);
+
+  // Admitted, then disconnected before the adapter was called: the turn fails unsent and cost
+  // nothing.
+  const unsent = turnReaches(thread, 'failed');
+  thread.send('Then the totals.', pick);
+  thread.store.transaction(() =>
+    thread.store.putConnection(
+      apiConnection(connectionId, 'openai', now, {
+        readiness: 'disconnected',
+        observedMode: null,
+        observedAt: null,
+      }),
+      now,
+    ),
+  );
+  const failed = await unsent;
+  assert.equal(failed.failure?.message, 'API billing is disconnected.');
+  assert.equal(failed.spend, null);
+  assert.equal(adapter.requests.length, 1);
+
+  // A turn already running on the connection stops when the person disconnects or forgets it.
+  const waiting = createScriptedChatAdapter({ family: 'openai', turns: [[{ kind: 'wait' }]] });
+  const running = standalone(t, {
+    adapters: new Map([['openai', { ...waiting, connectionModes: ['api'] as BillingMode[] }]]),
+  });
+  assignConnection(
+    running.store,
+    running.taskId,
+    'thread',
+    apiConnection(connectionId, 'openai', now),
+  );
+  const started = next(
+    running,
+    (event) =>
+      event.type === 'agent.event' && (event.payload as AgentEvent).type === 'turn.started',
+  );
+  running.send('Fix the rounding.', pick);
+  await started;
+  const stopped = turnReaches(running, 'stopped');
+  running.service.stopConnectionTurns(connectionId);
+  const ended = await stopped;
+  assert.equal(ended.stopCause, 'person');
+  assert.deepEqual(ended.spend, { reported: null, estimated: null, unreportedTurns: 1 });
+  assert.equal(
+    running.read().messages.at(-1)?.text,
+    'Stopped: you disconnected or forgot the connection this turn ran on.',
+  );
 });

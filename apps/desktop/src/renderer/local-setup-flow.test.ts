@@ -668,3 +668,36 @@ test('the rail connect line is short and the toast clears in a few seconds', () 
     assert.equal(railConnectLine(result), 'Local did not connect. Settings has the details.');
   assert.ok(RAIL_TOAST_MS >= 3_000 && RAIL_TOAST_MS <= 5_000);
 });
+
+// Claim: a launch reconnect reads the setup right after its connect command, with no fixed wait
+// first. A loopback probe can finish in milliseconds, and the wait only belongs between reads.
+test('the reconnect reads once before it waits', async () => {
+  const events: string[] = [];
+  const up = setup({ connected: true, operation: null });
+  const result = await connectInPlace({
+    setup: setup({ operation: null, reason: 'connection-required' }),
+    command: async (input) => {
+      events.push(input.command);
+      return { outcome: 'applied', revision: 2 };
+    },
+    read: async () => {
+      events.push('read');
+      return events.includes('RefreshLocalModels')
+        ? { ...up, observation: { residentLlms: 1 } as LocalSetup['observation'] }
+        : up;
+    },
+    wait: async () => {
+      events.push('wait');
+    },
+    active: () => true,
+    unattended: true,
+  });
+  assert.equal(result.kind, 'connected');
+  assert.deepEqual(events, [
+    'BeginLocalConnectionInput',
+    'read',
+    'RefreshLocalModels',
+    'wait',
+    'read',
+  ]);
+});

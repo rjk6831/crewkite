@@ -93,6 +93,7 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
     families?: ChatCatalogEntry[];
     autoHandoff?: boolean;
     excluded?: ChatFamily[];
+    assigned?: PlanInputs['assigned'];
     want: ([string, string, string] | string)[];
     candidates?: string[][];
   }[] = [
@@ -239,6 +240,85 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
       candidates: [['google', 'anthropic']],
     },
     {
+      // Google ranks first, but the builder would run there on an API connection (ADR 0056).
+      name: 'the handoff rule never moves a slice onto an API connection',
+      slices: [slice(1, 'medium')],
+      families: [
+        pinned(entry('openai', 0, 10), 'openai-pinned'),
+        entry('anthropic', 40, 2),
+        entry('google', 80, 10),
+      ],
+      autoHandoff: true,
+      assigned: (family) => (family === 'google' ? { billingMode: 'api', ready: true } : null),
+      want: [
+        [
+          'anthropic',
+          'anthropic-model',
+          'Slice 1 (medium) assigned to Anthropic (anthropic): Continue on another provider, since OpenAI has no allowance left. Ranked 1 of 1 by Most allowance left.',
+        ],
+      ],
+      candidates: [['anthropic']],
+    },
+    {
+      name: "a builder on its assigned connection runs by that connection, not the family's allowance",
+      slices: [slice(1, 'medium')],
+      families: [pinned(entry('openai', 0, 10), 'openai-pinned'), entry('google', 80, 10)],
+      assigned: (family, role) =>
+        family === 'openai' && role === 'assistant' ? { billingMode: 'api', ready: true } : null,
+      want: [
+        [
+          'openai',
+          'openai-pinned',
+          "Slice 1 (medium) assigned to OpenAI (openai pinned): Builder, the crew's model.",
+        ],
+      ],
+    },
+    {
+      // The crew has no fixer, so a moved slice's fix runs as the fixer on the family it moves to.
+      name: 'the handoff rule never moves a slice where its fix would run on an API connection',
+      slices: [slice(1, 'medium')],
+      families: [
+        pinned(entry('openai', 0, 10), 'openai-pinned'),
+        entry('anthropic', 40, 2),
+        entry('google', 80, 10),
+      ],
+      autoHandoff: true,
+      assigned: (family, role) =>
+        family === 'google' && role === 'fixer' ? { billingMode: 'api', ready: true } : null,
+      want: [
+        [
+          'anthropic',
+          'anthropic-model',
+          'Slice 1 (medium) assigned to Anthropic (anthropic): Continue on another provider, since OpenAI has no allowance left. Ranked 1 of 1 by Most allowance left.',
+        ],
+      ],
+    },
+    {
+      // The crew fixer takes a hard slice, but its build still runs as the assistant there.
+      name: "a fixer member is admitted by the build's own role on its family",
+      slices: [slice(1, 'hard')],
+      fixer: anthropic,
+      assigned: (family, role) =>
+        family === 'anthropic' && role === 'assistant'
+          ? { billingMode: 'api', ready: false }
+          : null,
+      want: [
+        [
+          'openai',
+          'openai-pinned',
+          "Slice 1 (hard) assigned to OpenAI (openai pinned): Builder, since Anthropic's assigned connection is not ready.",
+        ],
+      ],
+    },
+    {
+      name: 'a builder whose assigned connection is not ready takes no slice',
+      slices: [slice(1, 'medium')],
+      assigned: (family) => (family === 'openai' ? { billingMode: 'api', ready: false } : null),
+      want: [
+        "Slice 1 (medium) has no model in the crew to run on: OpenAI's assigned connection is not ready. Continue on another provider is off.",
+      ],
+    },
+    {
       name: 'the plan hint breaks a tie only among families the handoff rule ranks',
       slices: [slice(1, 'medium', [], { family: 'anthropic' })],
       families: [
@@ -279,6 +359,7 @@ test('slices stay inside the crew: the builder, the fixer for a hard slice, Loca
       localContext: 8192,
       localSliceFits: fits,
       files,
+      ...(row.assigned ? { assigned: row.assigned } : {}),
     };
     const { rows: cards, unassigned } = assignPlan(plan, inputs);
     // Same inputs, same card.

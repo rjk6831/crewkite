@@ -157,11 +157,11 @@ test('accept to branch publishes only accepted hunks, and the branch tree matche
       }
     const listing = (await at.page()).listing;
     const base = at.repo('rev-parse', 'HEAD');
-    const accepted = await at.run('AcceptChatChanges', { branch: 'crewkite/partial', listing });
+    const accepted = await at.run('AcceptChatChanges', { branch: 'feat/partial', listing });
     assert.equal(accepted.outcome, 'applied', `${row.name}: ${accepted.next}`);
     // The branch tree differs from the base exactly by these blob ids.
     const changed = at
-      .repo('diff-tree', '-r', '--no-renames', base, 'refs/heads/crewkite/partial')
+      .repo('diff-tree', '-r', '--no-renames', base, 'refs/heads/feat/partial')
       .split('\n')
       .filter(Boolean)
       .map((line) => {
@@ -255,15 +255,14 @@ test('paging over more than 2,000 entries reaches every entry once, and accept t
   writeFileSync(join(crowd, 'late'), 'late\n');
   const stale = await at.read('ReadChatChanges', { after: 'crowd/f0100', listing });
   assert.deepEqual([stale.outcome, stale.reason], ['blocked', 'listing-changed']);
-  const refused = await at.run('AcceptChatChanges', { branch: 'crewkite/crowd', listing });
+  const refused = await at.run('AcceptChatChanges', { branch: 'feat/crowd', listing });
   assert.equal(refused.reason, 'listing-changed');
   const fresh = (await at.page()).listing;
-  const accepted = await at.run('AcceptChatChanges', { branch: 'crewkite/crowd', listing: fresh });
+  const accepted = await at.run('AcceptChatChanges', { branch: 'feat/crowd', listing: fresh });
   assert.equal(accepted.outcome, 'applied', accepted.next);
   assert.equal((accepted.data as { fileCount: number }).fileCount, count + 1);
   assert.equal(
-    at.repo('ls-tree', '-r', '--name-only', 'refs/heads/crewkite/crowd', 'crowd').split('\n')
-      .length,
+    at.repo('ls-tree', '-r', '--name-only', 'refs/heads/feat/crowd', 'crowd').split('\n').length,
     count + 1,
   );
 });

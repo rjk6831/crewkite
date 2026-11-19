@@ -400,3 +400,50 @@ test('credits reach the catalog per family, and a reached limit counts until its
   assert.equal(read('2026-11-03T11:30:00.000Z', 0)[0].credits?.limitReached, false);
   assert.equal(read(null, 0)[0].credits?.limitReached, true);
 });
+
+// Claim: a window is called five-hour or weekly only when its reading reports that length or its
+// reader wrote the period into the id. An OpenAI slot with no length keeps its id and still counts.
+test('a usage window is labelled by a length it reports, and an unlabelled one still limits', () => {
+  const nowMs = Date.parse('2026-11-03T12:00:00.000Z');
+  const observedAt = '2026-11-03T11:00:00.000Z';
+  const cases: [string, string, number | undefined, string][] = [
+    ['a primary slot with no length keeps its id', 'client:primary', undefined, 'client:primary'],
+    [
+      'a secondary slot with no length keeps its id',
+      'client:secondary',
+      undefined,
+      'client:secondary',
+    ],
+    ['a reported 18,000 seconds is five-hour', 'client:primary', 18_000, 'five-hour'],
+    ['a reported 604,800 seconds is weekly', 'client:secondary', 604_800, 'weekly'],
+    ['another reported length keeps the id', 'client:primary', 86_400, 'client:primary'],
+    ['a reader-written five-hour id is five-hour', 'five-hour', undefined, 'five-hour'],
+    ['a reader-written weekly model id is weekly', 'weekly-model', undefined, 'weekly'],
+  ];
+  for (const [claim, windowId, periodSeconds, label] of cases) {
+    const [openai] = buildChatCatalog({
+      profiles: [],
+      openAiModels: null,
+      local: localSetup(false),
+      connectedOnce: [...everyFamily],
+      windows: [
+        {
+          family: 'openai',
+          observation: {
+            windowId,
+            ...(periodSeconds === undefined
+              ? {}
+              : { semantics: { scope: 'provider' as const, periodSeconds } }),
+            remaining: { value: 0, unit: 'percent' },
+            resetsAt: null,
+            observedAt,
+          },
+        },
+      ],
+      nowMs,
+    }).families;
+    assert.equal(openai.remaining[0]?.label, label, claim);
+    // The label never decides whether a window counts as a limit.
+    assert.equal(allowanceExhausted(openai), true, claim);
+  }
+});

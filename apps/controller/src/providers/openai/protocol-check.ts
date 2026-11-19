@@ -11,6 +11,7 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { createInterface } from 'node:readline';
+import { TURN_STATUSES } from './chat.ts';
 import {
   accountReadParams,
   approvalReply,
@@ -518,6 +519,28 @@ export async function check(context: { binary: string; work: string; validate: V
         detail: problems.join('; ') || 'matches the schema',
       });
     }
+    // A status the adapter does not know fails every turn that ends on it, so a build that adds
+    // or renames one needs a look before a person meets it.
+    const notifications = JSON.parse(
+      readFileSync(join(schemas, 'ServerNotification.json'), 'utf8'),
+    );
+    const enumerated: unknown = notifications.definitions?.TurnStatus?.enum;
+    const listed = Array.isArray(enumerated) ? enumerated.map(String) : [];
+    const added = listed.filter((status) => !TURN_STATUSES.has(status));
+    const dropped = [...TURN_STATUSES].filter((status) => !listed.includes(status));
+    rows.push({
+      request: 'turn/completed',
+      shape: 'turn status',
+      result: added.length || dropped.length ? 'refused' : 'accepted',
+      detail: !listed.length
+        ? 'the schema lists no turn statuses'
+        : [
+            added.length ? `${added.join(', ')} not known to the adapter` : null,
+            dropped.length ? `${dropped.join(', ')} no longer listed` : null,
+          ]
+            .filter(Boolean)
+            .join('; ') || listed.join(', '),
+    });
   }
 
   // A removed field the build still names, against every key CrewKite sends.

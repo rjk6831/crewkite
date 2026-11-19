@@ -171,10 +171,35 @@ const bridge: DesktopSource = {
       throw plain(failure);
     }
   },
+  feedbackDraft: async (input) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:feedback-draft', input);
+      if (typeof value !== 'string') throw new Error('The report could not be made.');
+      return value;
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  sendFeedback: async (input) => {
+    const value: unknown = await ipcRenderer.invoke('crewkite:feedback-send', input);
+    return value === 'done' ? 'done' : 'refused';
+  },
   saveNotes: async (projectId) => {
     try {
       const value: unknown = await ipcRenderer.invoke('crewkite:save-notes', projectId);
       return value === 'cancelled' ? 'cancelled' : 'saved';
+    } catch (failure) {
+      throw plain(failure);
+    }
+  },
+  saveResults: async (projectId) => {
+    try {
+      const value: unknown = await ipcRenderer.invoke('crewkite:save-results', projectId);
+      if (typeof value === 'object' && value !== null && 'records' in value && 'file' in value) {
+        const { records, file } = value;
+        if (typeof records === 'number' && typeof file === 'string') return { records, file };
+      }
+      return 'cancelled';
     } catch (failure) {
       throw plain(failure);
     }

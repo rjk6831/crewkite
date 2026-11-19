@@ -9,6 +9,7 @@ import {
   readFileSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -35,6 +36,9 @@ function ownership(events: string[]): OwnedCommandLifecycle {
     quiescent(group) {
       assert(group > 0);
       events.push('quiescent');
+    },
+    unlaunched() {
+      events.push('unlaunched');
     },
   };
 }
@@ -360,6 +364,55 @@ test('owned commands stream bounded output and keep cancellation owned through c
       }),
     /identity changed/,
   );
+});
+
+// Claim: a command whose spawn created no process releases its intent, whether the spawn throws
+// at once or reports the error later, and never records a group.
+test('an owned command that never started reports unlaunched and never owned', async (t) => {
+  const directory = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-unlaunched-')));
+  t.after(() => rmSync(directory, { recursive: true, force: true }));
+  const rows = [
+    // macOS refuses a file with no shebang at once. A Linux C library can hand the same file to
+    // /bin/sh, which starts a process, so the row runs only where the refusal is the platform's.
+    ...(process.platform === 'darwin'
+      ? [{ fixture: 'no shebang', text: 'exit 0\n', thrown: 'ENOEXEC' }]
+      : []),
+    { fixture: 'missing interpreter', text: `#!${join(directory, 'absent')}\n`, thrown: null },
+  ];
+  for (const row of rows) {
+    const executable = join(directory, row.fixture.replaceAll(' ', '-'));
+    writeFileSync(executable, row.text, { mode: 0o755 });
+    const events: string[] = [];
+    let command: OwnedCommand | undefined;
+    let thrown: string | null = null;
+    try {
+      command = new OwnedCommand({
+        streaming: true,
+        operationId: 'cmd_unlaunched',
+        executable,
+        executableIdentity: 'verified-prelaunch-sha256',
+        executableSha256: createHash('sha256').update(row.text).digest('hex'),
+        argv: [],
+        directory,
+        environment: { HOME: directory, LANG: 'C' },
+        lifecycle: ownership(events),
+      });
+    } catch (error) {
+      thrown = (error as NodeJS.ErrnoException).code ?? null;
+    }
+    if (command) {
+      await Promise.all([
+        collect(command.stdoutStream),
+        collect(command.stderrStream),
+        command.exited,
+        command.closed,
+      ]);
+      await assert.rejects(command.inputCompleted);
+      assert.equal(await command.quiescent(), true, row.fixture);
+      assert.equal(command.ownershipUnknown, false, row.fixture);
+    }
+    assert.deepEqual([thrown, events], [row.thrown, ['intent', 'unlaunched']], row.fixture);
+  }
 });
 
 test('an owned command accepts a client build up to 512 MiB and refuses a larger one', (t) => {

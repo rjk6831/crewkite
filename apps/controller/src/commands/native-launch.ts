@@ -66,9 +66,15 @@ export class NativeLaunchCommands {
     return {
       beforePhase: (phase) => {
         current();
-        this.store.transaction(() =>
-          this.store.intendNativePhase(attempt.id, phase.sequence, phase.kind, this.now()),
-        );
+        this.store.transaction(() => {
+          this.store.intendNativePhase(attempt.id, phase.sequence, phase.kind, this.now());
+          this.store.recordLaunchIdentity(
+            'native-phase',
+            `${attempt.id}:${phase.sequence}`,
+            this.launchIdentity,
+            this.now(),
+          );
+        });
       },
       owned: (phase, group) => {
         this.store.transaction(() => this.store.ownNativePhase(attempt.id, phase.sequence, group));

@@ -148,6 +148,9 @@ test('a turn sits right after the user message that started it', () => {
       endedAt: stamp,
       failure: null,
       handoffFrom: null,
+      rules: null,
+      designSystem: null,
+      spend: null,
       ...more,
     }) satisfies ChatTurn;
   const meta = (turn: ChatTurn, cursor: number): ThreadEvent => ({
@@ -632,6 +635,9 @@ test('the limit offer shows only while the newest turn is the one that hit a lim
     endedAt: stamp,
     failure: state === 'failed' ? failure(cause) : null,
     handoffFrom: null,
+    rules: null,
+    designSystem: null,
+    spend: null,
     ...(stopReason ? { stopReason } : {}),
   });
   const thread: ChatThread = {
@@ -828,6 +834,9 @@ test('the thread moves away from the family of its newest assistant turn, even o
       endedAt: stamp,
       failure: state === 'failed' ? limit : null,
       handoffFrom: null,
+      rules: null,
+      designSystem: null,
+      spend: null,
     } satisfies ChatTurn,
   });
   const fold = (events: ThreadEvent[]) =>
@@ -916,6 +925,9 @@ test('a reply restored from a thread read keeps the role, effort and stats of it
         endedAt: stamp,
         failure: null,
         handoffFrom: null,
+        rules: null,
+        designSystem: null,
+        spend: null,
         stats,
       },
     ],
@@ -1401,6 +1413,9 @@ test('Load earlier pages older messages in by the oldest cursor until a page say
     endedAt: stamp,
     failure: null,
     handoffFrom: null,
+    rules: null,
+    designSystem: null,
+    spend: null,
   });
   const read = (
     messages: ChatMessage[],
@@ -1581,6 +1596,9 @@ test('an output limit and a model change reach the view with the numbers and the
     endedAt: startedAt,
     failure: null,
     handoffFrom: null,
+    rules: null,
+    designSystem: null,
+    spend: null,
     ...(outputLimit ? { outputLimit } : {}),
   });
   const note: ChatMessage = {

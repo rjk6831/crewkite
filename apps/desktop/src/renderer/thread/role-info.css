@@ -2,7 +2,7 @@
 .role-name {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-2);
   min-width: 0;
 }
 .role-info {
@@ -36,11 +36,11 @@
   z-index: 30;
   width: max-content;
   max-width: min(240px, 60vw);
-  padding: 7px 9px;
+  padding: var(--space-4) var(--space-5);
   border: 1px solid var(--border-strong);
-  border-radius: 6px;
+  border-radius: var(--radius-3);
   background: var(--surface-raised);
-  box-shadow: 0 8px 24px rgb(0 0 0 / 0.25);
+  box-shadow: var(--shadow-tooltip);
   color: var(--text);
   font-size: 11px;
   font-weight: 400;

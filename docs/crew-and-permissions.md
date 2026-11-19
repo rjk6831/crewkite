@@ -9,8 +9,8 @@ The scratch copy is the thread's own working copy of the project. Nothing a turn
 | Mode | What runs after a builder turn | What asks | What runs on its own |
 |------|--------------------------------|-----------|----------------------|
 | Manual | Nothing. Every step is a message. A plan waits for Run on each slice or Run plan. | Whatever the Permissions policy says. | Nothing beyond the policy. |
-| Balanced | The reviewer, up to two fixer rounds, the challenger, then one closing line. A plan waits for Run plan, with a family picker per slice. | A command outside the read-only set, network access, an edit outside the scratch copy, a delete and any tool CrewKite cannot classify. The Permissions policy does not apply to the builder. | Read-only commands inside the scratch copy, edits inside it that are not deletes, and the project checks after each fix. |
-| Glide | The same chain, to the end. A plan starts at once and shows Stop. | Only what the Permissions policy does not cover. | Read-only commands inside the scratch copy, and everything the policy allows. |
+| Balanced | The project checks that are on, the reviewer, up to two fixer rounds, the challenger, then one closing line. A plan waits for Run plan, with a family picker per slice. | A command outside the read-only set, network access, an edit outside the scratch copy, a delete and any tool CrewKite cannot classify. The Permissions policy does not apply to the builder. | Read-only commands inside the scratch copy, edits inside it that are not deletes, and, once I allow them for the thread, the project checks after each writing turn. |
+| Glide | The same chain, to the end. A plan starts at once and shows Stop. | Only what the Permissions policy does not cover, a check whose command or script changed, and a project's design preview, once per thread, even under Allow all. | Read-only commands inside the scratch copy, and everything the policy allows. |
 
 A thread with no crew is Manual. Entering Glide turns automatic handoff on. If I turn it off, Glide stops on a usage limit like the other modes.
 

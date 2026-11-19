@@ -1,13 +1,13 @@
 /* The usage numbers of a thread or a project: figures and small tables, no chart. */
 .an {
   display: grid;
-  gap: 12px;
+  gap: var(--space-6);
   font-size: 13px;
 }
 .an-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-4);
 }
 .an-problem {
   color: var(--red);
@@ -15,7 +15,7 @@
 .an-totals {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(140px, 1fr));
-  gap: 8px 14px;
+  gap: var(--space-4) var(--space-7);
   margin: 0;
 }
 .an-totals dt {
@@ -23,7 +23,7 @@
   font-size: 11.5px;
 }
 .an-totals dd {
-  margin: 2px 0 0;
+  margin: var(--space-1) 0 0;
   font-variant-numeric: tabular-nums;
   overflow-wrap: anywhere;
 }
@@ -36,14 +36,14 @@
   font-variant-numeric: tabular-nums;
 }
 .an-table caption {
-  padding-bottom: 4px;
+  padding-bottom: var(--space-2);
   color: var(--text-dim);
   font-size: 11.5px;
   text-align: left;
 }
 .an-table th,
 .an-table td {
-  padding: 4px 10px 4px 0;
+  padding: var(--space-2) var(--space-5) var(--space-2) 0;
   border-bottom: 1px solid var(--border);
   text-align: left;
   white-space: nowrap;
@@ -65,7 +65,7 @@
 }
 .an-list {
   display: grid;
-  gap: 4px;
+  gap: var(--space-2);
   margin: 0;
   padding: 0;
   list-style: none;
@@ -73,7 +73,7 @@
 }
 /* A provider's name heads its allowance rows. */
 .an-table tr.an-group th {
-  padding-top: 10px;
+  padding-top: var(--space-5);
   border-bottom: 0;
   color: var(--text-dim);
   font-size: 11.5px;
@@ -84,6 +84,6 @@
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px 10px;
-  margin-top: 8px;
+  gap: var(--space-4) var(--space-5);
+  margin-top: var(--space-4);
 }

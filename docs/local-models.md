@@ -1,6 +1,6 @@
 # Local models and the context window
 
-A local model on a laptop usually runs with a small context window. At a few thousand tokens one medium source file can fill it. The local runtime's own chat keeps every message and file you paste. When the window is full it stops or drops the oldest messages, depending on its overflow setting. CrewKite runs the agent loop for Local itself, so it decides what goes into each prompt. CrewKite holds no context size of its own. It reads the context from the loaded instance and sizes every budget from that number. This page explains how a repository task fits, how Local connects and gives a demo you can run. Setup and the tool bounds are under [Local](providers.md#local) in the provider routes.
+A local model on a laptop usually runs with a small context window. At a few thousand tokens one medium source file can fill it. The local runtime's own chat keeps every message and file you paste. When the window is full it stops or drops the oldest messages, depending on its overflow setting. CrewKite runs the agent loop for Local itself, so it decides what goes into each prompt. CrewKite reads the context from the loaded instance and sizes every budget from that number. It holds a size of its own only for an OpenAI-compatible server that reports none, as described below. This page explains how a repository task fits, how Local connects and gives a demo you can run. Setup and the tool bounds are under [Local](providers.md#local) in the provider routes.
 
 ## Connect
 
@@ -27,6 +27,20 @@ After a connect that used a token, the card offers "Remember the token on this d
 The blob belongs to one endpoint in Token mode. A different host or port does not find it, and a changed endpoint or a saved no-token mode deletes it.
 
 The option is offered only when the storage really encrypts. On Linux the fallback backend is `basic_text`, which uses a fixed key, so a blob under it is a plain file with extra steps. There the option is hidden and the card says "This device has no keychain that encrypts stored secrets, so the token is asked for each launch." The token is asked for at each launch, as before. This is the one secret CrewKite can keep, and it is the token of a runtime on this device, not a provider credential.
+
+## OpenAI-compatible servers
+
+Local also connects to a server that speaks the OpenAI chat API, such as Ollama or llama.cpp. Type its address in the Local endpoint field, for example `http://127.0.0.1:11434`. A trailing `/v1` is dropped. The address has to be on this computer or a private network: loopback, 10.x, 172.16 to 172.31, 192.168.x, link-local, an IPv6 local address or a `.local` name. A name is resolved when Local connects, refreshes and starts a turn, and every address it resolves to has to be in those ranges, or Local does not connect. An http or https address marks the server as this kind, and a `ws://` address stays the LM Studio endpoint, so a saved setup keeps working. A server on another machine receives each prompt, project files included, over plain http unless its address is https.
+
+CrewKite sends no key or token to these servers, so it holds no secret for them. Connect skips the probe and the token window above, and a server that wants a key does not connect. Connect and Refresh model list read `/v1/models` from the controller itself, with no client process. The first eight models count as loaded and can be picked. Up to 64 are listed, and the rest show as not loaded. A turn streams through `/v1/chat/completions` with the tools offered as functions. When the server refuses tools for a model, CrewKite asks again in plain text and reads the tool calls the model writes into its reply, so the bounded tool loop below still holds.
+
+These servers report less than LM Studio, so a few values are fallbacks:
+
+- The window. CrewKite takes it from the model entry (`max_model_len`, `context_length` or `meta.n_ctx`), then from llama.cpp's `/props`, and assumes 4,096 tokens when nothing reports one. A server that runs a larger window than it reports gets a smaller prompt than it could hold.
+- Token counts. No tokenizer route exists, so the reply budget and the fold count one token for every 3 bytes, the estimate the slice fit check uses. That never undercounts text or code, and it leaves part of the window unused.
+- The format. The card shows every model as GGUF, since the server does not name its file format and Ollama and llama.cpp serve GGUF.
+
+These servers take no images, and the file writer profile stays on the LM Studio endpoint. The card keeps the Local billing line: no provider billing. I have run this path against a fake server only. Ollama and llama.cpp still have to qualify live.
 
 ## What the card shows
 

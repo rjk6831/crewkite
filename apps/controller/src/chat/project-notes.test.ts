@@ -16,6 +16,7 @@ import { createDemoFixtures, createTestClock, createTestIds } from '@crewkite/te
 import { createScriptedChatAdapter } from '@crewkite/testkit/chat-adapter';
 import { createSyntheticRepository } from '@crewkite/testkit/repository';
 import { ArtifactFiles } from '../artifacts/index.ts';
+import { RemoteEffects } from '../github/effects.ts';
 import { Store } from '../store/index.ts';
 import { NotesRefused, ProjectNotes } from './project-notes.ts';
 import {
@@ -340,6 +341,13 @@ function chatHarness(
     projectNotes: (projectId) => (projectId === project.id ? notesNow() : []),
     resolveSelection: (_taskId, value) => value ?? null,
     catalog: () => ({ families: [] }),
+    remoteEffects: new RemoteEffects({
+      store,
+      home: directory,
+      now: clock.now,
+      id: () => ids('rfx'),
+      projectPath: () => repository.directory,
+    }),
   });
   const settled = () =>
     new Promise<void>((resolve) => {
@@ -413,13 +421,21 @@ test('each family receives the notes with every turn, in its context or in the r
       if (now.length > 0)
         assert.ok(request.systemContext.includes(section(...now)), `${family} ${step.name}`);
       if (request.session === null) {
-        assert.equal(request.prompt.includes('CrewKite attaches'), false, `${family} ${step.name}`);
+        assert.equal(
+          request.prompt.includes('attaches the current notes'),
+          false,
+          `${family} ${step.name}`,
+        );
         continue;
       }
       const carries = step.carries;
       if (carries) assert.match(request.prompt, carries, `${family}: ${step.name}`);
       else
-        assert.equal(request.prompt.includes('CrewKite attaches'), false, `${family} ${step.name}`);
+        assert.equal(
+          request.prompt.includes('attaches the current notes'),
+          false,
+          `${family} ${step.name}`,
+        );
     }
   }
   // A resuming family does resume here, so the resumed rows above are not vacuous.

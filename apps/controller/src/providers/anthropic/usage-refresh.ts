@@ -559,11 +559,18 @@ export class AnthropicUsageRefresh {
    * The gauge reads on its own when the controller starts, after each chat turn settles, since a
    * turn spent some allowance, and every five minutes while no Anthropic turn runs. It reads only
    * when the client resolves, the last read is more than a minute old and no other read runs.
-   * Anything else skips it without a receipt.
+   * While another read runs, the caller waits for that one, so a caller that needs a fresh
+   * reading gets the read already on its way. Anything else skips it without a receipt.
    */
   refreshWhenDue(key: string): Promise<unknown> | undefined {
     try {
-      if (this.closed || this.active || this.blocker() || this.options.blocked()) return;
+      if (this.closed) return;
+      if (this.active)
+        return this.active.done.then(
+          () => undefined,
+          () => undefined,
+        );
+      if (this.blocker() || this.options.blocked()) return;
       const binding = this.binding();
       if (!binding) return;
       const previous = this.state();

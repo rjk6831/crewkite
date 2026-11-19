@@ -394,12 +394,6 @@ export function GoogleSetup({
     cancelling: cancelBusy,
     label: primaryLabel,
   });
-  const googleAccount =
-    setup?.auth.status === 'authenticated'
-      ? 'Signed in'
-      : setup?.auth.status === 'required'
-        ? 'Sign-in required'
-        : 'Unknown';
   const codingReady = ready && profile?.available === true;
   if (installStep && stepSince.current?.key !== installStep)
     stepSince.current = { key: installStep, at: Date.now() };
@@ -477,7 +471,6 @@ export function GoogleSetup({
       </details>
       <div className="facts-grid compact">
         <Fact label="Official client" value={officialClient} />
-        <Fact label="Google account" value={googleAccount} />
         <Fact label="Coding setup ready" value={codingReady ? 'Yes' : 'No'} />
         <Fact label="Quota available" value={quotaAvailable} />
       </div>

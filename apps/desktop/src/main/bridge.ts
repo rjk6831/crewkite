@@ -9,9 +9,14 @@ import {
   statSync,
   writeFileSync,
 } from 'node:fs';
-import { dirname, extname, relative, sep } from 'node:path';
-import { analyticsToCsv, promptsToJson } from '@crewkite/client';
-import { type ControllerClient, createCommandKey, transferArtifact } from '@crewkite/client/node';
+import { basename, dirname, extname, relative, sep } from 'node:path';
+import { analyticsToCsv, exportResults, promptsToJson } from '@crewkite/client';
+import {
+  type ControllerClient,
+  createCommandKey,
+  replaceFile,
+  transferArtifact,
+} from '@crewkite/client/node';
 import {
   ArtifactSchema,
   ArtifactVerificationSchema,
@@ -32,6 +37,7 @@ import {
   projectNotesMarkdown,
   ReadChatAnalyticsPayloadSchema,
   ReadProjectNotesPayloadSchema,
+  ReadResultsPayloadSchema,
   SnapshotSchema,
   SnapshotScopeSchema,
 } from '@crewkite/contracts';
@@ -41,6 +47,7 @@ import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
 import { installDiagnostics } from './diagnostics.ts';
 import { ExportStage } from './export.ts';
+import { installFeedback } from './feedback.ts';
 import { PathGrants, storedAttachmentPath } from './grants.ts';
 import {
   controllerPort,
@@ -50,7 +57,7 @@ import {
 } from './local-token.ts';
 import { McpVault, supplyMcp } from './mcp-vault.ts';
 import { CommandReceipts, sendRetained, syncDirectory } from './receipts.ts';
-import { type DesktopController, desktopActor } from './runtime.ts';
+import { type DesktopController, desktopActor, offlineNotice } from './runtime.ts';
 import { saveTextFile } from './save-file.ts';
 import { assertSender, openExternalLink } from './security.ts';
 
@@ -198,6 +205,8 @@ export async function installBridge(
     'local-token-remember',
     'local-token-forget',
     'export-diagnostics',
+    'feedback-draft',
+    'feedback-send',
     'dismiss-crash',
     'export-preview',
     'export-save',
@@ -209,6 +218,7 @@ export async function installBridge(
     send,
     notice,
   });
+  installFeedback(window);
   ipcMain.handle('crewkite:verify-artifact', async (event, input: unknown) => {
     assertSender(event, window);
     if (
@@ -312,11 +322,49 @@ export async function installBridge(
         'SetDefaultCrew',
         'ImportSavedCrews',
         'SetCreditSpending',
+        'ReadConnections',
+        'ReadWebhook',
+        // A sign-in check waits up to 30 s on the connection's own client. It holds no lock, so the
+        // window stays usable meanwhile, and it writes no receipt: a repeat only reads again.
+        'ProveConnection',
+        'AssignConnection',
+        'UnassignConnection',
+        'SetKeepConnected',
+        'DisconnectConnection',
+        'ForgetConnection',
         'SetFamilyModel',
         'RefreshChatModels',
         'ReadChatBranchStatus',
         'PushChatBranch',
         'OpenChatPullRequest',
+        'CheckChatMerge',
+        'ReadRemoteEffects',
+        'ReadAcceptance',
+        'CancelAcceptance',
+        'ReadDependencyPreparation',
+        // A copy can take minutes. It holds no lock, so the window stays usable meanwhile, and
+        // it writes no receipt: the controller refuses a second one for the same copy.
+        'PrepareDependencies',
+        // A draft saves nothing and can take three minutes, so it must not hold the window's lock.
+        'DraftDesignSystem',
+        // Recipe, schedule and result reads change nothing, so none of them holds the window's
+        // lock. A check resolution reads git, and an export reads its records one page at a time.
+        'ReadRecipes',
+        'ReadRecipe',
+        'ResolveRecipeChecks',
+        'DraftRecipe',
+        'ReadSchedules',
+        'ReadRecipeRuns',
+        'ReadResults',
+        'ExportResults',
+        'ProposeRemoteEffect',
+        'ConfirmRemoteEffect',
+        'CancelRemoteEffect',
+        'ReconcileRemoteEffect',
+        'SettleRemoteEffect',
+        'ReadRemoteEffectPreview',
+        'ReadReviewComments',
+        'ReadMergeReadiness',
         'GetProjectOperation',
         'PrepareProjectCommand',
         'StartProjectCommand',
@@ -334,6 +382,8 @@ export async function installBridge(
         'AuthenticateGoogleAcp',
         'DiscoverGoogleAcp',
         'StopGoogleAcpSetup',
+        'RecoverGoogleMetadata',
+        'RefreshGoogleAcpModels',
         'AcknowledgeGoogleTerms',
         'SignInOpenAi',
         'SignOutOpenAi',
@@ -707,6 +757,42 @@ export async function installBridge(
     }
     return 'saved';
   });
+  // The recorded results are the controller's. Main reads every page, so the page never supplies
+  // the bytes or a path, and the person picks where the file goes.
+  ipcMain.handle('crewkite:save-results', async (event, projectId: unknown) => {
+    assertSender(event, window);
+    if (!client) throw new Error('The controller is offline.');
+    const payload = ReadResultsPayloadSchema.safeParse({ projectId });
+    if (!payload.success) throw new Error('Choose a project to export.');
+    const results = await exportResults(
+      (request) =>
+        send(
+          CommandSchema.parse({
+            protocol: 1,
+            key: createCommandKey(),
+            actor: desktopActor,
+            command: 'ExportResults',
+            payload: request,
+          }),
+        ),
+      payload.data,
+      () => new Date(),
+    );
+    const choice = await dialog.showSaveDialog(window, {
+      title: 'Export results',
+      defaultPath: 'crewkite-results.json',
+      filters: [{ name: 'JSON', extensions: ['json'] }],
+    });
+    assertSender(event, window);
+    if (choice.canceled || !choice.filePath) return 'cancelled';
+    try {
+      // Whole or not at all, and never through a link: the same write the CLI's export makes.
+      replaceFile(choice.filePath, `${JSON.stringify(results, null, 2)}\n`);
+    } catch {
+      throw new Error('The file could not be written there. Choose another place.');
+    }
+    return { records: results.records.length, file: basename(choice.filePath) };
+  });
   // The usage numbers are the controller's. Main reads them for the thread or project the page
   // names, so the page never supplies the bytes, and the person picks where the file goes.
   ipcMain.handle('crewkite:save-analytics', async (event, input: unknown) => {
@@ -843,10 +929,10 @@ export async function installBridge(
           },
         },
       );
-    } catch {
+    } catch (error) {
       controller.resetClient();
       client = null;
-      connection = { kind: 'connection', state: 'offline', reconnectAvailable: true };
+      connection = offlineNotice(error);
       notice(connection);
     }
   }

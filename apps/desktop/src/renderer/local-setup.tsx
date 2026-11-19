@@ -2,6 +2,7 @@ import type { LocalTokenStatus } from '@crewkite/client';
 import {
   LocalEndpointSchema,
   type LocalSetup as LocalSetupState,
+  localOpenAiOrigin,
   type WorkspaceState,
 } from '@crewkite/contracts';
 import { useCallback, useEffect, useId, useRef, useState } from 'react';
@@ -75,7 +76,14 @@ export function LocalSetup({
   const mounted = useRef(true);
   const titleId = useId();
   const endpointErrorId = useId();
-  const parsedEndpoint = LocalEndpointSchema.safeParse(endpoint);
+  // An LM Studio socket, or the address of an OpenAI-compatible server with or without /v1.
+  const lmStudio = LocalEndpointSchema.safeParse(endpoint);
+  const openAi = localOpenAiOrigin(endpoint);
+  const parsedEndpoint = lmStudio.success
+    ? lmStudio
+    : openAi
+      ? { success: true as const, data: openAi }
+      : lmStudio;
   const endpointError = endpoint.length > 0 && !parsedEndpoint.success;
   const connected = workspace.connection === 'connected' && !workspace.preview;
   const busy = Boolean(workspace.pending || requested);
@@ -437,7 +445,7 @@ export function LocalSetup({
         Local endpoint
         <input
           value={endpoint}
-          placeholder="ws://127.0.0.1:port"
+          placeholder="ws://127.0.0.1:port or http://host:port"
           spellCheck={false}
           disabled={busy}
           aria-invalid={endpointError}
@@ -452,7 +460,8 @@ export function LocalSetup({
       </label>
       {endpointError && (
         <p className="notice" role="alert" id={endpointErrorId}>
-          Use ws://127.0.0.1 with a port from 1 to 65535.
+          Use ws://127.0.0.1 with a port from 1 to 65535, or the http or https address of an
+          OpenAI-compatible server on this computer or your local network.
         </p>
       )}
       <div className="button-row">

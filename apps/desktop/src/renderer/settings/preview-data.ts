@@ -210,6 +210,7 @@ export function settingsPreview(routes: Snapshot['routes'], now: string) {
       auth: { method: 'oauth-personal', status: 'required' },
       reason: 'authentication-required',
       googleTerms: null,
+      modelRefresh: null,
     },
     localSetup: {
       revision: 5,

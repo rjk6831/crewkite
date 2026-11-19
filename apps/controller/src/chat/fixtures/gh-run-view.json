@@ -1,0 +1,28 @@
+{
+  "attempt": 2,
+  "headSha": "__COMMIT__",
+  "jobs": [
+    {
+      "databaseId": 9001,
+      "name": "lint",
+      "status": "completed",
+      "conclusion": "success",
+      "url": "https://github.com/rjk6831/demo-shop/actions/runs/101/job/9001",
+      "startedAt": "2026-10-24T08:00:05Z",
+      "completedAt": "2026-10-24T08:01:10Z",
+      "steps": [{ "name": "Run lint", "status": "completed", "conclusion": "success", "number": 3 }]
+    },
+    {
+      "databaseId": 9002,
+      "name": "test",
+      "status": "completed",
+      "conclusion": "failure",
+      "url": "https://github.com/rjk6831/demo-shop/actions/runs/101/job/9002",
+      "startedAt": "2026-10-24T08:00:05Z",
+      "completedAt": "2026-10-24T08:02:44Z",
+      "steps": [
+        { "name": "Run tests", "status": "completed", "conclusion": "failure", "number": 4 }
+      ]
+    }
+  ]
+}

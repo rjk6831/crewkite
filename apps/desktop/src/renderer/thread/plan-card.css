@@ -1,10 +1,10 @@
 /* The plan card: goal, one row per slice, and the actions the flight mode allows. */
 .th-plan {
   display: grid;
-  gap: 10px;
-  padding: 12px 14px;
+  gap: var(--space-5);
+  padding: var(--space-6) var(--space-7);
   border: 1px solid var(--border-strong);
-  border-radius: 12px;
+  border-radius: var(--radius-6);
   background: var(--surface);
   font-size: 13px;
 }
@@ -12,7 +12,7 @@
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  gap: 4px 12px;
+  gap: var(--space-2) var(--space-6);
 }
 .th-plan-head h3 {
   font-size: 13px;
@@ -32,23 +32,23 @@
 }
 .th-plan-slices {
   display: grid;
-  gap: 8px;
+  gap: var(--space-4);
   margin: 0;
   padding: 0;
   list-style: none;
 }
 .th-plan-slice {
   display: grid;
-  gap: 4px;
-  padding: 8px 10px;
+  gap: var(--space-2);
+  padding: var(--space-4) var(--space-5);
   border: 1px solid var(--border);
-  border-radius: 9px;
+  border-radius: var(--radius-5);
 }
 .th-plan-line {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px 10px;
+  gap: var(--space-3) var(--space-5);
 }
 .th-plan-id {
   display: inline-grid;
@@ -73,7 +73,7 @@
 .th-plan-status {
   display: inline-flex;
   align-items: center;
-  gap: 5px;
+  gap: var(--space-3);
   color: var(--text-muted);
   font-size: 11.5px;
 }
@@ -90,7 +90,7 @@
 .th-plan-where {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   color: var(--text-muted);
   font-size: 12px;
 }
@@ -110,5 +110,5 @@
 .th-plan-actions {
   display: flex;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-4);
 }

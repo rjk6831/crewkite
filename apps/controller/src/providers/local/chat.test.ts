@@ -488,6 +488,35 @@ test('the local client is disposed when the turn ends', async () => {
   }
 });
 
+test('a Local turn is done only when its last round found the end of its reply, and any other end is completion-unknown, never a fit failure', async () => {
+  const { root, clock, request } = fixture();
+  const ended = (stopReason?: string): Round[] => [
+    { steps: [{ text: 'Done.' }], stats: { stopReason } as Round['stats'] },
+  ];
+  try {
+    const rows: Array<{ label: string; rounds: Round[]; expected: [string, string | null] }> = [
+      { label: 'eosFound', rounds: ended('eosFound'), expected: ['done', null] },
+      { label: 'stopStringFound', rounds: ended('stopStringFound'), expected: ['done', null] },
+      { label: 'toolCalls', rounds: ended('toolCalls'), expected: ['error', 'completion-unknown'] },
+      {
+        label: 'userStopped',
+        rounds: ended('userStopped'),
+        expected: ['error', 'completion-unknown'],
+      },
+      { label: 'no reason', rounds: ended(), expected: ['error', 'completion-unknown'] },
+      { label: 'no round', rounds: [], expected: ['error', 'completion-unknown'] },
+    ];
+    for (const row of rows) {
+      const turn = start(fakeModel(row.rounds, clock).model, 8192, request(0));
+      const { stopReason, failure } = await turn.handle.result;
+      assert.deepEqual([stopReason, failure?.kind ?? null], row.expected, row.label);
+      assert.equal(isLocalFitFailure(failure), false, row.label);
+    }
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test('a tool call written as text parses in each form small models use', () => {
   const read = { name: 'read_range', arguments: { path: 'src/a.ts', start: 1, end: 2 } };
   const cases: [form: string, text: string, calls: unknown[], rest: string][] = [

@@ -21,7 +21,18 @@ const files = [
     left.localeCompare(right),
 );
 if (files.length === 0) throw new Error('No repository tests were found.');
-const tests = run({ files, concurrency: 3 });
+// CI splits the files across jobs so each fits its window. Node takes every total-th file of the
+// sorted list, so the shards together run every file once and the two slowest land apart.
+const shardSetting = process.env.CREWKITE_TEST_SHARD;
+let shard;
+if (shardSetting !== undefined) {
+  const match = /^([1-9]\d*)\/([1-9]\d*)$/.exec(shardSetting);
+  if (!match || Number(match[1]) > Number(match[2]))
+    throw new Error('CREWKITE_TEST_SHARD must read index/total, for example 1/2.');
+  shard = { index: Number(match[1]), total: Number(match[2]) };
+  process.stderr.write(`Test shard ${shard.index} of ${shard.total}.\n`);
+}
+const tests = run({ files, concurrency: 3, ...(shard ? { shard } : {}) });
 const label = (value, limit) =>
   typeof value === 'string'
     ? Array.from(value.replace(/\p{Cc}/gu, ' ').toWellFormed())

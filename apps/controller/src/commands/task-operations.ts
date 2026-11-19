@@ -27,7 +27,7 @@ import type { ArtifactFiles } from '../artifacts/index.ts';
 import { type GitHubExecutable, githubReadArgv, startGitHubRead } from '../github/read.ts';
 import { committedFiles, git, inspectSource, materialize } from '../host/source.ts';
 import { groupAbsent, verifyOwnedCommandExecutable } from '../host/worker.ts';
-import type { Store } from '../store/index.ts';
+import type { LaunchIdentity, Store } from '../store/index.ts';
 import { liveOperations } from './live-operations.ts';
 import { type OperationRecord, OperationStore } from './operation-store.ts';
 import { createOwnedProjectCommandRunner } from './owned-runner.ts';
@@ -52,6 +52,7 @@ type Dependencies = {
   now: () => string;
   id: (prefix: 'cmd' | 'art') => string;
   event: (record: OperationRecord) => void;
+  launchIdentity?: LaunchIdentity;
 };
 
 export function executablePin(input: string) {
@@ -124,7 +125,12 @@ export class TaskOperations {
   private readonly options: Dependencies;
   constructor(options: Dependencies) {
     this.options = options;
-    this.journal = new OperationStore(options.store, options.now, options.event);
+    this.journal = new OperationStore(
+      options.store,
+      options.now,
+      options.event,
+      options.launchIdentity,
+    );
   }
   recover() {
     this.journal.recover(groupAbsent, new Set([...this.active.keys(), ...liveOperations]));
@@ -405,6 +411,9 @@ export class TaskOperations {
       quiescent: (group) => {
         this.journal.phase(id, phase, 'closed', group);
       },
+      unlaunched: () => {
+        this.journal.unlaunched(id, phase);
+      },
     };
   }
   private async publish(
@@ -547,10 +556,12 @@ export class TaskOperations {
       }
     })();
     this.active.set(record.id, { key: command.key, hash, stop, promise });
+    liveOperations.add(record.id);
     try {
       return await promise;
     } finally {
       this.active.delete(record.id);
+      liveOperations.delete(record.id);
     }
   }
   private complete(
@@ -587,6 +598,18 @@ export class TaskOperations {
     );
     return response;
   }
+  private acceptedCommit(taskId: string): string | null {
+    const row = this.options.store.db
+      .prepare('SELECT body FROM chat_threads WHERE task_id=?')
+      .get(taskId);
+    if (!row) return null;
+    try {
+      const commit = JSON.parse(row.body as string)?.lastAcceptance?.commit;
+      return typeof commit === 'string' ? commit : null;
+    } catch {
+      return null;
+    }
+  }
   private async github(
     command: Extract<TaskOperationCommand, { command: 'ReadGitHub' }>,
     task: Task,
@@ -596,8 +619,10 @@ export class TaskOperations {
     const root = this.root(task);
     const requested = command.payload.request;
     const source = inspectSource(task.projectId, root);
-    if (source.base !== requested.headSha)
-      throw Error('Choose the registered project committed head.');
+    // A chat Accept leaves the checkout alone, so the thread's accepted commit is the other
+    // commit a read may bind to.
+    if (source.base !== requested.headSha && this.acceptedCommit(task.id) !== requested.headSha)
+      throw Error('Choose the registered project committed head or the accepted chat commit.');
     const origin = git(root, ['remote', 'get-url', 'origin']).toString('utf8').trim();
     const repository = requested.repository;
     const allowed = [
@@ -687,10 +712,12 @@ export class TaskOperations {
         );
       });
     this.active.set(record.id, { key: command.key, hash, stop: execution.stop, promise });
+    liveOperations.add(record.id);
     try {
       return await promise;
     } finally {
       this.active.delete(record.id);
+      liveOperations.delete(record.id);
     }
   }
   stopTask(taskId: string) {

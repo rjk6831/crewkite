@@ -45,13 +45,13 @@ test('a finished or failed reply, a waiting permission and a crew end post a not
       [],
     ],
     [
-      'a reply that ends in an error or a usage limit while unfocused posts a failed notice',
+      'a reply that ends in an error or a usage limit while unfocused posts a failed or limit notice',
       () => [
         streamed(other, { type: 'turn.completed', stopReason: 'error' }),
         streamed(open, { type: 'turn.completed', stopReason: 'limit' }),
       ],
       away,
-      [`${other}:failed`, `${open}:failed`],
+      [`${other}:failed`, `${open}:limit`],
     ],
     [
       'a failed reply in the open thread posts nothing',

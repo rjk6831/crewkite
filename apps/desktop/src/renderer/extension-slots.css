@@ -3,12 +3,12 @@
   display: inline-flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
 }
 .th-extension-output {
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  gap: var(--space-3);
   max-width: 420px;
   font-size: 12px;
 }
@@ -18,8 +18,8 @@
 .st-extension-manifest dl {
   display: grid;
   grid-template-columns: max-content 1fr;
-  gap: 2px 12px;
-  margin: 6px 0 0;
+  gap: var(--space-1) var(--space-6);
+  margin: var(--space-3) 0 0;
   font-size: 12px;
 }
 .st-extension-manifest dd {

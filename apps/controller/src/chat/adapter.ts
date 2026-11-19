@@ -1,5 +1,6 @@
 import type {
   AgentEvent,
+  BillingMode,
   ChatAttachment,
   ChatFailure,
   ChatFamily,
@@ -9,6 +10,7 @@ import type {
   ChatRole,
   ChatSession,
   ChatToolKind,
+  Spend,
 } from '@crewkite/contracts';
 import { LOW_ALLOWANCE_PERCENT } from '@crewkite/contracts';
 import type { ThreadMcp } from './mcp-servers.ts';
@@ -29,6 +31,19 @@ export type ChatTurnRequest = Readonly<{
    * run past the included allowance on credits the provider reports usable, and on nothing else.
    */
   creditSpending?: boolean;
+  /**
+   * The connection the person assigned for this turn, which the controller admitted on its last
+   * proof. The adapter runs it on the connection's own profile and reads the client's billing mode
+   * there before it sends anything. A mode other than `billingMode` fails the turn unsent. A change
+   * it sees after sending stops the turn and leaves its cost unreported, never free. Absent: the
+   * family's own route.
+   */
+  connection?: Readonly<{
+    connectionId: string;
+    billingMode: BillingMode;
+    profileId: string;
+    proofGeneration: number;
+  }>;
   /** The user's text for this turn. A handoff packet is prepended by the controller. */
   prompt: string;
   /**
@@ -117,6 +132,11 @@ export type ChatTurnResult = Readonly<{
   changedPaths: readonly string[];
   /** Set when the reply stopped at the output limit. The stop reason stays done. */
   outputLimit?: ChatOutputLimit;
+  /**
+   * What the client reported, or the adapter estimated, for a turn on an API connection. Absent
+   * leaves the turn counted as unreported.
+   */
+  spend?: Spend;
 }>;
 
 export type ChatTurnHandle = Readonly<{
@@ -137,6 +157,11 @@ export type ChatTurnHandle = Readonly<{
 
 export interface ChatAdapter {
   readonly family: ChatFamily;
+  /**
+   * The billing modes this adapter can run on a connection's own profile and prove before it
+   * sends. A turn assigned to a connection in any other mode is refused. Absent: none.
+   */
+  readonly connectionModes?: readonly BillingMode[];
   /**
    * Start one turn. Emit events in order. Resolve `result` once the native process is
    * finished, whether it succeeded, was stopped or failed. Never throw after returning.
@@ -181,6 +206,9 @@ export function chatFailure(
       stopped: 'Send a new message to continue.',
       internal: 'Send again. If it repeats, report the details.',
       'attachment-rejected': 'Try another provider for these files.',
+      incomplete: 'Send Continue to let it finish, or narrow the request.',
+      'completion-unknown':
+        'Your files are kept. Review the changes, then send again. If it repeats, report the details.',
     }[input.kind];
   return {
     stage: input.stage,

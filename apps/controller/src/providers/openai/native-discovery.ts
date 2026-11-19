@@ -158,6 +158,7 @@ export function nativeDiscoveryArguments(
 
 /** The client's private subtree inside the selected state root. */
 export const CODEX_HOME_PATH = 'providers/openai/codex-home';
+export const CODEX_PROFILES_PATH = 'providers/openai/codex-profiles';
 
 /**
  * CrewKite's own Codex home. Codex keeps its sign-in, config and saved threads there, so nothing
@@ -165,10 +166,15 @@ export const CODEX_HOME_PATH = 'providers/openai/codex-home';
  * keep this beside the controller home; source and directory builds keep it inside that home.
  */
 export function crewKiteCodexHome(source: NodeJS.ProcessEnv): string {
-  return join(providerStateRoot(source), CODEX_HOME_PATH);
+  const profile = source.CREWKITE_CODEX_PROFILE;
+  if (profile === undefined) return join(providerStateRoot(source), CODEX_HOME_PATH);
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(profile)) throw new Error('A Codex profile is a short id.');
+  // An API key login replaces the sign-in in its home, so each API connection keeps its own and
+  // the subscription sign-in in the default home stays as it was.
+  return join(providerStateRoot(source), CODEX_PROFILES_PATH, profile);
 }
 
-function providerStateRoot(source: NodeJS.ProcessEnv): string {
+export function providerStateRoot(source: NodeJS.ProcessEnv): string {
   if (source.CREWKITE_INSTALLED_STATE_ROOT !== undefined) {
     const state = resolveInstalledState(source);
     if (source.CREWKITE_INSTALLED_STATE_ROOT !== state.root)
@@ -194,6 +200,7 @@ export function nativeDiscoveryEnvironment(source: NodeJS.ProcessEnv): NodeJS.Pr
     'CREWKITE_HOME',
     'CREWKITE_PROFILE',
     'CREWKITE_INSTALLED_STATE_ROOT',
+    'CREWKITE_CODEX_PROFILE',
     'PATH',
     'TMPDIR',
     'USER',

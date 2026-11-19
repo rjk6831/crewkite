@@ -44,6 +44,7 @@ const app = (calls: string[]): PaletteApp => ({
   newThread: () => calls.push('new'),
   openSettings: () => calls.push('settings'),
   openSettingsSection: (id) => calls.push(`section:${id}`),
+  openRecipes: () => calls.push('recipes'),
   about: () => calls.push('about'),
   switchThread: (step) => calls.push(`switch:${step}`),
   addProject: null,
@@ -73,7 +74,8 @@ test('every palette entry runs an action that exists and grants nothing of its o
   byId.get('slash-new')?.run();
   byId.get('settings-st-card-openai')?.run();
   byId.get('next-thread')?.run();
-  assert.deepEqual(calls.splice(0), ['new', 'section:st-card-openai', 'switch:1']);
+  byId.get('open-recipes')?.run();
+  assert.deepEqual(calls.splice(0), ['new', 'section:st-card-openai', 'switch:1', 'recipes']);
 
   // The consequential commands are never the one Enter picks after typing.
   for (const id of ['slash-accept', 'slash-push', 'slash-pr', 'export-markdown', 'share-page'])

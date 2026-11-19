@@ -44,6 +44,7 @@ Some things never get the short version: input validation at trust boundaries, e
 - Add a dependency only with a sentence in the pull request explaining why the ladder stopped there.
 - Mark a deliberate shortcut with a `shortcut:` comment that names its limit and the upgrade path.
 - Respect the component boundaries in [docs/architecture.md](docs/architecture.md). The renderer never touches the database or launches providers.
+- Take every renderer style value from `apps/desktop/src/renderer/tokens.css`. `design-system.test.ts` fails on a raw color, a literal spacing or radius, a font family no token names or a shadow written by hand anywhere else in the renderer, and both themes must set the same tokens.
 - Changes to contracts, migrations, the lockfile or entry points land in their own pull request before the code that depends on them.
 - Agent and model product names belong only under a `providers/` directory.
 

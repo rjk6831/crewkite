@@ -1,5 +1,7 @@
 import type { ChatCheckRun, ChatChecksState, ChatThread } from '@crewkite/contracts';
 import { useEffect, useRef, useState } from 'react';
+import { PrepareButton, PrepareStatus, type Preparing } from './prepare-dependencies.tsx';
+import type { CopyNeed } from './work-view.ts';
 import './checks-card.css';
 
 const statusLabel: Record<ChatCheckRun['status'], string> = {
@@ -7,6 +9,7 @@ const statusLabel: Record<ChatCheckRun['status'], string> = {
   passed: 'Passed',
   failed: 'Failed',
   stopped: 'Stopped',
+  unknown: 'Unconfirmed',
 };
 
 const failure = (error: unknown) =>
@@ -15,27 +18,51 @@ const failure = (error: unknown) =>
 export const durationLabel = (ms: number | null) =>
   ms === null ? '' : ms < 1000 ? `${ms} ms` : `${(ms / 1000).toFixed(1)} s`;
 
+/** When a run ran: after which write or merge, or on whose request. */
+export function runMoment(run: Pick<ChatCheckRun, 'trigger' | 'slice'>): string {
+  switch (run.trigger) {
+    case 'after-write':
+      return run.slice ? `Slice ${run.slice}, after its write` : 'After a writing turn';
+    case 'combined':
+      return run.slice ? `After slice ${run.slice} merged` : 'After a merge';
+    case 'accept':
+      return 'Accept';
+    case 'manual':
+      return 'Run tests';
+    case 'fix':
+      return 'After a fix';
+    case 'plan':
+      return 'After a plan slice';
+  }
+}
+
 const sizeLabel = (bytes: number) =>
   bytes < 1024 ? `${bytes} B` : `${Math.round(bytes / 1024)} KB`;
 
 /**
- * What the project checks did in this thread: each run with its status, how long it took and the
- * tail of its output. The whole output is kept in the artifact store. Stop is offered while a run
- * is open.
+ * What the project checks did in this thread: each run with when it ran, its status, how long it
+ * took and the tail of its output. The whole output is kept in the artifact store. Stop is offered
+ * while a run is open. When the thread's dependency copy is not ready, the card says so first and
+ * offers Prepare dependencies. The gate after a writing turn prepares the copy itself and stops on
+ * that line only when it cannot.
  */
 export function ChecksCard({
   checks,
+  copy,
+  preparing,
   onStop,
   onAnswer,
 }: {
   checks: ChatChecksState;
+  copy: CopyNeed | null;
+  preparing: Preparing;
   onStop: () => Promise<void>;
   onAnswer: (requestId: string, choice: 'allow' | 'allow-thread' | 'deny') => Promise<void>;
 }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const ask = checks.ask;
-  if (checks.runs.length === 0 && !ask) return null;
+  if (checks.runs.length === 0 && !ask && !copy && !preparing.busy && !preparing.line) return null;
   const open = checks.runs.some((run) => run.status === 'running') || !!ask;
   const act = (work: Promise<void>) => {
     setBusy(true);
@@ -57,6 +84,13 @@ export function ChecksCard({
           </button>
         )}
       </header>
+      {copy && (
+        <div className="th-checks-copy">
+          <p>{copy.line}</p>
+          {copy.preparable && <PrepareButton preparing={preparing} />}
+        </div>
+      )}
+      <PrepareStatus preparing={preparing} />
       {ask && (
         <fieldset className="th-checks-ask">
           <legend className="th-sr">Allow these commands</legend>
@@ -104,14 +138,24 @@ export function ChecksCard({
       )}
       <ol className="th-checks-runs">
         {[...checks.runs].reverse().map((run) => (
-          <li key={run.id} className={`th-checks-run is-${run.status}`}>
+          <li key={run.id} className={`th-checks-item is-${run.status}`}>
             <div className="th-checks-line">
               <span className="th-checks-label">{run.label}</span>
+              <span className="th-muted">{runMoment(run)}</span>
               <span className={`th-checks-status is-${run.status}`}>{statusLabel[run.status]}</span>
               <span className="th-muted">{durationLabel(run.durationMs)}</span>
             </div>
             <p className="th-muted th-checks-command">{run.command}</p>
             {run.reason && <p className="th-checks-reason">{run.reason}</p>}
+            {run.changedPaths && run.changedPaths.length > 0 && (
+              <p className="th-muted th-checks-reason">
+                Files it changed: {run.changedPaths.join(', ')}
+                {(run.changedCount ?? 0) > run.changedPaths.length
+                  ? ` and ${(run.changedCount ?? 0) - run.changedPaths.length} more`
+                  : ''}
+                .
+              </p>
+            )}
             {run.tail && <pre className="th-checks-tail">{run.tail}</pre>}
             {(run.stdout || run.stderr) && (
               <p className="th-muted">
@@ -148,7 +192,10 @@ export function runTestsBlocker(thread: ChatThread | null): string | null {
   if (thread.checks.ask) return 'Answer the open question about the checks first.';
   if (thread.checks.runs.some((run) => run.status === 'running'))
     return 'The project checks are running.';
-  if (thread.activeTurnId || thread.crewChain || thread.plan?.phase === 'running')
+  // A finished or stopped chain stays on the thread for its history and holds nothing.
+  const step = thread.crewChain?.step;
+  const onStep = step === 'review' || step === 'fix' || step === 'challenge';
+  if (thread.activeTurnId || onStep || thread.plan?.phase === 'running')
     return 'Run tests when the current turn or crew step has finished.';
   return null;
 }
@@ -244,7 +291,7 @@ export function ChecksSettings({
         </ul>
       )}
       {onRunTests && (
-        <div className="th-checks-run">
+        <div className="th-run-tests">
           <button
             type="button"
             className="th-pill th-outline"
@@ -294,10 +341,11 @@ export function ChecksSettings({
         </button>
       </form>
       <p className="th-muted">
-        Balanced and Glide run the checks that are on after each fix and after the last slice. A
-        failing check goes to the next fix. Balanced asks until you allow the commands for this
-        thread. Glide runs them when this thread allows commands. A changed command or script asks
-        again in every mode.{' '}
+        Balanced and Glide run the checks that are on after each writing turn, 15 minutes at most in
+        all, and after each merge of a plan slice. A failing check goes to the next fix, two fixes
+        at most. They copy your installed dependencies into the thread's copy first when it needs
+        them. Balanced asks until you allow the commands for this thread. Glide runs them when this
+        thread allows commands. A changed command or script asks again in every mode.{' '}
         {allowed ? 'This thread allows commands.' : 'This thread does not allow commands yet.'}
       </p>
       {error && (

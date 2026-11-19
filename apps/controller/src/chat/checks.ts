@@ -22,14 +22,21 @@ import { liveOperations } from '../commands/live-operations.ts';
 import { OperationStore } from '../commands/operation-store.ts';
 import { createOwnedProjectCommandRunner } from '../commands/owned-runner.ts';
 import {
+  type OwnedProjectCommandRunner,
   type ProjectCommandDefinition,
   type ProjectCommandRecipeName,
   startProjectCommand,
 } from '../commands/project-command.ts';
 import { executablePin } from '../commands/task-operations.ts';
-import { inspectSource } from '../host/source.ts';
+import {
+  hashCandidateFiles,
+  inspectSource,
+  type ScratchPlan,
+  scratchPlan,
+} from '../host/source.ts';
+import { defaultSchedule, type Schedule } from '../host/worker.ts';
 import { createIds } from '../store/ids.ts';
-import type { Store } from '../store/index.ts';
+import type { LaunchIdentity, Store } from '../store/index.ts';
 import { redact } from './thread-reader.ts';
 
 // Project checks in the loop (ADR 0038 chain, ADR 0002 authority). The controller detects the
@@ -38,7 +45,8 @@ import { redact } from './thread-reader.ts';
 // A check runs without a shell: the controller finds the program on PATH and pins its bytes
 // before every run, and records the process in the operation journal like any project command.
 // A command the person adds cannot start a shell or a wrapper, run inline code or name a file
-// outside the scratch copy. Output lands in the artifact store.
+// outside the scratch copy. Output lands in the artifact store. A check that changes the files
+// Accept would publish cannot pass.
 
 export type DetectedCheck = Pick<
   ChatCheck,
@@ -46,8 +54,16 @@ export type DetectedCheck = Pick<
 >;
 
 const MAX_ITEMS = 16;
-const FILE_BYTES = 1024 * 1024;
+/** The most bytes a check reads from one file. A larger file reads as absent. */
+export const FILE_BYTES = 1024 * 1024;
 const DEADLINE_MS = 10 * 60_000;
+// The checks after one writing turn, or after a plan merges a slice, run one after another, so two
+// slow commands could hold the thread for twenty minutes. They stop at fifteen in all.
+const GATE_MS = 15 * 60_000;
+const GATE_OVER =
+  'The checks after this turn reached their 15-minute total, so this one did not finish.';
+const MERGE_OVER =
+  'The checks after this merge reached their 15-minute total, so this one did not finish.';
 // The newest output kept in memory for the fix message. The card keeps less.
 const KEPT_BYTES = 12 * 1024;
 const BRIEF_CHARACTERS = 12_000;
@@ -84,8 +100,21 @@ const INTERPRETERS = new Set([
   'deno',
 ]);
 const INLINE_FLAG = /^(--eval|--print)(=.*)?$|^-[a-zA-Z]*[ecpE][a-zA-Z]*$/;
+// Programs that run a package.json script a word names.
+const PACKAGE_MANAGERS = new Set(['npm', 'pnpm', 'yarn', 'bun']);
 export const ADDED_RULE =
   'Name a program on PATH and files inside the scratch copy. Shells, wrappers such as env, inline code such as node -e and paths outside the copy are refused.';
+const UNCONFIRMED =
+  'CrewKite could not confirm the process exited. It checks again before the next turn.';
+const AFTER_UNCONFIRMED =
+  'A check before this one may still be running in the copy, so this one did not start.';
+/** The reason a run carries when the check changed files Accept would publish. */
+export const CHANGED_FILES =
+  'This check changed files in the copy. Review the changes before running it again.';
+const CHANGED_PATHS_KEPT = 50;
+// No process group has this number. A command journaled at intent never recorded its group, and
+// this stands in for it so the thread stays held.
+const UNRECORDED_GROUP = 0;
 
 const KINDS = [
   ['test', 'Tests'],
@@ -266,8 +295,85 @@ export function addedProblem(words: readonly string[], scratch: string): string 
   return null;
 }
 
+// Flags that send a package manager to another package. The root's scripts say nothing then.
+const ELSEWHERE = new Set([
+  '--filter',
+  '-F',
+  '--workspace',
+  '-w',
+  '--workspaces',
+  '-ws',
+  '--prefix',
+  '-C',
+  '--dir',
+  '--cwd',
+  '-r',
+  '--recursive',
+]);
+// npm runs a script by bare name only for these lifecycle shortcuts.
+const NPM_SHORTCUTS: Record<string, string> = {
+  test: 'test',
+  t: 'test',
+  tst: 'test',
+  start: 'start',
+  stop: 'stop',
+  restart: 'restart',
+};
+// The commands pnpm, yarn and bun run themselves, which a bare word never means as a script.
+// pnpm runs its test and start through the scripts, so they are not here.
+const OWN_COMMANDS: Record<string, ReadonlySet<string>> = {
+  pnpm: new Set(
+    'add install i update up remove rm link ln unlink import rebuild rb prune fetch patch exec dlx create init publish pack outdated list ls why audit store root bin env config setup server deploy licenses doctor'.split(
+      ' ',
+    ),
+  ),
+  yarn: new Set(
+    'add install remove up upgrade dlx exec workspace workspaces info init link unlink node pack npm plugin set config constraints why version cache explain'.split(
+      ' ',
+    ),
+  ),
+  bun: new Set(
+    'test build install i add a remove rm x create init upgrade pm link unlink outdated publish patch exec repl'.split(
+      ' ',
+    ),
+  ),
+};
+
+/**
+ * The package.json script a package manager command runs from the root, with its text: the word
+ * after run or run-script, an npm lifecycle shortcut, or for pnpm, yarn and bun a bare script name
+ * that is not one of the manager's own commands. `around` adds the pre and post scripts that npm,
+ * yarn and bun run around a script. Nothing for another program or another workspace.
+ */
+function namedScripts(command: string, directory: string, around: boolean): string[] {
+  const words = command.split(/\s+/);
+  const manager = basename(words[0]).toLowerCase();
+  if (!PACKAGE_MANAGERS.has(manager)) return [];
+  const rest = words.slice(1);
+  // pnpm's -w is the workspace root, which is where these scripts live.
+  const elsewhere = (word: string) =>
+    ELSEWHERE.has(word.split('=')[0]) && !(manager === 'pnpm' && word === '-w');
+  if (rest.some(elsewhere)) return [];
+  const scripts = packageScripts(directory);
+  if (!scripts) return [];
+  const positional = rest.filter((word) => !word.startsWith('-'));
+  const [first, second] = positional;
+  const name =
+    first === 'run' || first === 'run-script'
+      ? second
+      : manager === 'npm'
+        ? NPM_SHORTCUTS[first ?? '']
+        : first && !OWN_COMMANDS[manager]?.has(first)
+          ? first
+          : undefined;
+  if (!name || typeof scripts[name] !== 'string') return [];
+  return (around ? [`pre${name}`, name, `post${name}`] : [name]).flatMap((entry) =>
+    typeof scripts[entry] === 'string' ? [`${entry}: ${scripts[entry]}`] : [],
+  );
+}
+
 /** A digest of the command and of the files that decide what it runs. */
-function sourceDigest(
+export function sourceDigest(
   item: Pick<ChatCheck, 'kind' | 'source' | 'command'>,
   directory: string,
 ): string {
@@ -278,11 +384,14 @@ function sourceDigest(
     for (const name of [`pre${item.kind}`, item.kind, `post${item.kind}`])
       hash.update(`${name}=${typeof scripts?.[name] === 'string' ? scripts[name] : ''}\0`);
   } else if (item.source === 'custom') {
-    // A word that names a file of the copy pins the file, so editing a script asks again.
+    // A word that names a file of the copy pins the file, and a script a package manager runs
+    // pins its text, so editing either asks again.
     for (const word of item.command.split(/\s+/).slice(1)) {
       const content = word.startsWith('-') ? null : read(directory, word);
       if (content !== null) hash.update(`${word}\0${content}\0`);
     }
+    for (const script of namedScripts(item.command, directory, true))
+      hash.update(`script\0${script}\0`);
   } else {
     hash.update(read(directory, item.source) ?? 'missing');
   }
@@ -290,14 +399,74 @@ function sourceDigest(
 }
 
 /** What an item runs now, and the digest to compare with its pin. */
-function describe(item: ChatCheck, directory: string): { resolved: string; digest: string } {
+export function describe(item: ChatCheck, directory: string): { resolved: string; digest: string } {
   const found =
     item.source === 'custom' ? null : detectChecks(directory).find((value) => value.id === item.id);
+  const custom = () => {
+    const pnpm = basename(item.command.split(/\s+/)[0]).toLowerCase() === 'pnpm';
+    const scripts = namedScripts(item.command, directory, !pnpm);
+    return clipText(
+      scripts.length ? `${item.command} runs ${scripts.join('; ')}` : item.command,
+      500,
+    );
+  };
   return {
     resolved:
       found?.resolved ??
-      (item.source === 'custom' ? item.command : `${item.command} (no longer declared)`),
+      (item.source === 'custom' ? custom() : `${item.command} (no longer declared)`),
     digest: sourceDigest(item, directory),
+  };
+}
+
+/**
+ * The files Accept would publish from a copy, by path: tracked and untracked files less what the
+ * base's ignore rules leave out, each as its mode and blob id.
+ */
+function publishable(repository: string, copy: string, plan: ScratchPlan): Map<string, string> {
+  return new Map(
+    hashCandidateFiles(copy, repository, plan).map((file) => [
+      file.path,
+      `${file.mode} ${file.oid}`,
+    ]),
+  );
+}
+
+/** Paths whose bytes or mode differ between two reads of a copy, sorted. */
+function differences(
+  before: ReadonlyMap<string, string>,
+  after: ReadonlyMap<string, string>,
+): string[] {
+  return [...new Set([...before.keys(), ...after.keys()])]
+    .filter((path) => before.get(path) !== after.get(path))
+    .sort();
+}
+
+/**
+ * Read what Accept would publish from a copy, before a command runs in it. The function it
+ * returns reads the copy again: null when it holds what it held before, otherwise the changed
+ * paths. A copy left with something it cannot hold, such as a link or a .git folder, counts as
+ * changed with no paths. The files stay for the person to review. Throws when the copy cannot be
+ * read at the start.
+ */
+export function watchCopy(
+  repository: string,
+  base: string,
+  copy: string,
+): () => Pick<ChatCheckRun, 'changedPaths' | 'changedCount'> | null {
+  const plan = scratchPlan(repository, base);
+  const before = publishable(repository, copy, plan);
+  return () => {
+    let changed: string[];
+    try {
+      changed = differences(before, publishable(repository, copy, plan));
+    } catch {
+      return {};
+    }
+    if (!changed.length) return null;
+    return {
+      changedPaths: changed.filter((path) => path.length <= 1024).slice(0, CHANGED_PATHS_KEPT),
+      changedCount: changed.length,
+    };
   };
 }
 
@@ -339,9 +508,32 @@ export type ChecksHost = {
   holdOwnership: (taskId: string) => void;
   groupAbsent: (group: number) => boolean;
   deadlineMs?: number;
+  /** Recorded with each check's launch intent. */
+  launchIdentity?: LaunchIdentity;
+  /** Timers and the process runner. Tests replace them; the defaults are the real ones. */
+  schedule?: Schedule;
+  runner?: OwnedProjectCommandRunner;
 };
 
-type Entry = { taskId: string; combined: boolean; stopped: boolean; stop: () => void };
+type Entry = {
+  taskId: string;
+  combined: boolean;
+  /** An Accept's run, in a copy of its own. It holds neither the scratch copy nor a merged one. */
+  accept: boolean;
+  stopped: boolean;
+  /**
+   * The gate's total ran out. Its open check fails once its process is gone, and the rest fail
+   * without starting.
+   */
+  expired?: boolean;
+  /** A run's process may still be running, so the rest fail without starting. */
+  unconfirmed?: boolean;
+  stop: () => void;
+  /** The plan slice the runs check, in its own copy or on the thread's copy after its merge. */
+  slice?: number;
+  /** Called with each change to a run of this entry, inside the transaction that saves it. */
+  saw?: (run: ChatCheckRun) => void;
+};
 type Finished = { run: ChatCheckRun; output: string };
 
 const clip = (text: string, characters: number) =>
@@ -435,6 +627,21 @@ export function checkFixBrief(runs: readonly Finished[]): string {
   ].join('\n\n');
 }
 
+/** The thread with the run added, or in place of its earlier state. The newest runs are kept. */
+export function withRun(thread: ChatThread, run: ChatCheckRun): ChatThread {
+  const current = thread.checks ?? {
+    items: [],
+    ask: null,
+    approved: null,
+    runs: [],
+    detectedAt: null,
+  };
+  const runs = current.runs.some((value) => value.id === run.id)
+    ? current.runs.map((value) => (value.id === run.id ? run : value))
+    : [...current.runs, run];
+  return { ...thread, checks: { ...current, runs: runs.slice(-CHECK_RUNS_KEPT) } };
+}
+
 export class ThreadChecks {
   private readonly host: ChecksHost;
   private readonly entries = new Set<Entry>();
@@ -445,7 +652,7 @@ export class ThreadChecks {
   constructor(host: ChecksHost) {
     this.host = host;
     this.ids = createIds(host.now);
-    this.journal = new OperationStore(host.store, host.now);
+    this.journal = new OperationStore(host.store, host.now, undefined, host.launchIdentity);
   }
 
   /** A run of this thread's own scratch copy is open. The thread takes no new turn meanwhile. */
@@ -453,16 +660,26 @@ export class ThreadChecks {
     return [...this.entries].some((entry) => entry.taskId === taskId && !entry.combined);
   }
 
+  /** Any run of this thread is open, a plan's run of the merged copy too. */
+  open(taskId: string): boolean {
+    return [...this.entries].some((entry) => entry.taskId === taskId && !entry.accept);
+  }
+
   /** Mark a run as coming before it starts, so a message sent in between waits. */
-  reserve(taskId: string, combined = false): Entry {
-    const entry: Entry = { taskId, combined, stopped: false, stop: () => {} };
+  reserve(taskId: string, combined = false, accept = false, slice?: number): Entry {
+    const entry: Entry = { taskId, combined, accept, slice, stopped: false, stop: () => {} };
     this.entries.add(entry);
     return entry;
   }
 
+  /** Drop a reservation whose run never started, or has ended. */
+  release(entry: Entry) {
+    this.entries.delete(entry);
+  }
+
   /**
-   * Stop the thread's open runs of the scratch copy. Runs on a merged copy belong to the plan
-   * step that started them and end only through `stopCombined`.
+   * Stop the thread's open runs of the scratch copy. A plan's runs, in a slice's copy or on the
+   * merged copy, belong to the plan step that started them and end only through `stopCombined`.
    */
   stop(taskId: string): boolean {
     return this.stopWhere(taskId, false);
@@ -475,7 +692,7 @@ export class ThreadChecks {
   private stopWhere(taskId: string, combined: boolean): boolean {
     let any = false;
     for (const entry of this.entries)
-      if (entry.taskId === taskId && entry.combined === combined) {
+      if (entry.taskId === taskId && entry.combined === combined && !entry.accept) {
         any = true;
         entry.stopped = true;
         entry.stop();
@@ -491,11 +708,21 @@ export class ThreadChecks {
   }
 
   /**
-   * After a restart nobody owns an open run. It reads as failed, the question it waited on is
-   * gone, and a process the journal cannot prove gone keeps the thread from taking a turn.
+   * After a restart nobody owns an open run, and the question it waited on is gone. A process the
+   * journal cannot prove gone keeps the thread from taking a turn, and the open run reads as
+   * unknown. Otherwise it reads as failed.
    */
   recover() {
     this.journal.recover(this.host.groupAbsent, this.ops);
+    const unknown = new Set(
+      (
+        this.host.store.db
+          .prepare(
+            "SELECT DISTINCT task_id FROM task_operations WHERE kind='project-command' AND state='unknown'",
+          )
+          .all() as { task_id: string }[]
+      ).map((row) => row.task_id),
+    );
     const rows = this.host.store.db
       .prepare(
         `SELECT task_id FROM chat_threads WHERE json_extract(body,'$.checks.ask') IS NOT NULL
@@ -509,7 +736,7 @@ export class ThreadChecks {
           run.status === 'running'
             ? {
                 ...run,
-                status: 'failed' as const,
+                status: unknown.has(task_id) ? ('unknown' as const) : ('failed' as const),
                 reason:
                   'CrewKite restarted while this check ran. Its process may still be running.',
               }
@@ -517,31 +744,67 @@ export class ThreadChecks {
         );
         return { ...thread, checks: { ...thread.checks, runs, ask: null } };
       });
-    const unknown = this.host.store.db
-      .prepare(
-        "SELECT DISTINCT task_id FROM task_operations WHERE kind='project-command' AND state='unknown'",
-      )
-      .all() as { task_id: string }[];
-    for (const { task_id } of unknown) this.host.holdOwnership(task_id);
+    for (const task_id of unknown) this.host.holdOwnership(task_id);
   }
 
-  /** Process groups of this task's unresolved commands that are still present. Reads only. */
+  /**
+   * Process groups of this task's unresolved commands that are still present. Reads only. A
+   * command journaled at intent may have started a process whose group was never recorded.
+   * Nothing can prove that process gone, so it counts as present. Every unresolved command of the
+   * task counts, however many came after it.
+   */
   orphans(taskId: string): number[] {
     return this.journal
-      .list(taskId, undefined, 21)
+      .unresolved(taskId)
+      .filter((record) => record.kind === 'project-command' && !this.ops.has(record.id))
+      .flatMap((record) =>
+        record.phases.flatMap((phase) => {
+          if (phase.state === 'intent') return [UNRECORDED_GROUP];
+          return phase.state === 'owned' &&
+            phase.group !== null &&
+            !this.host.groupAbsent(phase.group)
+            ? [phase.group]
+            : [];
+        }),
+      );
+  }
+
+  /** A run of the thread is open in this process, or an operation of it runs here. */
+  live(taskId: string): boolean {
+    return (
+      [...this.entries].some((entry) => entry.taskId === taskId) ||
+      this.journal
+        .unresolved(taskId)
+        .some((record) => liveOperations.has(record.id) || this.ops.has(record.id))
+    );
+  }
+
+  /**
+   * Release the thread from commands journaled at intent that never recorded a group, on the
+   * person's word: ones recovery left unknown, and ones still marked running that nothing in this
+   * process owns, since a failed journal write can leave a command so. Each fails with their note
+   * as its reason, and the count comes back. Nothing is signaled, and no group number is read for
+   * them, since none was recorded. Design preview passes and project commands started for the
+   * thread use the same journal, so one that lost its process is released the same way. The caller
+   * has already refused a command this process runs and a recorded group still present. Runs
+   * inside the caller's transaction.
+   */
+  releaseHeld(taskId: string, note: string): number {
+    if (this.live(taskId) || this.orphans(taskId).some((group) => group !== UNRECORDED_GROUP))
+      throw Error('A held command is still owned or present.');
+    const held = this.journal
+      .unresolved(taskId)
       .filter(
         (record) =>
           record.kind === 'project-command' &&
-          ['running', 'stopping', 'unknown'].includes(record.state) &&
-          !this.ops.has(record.id),
-      )
-      .flatMap((record) =>
-        record.phases.flatMap((phase) =>
-          phase.state === 'owned' && phase.group !== null && !this.host.groupAbsent(phase.group)
-            ? [phase.group]
-            : [],
-        ),
+          record.phases.some((phase) => phase.state === 'intent'),
       );
+    for (const record of held)
+      this.journal.release(record.id, `operation-released-by-person: ${note}`, {
+        outcome: 'blocked',
+        reason: 'operation-released-by-person',
+      });
+    return held.length;
   }
 
   private directory(task: Task): string {
@@ -628,18 +891,27 @@ export class ThreadChecks {
     return { state };
   }
 
-  /** What a run would execute, and which checks changed since the person turned them on. */
+  /**
+   * What a run would execute, and which checks changed since the person turned them on. `seen`
+   * is a digest of what runs in the copy now, so an answer can tell whether it still holds.
+   */
   assess(
     task: Task,
     thread: ChatThread,
     directory?: string,
     only?: readonly ChatCheck[],
-  ): { commands: { label: string; resolved: string }[]; changed: string[]; set: string } {
+  ): {
+    commands: { label: string; resolved: string }[];
+    changed: string[];
+    set: string;
+    seen: string;
+  } {
     const where = directory ?? this.directory(task);
     const home = this.directory(task);
     const commands: { label: string; resolved: string }[] = [];
     const changed: string[] = [];
     const set = createHash('sha256');
+    const seen = createHash('sha256');
     for (const item of only ?? enabledChecks(thread)) {
       const now = describe(item, where);
       commands.push({ label: item.label.slice(0, 80), resolved: now.resolved });
@@ -648,8 +920,9 @@ export class ThreadChecks {
       if (item.pin !== null && item.pin !== now.digest) changed.push(item.label.slice(0, 80));
       // The set an approval covers is read from the thread's own copy, whatever copy runs.
       set.update(`${item.id}\0${item.command}\0${sourceDigest(item, home)}\0`);
+      seen.update(`${item.id}\0${item.command}\0${now.digest}\0`);
     }
-    return { commands, changed, set: set.digest('hex') };
+    return { commands, changed, set: set.digest('hex'), seen: seen.digest('hex') };
   }
 
   /** The person allowed this command set for the thread. */
@@ -683,20 +956,11 @@ export class ThreadChecks {
     );
   }
 
-  private save(taskId: string, run: ChatCheckRun) {
+  private save(taskId: string, run: ChatCheckRun, entry?: Entry) {
     try {
       this.host.update(taskId, (thread) => {
-        const current = thread.checks ?? {
-          items: [],
-          ask: null,
-          approved: null,
-          runs: [],
-          detectedAt: null,
-        };
-        const runs = current.runs.some((value) => value.id === run.id)
-          ? current.runs.map((value) => (value.id === run.id ? run : value))
-          : [...current.runs, run];
-        return { ...thread, checks: { ...current, runs: runs.slice(-CHECK_RUNS_KEPT) } };
+        entry?.saw?.(run);
+        return withRun(thread, run);
       });
     } catch {
       // A thread deleted mid-run has nowhere to show the run.
@@ -705,8 +969,13 @@ export class ThreadChecks {
 
   /**
    * Run the thread's enabled checks one after another in `directory` (the scratch copy unless a
-   * merged copy is named). The caller has the person's answer already. A failure does not end
+   * merged copy or an Accept's copy is named). The caller has the person's answer already. A failure does not end
    * the list: the fix message carries every failure. Stop ends the open check and skips the rest.
+   * The gate after a writing turn and the checks after a plan's merge also have a total. Past it
+   * the open check stops through its runner and fails once its process is proven gone, and the
+   * checks left fail without starting.
+   * They fail the same way after a check whose process may still be running, since it could
+   * still write the copy they would read.
    */
   async run(
     taskId: string,
@@ -716,6 +985,13 @@ export class ThreadChecks {
     only?: readonly ChatCheck[],
   ): Promise<ChecksOutcome> {
     const entry = reserved ?? this.reserve(taskId, directory !== undefined);
+    const cancel =
+      trigger === 'after-write' || trigger === 'combined'
+        ? (this.host.schedule ?? defaultSchedule)(() => {
+            entry.expired = true;
+            entry.stop();
+          }, GATE_MS)
+        : undefined;
     try {
       const task = this.host.task(taskId);
       const thread = this.host.thread(taskId);
@@ -724,9 +1000,14 @@ export class ThreadChecks {
       const finished: Finished[] = [];
       for (const item of items) {
         if (entry.stopped) break;
-        finished.push(await this.one(task, thread, item, trigger, entry, directory));
+        const done = await this.one(task, thread, item, trigger, entry, directory);
+        if (done.run.status === 'unknown') entry.unconfirmed = true;
+        finished.push(done);
       }
-      const failed = finished.filter(({ run }) => run.status === 'failed');
+      // A run whose process may still be running never counts as a pass.
+      const failed = finished.filter(
+        ({ run }) => run.status === 'failed' || run.status === 'unknown',
+      );
       const runs = finished.map(({ run }) => run);
       if (entry.stopped || finished.some(({ run }) => run.status === 'stopped'))
         return { outcome: 'stopped', runs, brief: null };
@@ -734,6 +1015,7 @@ export class ThreadChecks {
         ? { outcome: 'failed', runs, brief: checkFixBrief(failed) }
         : { outcome: 'passed', runs, brief: null };
     } finally {
+      cancel?.();
       this.entries.delete(entry);
     }
   }
@@ -760,9 +1042,11 @@ export class ThreadChecks {
       tail: '',
       stdout: null,
       stderr: null,
+      ...(entry.slice === undefined ? {} : { slice: entry.slice }),
     };
-    this.save(task.id, run);
+    this.save(task.id, run, entry);
     const began = performance.now();
+    const over = trigger === 'combined' ? MERGE_OVER : GATE_OVER;
     let kept = Buffer.alloc(0);
     const keep = (chunk: Uint8Array) => {
       kept = Buffer.concat([kept, chunk]);
@@ -777,9 +1061,11 @@ export class ThreadChecks {
         tail: clip(output, CHECK_TAIL_CHARACTERS),
         ...patch,
       };
-      this.save(task.id, done);
+      this.save(task.id, done, entry);
       return { run: done, output };
     };
+    if (entry.expired) return end({ status: 'failed', reason: over });
+    if (entry.unconfirmed) return end({ status: 'failed', reason: AFTER_UNCONFIRMED });
     const words = commandWords(item.command);
     const scratch = this.host.scratchDirectory(task.id);
     if (!words || (item.source === 'custom' && addedProblem(words, scratch)))
@@ -792,6 +1078,17 @@ export class ThreadChecks {
       pin = executablePin(words[0]);
     } catch {
       return end({ status: 'failed', reason: `Could not find ${words[0]} on this computer.` });
+    }
+    // What Accept would publish from the copy, read before the check starts and again after it
+    // ends. A check that changes it cannot pass, whatever its exit code.
+    let changes: ReturnType<typeof watchCopy>;
+    try {
+      changes = watchCopy(root, thread.base, directory ?? scratch);
+    } catch {
+      return end({
+        status: 'failed',
+        reason: 'CrewKite could not read the copy, so the check did not run.',
+      });
     }
 
     const operationId = this.ids('cmd');
@@ -881,7 +1178,8 @@ export class ThreadChecks {
         output: { stdout: 'artifact', stderr: 'artifact', chunkBytes: 65536 },
       };
       const execution = startProjectCommand(request, {
-        runner: createOwnedProjectCommandRunner({ deadlineMs: preview.deadlineMs }),
+        runner:
+          this.host.runner ?? createOwnedProjectCommandRunner({ deadlineMs: preview.deadlineMs }),
         lifecycle: {
           intent: () => {
             this.journal.phase(operationId, 'command', 'intent', null);
@@ -891,6 +1189,9 @@ export class ThreadChecks {
           },
           quiescent: (group) => {
             this.journal.phase(operationId, 'command', 'closed', group);
+          },
+          unlaunched: () => {
+            this.journal.unlaunched(operationId, 'command');
           },
         },
         publishStream: async (source, options) => {
@@ -936,7 +1237,7 @@ export class ThreadChecks {
           {
             state: 'unknown',
             reason: 'operation-ownership-unknown',
-            next: 'Quit the process, then send again.',
+            next: 'CrewKite checks again before the next turn. If it stays, export diagnostics before taking further action.',
             stdout,
             stderr,
           },
@@ -944,12 +1245,7 @@ export class ThreadChecks {
         );
         // No turn may edit the scratch copy while a process of unknown ownership may run.
         this.host.holdOwnership(task.id);
-        return end({
-          status: 'failed',
-          reason: 'CrewKite could not confirm the process exited. Quit it before the next turn.',
-          exitCode: result.code,
-          ...saved,
-        });
+        return end({ status: 'unknown', reason: UNCONFIRMED, exitCode: result.code, ...saved });
       }
       this.journal.finish(
         operationId,
@@ -964,11 +1260,24 @@ export class ThreadChecks {
           ? { outcome: 'applied' }
           : { outcome: 'blocked', reason: result.reason },
       );
+      const changed = changes();
+      // The gate's total stopped this run, and that is a failure the fixer may see. Only the
+      // person's own stop reads as stopped.
+      const stopped = result.status === 'cancelled' && !entry.expired;
+      // A run the person stopped stays stopped. Any other run that changed the copy fails.
+      if (changed)
+        return end({
+          status: stopped ? 'stopped' : 'failed',
+          reason: CHANGED_FILES,
+          exitCode: result.code,
+          ...changed,
+          ...saved,
+        });
       if (result.status === 'succeeded') return end({ status: 'passed', exitCode: 0, ...saved });
       if (result.status === 'cancelled')
         return end({
-          status: 'stopped',
-          reason: 'You stopped it.',
+          status: stopped ? 'stopped' : 'failed',
+          reason: stopped ? 'You stopped it.' : over,
           exitCode: result.code,
           ...saved,
         });
@@ -995,7 +1304,10 @@ export class ThreadChecks {
       } catch {
         // Recovery reads the rows that are left.
       }
-      if (open) this.host.holdOwnership(task.id);
+      if (open) {
+        this.host.holdOwnership(task.id);
+        return end({ status: 'unknown', reason: UNCONFIRMED });
+      }
       return end({
         status: 'failed',
         reason: error instanceof Error ? error.message.slice(0, 300) : 'The check could not run.',
@@ -1025,7 +1337,7 @@ export function testsLine(
     return runs.length > 1
       ? `Tests passed: all ${runs.length} commands. The output is under Checks.`
       : `Tests passed: ${named(runs[0])}.`;
-  const failed = runs.filter((run) => run.status === 'failed');
+  const failed = runs.filter((run) => run.status === 'failed' || run.status === 'unknown');
   const first = failed[0] ?? runs.at(-1);
   const count = runs.length > 1 ? `, ${failed.length || 1} of ${runs.length} commands failed` : '';
   return `Tests failed: ${named(first)}${count}. The output is under Checks.`;

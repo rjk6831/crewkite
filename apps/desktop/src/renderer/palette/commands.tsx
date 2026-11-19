@@ -6,6 +6,7 @@ import {
   FileDown,
   Folder,
   Info,
+  ListChecks,
   MessageSquareText,
   PanelLeft,
   Plug,
@@ -51,6 +52,7 @@ const ICONS: Record<EntryIcon, ReactNode> = {
   sidebar: <PanelLeft size={17} />,
   about: <Info size={17} />,
   connect: <Plug size={17} />,
+  recipes: <ListChecks size={17} />,
 };
 
 // A view's action opens a control that takes focus, so it runs once focus is back where it was.

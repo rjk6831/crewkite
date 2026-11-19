@@ -39,7 +39,7 @@ body:
     attributes:
       label: CrewKite version
       description: Run `crewkite --version` and paste the output.
-      placeholder: "0.1.0"
+      placeholder: "0.2.0"
   - type: textarea
     id: workaround
     attributes:

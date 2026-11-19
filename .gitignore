@@ -27,9 +27,11 @@ playwright-report/
 !/docs/history.md
 !/docs/project-operations.md
 !/docs/providers.md
+!/docs/google-metadata-hold.md
 !/docs/preview.md
 !/docs/roadmap.md
 !/docs/routing.md
+!/docs/terms.md
 !/docs/testing.md
 
 # Root dot entries are allowlisted. Editor and tool folders stay untracked.

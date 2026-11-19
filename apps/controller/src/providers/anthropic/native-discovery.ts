@@ -12,8 +12,10 @@ import {
 import { userInfo } from 'node:os';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import { performance } from 'node:perf_hooks';
+import { preparePrivateStateDirectory } from '@crewkite/client/node';
 import { groupAbsent, type Schedule } from '../../host/worker.ts';
 import { fileDigestSync } from '../file-digest.ts';
+import { providerStateRoot } from '../openai/native-discovery.ts';
 import { type AuthMetadata, metadataCommand, projectAuthStatus } from './discovery.ts';
 
 type Reason =
@@ -120,19 +122,61 @@ export class NativeDiscoveryError extends Error {
   }
 }
 
+const CLAUDE_PROFILES_PATH = 'providers/anthropic/claude-profiles';
+
+/**
+ * The configuration folder of one API connection, or null for the family's own sign-in. Claude
+ * Code keeps its sign-in under CLAUDE_CONFIG_DIR, and a Console login replaces the subscription
+ * login in the folder it runs in, so each API connection gets a folder of its own. The person's
+ * own CLAUDE_CONFIG_DIR is never read or passed on.
+ */
+export function ownedClaudeConfigDir(source: NodeJS.ProcessEnv): string | null {
+  const profile = source.CREWKITE_CLAUDE_PROFILE;
+  if (profile === undefined) return null;
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(profile)) throw new NativeDiscoveryError('environment');
+  return join(providerStateRoot(source), CLAUDE_PROFILES_PATH, profile);
+}
+
+/** The folder is private to the person before a client writes a sign-in into it. */
+export function prepareClaudeConfigDir(source: NodeJS.ProcessEnv) {
+  const directory = ownedClaudeConfigDir(source);
+  if (directory === null) return;
+  preparePrivateStateDirectory(providerStateRoot(source), directory);
+}
+
+/**
+ * The line a person runs in their own terminal to sign one API connection in with an Anthropic
+ * Console account. The client opens its own browser login. CrewKite never sees a key, stores one
+ * or puts one in an argument.
+ */
+export function anthropicApiLoginLine(environment: NodeJS.ProcessEnv, profileId: string): string {
+  const directory = ownedClaudeConfigDir({ ...environment, CREWKITE_CLAUDE_PROFILE: profileId });
+  return `CLAUDE_CONFIG_DIR='${String(directory).replaceAll("'", "'\\''")}' claude auth login --console`;
+}
+
 export function nativeAuthEnvironment(
   source: NodeJS.ProcessEnv,
   temporary: string,
 ): NodeJS.ProcessEnv {
+  const owned = ownedClaudeConfigDir(source);
   if (
     !source.HOME ||
     !isAbsolute(source.HOME) ||
     !isAbsolute(temporary) ||
-    source.CLAUDE_CONFIG_DIR
+    (owned === null && source.CLAUDE_CONFIG_DIR)
   )
     throw new NativeDiscoveryError('environment');
+  // The state root an API connection's folder sits under, as the OpenAI client's environment
+  // carries it. Without these every later step would put the folder under HOME.
+  const root = Object.fromEntries(
+    (['CREWKITE_HOME', 'CREWKITE_PROFILE', 'CREWKITE_INSTALLED_STATE_ROOT'] as const).flatMap(
+      (key) => (source[key] === undefined ? [] : [[key, source[key]]]),
+    ),
+  );
   return {
     HOME: source.HOME,
+    ...root,
+    ...(owned ? { CLAUDE_CONFIG_DIR: owned } : {}),
     USER: userInfo().username,
     // A client installed as a script (`#!/usr/bin/env node`) finds node on the person's PATH, as
     // in chatEnvironment. The digest check still binds the client file itself.
@@ -162,10 +206,12 @@ export function startNativeAuthStatus(
     schedule?: Schedule;
     spawn?: Spawn;
     lifecycle?: NativeLifecycle;
+    /** Sign the environment's own configuration folder out. Reads no status. */
+    signOut?: boolean;
   } = {},
 ) {
   if (process.platform === 'win32') throw new NativeDiscoveryError('ownership');
-  const plan = metadataCommand('auth-status');
+  const plan = metadataCommand(options.signOut ? 'auth-logout' : 'auth-status');
   const now = options.now ?? (() => performance.now());
   const started = now();
   if (
@@ -303,7 +349,9 @@ export function startNativeAuthStatus(
       }
     }
     if (remaining() === 0) reason ??= 'deadline';
-    if (quiescent && reason === null) {
+    if (quiescent && reason === null && options.signOut) {
+      if (exitCode !== 0) reason = 'protocol';
+    } else if (quiescent && reason === null) {
       try {
         metadata = projectAuthStatus({ stdout: Buffer.concat(stdout), stderrBytes, exitCode });
       } catch {

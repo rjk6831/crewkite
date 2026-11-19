@@ -8,9 +8,11 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readSync,
   realpathSync,
 } from 'node:fs';
+import { createConnection } from 'node:net';
 import { basename, dirname, isAbsolute, join, relative, resolve, sep } from 'node:path';
 import {
   ControllerClient,
@@ -20,7 +22,7 @@ import {
   resolveInstalledState,
   verifyRuntimeIntegrity,
 } from '@crewkite/client/node';
-import type { RuntimeManifest } from '@crewkite/contracts';
+import type { DesktopNotice, RuntimeManifest } from '@crewkite/contracts';
 import { prepareStateDirectory } from '../../../../scripts/demo-state.ts';
 import { sourceDesktopState } from '../../../../scripts/desktop-state.ts';
 import {
@@ -209,6 +211,34 @@ export function resolveRuntime(
   };
 }
 
+export class IncompatibleController extends Error {}
+
+/** The offline notice for a failed connect. Only this refusal gives a reason the person can act on. */
+export const offlineNotice = (error: unknown): DesktopNotice => ({
+  kind: 'connection',
+  state: 'offline',
+  reconnectAvailable: true,
+  ...(error instanceof IncompatibleController ? { reason: error.message } : {}),
+});
+
+// The schema a controller from this runtime brings a home to: one version per bundled migration.
+const bundledSchema = (root: string) =>
+  readdirSync(join(root, 'apps/controller/migrations')).filter((name) =>
+    /^\d{3}-[a-z0-9-]+\.sql$/.test(name),
+  ).length;
+
+// Whether a process accepts connections on the socket. Nothing is written, so no token goes out.
+function listening(socketPath: string) {
+  return new Promise<boolean>((resolve) => {
+    const socket = createConnection(socketPath);
+    socket.once('connect', () => {
+      socket.destroy();
+      resolve(true);
+    });
+    socket.once('error', () => resolve(false));
+  });
+}
+
 export class DesktopController {
   readonly paths: RuntimePaths;
   client: ControllerClient | null = null;
@@ -226,10 +256,19 @@ export class DesktopController {
     return this.starting;
   }
   private async endpoint() {
-    const client = new ControllerClient({
-      ...readControllerEndpoint(this.paths.home),
-      actor: desktopActor,
-    });
+    const { schema, ...endpoint } = readControllerEndpoint(this.paths.home);
+    const bundled = bundledSchema(this.paths.root);
+    // A live controller on another schema reads and writes this home its own way, and its owner
+    // lock keeps a second controller from starting. Only its own app can end it cleanly. A
+    // controller from before this check records no schema. A record left by one that stopped
+    // names a socket nobody listens on, and starting ours is safe.
+    if (schema !== bundled && (await listening(endpoint.socketPath)))
+      throw new IncompatibleController(
+        (schema ?? 0) < bundled
+          ? 'An older CrewKite is still running with this home. Quit it from its menu, then open CrewKite again.'
+          : 'A newer CrewKite is running with this home. Use that version.',
+      );
+    const client = new ControllerClient({ ...endpoint, actor: desktopActor });
     try {
       await client.connect();
       return client;
@@ -242,7 +281,9 @@ export class DesktopController {
     try {
       this.client = await this.endpoint();
       return this.client;
-    } catch {}
+    } catch (error) {
+      if (error instanceof IncompatibleController) throw error;
+    }
     await this.start();
     this.client = await this.endpoint();
     return this.client;

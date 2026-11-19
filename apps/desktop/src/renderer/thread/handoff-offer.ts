@@ -81,3 +81,21 @@ export function offerChoices(
     ];
   });
 }
+
+/** The clock time of a start at reset, in the person's time zone as 24-hour HH:MM. */
+export const startTime = (at: string): string =>
+  new Date(at).toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+
+/**
+ * When the stopped family's window reopens, if CrewKite recorded a reset time ahead of `now`.
+ * Without one the card offers no start, since a guess could run the message into the same limit.
+ */
+export function resetStart(
+  catalog: ChatCatalogRead,
+  family: ChatFamily,
+  now: number,
+): string | null {
+  const entry = catalog.families.find((value) => value.family === family);
+  const at = entry ? tightestAllowance(entry, familyModel(entry)).resetsAt : null;
+  return at && Date.parse(at) > now ? at : null;
+}

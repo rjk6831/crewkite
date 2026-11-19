@@ -86,6 +86,8 @@ export function useWorkspace() {
   const [taskPages, setTaskPages] = useState<Record<string, TaskPage>>({});
   const [navigationBusy, setNavigationBusy] = useState(false);
   const [navigationStale, setNavigationStale] = useState(false);
+  // Set by the rail's Refresh, the one read that may clear the flag under an unchanged stamp.
+  const refreshAsked = useRef(false);
   const selectedTask = useRef<string | null>(null);
   const detailCache = useRef(new Map<string, Snapshot>());
   const headerRef = useRef<WorkspaceState | null>(null);
@@ -217,6 +219,7 @@ export function useWorkspace() {
   const [connection, setConnection] = useState('connecting');
   const [error, setError] = useState<string | null>(null);
   const [transportError, setTransportError] = useState<string | null>(null);
+  const [offlineReason, setOfflineReason] = useState<string | null>(null);
   const [pending, setPending] = useState(0);
   const [retryAvailable, setRetryAvailable] = useState(false);
   const connectionState = useRef('connecting');
@@ -252,7 +255,14 @@ export function useWorkspace() {
         navigationStamp.current = stampKey;
         setTaskPages({});
         setNavigationStale(false);
+      } else if (refreshAsked.current) {
+        // A page read that failed under this same stamp left navigation stale. The person asked to
+        // refresh and the stamp is unchanged, so the flag clears and whoever needs the missing page
+        // reads it once more. A refresh after a controller event never clears it, or a read that
+        // keeps failing would be retried on every event.
+        setNavigationStale(false);
       }
+      refreshAsked.current = false;
       const taskId = selectedTask.current;
       if (taskId) {
         try {
@@ -322,6 +332,12 @@ export function useWorkspace() {
       );
     return read();
   }, [source, read]);
+  const refreshNavigation = useCallback(() => {
+    refreshAsked.current = true;
+    return refresh();
+  }, [refresh]);
+  /** A reader outside the rail found a page it could not read. The rail offers Refresh. */
+  const navigationFailed = useCallback(() => setNavigationStale(true), []);
   useEffect(() => {
     let active = true;
     void refresh().catch((failure: unknown) => {
@@ -399,8 +415,10 @@ export function useWorkspace() {
       const parsed = DesktopNoticeSchema.safeParse(value);
       if (!parsed.success) return;
       const notice = parsed.data;
-      if (notice.kind === 'connection') changedConnection(notice.state);
-      else if (notice.kind === 'retry') setRetryAvailable(notice.available);
+      if (notice.kind === 'connection') {
+        setOfflineReason(notice.state === 'offline' ? (notice.reason ?? null) : null);
+        changedConnection(notice.state);
+      } else if (notice.kind === 'retry') setRetryAvailable(notice.available);
       else if (notice.kind === 'history-gap')
         void refresh().catch(() => {
           if (active)
@@ -471,7 +489,9 @@ export function useWorkspace() {
             | 'InitializeGoogleAcp'
             | 'AuthenticateGoogleAcp'
             | 'DiscoverGoogleAcp'
-            | 'StopGoogleAcpSetup';
+            | 'StopGoogleAcpSetup'
+            | 'RecoverGoogleMetadata'
+            | 'RefreshGoogleAcpModels';
         }
       >,
     ) => {
@@ -509,7 +529,9 @@ export function useWorkspace() {
         input.command === 'InitializeGoogleAcp' ||
         input.command === 'AuthenticateGoogleAcp' ||
         input.command === 'DiscoverGoogleAcp' ||
-        input.command === 'StopGoogleAcpSetup'
+        input.command === 'StopGoogleAcpSetup' ||
+        input.command === 'RecoverGoogleMetadata' ||
+        input.command === 'RefreshGoogleAcpModels'
       )
         return metadataCommand(input);
       // The Local card says what happened to its own commands, so they raise no page error.
@@ -561,6 +583,7 @@ export function useWorkspace() {
     loadProjects,
     readTaskPage,
     connection,
+    offlineReason,
     preview,
     pending: pending > 0 || detailStale,
     error: error ?? transportError,
@@ -569,6 +592,8 @@ export function useWorkspace() {
       if (value === null) setTransportError(null);
     },
     refresh,
+    refreshNavigation,
+    navigationFailed,
     command,
     metadataCommand,
     pickProject,

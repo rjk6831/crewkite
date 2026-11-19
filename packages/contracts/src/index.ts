@@ -1,4 +1,9 @@
 import { z } from 'zod';
+import {
+  AcceptanceReadSchema,
+  CancelAcceptancePayloadSchema,
+  ReadAcceptancePayloadSchema,
+} from './acceptance.ts';
 import { ChatAnalyticsReadSchema, ReadChatAnalyticsPayloadSchema } from './analytics.ts';
 import {
   ChatChangesReadSchema,
@@ -18,6 +23,7 @@ import {
   ChatCatalogReadSchema,
   ChatEffortSchema,
   ChatFamilySchema,
+  ChatMergeCheckSchema,
   ChatPullRequestResultSchema,
   ChatPushResultSchema,
   ChatQueuedMessageSchema,
@@ -28,6 +34,7 @@ import {
   ChatTurnEventsReadSchema,
   ChatTurnIdSchema,
   ChatTurnSchema,
+  CheckChatMergePayloadSchema,
   ConfigureChatThreadPayloadSchema,
   DeleteChatThreadPayloadSchema,
   HandoffChatThreadPayloadSchema,
@@ -50,6 +57,7 @@ import {
   SteerChatMessagePayloadSchema,
   StopChatTurnPayloadSchema,
 } from './chat.ts';
+import { ReleaseChatCheckPayloadSchema } from './checks.ts';
 import { CheckProviderClientPayloadSchema, ClientVersionStatusSchema } from './client-versions.ts';
 import {
   ChatInstructionsReadSchema,
@@ -62,6 +70,18 @@ import {
   SavedPromptsSchema,
 } from './composer.ts';
 import {
+  AddConnectionPayloadSchema,
+  AssignConnectionPayloadSchema,
+  ConnectionAddedSchema,
+  ConnectionsReadSchema,
+  DisconnectConnectionPayloadSchema,
+  ForgetConnectionPayloadSchema,
+  ProveConnectionPayloadSchema,
+  ReadConnectionsPayloadSchema,
+  SetKeepConnectedPayloadSchema,
+  UnassignConnectionPayloadSchema,
+} from './connections.ts';
+import {
   DeleteCrewPayloadSchema,
   ImportSavedCrewsPayloadSchema,
   ReadSavedCrewsPayloadSchema,
@@ -69,6 +89,21 @@ import {
   SavedCrewsReadSchema,
   SetDefaultCrewPayloadSchema,
 } from './crews.ts';
+import {
+  DesignFindingsSchema,
+  DesignSystemDraftSchema,
+  DesignSystemReadSchema,
+  DesignSystemSavedSchema,
+  DraftDesignSystemPayloadSchema,
+  ImportDesignSystemPayloadSchema,
+  ReadDesignFindingsPayloadSchema,
+  ReadDesignSystemPayloadSchema,
+  ResolveDesignFindingPayloadSchema,
+  RunDesignCheckPayloadSchema,
+  SaveDesignSystemPayloadSchema,
+  SetDesignPreviewPayloadSchema,
+  SetDesignSystemDeliveryPayloadSchema,
+} from './design-system.ts';
 import { DiagnosticsReadSchema, ReadDiagnosticsPayloadSchema } from './diagnostics.ts';
 import { ChatExportSchema, ExportChatThreadPayloadSchema } from './export.ts';
 import {
@@ -79,6 +114,26 @@ import {
   ReadExtensionsPayloadSchema,
   RunExtensionCommandPayloadSchema,
 } from './extensions.ts';
+import {
+  CancelRemoteEffectPayloadSchema,
+  ConfirmRemoteEffectPayloadSchema,
+  GitHubRepositorySchema,
+  MergeReadinessSchema,
+  ProposeRemoteEffectPayloadSchema,
+  ReadMergeReadinessPayloadSchema,
+  ReadRemoteEffectPreviewPayloadSchema,
+  ReadRemoteEffectsPayloadSchema,
+  ReadRepositoryPolicyPayloadSchema,
+  ReadReviewCommentsPayloadSchema,
+  ReconcileRemoteEffectPayloadSchema,
+  RemoteEffectChangeSchema,
+  RemoteEffectPreviewSchema,
+  RemoteEffectsReadSchema,
+  RepositoryPolicyReadSchema,
+  ReviewCommentsReadSchema,
+  SetRepositoryPolicyPayloadSchema,
+  SettleRemoteEffectPayloadSchema,
+} from './github-effects.ts';
 import { AcknowledgeGoogleTermsPayloadSchema, GoogleTermsSchema } from './google-terms.ts';
 import { ChatSearchResultSchema, SearchChatHistoryPayloadSchema } from './history-search.ts';
 import { McpSupplySchema } from './mcp.ts';
@@ -90,6 +145,48 @@ import {
   ReadProjectNotesPayloadSchema,
   RemoveProjectNotePayloadSchema,
 } from './notes.ts';
+import {
+  DependencyPreparationsReadSchema,
+  PrepareDependenciesPayloadSchema,
+  ReadDependencyPreparationPayloadSchema,
+} from './preparation.ts';
+import {
+  DraftRecipePayloadSchema,
+  ForgetRecipePayloadSchema,
+  PlanRecipeChecksSchema,
+  PlanRecipeDraftSchema,
+  PlanRecipeReadSchema,
+  PlanRecipeRunStartedSchema,
+  PlanRecipeRunsReadSchema,
+  PlanRecipeSavedSchema,
+  PlanRecipesChangedSchema,
+  PlanRecipesReadSchema,
+  PlanSchedulesReadSchema,
+  ReadRecipePayloadSchema,
+  ReadRecipeRunsPayloadSchema,
+  ReadRecipesPayloadSchema,
+  ReadSchedulesPayloadSchema,
+  ResolveRecipeChecksPayloadSchema,
+  RunRecipePayloadSchema,
+  SaveRecipePayloadSchema,
+  SetRecipeFolderPayloadSchema,
+  SetRecipeSchedulePayloadSchema,
+} from './recipes.ts';
+import {
+  ExportResultsPayloadSchema,
+  ReadResultsPayloadSchema,
+  ResultsExportSchema,
+  ResultsReadSchema,
+} from './results.ts';
+import { ReadWebhookPayloadSchema, SetWebhookPayloadSchema, WebhookReadSchema } from './webhook.ts';
+import {
+  ExportWritingRulesPayloadSchema,
+  PreviewWritingRulesExportPayloadSchema,
+  ReadWritingRulesPayloadSchema,
+  SetWritingRulePayloadSchema,
+  WritingRulesExportSchema,
+  WritingRulesReadSchema,
+} from './writing-rules.ts';
 
 export const PROTOCOL_VERSION = 1;
 export const MAX_FRAME_BYTES = 1024 * 1024;
@@ -413,6 +510,53 @@ export const LocalEndpointSchema = z
     (value) => value.trim() === value && Number(value.slice(value.lastIndexOf(':') + 1)) <= 65535,
     'A Local endpoint needs a literal loopback address and valid port.',
   );
+/**
+ * The origin of an OpenAI-compatible server on this machine or the local network, with no path.
+ * `localOpenAiOrigin` turns what a person types into this form.
+ */
+export function localOpenAiOrigin(input: string): string | null {
+  let url: URL;
+  try {
+    url = new URL(input.trim());
+  } catch {
+    return null;
+  }
+  const host = url.hostname;
+  const octets = host.split('.').map(Number);
+  const privateV4 =
+    /^\d{1,3}(\.\d{1,3}){3}$/.test(host) &&
+    octets.every((octet) => octet <= 255) &&
+    (octets[0] === 127 ||
+      octets[0] === 10 ||
+      (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
+      (octets[0] === 192 && octets[1] === 168) ||
+      (octets[0] === 169 && octets[1] === 254));
+  const privateV6 = /^\[(::1|f[cd][0-9a-f]{2}:[0-9a-f:]*|fe[89ab][0-9a-f]:[0-9a-f:]*)\]$/.test(
+    host,
+  );
+  const named = host === 'localhost' || /^[a-z0-9-]+\.local$/.test(host);
+  if (
+    !['http:', 'https:'].includes(url.protocol) ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash ||
+    !['/', '/v1', '/v1/'].includes(url.pathname) ||
+    !(privateV4 || privateV6 || named)
+  )
+    return null;
+  return url.origin;
+}
+export const LocalOpenAiEndpointSchema = z
+  .string()
+  .max(200)
+  .refine(
+    (value) => localOpenAiOrigin(value) === value,
+    'An OpenAI-compatible Local endpoint is the origin of a loopback or local-network server.',
+  );
+/** Any endpoint Local takes: an LM Studio socket or an OpenAI-compatible server. */
+export const LocalAnyEndpointSchema = z.union([LocalEndpointSchema, LocalOpenAiEndpointSchema]);
+export const isOpenAiLocalEndpoint = (endpoint: string) => /^https?:\/\//.test(endpoint);
 export const LocalSetupReceiptSchema = z.strictObject({
   version: z.literal(1),
   runtimeVersion: localIdentifier,
@@ -442,7 +586,7 @@ export const LocalSetupSchema = z
     revision: RevisionSchema,
     connectionRevision: RevisionSchema,
     connectorId: z.literal('local-sdk-v1'),
-    endpoint: LocalEndpointSchema.nullable(),
+    endpoint: LocalAnyEndpointSchema.nullable(),
     setupHash: HashSchema.nullable(),
     connectionHash: HashSchema.nullable(),
     secretConfigured: z.boolean(),
@@ -744,6 +888,69 @@ export const GoogleAcpSelectionSchema = z.strictObject({
   modelId: acpIdentifier,
   thoughtLevelId: acpIdentifier.nullable(),
 });
+/**
+ * Why a Google metadata hold stays. Each reason maps to fixed copy in
+ * GOOGLE_RECOVERY_HOLD_COPY, shared by desktop and CLI.
+ */
+export const GoogleRecoveryHoldSchema = z.enum([
+  // The recorded group is gone. Recover releases the row; its result stays unknown.
+  'recoverable',
+  // The recorded group still answers. It may now belong to another program.
+  'owner-present',
+  // The probe was refused, so absence is not proven.
+  'owner-unconfirmed',
+  // The row recorded no process group.
+  'no-process-identity',
+  // A Google runtime or a delayed launch could still run.
+  'runtime-active',
+  // An interrupted sign-in. Startup never releases it; a person can.
+  'authentication-needs-person',
+  // The row's home or machine provenance conflicts with this controller.
+  'provenance-conflict',
+]);
+export type GoogleRecoveryHold = z.infer<typeof GoogleRecoveryHoldSchema>;
+export const GoogleMetadataRecoverySchema = z.strictObject({
+  kind: z.literal('google-metadata-recovery'),
+  outcome: z.enum(['settled', 'held', 'clear']),
+  settled: z
+    .array(
+      z.strictObject({
+        commandId: CommandIdSchema,
+        operation: z.enum(['usage', 'acp-initialize', 'acp-authenticate', 'acp-discover']),
+      }),
+    )
+    .max(16),
+  held: z
+    .array(
+      z.strictObject({
+        commandId: CommandIdSchema,
+        operation: z.enum(['usage', 'acp-initialize', 'acp-authenticate', 'acp-discover']),
+        reason: GoogleRecoveryHoldSchema,
+      }),
+    )
+    .max(16),
+  // Counts only. The sweep never reports directory contents.
+  swept: z.strictObject({
+    removed: z.number().int().nonnegative(),
+    failed: z.number().int().nonnegative(),
+  }),
+});
+export type GoogleMetadataRecovery = z.infer<typeof GoogleMetadataRecoverySchema>;
+export const GOOGLE_RECOVERY_HOLD_COPY: Readonly<Record<GoogleRecoveryHold, string>> = {
+  recoverable:
+    'An interrupted Google operation has ended. Recover releases it. Its result stays unknown.',
+  'owner-present':
+    'CrewKite cannot confirm that the interrupted operation ended. This process number may now belong to another program. Export diagnostics before taking further action.',
+  'owner-unconfirmed':
+    'CrewKite cannot confirm that the interrupted operation ended. This process number may now belong to another program. Export diagnostics before taking further action.',
+  'no-process-identity':
+    'The interrupted operation recorded no process identity. Reconnect cannot safely clear it. Export diagnostics. Other provider connections remain available.',
+  'runtime-active': 'A Google operation is still running. Wait for it to finish or stop it.',
+  'authentication-needs-person':
+    'A Google sign-in was interrupted. Recover releases it here. A sign-in already open in your browser may still complete, so check it again afterwards.',
+  'provenance-conflict':
+    'This home was used on another machine or by another controller. CrewKite cannot clear the interrupted operation here. Export diagnostics.',
+};
 export const GoogleAcpSetupSchema = z
   .strictObject({
     profileId: z.literal('google-acp-v1'),
@@ -771,6 +978,21 @@ export const GoogleAcpSetupSchema = z
     }),
     reason: GoogleAcpReasonSchema.nullable(),
     googleTerms: GoogleTermsSchema.nullable().default(null),
+    /**
+     * The last deliberate model refresh from Ready. A failed refresh keeps Ready and the earlier
+     * catalog, and keeps its diagnostic here so the card can say what happened.
+     */
+    modelRefresh: z
+      .strictObject({
+        commandId: CommandIdSchema,
+        at: TimestampSchema,
+        // running: the refresh holds the metadata gate while setup stays Ready.
+        outcome: z.enum(['running', 'refreshed', 'failed', 'unknown']),
+        reason: GoogleAcpReasonSchema.nullable(),
+        evidenceId: ArtifactIdSchema.nullable(),
+      })
+      .nullable()
+      .default(null),
   })
   .refine(
     (setup) =>
@@ -1530,6 +1752,8 @@ export const DesktopNoticeSchema = z.discriminatedUnion('kind', [
     kind: z.literal('connection'),
     state: z.enum(['connecting', 'connected', 'offline']),
     reconnectAvailable: z.boolean(),
+    /** Why the desktop stays offline when the cause is one the person can act on. */
+    reason: z.string().min(1).max(200).optional(),
   }),
   z.strictObject({ kind: z.literal('history-gap'), after: CursorSchema }),
   z.strictObject({ kind: z.literal('retry'), available: z.boolean() }),
@@ -1669,14 +1893,9 @@ export const ProjectCommandPreviewSchema = z
     'Command definition exceeds its encoded limit.',
   );
 export type ProjectCommandPreview = z.infer<typeof ProjectCommandPreviewSchema>;
-const githubRepository = z.strictObject({
-  host: z.string().regex(/^[a-zA-Z0-9](?:[a-zA-Z0-9.-]{0,251}[a-zA-Z0-9])?$/),
-  owner: z.string().regex(/^(?!\.{1,2}$)[a-zA-Z0-9_.-]{1,100}$/),
-  name: z.string().regex(/^(?!\.{1,2}$)[a-zA-Z0-9_.-]{1,100}$/),
-});
 const githubId = z.string().regex(/^[1-9][0-9]{0,19}$/);
 const githubBinding = {
-  repository: githubRepository,
+  repository: GitHubRepositorySchema,
   headSha: z.string().regex(/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/),
 };
 export const GitHubReadRequestSchema = z.discriminatedUnion('kind', [
@@ -2556,6 +2775,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('StopChatTurn', StopChatTurnPayloadSchema),
   mutate('ConfigureChatThread', ConfigureChatThreadPayloadSchema),
   mutate('RunChatTests', RunChatTestsPayloadSchema),
+  mutate('ReleaseChatCheck', ReleaseChatCheckPayloadSchema),
   mutate('HandoffChatThread', HandoffChatThreadPayloadSchema),
   mutate('AcceptChatChanges', AcceptChatChangesPayloadSchema),
   read('ReadChatThread', ReadChatThreadPayloadSchema),
@@ -2582,11 +2802,14 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('ImportSavedCrews', ImportSavedCrewsPayloadSchema),
   mutate('RefreshChatModels', RefreshChatModelsPayloadSchema),
   mutate('SetCreditSpending', SetCreditSpendingPayloadSchema),
+  mutate('SetWebhook', SetWebhookPayloadSchema),
+  read('ReadWebhook', ReadWebhookPayloadSchema),
   mutate('SetFamilyModel', SetFamilyModelPayloadSchema),
   mutate('SteerChatMessage', SteerChatMessagePayloadSchema),
   mutate('PushChatBranch', PushChatBranchPayloadSchema),
   mutate('OpenChatPullRequest', OpenChatPullRequestPayloadSchema),
   read('ReadChatBranchStatus', ReadChatBranchStatusPayloadSchema),
+  mutate('CheckChatMerge', CheckChatMergePayloadSchema),
   mutate('ImportChatAttachment', ImportChatAttachmentPayloadSchema),
   mutate('RetryChatTurn', RetryChatTurnPayloadSchema),
   read('ReadChatTurnEvents', ReadChatTurnEventsPayloadSchema),
@@ -2605,7 +2828,7 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate('AcknowledgeGoogleTerms', AcknowledgeGoogleTermsPayloadSchema),
   mutate(
     'ConfigureLocal',
-    z.strictObject({ endpoint: LocalEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
+    z.strictObject({ endpoint: LocalAnyEndpointSchema, authMode: LocalAuthModeSchema.optional() }),
   ),
   mutate('RefreshLocalModels', z.strictObject({ consent: z.literal('explicit') })),
   mutate('SelectLocalModel', LocalModelSelectionSchema),
@@ -2683,6 +2906,18 @@ export const CommandSchema = z.discriminatedUnion('command', [
   mutate(
     'StopGoogleAcpSetup',
     z.strictObject({ profileId: z.literal('google-acp-v1'), operationId: CommandIdSchema }),
+  ),
+  // Release a Google metadata hold whose recorded owner is proven gone. Startup runs the same rule
+  // for usage, initialize and discover. Only a person can release an interrupted sign-in.
+  mutate('RecoverGoogleMetadata', z.strictObject({ consent: z.literal('explicit') })),
+  // Read the model catalog again from Ready. A failure keeps Ready and the earlier catalog.
+  mutate(
+    'RefreshGoogleAcpModels',
+    z.strictObject({
+      profileId: z.literal('google-acp-v1'),
+      proofId: ArtifactIdSchema,
+      consent: z.literal('explicit'),
+    }),
   ),
   read('InspectSource', z.strictObject({ projectId: ProjectIdSchema })),
   mutate(
@@ -2806,6 +3041,55 @@ export const CommandSchema = z.discriminatedUnion('command', [
     }),
   ),
   mutate('ReadGitHub', z.strictObject({ taskId: TaskIdSchema, request: GitHubReadRequestSchema })),
+  read('ReadWritingRules', ReadWritingRulesPayloadSchema),
+  mutate('SetWritingRule', SetWritingRulePayloadSchema),
+  read('PreviewWritingRulesExport', PreviewWritingRulesExportPayloadSchema),
+  mutate('ExportWritingRules', ExportWritingRulesPayloadSchema),
+  read('ReadConnections', ReadConnectionsPayloadSchema),
+  mutate('AssignConnection', AssignConnectionPayloadSchema),
+  mutate('UnassignConnection', UnassignConnectionPayloadSchema),
+  mutate('SetKeepConnected', SetKeepConnectedPayloadSchema),
+  mutate('DisconnectConnection', DisconnectConnectionPayloadSchema),
+  mutate('ForgetConnection', ForgetConnectionPayloadSchema),
+  mutate('AddConnection', AddConnectionPayloadSchema),
+  mutate('ProveConnection', ProveConnectionPayloadSchema),
+  read('ReadDependencyPreparation', ReadDependencyPreparationPayloadSchema),
+  mutate('PrepareDependencies', PrepareDependenciesPayloadSchema),
+  read('ReadAcceptance', ReadAcceptancePayloadSchema),
+  mutate('CancelAcceptance', CancelAcceptancePayloadSchema),
+  read('ReadDesignSystem', ReadDesignSystemPayloadSchema),
+  read('ImportDesignSystem', ImportDesignSystemPayloadSchema),
+  mutate('DraftDesignSystem', DraftDesignSystemPayloadSchema),
+  mutate('SaveDesignSystem', SaveDesignSystemPayloadSchema),
+  mutate('SetDesignSystemDelivery', SetDesignSystemDeliveryPayloadSchema),
+  mutate('SetDesignPreview', SetDesignPreviewPayloadSchema),
+  mutate('RunDesignCheck', RunDesignCheckPayloadSchema),
+  read('ReadDesignFindings', ReadDesignFindingsPayloadSchema),
+  mutate('ResolveDesignFinding', ResolveDesignFindingPayloadSchema),
+  read('ReadRepositoryPolicy', ReadRepositoryPolicyPayloadSchema),
+  mutate('SetRepositoryPolicy', SetRepositoryPolicyPayloadSchema),
+  read('ReadRemoteEffects', ReadRemoteEffectsPayloadSchema),
+  mutate('ProposeRemoteEffect', ProposeRemoteEffectPayloadSchema),
+  mutate('ConfirmRemoteEffect', ConfirmRemoteEffectPayloadSchema),
+  mutate('CancelRemoteEffect', CancelRemoteEffectPayloadSchema),
+  mutate('ReconcileRemoteEffect', ReconcileRemoteEffectPayloadSchema),
+  mutate('SettleRemoteEffect', SettleRemoteEffectPayloadSchema),
+  read('ReadRemoteEffectPreview', ReadRemoteEffectPreviewPayloadSchema),
+  read('ReadMergeReadiness', ReadMergeReadinessPayloadSchema),
+  read('ReadReviewComments', ReadReviewCommentsPayloadSchema),
+  read('ReadRecipes', ReadRecipesPayloadSchema),
+  read('ReadRecipe', ReadRecipePayloadSchema),
+  read('DraftRecipe', DraftRecipePayloadSchema),
+  read('ResolveRecipeChecks', ResolveRecipeChecksPayloadSchema),
+  mutate('SetRecipeFolder', SetRecipeFolderPayloadSchema),
+  mutate('SaveRecipe', SaveRecipePayloadSchema),
+  mutate('ForgetRecipe', ForgetRecipePayloadSchema),
+  mutate('RunRecipe', RunRecipePayloadSchema),
+  mutate('SetRecipeSchedule', SetRecipeSchedulePayloadSchema),
+  read('ReadSchedules', ReadSchedulesPayloadSchema),
+  read('ReadRecipeRuns', ReadRecipeRunsPayloadSchema),
+  read('ReadResults', ReadResultsPayloadSchema),
+  read('ExportResults', ExportResultsPayloadSchema),
   mutate(
     'StopProjectOperation',
     z.strictObject({ taskId: TaskIdSchema, operationId: CommandIdSchema }),
@@ -3240,6 +3524,8 @@ export const SnapshotSchema = z
       )
       .default([]),
     googleAcpSetup: GoogleAcpSetupSchema.nullable().default(null),
+    // Google metadata rows still holding the gate, with why. Ready setup never hides them.
+    googleMetadataHolds: GoogleMetadataRecoverySchema.shape.held.optional(),
     localSetup: LocalSetupSchema.nullable().optional(),
     nativeProfiles: z
       .array(NativeProfileSchema)
@@ -3513,6 +3799,7 @@ export const WorkspaceStateSchema = z
     cursor: CursorSchema,
     usageReaders: SnapshotSchema.shape.usageReaders,
     googleAcpSetup: SnapshotSchema.shape.googleAcpSetup,
+    googleMetadataHolds: SnapshotSchema.shape.googleMetadataHolds,
     localSetup: SnapshotSchema.shape.localSetup,
     localHardware: LocalHardwareStatusSchema.optional(),
     googleAcpInstall: SnapshotSchema.shape.googleAcpInstall,
@@ -3700,6 +3987,36 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ProjectNotesChangedSchema.extend({ kind: z.literal('project-notes-changed') }),
   SavedCrewsReadSchema.extend({ kind: z.literal('saved-crews') }),
   ChatExportSchema.extend({ kind: z.literal('chat-export') }),
+  WritingRulesReadSchema.extend({ kind: z.literal('writing-rules') }),
+  WritingRulesExportSchema.extend({ kind: z.literal('writing-rules-export') }),
+  ConnectionsReadSchema.extend({ kind: z.literal('connections') }),
+  ConnectionAddedSchema.extend({ kind: z.literal('connection-added') }),
+  WebhookReadSchema.extend({ kind: z.literal('webhook') }),
+  DependencyPreparationsReadSchema.extend({ kind: z.literal('dependency-preparations') }),
+  // The check on which attempt is current stays with the kind tag.
+  AcceptanceReadSchema.safeExtend({ kind: z.literal('acceptance') }),
+  DesignSystemReadSchema.extend({ kind: z.literal('design-system') }),
+  DesignSystemSavedSchema.extend({ kind: z.literal('design-system-saved') }),
+  // The check on the draft's file stays with the kind tag.
+  DesignSystemDraftSchema.safeExtend({ kind: z.literal('design-system-draft') }),
+  DesignFindingsSchema.extend({ kind: z.literal('design-findings') }),
+  RepositoryPolicyReadSchema.extend({ kind: z.literal('repository-policy') }),
+  RemoteEffectPreviewSchema.extend({ kind: z.literal('remote-effect') }),
+  RemoteEffectsReadSchema.extend({ kind: z.literal('remote-effects') }),
+  ReviewCommentsReadSchema.extend({ kind: z.literal('review-comments') }),
+  PlanRecipesReadSchema.extend({ kind: z.literal('recipes') }),
+  PlanRecipeReadSchema.extend({ kind: z.literal('recipe') }),
+  PlanRecipeDraftSchema.extend({ kind: z.literal('recipe-draft') }),
+  PlanRecipeChecksSchema.extend({ kind: z.literal('recipe-checks') }),
+  PlanRecipeSavedSchema.extend({ kind: z.literal('recipe-saved') }),
+  PlanRecipeRunStartedSchema.extend({ kind: z.literal('recipe-run') }),
+  PlanRecipeRunsReadSchema.extend({ kind: z.literal('recipe-runs') }),
+  PlanSchedulesReadSchema.extend({ kind: z.literal('schedules') }),
+  ResultsReadSchema.extend({ kind: z.literal('results') }),
+  // The check that a page holds one part stays with the kind tag.
+  ResultsExportSchema.safeExtend({ kind: z.literal('results-export') }),
+  // The check on reason and line stays with the kind tag.
+  MergeReadinessSchema.safeExtend({ kind: z.literal('merge-readiness') }),
   z.strictObject({ kind: z.literal('local-token'), token: LocalTokenSchema.nullable() }),
   z.strictObject({
     kind: z.literal('chat-acceptance'),
@@ -3707,8 +4024,15 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
     commit: z.string().regex(/^[a-f0-9]{40}$/),
     fileCount: z.number().int().nonnegative(),
   }),
+  z.strictObject({
+    kind: z.literal('chat-check-released'),
+    taskId: TaskIdSchema,
+    released: z.number().int().positive(),
+    held: z.boolean(),
+  }),
   ChatPushResultSchema.extend({ kind: z.literal('chat-push') }),
   ChatPullRequestResultSchema.extend({ kind: z.literal('chat-pull-request') }),
+  ChatMergeCheckSchema.extend({ kind: z.literal('chat-merge-check') }),
   ChatBranchStatusSchema.extend({ kind: z.literal('chat-branch-status') }),
   ChatAttachmentSchema.extend({ kind: z.literal('chat-attachment') }),
   ExtensionsReadSchema.extend({ kind: z.literal('extensions') }),
@@ -3732,6 +4056,7 @@ export const ReadDataSchema = z.discriminatedUnion('kind', [
   ConversationPageSchema,
   z.strictObject({ kind: z.literal('google-acp-setup'), setup: GoogleAcpSetupSchema }),
   z.strictObject({ kind: z.literal('google-acp-install'), install: GoogleAcpInstallStatusSchema }),
+  GoogleMetadataRecoverySchema,
   sourceInspection,
   z.strictObject({ kind: z.literal('snapshot'), snapshot: SnapshotSchema }),
   z.strictObject({
@@ -3829,6 +4154,7 @@ export const AttemptOutputSchema = z.union([
 ]);
 export const EventSchema = z.discriminatedUnion('type', [
   event('operation.updated', TaskOperationSummarySchema),
+  event('remote-effect.updated', RemoteEffectChangeSchema),
   event('combined.updated', CombinedRunPreviewSchema),
   event('conversation.entry', ConversationEntrySchema),
   event('agent.event', AgentEventSchema),
@@ -3836,6 +4162,7 @@ export const EventSchema = z.discriminatedUnion('type', [
   event('chat.thread', ChatThreadSchema),
   event('chat.catalog', ChatCatalogChangeSchema),
   event('extension.event', ExtensionEventSchema),
+  event('recipes.changed', PlanRecipesChangedSchema),
   event('task.created', TaskSchema),
   event('task.updated', TaskSchema),
   // A deleted thread's task is gone. Views drop it from the rail.
@@ -3968,6 +4295,7 @@ export type SealedHandoffPacket = z.infer<typeof SealedHandoffPacketSchema>;
 export type Event = z.infer<typeof EventSchema>;
 export type FakeWorkerInput = z.infer<typeof FakeWorkerInputSchema>;
 export type FakeWorkerEvent = z.infer<typeof FakeWorkerEventSchema>;
+export * from './acceptance.ts';
 export * from './analytics.ts';
 export { canonicalJson } from './canonical.ts';
 export * from './changes.ts';
@@ -3976,16 +4304,24 @@ export * from './checks.ts';
 export * from './cli.ts';
 export * from './client-versions.ts';
 export * from './composer.ts';
+export * from './connections.ts';
 export * from './crews.ts';
+export * from './design-system.ts';
 export * from './diagnostics.ts';
 export * from './export.ts';
 export * from './extensions.ts';
+export * from './github-effects.ts';
 export * from './google-terms.ts';
 export * from './history-search.ts';
 export * from './mcp.ts';
 export * from './notes.ts';
 export * from './plan-lanes.ts';
+export * from './preparation.ts';
+export * from './recipes.ts';
+export * from './results.ts';
 export * from './subagents.ts';
+export * from './webhook.ts';
+export * from './writing-rules.ts';
 
 export type Grant = z.infer<typeof GrantSchema>;
 export type Effect = z.infer<typeof EffectSchema>;

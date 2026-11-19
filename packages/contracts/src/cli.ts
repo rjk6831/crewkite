@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import {
   AgentEventSchema,
+  ChatAdmissionSchema,
   ChatCrewRoleSchema,
   ChatFailureSchema,
   ChatFamilySchema,
@@ -23,7 +24,7 @@ import {
 const cursor = z.string().regex(/^(0|[1-9][0-9]{0,19})$/);
 const taskId = z.string().regex(/^tsk_[0-7][0-9A-HJKMNP-TV-Z]{25}$/);
 /** The `v` of every line. Change it with `CLI_JSON_LINE_SHAPE`. */
-export const CLI_JSON_LINE_VERSION = 7;
+export const CLI_JSON_LINE_VERSION = 10;
 const line = { v: z.literal(CLI_JSON_LINE_VERSION) };
 
 /** One stream event of one thread. A stored message arrives as a `message`. */
@@ -47,6 +48,8 @@ export const CliJsonLineSchema = z.discriminatedUnion('kind', [
     next: z.string().max(4096).nullable(),
     taskId: taskId.nullable(),
     data: z.unknown().optional(),
+    /** Set on a send: the turn it opened, or why it opened none. */
+    admission: ChatAdmissionSchema.optional(),
   }),
   /** A turn the command watched has ended. Print mode exits with this status. */
   z.strictObject({
@@ -79,7 +82,7 @@ export type CliJsonLine = z.infer<typeof CliJsonLineSchema>;
 
 /** The hash of the shape `CLI_JSON_LINE_VERSION` names. Change them together. */
 export const CLI_JSON_LINE_SHAPE =
-  '201d1251257ee0c8b030d1fbae578fbe1824cd67d9c414e8c8fb4272e37de8ac';
+  'f9da6d857820254b01296e3f02a64c234b606fee5e1f83250cf18ad5b80a1127';
 
 /**
  * Exit codes of every CLI command. 0: the request applied, or the followed turn finished. 1: it
