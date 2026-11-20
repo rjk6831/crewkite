@@ -106,6 +106,11 @@ type Model = {
   /** Open permission asks by request ID. */
   asks: Map<string, { turnId: string; question: string }>;
   runs: Map<string, ChatCheckRun>;
+  /**
+   * The cursor at which each item last changed: `thread`, `turn:<id>`, `run:<id>`, `ask:<id>`,
+   * and `end:<turn id>` for the turn's end.
+   */
+  changed: Map<string, bigint>;
   cursor: bigint;
 };
 
@@ -118,18 +123,35 @@ function fromRead(read: ChatThreadRead, model?: Model): Model {
     turns: new Map(),
     asks: new Map(),
     runs: new Map(),
+    changed: new Map(),
     cursor: 0n,
   };
-  next.thread = read.thread;
-  for (const turn of read.turns) next.turns.set(turn.id, turn);
-  for (const run of read.thread.checks?.runs ?? []) next.runs.set(run.id, run);
-  next.asks.clear();
+  // A read shows the thread as of its cursor. Events can reach the follow while the read is on its
+  // way, and whatever they changed after that cursor is newer than the read. Taking the read over
+  // them would put an ended turn back to running, and no later event comes to correct it.
+  const cursor = BigInt(read.cursor);
+  const take = (key: string) => {
+    if ((next.changed.get(key) ?? -1n) > cursor) return false;
+    next.changed.set(key, cursor);
+    return true;
+  };
+  if (take('thread')) next.thread = read.thread;
+  for (const turn of read.turns) if (take(`turn:${turn.id}`)) next.turns.set(turn.id, turn);
+  for (const run of read.thread.checks?.runs ?? [])
+    if (take(`run:${run.id}`)) next.runs.set(run.id, run);
+  const asks = new Map<string, { turnId: string; question: string }>();
   for (const event of read.liveEvents) {
     if (event.type === 'permission.requested')
-      next.asks.set(event.requestId, { turnId: event.turnId, question: event.question });
-    else if (event.type === 'permission.resolved') next.asks.delete(event.requestId);
+      asks.set(event.requestId, { turnId: event.turnId, question: event.question });
+    else if (event.type === 'permission.resolved') asks.delete(event.requestId);
   }
-  next.cursor = BigInt(read.cursor);
+  for (const id of next.asks.keys()) if (!asks.has(id) && take(`ask:${id}`)) next.asks.delete(id);
+  // A question can reach the follow only through a read when its request fell in a gap of the
+  // stream. Its turn may have ended after the read, and then the question went with it.
+  for (const [id, ask] of asks)
+    if ((next.changed.get(`end:${ask.turnId}`) ?? -1n) <= cursor && take(`ask:${id}`))
+      next.asks.set(id, ask);
+  if (cursor > next.cursor) next.cursor = cursor;
   return next;
 }
 
@@ -378,19 +400,33 @@ export function followWorkflow(
     const cursor = BigInt(event.cursor);
     if (cursor <= model.cursor) return;
     model.cursor = cursor;
+    const changed = (key: string) => model.changed.set(key, cursor);
     if (event.type === 'chat.thread') {
       model.thread = event.payload;
-      for (const run of event.payload.checks?.runs ?? []) model.runs.set(run.id, run);
+      changed('thread');
+      for (const run of event.payload.checks?.runs ?? []) {
+        model.runs.set(run.id, run);
+        changed(`run:${run.id}`);
+      }
     } else if (event.type === 'chat.turn') {
       model.turns.set(event.payload.id, event.payload);
+      changed(`turn:${event.payload.id}`);
     } else if (event.type === 'agent.event') {
       const item = event.payload;
-      if (item.type === 'permission.requested')
+      if (item.type === 'permission.requested') {
         model.asks.set(item.requestId, { turnId: item.turnId, question: item.question });
-      else if (item.type === 'permission.resolved') model.asks.delete(item.requestId);
-      else if (item.type === 'turn.completed') {
+        changed(`ask:${item.requestId}`);
+      } else if (item.type === 'permission.resolved') {
+        model.asks.delete(item.requestId);
+        changed(`ask:${item.requestId}`);
+      } else if (item.type === 'turn.completed') {
         // Every question of the ended turn goes, whatever other turns still ask.
-        for (const [id, ask] of model.asks) if (ask.turnId === item.turnId) model.asks.delete(id);
+        changed(`end:${item.turnId}`);
+        for (const [id, ask] of model.asks)
+          if (ask.turnId === item.turnId) {
+            model.asks.delete(id);
+            changed(`ask:${id}`);
+          }
       } else return;
     } else return;
     void evaluate();

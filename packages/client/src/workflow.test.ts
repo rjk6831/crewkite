@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 import {
+  type AgentEvent,
+  AgentEventSchema,
   type ChatThread,
   ChatThreadSchema,
   type ChatTurn,
@@ -331,4 +333,97 @@ test('the work under way starts at its plan, its chain or its running turn, and 
   ];
   for (const [name, thread, turns, since] of rows)
     assert.equal(sinceUnderWay(read(thread, turns)), since, name);
+});
+
+// Claim: a thread read answers from its own cursor. Events that reach the follow while that read is
+// on its way are newer, and the read must not undo them, since no later event may come to correct
+// it. The first case is a crew step that starts and ends while the read is out. The second is a
+// question whose request fell in a gap of the stream: the read made after the gap still holds it,
+// but its turn ends before the read comes back.
+test('a thread read older than events the follow already holds never undoes them', async () => {
+  // Events reach the follow only when the test lets them through, reads answer with the thread as
+  // it stood when asked, once released, and `live` sets the questions a read reports.
+  const lagging = (w: ReturnType<typeof world>, keepWaiting?: readonly 'permission'[]) => {
+    const queue: Event[] = [];
+    let deliver: (event: Event) => void = () => {};
+    let resync: () => void = () => {};
+    const held: (() => void)[] = [];
+    const lag = {
+      live: [] as AgentEvent[],
+      held,
+      release(count = queue.length) {
+        for (const event of queue.splice(0, count)) deliver(event);
+      },
+      drop: (count: number) => queue.splice(0, count),
+      gap: () => resync(),
+      result: null as WorkflowResult | null,
+      stop: () => {},
+    };
+    const source = {
+      readThread: () => {
+        const snapshot = { ...w.read(), liveEvents: lag.live };
+        return new Promise<typeof snapshot>((resolve) => held.push(() => resolve(snapshot)));
+      },
+      subscribe: async (after: string, onEvent: (event: Event) => void, onResync?: () => void) => {
+        deliver = onEvent;
+        resync = onResync ?? (() => {});
+        return w.source.subscribe(after, (event) => queue.push(event));
+      },
+    };
+    const handle = followWorkflow(source, w.read(), { since: 1, keepWaiting });
+    lag.stop = handle.stop;
+    void handle.done.then((value) => {
+      lag.result = value;
+    });
+    return lag;
+  };
+
+  const first = turn(1, 'assistant', 'running');
+  const w = world({ activeTurnId: first.id }, [first]);
+  const step = lagging(w);
+  await flush();
+  const second = turn(2, 'assistant', 'running');
+  w.change({ activeTurnId: null }, turn(1, 'assistant', 'done'));
+  w.change({ activeTurnId: second.id }, second);
+  // Only the first turn's end has arrived, so the follow asks for a read. The controller answers
+  // it from a thread where the second turn runs.
+  step.release(2);
+  await flush();
+  assert.equal(step.held.length, 1);
+  w.change({ activeTurnId: null }, turn(2, 'assistant', 'done'));
+  step.release();
+  step.held[0]();
+  await flush();
+  assert.equal(step.result?.state, 'done', 'A turn that ended stays ended.');
+  step.stop();
+
+  const asking = turn(1, 'assistant', 'running');
+  const v = world({ activeTurnId: asking.id }, [asking]);
+  const question = lagging(v, ['permission']);
+  await flush();
+  const request = AgentEventSchema.parse({
+    type: 'permission.requested',
+    turnId: asking.id,
+    requestId: 'req-1',
+    question: 'Run it?',
+    options: [{ id: 'allow', label: 'Allow', kind: 'allow-once' }],
+  });
+  v.agent(request);
+  question.drop(1);
+  question.live = [request];
+  question.gap();
+  v.agent({ type: 'turn.completed', turnId: asking.id, stopReason: 'stopped', at });
+  v.change({}, turn(1, 'assistant', 'stopped'));
+  // The turn's end arrives before the read made after the gap, which still holds the question.
+  question.release(2);
+  question.held[0]();
+  question.live = [];
+  await flush();
+  v.change({ activeTurnId: null });
+  question.release();
+  await flush();
+  for (const release of question.held.slice(1)) release();
+  await flush();
+  assert.notEqual(question.result, null, 'A question of an ended turn holds nothing open.');
+  question.stop();
 });
