@@ -211,7 +211,8 @@ test('a usage read maps each reported limit and ignores what it does not show', 
   assert.equal(plan.argv.includes('--restricted'), true);
   assert.equal(plan.argv[plan.argv.indexOf('--settings') + 1], '{"disableAllHooks":true}');
   assert.equal(plan.argv[plan.argv.indexOf('--setting-sources') + 1], '');
-  // Any build in the accepted range reads, whatever its digest; a build outside it never does.
+  // Any build from the minimum on reads, whatever its digest, a new major one included. A build
+  // older than the minimum never does.
   for (const [version, accepted] of [
     ['2.1.302', true],
     ['2.1.340', true],
@@ -219,7 +220,7 @@ test('a usage read maps each reported limit and ignores what it does not show', 
     ['2.1.259', true],
     ['2.1.258', false],
     ['2.0.99', false],
-    ['3.0.0', false],
+    ['3.0.0', true],
     ['unknown', false],
   ] as const) {
     const read = () =>

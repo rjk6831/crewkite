@@ -47,7 +47,7 @@ export function ConnectLine({
     }
   }
   async function press() {
-    if (state?.action === 'cancel' || state?.action === 'sign-out') return run('SignOutOpenAi');
+    if (state?.action === 'cancel') return run('SignOutOpenAi');
     if (family === 'openai') return run('SignInOpenAi');
     setBusy(true);
     try {
@@ -56,8 +56,7 @@ export function ConnectLine({
       setBusy(false);
     }
   }
-  const label =
-    state.action === 'sign-out' ? 'Sign out' : state.action === 'cancel' ? 'Cancel' : 'Connect';
+  const label = state.action === 'cancel' ? 'Cancel' : 'Connect';
   return (
     <div className="st-connect">
       <p role="status">{state.line}</p>

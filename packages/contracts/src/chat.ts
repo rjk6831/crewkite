@@ -1029,9 +1029,11 @@ export const HandoffChatThreadPayloadSchema = z.strictObject({
   selection: ChatModelSelectionSchema,
   reason: z.enum(['manual', 'limit']).default('manual'),
 });
-// Only the OpenAI list comes from a separate read. The other families list what their profile or
-// setup already holds.
-export const RefreshChatModelsPayloadSchema = z.strictObject({ family: z.literal('openai') });
+// OpenAI and Anthropic list models from a separate read of the client. Google refreshes its list
+// through its own setup command, and Local through its own.
+export const RefreshChatModelsPayloadSchema = z.strictObject({
+  family: z.enum(['openai', 'anthropic']),
+});
 
 /**
  * Pasted bytes cross the socket as base64, so each item is capped. A path the controller copies

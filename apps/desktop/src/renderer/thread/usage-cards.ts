@@ -23,6 +23,7 @@ const DIAL_LIMIT = 3;
 export function usageCards(
   scopes: readonly UsageGaugeCard[],
   snapshot: Pick<Snapshot, 'usageReaders'>,
+  nowMs: number,
 ): UsageCard[] {
   const cards: UsageCard[] = scopes.map((scope) => {
     const primary = [
@@ -46,7 +47,7 @@ export function usageCards(
       emptyText: 'No usage observations.',
     };
   });
-  const nativeQuota = anthropicUsageCard(snapshot);
+  const nativeQuota = anthropicUsageCard(snapshot, nowMs);
   if (nativeQuota) cards.push(nativeQuota);
   return cards;
 }

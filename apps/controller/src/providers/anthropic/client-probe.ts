@@ -3,7 +3,8 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { z } from 'zod';
 import { clientRecord, recordClient } from '../client-record.ts';
-import { CLIENT_VERSIONS } from '../client-versions.ts';
+import { CLIENT_VERSIONS, managedClientRoot } from '../client-versions.ts';
+import { refuseManagedClient } from '../managed-client.ts';
 import {
   flagsIn,
   OPTIONAL_FLAGS,
@@ -65,6 +66,11 @@ const list = (names: readonly string[]) => names.join(', ');
  * for the adapters; the card line says what the build does not list.
  * shortcut: the read is synchronous and runs --help once per changed build with a five second
  * bound, like the version read. Upgrade: an asynchronous probe with a pending state on the card.
+ *
+ * A build CrewKite fetched itself has to pass: when its help lacks a flag that limits the client,
+ * the copy is removed and this returns false, so the caller finds the copy that ran before. A
+ * help text that cannot be read proves nothing and removes nothing. A client the person installed
+ * is never removed and keeps its card line.
  */
 export function probeClient(input: {
   executable: string;
@@ -73,7 +79,17 @@ export function probeClient(input: {
   environment: NodeJS.ProcessEnv;
   /** Runs the client's help. Tests pass their own. */
   help?: (executable: string) => string | null;
-}) {
+  /** The time a refusal is recorded with. */
+  now?: () => string;
+}): boolean {
+  const refuse = (reason: string) =>
+    refuseManagedClient(
+      managedClientRoot(input.environment),
+      'anthropic',
+      input.executable,
+      reason,
+      input.now ?? (() => new Date().toISOString()),
+    );
   const home = crewkiteHome(input.environment);
   const { sha256, version } = input;
   if (!attempted.has(sha256)) {
@@ -92,6 +108,11 @@ export function probeClient(input: {
       const missing = PASSED_FLAGS.filter((flag) => !flags.has(flag) && !UNLISTED_FLAGS.has(flag));
       const optional = missing.filter((flag) => OPTIONAL_FLAGS.has(flag));
       const required = missing.filter((flag) => !OPTIONAL_FLAGS.has(flag));
+      if (
+        required.length &&
+        refuse(`It does not list ${list(required)}, which CrewKite passes to limit the client.`)
+      )
+        return false;
       const before = readGood(home);
       const lost = before
         ? before.flags.filter((flag) => !flags.has(flag) && PASSED_FLAGS.includes(flag))
@@ -122,6 +143,7 @@ export function probeClient(input: {
     }
   }
   review(home, sha256, version);
+  return true;
 }
 
 /**

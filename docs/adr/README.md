@@ -58,6 +58,7 @@ Each record states one decision, the context that forced it, why I chose it and 
 | [0058](0058-a-schedule-cannot-be-saved-without-a-budget.md) | A schedule cannot be saved without a budget | Proposed |
 | [0059](0059-results-stay-on-the-device.md) | Results stay on the device | Proposed |
 | [0060](0060-a-recipe-changes-from-results-only-through-a-proposal-i-approve.md) | A recipe changes from results only through a proposal I approve and can revert | Proposed |
+| [0061](0061-run-the-newest-verified-client-copy.md) | Run the newest verified copy of each provider's client | Proposed |
 
 ## Writing a new record
 

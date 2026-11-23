@@ -116,6 +116,11 @@ import { connectLocalModel } from '../providers/local/chat-connect.ts';
 import { connectOpenAiModel } from '../providers/local/openai-compat.ts';
 import type { startLocalDiscovery, startLocalReplacement } from '../providers/local/replacement.ts';
 import type { LocalInputHelper, startLocalSecretInput } from '../providers/local/secure-input.ts';
+import {
+  connectReadEnded,
+  fetchNewerClient,
+  type ManagedFamily,
+} from '../providers/managed-client.ts';
 import { openAiChatAdapter } from '../providers/openai/chat.ts';
 import { openAiCreditReading } from '../providers/openai/discovery.ts';
 import { openAiApiLoginLine, startOpenAiAccountStep } from '../providers/openai/login.ts';
@@ -264,6 +269,11 @@ export type ControllerOptions = {
   chatAdapters?: ReadonlyMap<ChatFamily, ChatAdapter>;
   /** The chat client per family, found by version range. Without one, the profiles stand in. */
   chatClients?: ChatClientResolvers;
+  /**
+   * CrewKite's own client copies: their folder and the one network access that fetches them.
+   * Without it nothing is fetched.
+   */
+  managedClients?: { root: string; fetch: typeof fetch };
   /** Fixed Anthropic picker rows for a scripted setup, in place of reading the client. */
   anthropicModels?: readonly AnthropicLiveModel[];
   /** Digests of this boot and machine for a home. Tests pass their own. */
@@ -285,6 +295,7 @@ export class Controller {
 
   artifacts!: ArtifactFiles;
   private readonly outputAbort = new AbortController();
+  private readonly clientFetches = new Map<ManagedFamily, Promise<void>>();
   private readonly outputPreparations = new Map<string, Promise<Artifact>>();
   private readonly outputReads = new Set<Promise<CommandResult>>();
   evidence!: CandidateEvidence;
@@ -1034,6 +1045,7 @@ export class Controller {
       resolveEnvironment: (family) => this.chatEnvironment(family),
       launchIdentity: this.launchIdentity,
       googleTermsAcknowledged: () => googleTermsCurrent(this.store.googleAcpSetup().googleTerms),
+      signedOut: (family) => this.store.signedOut(family),
       familyModel: (family) => this.store.familyModel(family),
       projectPath: (projectId) => this.projectPath(projectId),
       projectNotes: (projectId) => this.projectNotes().texts(projectId),
@@ -1129,27 +1141,35 @@ export class Controller {
   // The Anthropic client's picker rows, read in the background. A read that fails leaves the last
   // rows in place, or none, and the catalog then lists the model IDs this home ran turns on.
   private anthropicModelRows: readonly AnthropicLiveModel[] | null = null;
-  private anthropicModelRead = { at: Number.NEGATIVE_INFINITY, busy: false };
+  private anthropicModelRead = {
+    at: Number.NEGATIVE_INFINITY,
+    busy: false,
+    done: Promise.resolve(false),
+  };
 
-  /** Starts a picker read when the last one is old. A catalog read never waits for it. */
-  private refreshAnthropicModels(profiles: NativeProfileResolution[]) {
-    if (this.options.anthropicModels || !this.store.hasConnectedOnce('anthropic')) return;
+  /**
+   * Starts a picker read when the last one is old, or at once with `force`. A catalog read never
+   * waits for it. The promise says whether rows landed, and a read already running is joined.
+   */
+  private refreshAnthropicModels(profiles: NativeProfileResolution[], force = false) {
     const read = this.anthropicModelRead;
+    if (this.options.anthropicModels || !this.store.hasConnectedOnce('anthropic'))
+      return Promise.resolve(false);
+    if (read.busy) return read.done;
     const client = this.chatClientFor('anthropic', profiles).profile?.client;
     const now = Date.parse(this.now());
     // Ten minutes after a read, one minute after a miss.
     if (
       !client ||
       this.closed ||
-      read.busy ||
-      now - read.at < (this.anthropicModelRows ? 600_000 : 60_000)
+      (!force && now - read.at < (this.anthropicModelRows ? 600_000 : 60_000))
     )
-      return;
+      return Promise.resolve(false);
     read.busy = true;
     read.at = now;
     const directory = join(this.home, 'native', 'chat-models-anthropic');
     mkdirSync(directory, { recursive: true, mode: 0o700 });
-    readAnthropicModels({
+    read.done = readAnthropicModels({
       executable: client.executable,
       sha256: client.sha256,
       environment: this.chatEnvironment('anthropic'),
@@ -1158,7 +1178,7 @@ export class Controller {
       schedule: this.options.schedule,
     })
       .then((rows) => {
-        if (!rows || this.closed) return;
+        if (!rows || this.closed) return false;
         this.anthropicModelRows = rows;
         // CrewKite ships no Anthropic model names, so an open picker reads again when the list
         // arrives.
@@ -1169,11 +1189,34 @@ export class Controller {
             reason: null,
           }),
         );
+        return true;
       })
-      .catch(() => {})
+      .catch(() => false)
       .finally(() => {
         read.busy = false;
       });
+    return read.done;
+  }
+
+  /** Refresh models on the Anthropic card: read the picker rows from the client CrewKite runs. */
+  private async readAnthropicModelsNow(): Promise<CommandResult> {
+    if (!this.store.hasConnectedOnce('anthropic'))
+      return {
+        outcome: 'blocked',
+        reason: 'not-connected',
+        next: 'Connect Anthropic, then refresh models.',
+      };
+    if (this.options.anthropicModels) return { outcome: 'applied' };
+    return (await this.refreshAnthropicModels(this.resolveProfiles(), true))
+      ? { outcome: 'applied' }
+      : {
+          outcome: 'blocked',
+          reason: 'model-read-unavailable',
+          next:
+            this.nativeConnections().status().state === 'signed-out'
+              ? 'Sign in with the Anthropic client, then press Connect.'
+              : 'The Anthropic client did not list its models. Check again, then refresh models.',
+        };
   }
 
   private chatCatalog(): ChatCatalogRead {
@@ -1300,6 +1343,45 @@ export class Controller {
     } catch {
       // A damaged read record leaves the catalog as it is. Refresh models reports the failure.
     }
+  }
+
+  /**
+   * Check again looks for a newer published client, in the background. It runs only on that
+   * press, one at a time per family, and only when a copy is already on the device: the person
+   * asked CrewKite to look, and a download of some hundred megabytes should not start unasked.
+   * The next read of the client status names the fetched copy or says why it is not used.
+   */
+  fetchNewerClient(family: ManagedFamily, installed: string | null) {
+    const managed = this.options.managedClients;
+    if (!managed || !installed || this.closed || this.clientFetches.has(family)) return;
+    this.clientFetches.set(
+      family,
+      fetchNewerClient(family, {
+        ...managed,
+        installed,
+        now: this.now,
+        signal: this.outputAbort.signal,
+      })
+        .then(
+          () => {},
+          () => {},
+        )
+        .finally(() => this.clientFetches.delete(family)),
+    );
+  }
+
+  /**
+   * How a client's connect-time reads ended, a sentence for a failure and null for a pass. A
+   * fetched client that fails them twice in a row goes, so the copy before it runs.
+   */
+  private connectReadEnded(family: ManagedFamily, executable: string, failure: string | null) {
+    return connectReadEnded(
+      this.options.managedClients?.root ?? null,
+      family,
+      executable,
+      failure,
+      this.now,
+    );
   }
 
   /** The client a chat turn, model read or quota read launches, found by version range. */
@@ -1455,6 +1537,21 @@ export class Controller {
       : observation
         ? null
         : modelReadFailure(failure);
+    // The model read is a connect-time read too, under the same rule as a chat turn. A slow or
+    // stopped read and a launch that never started say nothing about the build.
+    const answered = observation !== null;
+    if (
+      !record.groups.length &&
+      profile.client &&
+      (answered || (failure.lastRequest === 'initialize' && failure.reason === 'protocol')) &&
+      this.connectReadEnded(
+        'openai',
+        profile.client.executable,
+        answered ? null : 'It did not answer initialize when CrewKite read its models.',
+      )
+    )
+      record.reason =
+        'The OpenAI client CrewKite fetched did not answer initialize and is no longer used. Refresh models to read from the copy before it.';
     if (this.chatModelRead === runtime) this.chatModelRead = undefined;
     this.store.transaction(() => {
       this.retainNativeRecord(CHAT_MODEL_READ, ChatModelReadSchema.parse(record));
@@ -1553,6 +1650,8 @@ export class Controller {
         const reading = openAiCreditReading(usage);
         if (reading) this.openAiTurnCredits = { ...reading, observedAt: this.now() };
       },
+      onConnectRead: (executable, failure) =>
+        void this.connectReadEnded('openai', executable, failure),
       threadTools,
     });
     const anthropic = anthropicChatAdapter({
@@ -1720,8 +1819,16 @@ export class Controller {
     const termsRefusal = googleTermsGate(this.store, command, (runId) => this.isPreparedAcp(runId));
     if (termsRefusal) return termsRefusal;
     if (command.command === 'RefreshGoogleAcpModels') {
-      // A refresh from Ready changes no connect state, so it stays out of the connect log.
-      return this.executeAcpSetup(command, principal);
+      // A refresh from Ready keeps the setup as it is and stays out of the connect log. After Sign
+      // out, the Connect press sends it, and it connects Google on this device again.
+      const refreshed = this.executeAcpSetup(command, principal);
+      if (!this.store.hasConnectedOnce('google'))
+        void refreshed
+          .then((result) => {
+            if (result.outcome === 'applied') this.connectedNow('google');
+          })
+          .catch(() => {});
+      return refreshed;
     }
     if (
       [
@@ -1764,11 +1871,15 @@ export class Controller {
     if (command.command === 'ProveConnection')
       return this.connections().prove(command.payload.connectionId, true);
     if (command.command === 'SignOutOpenAi') return this.signOutOpenAi(command);
+    if (command.command === 'SignOutProvider') return this.signOutProvider(command);
     if (command.command === 'RefreshAnthropicUsage' || command.command === 'StopAnthropicUsage')
       return this.anthropicUsage().execute(command);
     if (command.command === 'ObserveUsage') return this.observeUsageCommand(command, principal);
     // A model read changes no task and no authority. A retry with the same key reads again.
-    if (command.command === 'RefreshChatModels') return this.readChatModels();
+    if (command.command === 'RefreshChatModels')
+      return command.payload.family === 'anthropic'
+        ? this.readAnthropicModelsNow()
+        : this.readChatModels();
     // Git steps after Accept run git and gh, which wait on the network, so they answer later.
     if (
       command.command === 'PushChatBranch' ||
@@ -2033,6 +2144,8 @@ export class Controller {
     }
     this.outputAbort.abort();
     native.push(...this.outputReads);
+    // An aborted client fetch removes its staging folder before it settles.
+    native.push(...this.clientFetches.values());
     const usageClosing = this.anthropicUsageRuntime?.close();
     if (usageClosing) native.push(usageClosing);
     const connectionClosing = this.connectionChecks?.close();

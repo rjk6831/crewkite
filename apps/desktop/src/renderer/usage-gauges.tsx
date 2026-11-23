@@ -1,7 +1,7 @@
 import type { Observation, Window } from '@crewkite/contracts';
 import { CircleAlert, CircleHelp, CircleSlash, Clock, Target } from 'lucide-react';
 import { type ReactNode, useEffect, useId, useState } from 'react';
-import { gaugeAge, gaugeColor } from './usage-presentation.ts';
+import { gaugeAge, gaugeColor, pastReset } from './usage-presentation.ts';
 import './usage-gauges.css';
 
 export type UsageAmount = NonNullable<Observation['remaining']>;
@@ -158,7 +158,9 @@ function describe(reading: UsageReading, nowMs: number) {
     reading.remaining && Number.isFinite(reading.remaining.value)
       ? { ...reading.remaining, value: Math.max(0, reading.remaining.value) }
       : null;
-  const known = remaining !== null && state !== 'unknown' && state !== 'unavailable';
+  // A reading from before its reset counts for nothing now, on this card as on the rail.
+  const before = pastReset(reading.resetsAt, nowMs);
+  const known = remaining !== null && !before && state !== 'unknown' && state !== 'unavailable';
   const percent = known && remaining.unit === 'percent' ? Math.min(100, remaining.value) : null;
   const usableReserve = reserve && Number.isFinite(reserve.value) ? reserve : null;
   const reservePercent =
@@ -175,7 +177,7 @@ function describe(reading: UsageReading, nowMs: number) {
     usableReserve !== null &&
     usableReserve.unit === remaining.unit &&
     remaining.value <= usableReserve.value;
-  const dated = state === 'stale' || state === 'reset-pending';
+  const dated = state === 'stale';
   const observedAt = time(reading.observedAt);
   const resetsAt = time(reading.resetsAt);
   const resets = resetsAt === null ? null : resetsAt - nowMs;
@@ -185,6 +187,7 @@ function describe(reading: UsageReading, nowMs: number) {
     remaining,
     known,
     unknownValue: !known && state !== 'unavailable',
+    before,
     percent,
     reservePercent,
     exhausted,
@@ -202,7 +205,7 @@ function describe(reading: UsageReading, nowMs: number) {
         : Number.isNaN(resets)
           ? 'Reset time unreadable'
           : resets <= 0
-            ? 'Reset time passed. Waiting for a new reading'
+            ? 'Reset passed'
             : `Resets in ${formatSpan(resets)}`,
     reserveText: reserveValue && note ? `${reserveValue}. ${note}` : (reserveValue ?? note ?? null),
   };
@@ -226,7 +229,7 @@ function details(reading: UsageReading, view: ReturnType<typeof describe>) {
 
 // A missing value names itself and explains why on hover, keyboard focus and tap. It never
 // renders as zero, empty or full.
-function Missing({ reading }: { reading: UsageReading }) {
+function Missing({ reading, before }: { reading: UsageReading; before: boolean }) {
   const tipId = `usage-missing-${useId().replace(/[^a-zA-Z0-9]/g, '')}`;
   const unavailable = reading.state === 'unavailable';
   // Escape hides the explanation without moving focus or the pointer. A new hover or focus
@@ -254,7 +257,9 @@ function Missing({ reading }: { reading: UsageReading }) {
       <span role="tooltip" id={tipId} className="usage-missing-tip">
         {unavailable
           ? 'This source has not reported this allowance.'
-          : 'No usable report for this allowance. A missing value is never shown as zero.'}
+          : before
+            ? 'Read before this window reset. The old value is not shown.'
+            : 'No usable report for this allowance. A missing value is never shown as zero.'}
       </span>
     </span>
   );
@@ -331,12 +336,6 @@ export function UsageGauge({
         Stale
       </Chip>,
     );
-  if (reading.state === 'reset-pending')
-    chips.push(
-      <Chip key="pending" tone="low" icon={<Clock size={11} aria-hidden="true" />}>
-        Reset pending
-      </Chip>,
-    );
   if (view.unknownValue)
     chips.push(
       <Chip key="unknown" tone="unknown" icon={<CircleHelp size={11} aria-hidden="true" />}>
@@ -352,7 +351,7 @@ export function UsageGauge({
   const rows = cluster ? [] : details(reading, view).filter(([term]) => term !== 'Reserve');
   return (
     <figure
-      className={`usage-gauge is-${size} tone-${view.tone} state-${reading.state}${unscaled ? ' is-unscaled' : ''}${view.unknownValue ? ' is-unknown-value' : ''}${reading.constraining ? ' is-constraining' : ''}${cluster ? ' is-clustered' : ''}${view.age.dotted ? ' is-aged' : ''}`}
+      className={`usage-gauge is-${size} tone-${view.tone} state-${reading.state}${view.before ? ' is-before-reset' : ''}${unscaled ? ' is-unscaled' : ''}${view.unknownValue ? ' is-unknown-value' : ''}${reading.constraining ? ' is-constraining' : ''}${cluster ? ' is-clustered' : ''}${view.age.dotted ? ' is-aged' : ''}`}
       aria-labelledby={labelId}
     >
       <figcaption id={labelId} className="usage-gauge-label">
@@ -436,7 +435,7 @@ export function UsageGauge({
         <p className="usage-gauge-value">
           {!view.known || remaining === null ? (
             <strong className="is-word">
-              <Missing reading={reading} />
+              <Missing reading={reading} before={view.before} />
             </strong>
           ) : view.percent !== null ? (
             <strong>
@@ -450,7 +449,9 @@ export function UsageGauge({
             {!view.known || remaining === null
               ? reading.state === 'unavailable'
                 ? 'No reading'
-                : 'No usable report'
+                : view.before
+                  ? 'Read before its reset'
+                  : 'No usable report'
               : `${remaining.unit === 'percent' ? '' : `${remaining.unit} `}${reading.state === 'reported' ? 'remaining' : view.dated ? 'left when observed' : 'remaining'}`}
           </span>
         </p>
@@ -501,7 +502,6 @@ const flagText: Record<string, string> = {
   exhausted: 'Exhausted',
   low: 'At reserve',
   stale: 'Stale',
-  'reset-pending': 'Reset pending',
 };
 
 // An auxiliary allowance on one line. It keeps its own value, reset and warning, so a low or
@@ -538,7 +538,7 @@ function UsageMeter({ reading, nowMs }: { reading: UsageReading; nowMs: number }
       </span>
       <span className="usage-meter-value">
         {!view.known || remaining === null ? (
-          <Missing reading={reading} />
+          <Missing reading={reading} before={view.before} />
         ) : view.percent !== null ? (
           `${percentText(view.percent)}%`
         ) : (
@@ -569,9 +569,7 @@ function UsageMeter({ reading, nowMs }: { reading: UsageReading; nowMs: number }
             <span className="usage-sr-only">Reset time </span>Unreadable
           </>
         ) : (
-          <>
-            Reset passed<span className="usage-sr-only">. Waiting for a new reading</span>
-          </>
+          <>Reset passed</>
         )}
       </span>
       {flags.length > 0 && (

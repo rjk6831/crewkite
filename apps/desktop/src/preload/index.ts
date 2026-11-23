@@ -15,6 +15,7 @@ import {
 } from '@crewkite/contracts';
 import { contextBridge, ipcRenderer, webUtils } from 'electron';
 import { desktopFiles, droppedPaths, MAX_ATTACH_FILES } from '../shared/attach.ts';
+import { plainFailure } from '../shared/ipc-error.ts';
 import { attachmentTarget } from '../shared/open-file.ts';
 import { TASK_ID_PATTERN, threadAttention } from '../shared/thread-notice.ts';
 
@@ -37,35 +38,28 @@ ipcRenderer.on('crewkite:notice', (_event, value: unknown) => {
   recent.set(parsed.data.kind, parsed.data);
   for (const listener of notices) listener(parsed.data);
 });
+// Every call into main goes through here, so no card prints Electron's wrapper text.
+const invoke = async (channel: string, ...args: unknown[]): Promise<unknown> => {
+  try {
+    return await ipcRenderer.invoke(channel, ...args);
+  } catch (failure) {
+    throw plainFailure(failure);
+  }
+};
 const result = async (channel: string, input?: unknown) => {
-  const value: unknown = await ipcRenderer.invoke(channel, ...(input === undefined ? [] : [input]));
+  const value: unknown = await invoke(channel, ...(input === undefined ? [] : [input]));
   return value === null ? null : CommandResultSchema.parse(value);
 };
 const readPage = async (
   command: 'GetWorkspaceState' | 'GetProjectPage' | 'GetTaskPage',
   payload: unknown,
 ) => {
-  const result = CommandResultSchema.parse(
-    await ipcRenderer.invoke('crewkite:command', { command, payload }),
-  );
+  const result = CommandResultSchema.parse(await invoke('crewkite:command', { command, payload }));
   if (result.outcome !== 'applied' || !result.data)
     throw new Error(result.reason ?? 'Workspace read unavailable.');
   return result.data;
 };
-// Main's own sentence, without the IPC wrapper text Electron puts in front of it.
-const plain = (failure: unknown) =>
-  new Error(
-    failure instanceof Error
-      ? failure.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '')
-      : 'The files could not be read.',
-  );
-const findFiles = async (input: unknown) => {
-  try {
-    return desktopFiles(await ipcRenderer.invoke('crewkite:attach', input));
-  } catch (failure) {
-    throw plain(failure);
-  }
-};
+const findFiles = async (input: unknown) => desktopFiles(await invoke('crewkite:attach', input));
 // Anything that is not a file from the page has no path.
 const pathOf = (file: File) => {
   try {
@@ -87,41 +81,35 @@ const attachFiles: NonNullable<DesktopSource['attachFiles']> = async (input) => 
   return unnamed ? [...found, ...(await findFiles({ from: 'clipboard' }))] : found;
 };
 const tokenStatus = async (channel: string): Promise<LocalTokenStatus> => {
-  try {
-    const value: unknown = await ipcRenderer.invoke(channel);
-    const found = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
-    return {
-      available: found.available === true,
-      remembered: found.remembered === true,
-      ...(typeof found.reason === 'string' ? { reason: found.reason.slice(0, 200) } : {}),
-    };
-  } catch (failure) {
-    throw plain(failure);
-  }
+  const value: unknown = await invoke(channel);
+  const found = value && typeof value === 'object' ? (value as Record<string, unknown>) : {};
+  return {
+    available: found.available === true,
+    remembered: found.remembered === true,
+    ...(typeof found.reason === 'string' ? { reason: found.reason.slice(0, 200) } : {}),
+  };
 };
 const bridge: DesktopSource = {
   verifyArtifact: async (input) =>
     ArtifactVerificationSchema.parse(
-      await ipcRenderer.invoke('crewkite:verify-artifact', {
+      await invoke('crewkite:verify-artifact', {
         requestId: input.requestId,
         artifact: ArtifactSchema.parse(input.artifact),
       }),
     ),
   cancelArtifactVerification: async (requestId) => {
-    await ipcRenderer.invoke('crewkite:cancel-artifact-verification', requestId);
+    await invoke('crewkite:cancel-artifact-verification', requestId);
   },
-  getSnapshot: async (scope) =>
-    SnapshotSchema.parse(await ipcRenderer.invoke('crewkite:snapshot', scope)),
+  getSnapshot: async (scope) => SnapshotSchema.parse(await invoke('crewkite:snapshot', scope)),
   workspaceState: async () => WorkspaceStateSchema.parse(await readPage('GetWorkspaceState', {})),
   projectPage: async (input) => ProjectPageSchema.parse(await readPage('GetProjectPage', input)),
   taskPage: async (input) => TaskPageSchema.parse(await readPage('GetTaskPage', input)),
-  command: async (input) =>
-    CommandResultSchema.parse(await ipcRenderer.invoke('crewkite:command', input)),
+  command: async (input) => CommandResultSchema.parse(await invoke('crewkite:command', input)),
   subscribe(listener) {
     events.add(listener);
     if (!subscribed) {
       subscribed = true;
-      void ipcRenderer.invoke('crewkite:events').catch(() => {
+      void invoke('crewkite:events').catch(() => {
         subscribed = false;
       });
     }
@@ -141,136 +129,94 @@ const bridge: DesktopSource = {
     };
   },
   openLink: async (url) => {
-    const value: unknown = await ipcRenderer.invoke('crewkite:open-link', String(url));
+    const value: unknown = await invoke('crewkite:open-link', String(url));
     return value === 'opened' || value === 'declined' ? value : 'refused';
   },
   attachFiles,
   openAttachment: async (input) => {
     const target = attachmentTarget(input);
     if (!target) throw new Error('The file request is invalid.');
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:open-attachment', target);
-      return value === 'cancelled' ? 'cancelled' : 'done';
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const value: unknown = await invoke('crewkite:open-attachment', target);
+    return value === 'cancelled' ? 'cancelled' : 'done';
   },
   savePrompts: async () => {
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:save-prompts');
-      return value === 'cancelled' ? 'cancelled' : 'saved';
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const value: unknown = await invoke('crewkite:save-prompts');
+    return value === 'cancelled' ? 'cancelled' : 'saved';
   },
   exportDiagnostics: async (input) => {
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:export-diagnostics', input);
-      return value === 'saved' ? 'saved' : 'cancelled';
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const value: unknown = await invoke('crewkite:export-diagnostics', input);
+    return value === 'saved' ? 'saved' : 'cancelled';
   },
   feedbackDraft: async (input) => {
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:feedback-draft', input);
-      if (typeof value !== 'string') throw new Error('The report could not be made.');
-      return value;
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const value: unknown = await invoke('crewkite:feedback-draft', input);
+    if (typeof value !== 'string') throw new Error('The report could not be made.');
+    return value;
   },
   sendFeedback: async (input) => {
-    const value: unknown = await ipcRenderer.invoke('crewkite:feedback-send', input);
+    const value: unknown = await invoke('crewkite:feedback-send', input);
     return value === 'done' ? 'done' : 'refused';
   },
   saveNotes: async (projectId) => {
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:save-notes', projectId);
-      return value === 'cancelled' ? 'cancelled' : 'saved';
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const value: unknown = await invoke('crewkite:save-notes', projectId);
+    return value === 'cancelled' ? 'cancelled' : 'saved';
   },
   saveResults: async (projectId) => {
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:save-results', projectId);
-      if (typeof value === 'object' && value !== null && 'records' in value && 'file' in value) {
-        const { records, file } = value;
-        if (typeof records === 'number' && typeof file === 'string') return { records, file };
-      }
-      return 'cancelled';
-    } catch (failure) {
-      throw plain(failure);
+    const value: unknown = await invoke('crewkite:save-results', projectId);
+    if (typeof value === 'object' && value !== null && 'records' in value && 'file' in value) {
+      const { records, file } = value;
+      if (typeof records === 'number' && typeof file === 'string') return { records, file };
     }
+    return 'cancelled';
   },
   saveAnalytics: async (input) => {
     const payload = ReadChatAnalyticsPayloadSchema.safeParse(input);
     if (!payload.success) throw new Error('The usage request is invalid.');
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:save-analytics', payload.data);
-      return value === 'cancelled' ? 'cancelled' : 'saved';
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const value: unknown = await invoke('crewkite:save-analytics', payload.data);
+    return value === 'cancelled' ? 'cancelled' : 'saved';
   },
   previewShare: async (taskId) => {
-    try {
-      const shared = ChatExportSchema.parse(
-        await ipcRenderer.invoke('crewkite:export-preview', String(taskId)),
-      );
-      return {
-        html: shared.content,
-        filename: shared.filename,
-        turns: shared.turns,
-        omitted: shared.omitted,
-      };
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const shared = ChatExportSchema.parse(await invoke('crewkite:export-preview', String(taskId)));
+    return {
+      html: shared.content,
+      filename: shared.filename,
+      turns: shared.turns,
+      omitted: shared.omitted,
+    };
   },
   dismissCrash: async () => {
-    await ipcRenderer.invoke('crewkite:dismiss-crash');
+    await invoke('crewkite:dismiss-crash');
   },
   saveExport: async (input) => {
-    try {
-      const value: unknown = await ipcRenderer.invoke('crewkite:export-save', {
-        taskId: String(input.taskId),
-        format: input.format,
-      });
-      return value === 'cancelled' ? 'cancelled' : 'saved';
-    } catch (failure) {
-      throw plain(failure);
-    }
+    const value: unknown = await invoke('crewkite:export-save', {
+      taskId: String(input.taskId),
+      format: input.format,
+    });
+    return value === 'cancelled' ? 'cancelled' : 'saved';
   },
   pickProject: () => result('crewkite:pick-project'),
   reconnect: async () => {
-    await ipcRenderer.invoke('crewkite:reconnect');
+    await invoke('crewkite:reconnect');
   },
   retryCommand: (expected) => result('crewkite:retry', expected),
   threadAttention: async (input) => {
     const attention = threadAttention(input);
     if (!attention) throw new Error('The thread notice is invalid.');
-    await ipcRenderer.invoke('crewkite:thread-attention', attention);
+    await invoke('crewkite:thread-attention', attention);
   },
   localTokenStatus: () => tokenStatus('crewkite:local-token-status'),
   rememberLocalToken: () => tokenStatus('crewkite:local-token-remember'),
   forgetLocalToken: () => tokenStatus('crewkite:local-token-forget'),
   mcp: {
-    state: async () => McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-state')),
-    save: async (server) =>
-      McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-save', server)),
-    remove: async (name) =>
-      McpStateSchema.parse(await ipcRenderer.invoke('crewkite:mcp-remove', { name })),
+    state: async () => McpStateSchema.parse(await invoke('crewkite:mcp-state')),
+    save: async (server) => McpStateSchema.parse(await invoke('crewkite:mcp-save', server)),
+    remove: async (name) => McpStateSchema.parse(await invoke('crewkite:mcp-remove', { name })),
     setThread: async (taskId, name, policy) =>
-      McpStateSchema.parse(
-        await ipcRenderer.invoke('crewkite:mcp-thread', { taskId, name, policy }),
-      ),
+      McpStateSchema.parse(await invoke('crewkite:mcp-thread', { taskId, name, policy })),
   },
   onboarding: {
-    finished: async () => (await ipcRenderer.invoke('crewkite:onboarding-read')) === true,
+    finished: async () => (await invoke('crewkite:onboarding-read')) === true,
     setFinished: async (finished) => {
-      await ipcRenderer.invoke('crewkite:onboarding-write', finished === true);
+      await invoke('crewkite:onboarding-write', finished === true);
     },
   },
   onOpenThread(listener) {

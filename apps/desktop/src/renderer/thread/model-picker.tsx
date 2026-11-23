@@ -14,6 +14,7 @@ import { REOBSERVE_MS } from '../local-setup-flow.ts';
 import { Select } from '../select.tsx';
 import { familyModel } from '../settings/preferences.ts';
 import { formatSpan } from '../usage-gauges.tsx';
+import { currentAllowance } from '../usage-presentation.ts';
 import { FamilyMark } from './family-mark.tsx';
 import {
   effortLabel,
@@ -67,8 +68,9 @@ const left = (percent: number | null) =>
 
 // The window with the least left decides what the person can still do, so it is the one shown. The
 // family line follows its default model. A window named for another model does not count.
-function allowance(entry: Entry, nowMs: number): string {
-  if (entry.family === 'local' && entry.remaining.length === 0) return 'Runs on this computer';
+function allowance(listed: Entry, nowMs: number): string {
+  if (listed.family === 'local' && listed.remaining.length === 0) return 'Runs on this computer';
+  const entry = currentAllowance(listed, nowMs);
   const { percent, resetsAt } = tightestAllowance(entry, familyModel(entry));
   const reset = resetsAt ? Date.parse(resetsAt) - nowMs : null;
   return percent !== null && reset !== null && reset > 0
@@ -78,7 +80,8 @@ function allowance(entry: Entry, nowMs: number): string {
 
 // A model with a window of its own, such as a weekly pool for one model, shows what it has left
 // on its row when that differs from the family line.
-function modelAllowance(entry: Entry, model: string): string | null {
+function modelAllowance(listed: Entry, model: string, nowMs: number): string | null {
+  const entry = currentAllowance(listed, nowMs);
   const own = left(tightestAllowance(entry, model).percent);
   return own === left(tightestAllowance(entry, familyModel(entry)).percent) ? null : own;
 }
@@ -276,7 +279,7 @@ export function ModelPicker({
             const item = (model: Entry['models'][number]) => {
               const checked =
                 selection?.family === family.family && selection.model === model.model;
-              const own = family.connected ? modelAllowance(family, model.model) : null;
+              const own = family.connected ? modelAllowance(family, model.model, nowMs) : null;
               return (
                 <button
                   key={model.model}

@@ -7,6 +7,7 @@ import { ClientStatus, QuotaRefresh } from './client-status.tsx';
 import { Allowance, type CardProps, ProviderCard } from './provider-card.tsx';
 import { providerEvidence } from './provider-evidence.ts';
 import { ConnectLine } from './providers/connect.tsx';
+import { connectedOnce } from './providers/connect-copy.ts';
 
 export function GoogleCard({ header, workspace, entry, now, actions, scopes }: CardProps) {
   // The quota read waits for Connect. Until then the card shows no gauge and no refresh, even when
@@ -16,6 +17,7 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
   const cards = usageCards(
     scopes.filter(({ family }) => family === 'google'),
     { usageReaders: [] },
+    now,
   );
   return (
     <ProviderCard
@@ -24,11 +26,16 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
       evidence={providerEvidence('google', entry, header, now)}
       reasonLine={googleReasonLine(entry?.reason, header, connecting)}
       client={header.usageReaders.find((reader) => reader.family === 'google')?.client}
-      onCheck={() => actions.checkClient('google')}
+      cloud={{ header, workspace }}
       main={
         <>
           <ConnectLine family="google" header={header} workspace={workspace} />
-          <GoogleSetup snapshot={header} workspace={workspace} onConnecting={setConnecting} />
+          <GoogleSetup
+            snapshot={header}
+            workspace={workspace}
+            onConnecting={setConnecting}
+            connectedOnce={connectedOnce(header, 'google')}
+          />
           <GoogleRecovery header={header} workspace={workspace} />
           <ClientStatus family="google" header={header} now={now} facts={false}>
             {connected && (

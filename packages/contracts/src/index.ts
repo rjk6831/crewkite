@@ -893,7 +893,8 @@ export const GoogleAcpSelectionSchema = z.strictObject({
  * GOOGLE_RECOVERY_HOLD_COPY, shared by desktop and CLI.
  */
 export const GoogleRecoveryHoldSchema = z.enum([
-  // The recorded group is gone. Recover releases the row; its result stays unknown.
+  // The recorded group is gone, or its number went to a later process. Recover releases the row;
+  // its result stays unknown.
   'recoverable',
   // The recorded group still answers. It may now belong to another program.
   'owner-present',
@@ -936,13 +937,15 @@ export const GoogleMetadataRecoverySchema = z.strictObject({
   }),
 });
 export type GoogleMetadataRecovery = z.infer<typeof GoogleMetadataRecoverySchema>;
+// A number that answers and a refused probe leave the person with the same step. Startup releases
+// the row after a restart, and a sign-in waits for Recover, so the line names both.
+const NUMBER_IN_USE =
+  'The process number this operation recorded is still in use, so CrewKite cannot confirm that it ended. Another program may hold the number. Restart the computer to free the number. The operation is then released when CrewKite starts, or by Recover.';
 export const GOOGLE_RECOVERY_HOLD_COPY: Readonly<Record<GoogleRecoveryHold, string>> = {
   recoverable:
     'An interrupted Google operation has ended. Recover releases it. Its result stays unknown.',
-  'owner-present':
-    'CrewKite cannot confirm that the interrupted operation ended. This process number may now belong to another program. Export diagnostics before taking further action.',
-  'owner-unconfirmed':
-    'CrewKite cannot confirm that the interrupted operation ended. This process number may now belong to another program. Export diagnostics before taking further action.',
+  'owner-present': NUMBER_IN_USE,
+  'owner-unconfirmed': NUMBER_IN_USE,
   'no-process-identity':
     'The interrupted operation recorded no process identity. Reconnect cannot safely clear it. Export diagnostics. Other provider connections remain available.',
   'runtime-active': 'A Google operation is still running. Wait for it to finish or stop it.',
@@ -2877,6 +2880,9 @@ export const CommandSchema = z.discriminatedUnion('command', [
   // starts it, and sign-out also ends a sign-in that is still waiting.
   mutate('SignInOpenAi', z.strictObject({ consent: z.literal('explicit') })),
   mutate('SignOutOpenAi', empty),
+  // The Anthropic and Google sign-ins live in the person's own home, not in a home CrewKite owns.
+  // Sign out ends CrewKite's connection and leaves the client and its sign-in as they are.
+  mutate('SignOutProvider', z.strictObject({ family: z.enum(['anthropic', 'google']) })),
   // Initialize and discover run on their own at launch as well as on a click. Authenticate opens
   // a browser, so only a person starts it.
   mutate(

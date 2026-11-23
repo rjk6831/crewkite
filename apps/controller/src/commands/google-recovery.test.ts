@@ -22,7 +22,11 @@ import {
 } from '../providers/google/acp/profile.ts';
 import { fixtureClientHash } from '../store/controller-fixture.ts';
 import { Controller, type ControllerOptions } from './controller.ts';
-import { googleMetadataHolds, recoverGoogleMetadata } from './google-recovery.ts';
+import {
+  googleMetadataHolds,
+  NUMBER_STILL_IN_USE,
+  recoverGoogleMetadata,
+} from './google-recovery.ts';
 
 const sha = (value: string | Buffer) => createHash('sha256').update(value).digest('hex');
 const harness = '#!/bin/sh\nexit 99\n';
@@ -177,14 +181,21 @@ test('recovery settles a Google metadata row only when a zero probe finds its gr
   const { clock, id, open } = googleHome(t);
   const controller = open();
   t.after(() => controller.close());
+  // The probe is scripted. The numbers lie above any PID macOS or Linux issues, so the process
+  // table holds no entry for them and each scripted answer stands alone.
   const rows = [
-    { kind: 'usage', group: 4101, probe: 'ESRCH', hold: 'recoverable' },
-    { kind: 'usage', group: 4102, probe: 'EPERM', hold: 'owner-unconfirmed' },
-    { kind: 'acp-discover', group: 4103, probe: 'present', hold: 'owner-present' },
+    { kind: 'usage', group: 1073741824, probe: 'ESRCH', hold: 'recoverable' },
+    { kind: 'usage', group: 1073741825, probe: 'EPERM', hold: 'owner-unconfirmed' },
+    { kind: 'acp-discover', group: 1073741826, probe: 'present', hold: 'owner-present' },
     { kind: 'usage', group: null, probe: 'ESRCH', hold: 'no-process-identity' },
-    { kind: 'usage', group: 4104, probe: 'ESRCH', hold: 'runtime-active', running: true },
-    { kind: 'acp-authenticate', group: 4105, probe: 'ESRCH', hold: 'authentication-needs-person' },
-    { kind: 'acp-authenticate', group: 4106, probe: 'present', hold: 'owner-present' },
+    { kind: 'usage', group: 1073741827, probe: 'ESRCH', hold: 'runtime-active', running: true },
+    {
+      kind: 'acp-authenticate',
+      group: 1073741828,
+      probe: 'ESRCH',
+      hold: 'authentication-needs-person',
+    },
+    { kind: 'acp-authenticate', group: 1073741829, probe: 'present', hold: 'owner-present' },
   ] as const;
   for (const row of rows) {
     const key = id('cmd');
@@ -409,4 +420,61 @@ test('only a person releases an interrupted Google sign-in, and the sign-in then
   // The older proof still records a finished sign-in. Nothing discovers on it until the person
   // signs in again.
   assert.equal(controller.googleAcpPreparationStep(), null);
+});
+
+test('a held row whose process number now belongs to a younger process settles as owner-absent', async (t) => {
+  const home = googleHome(t);
+  let controller = home.open();
+  t.after(() => controller.close());
+  // The program that took the number. A detached child leads its own group, so its PID is the
+  // group number a row would have recorded.
+  const taker = spawnProcess(process.execPath, ['-e', 'setInterval(() => {}, 60000)'], {
+    detached: true,
+    stdio: 'ignore',
+  });
+  t.after(() => taker.kill('SIGKILL'));
+  await new Promise((done) => taker.once('spawn', done));
+  const group = taker.pid as number;
+  // The process table reports the real clock, so the rows are dated against it.
+  const spawned = Date.now();
+  const hold = (key: string, startedAt: number) =>
+    controller.store.transaction(() => {
+      controller.store.beginGoogleMetadata(key, 'usage', 0, new Date(startedAt).toISOString());
+      controller.store.ownGoogleMetadata(key, group);
+      controller.store.unknownGoogleMetadata(key);
+    });
+
+  // A read recorded after the process started, or less than an hour before it, may be that process.
+  for (const startedAt of [spawned + 60_000, spawned - 30 * 60_000]) {
+    const key = home.id('cmd');
+    hold(key, startedAt);
+    const refused = await home.send(controller, 'RecoverGoogleMetadata', { consent: 'explicit' });
+    assert.equal(refused.outcome, 'blocked');
+    assert.equal(refused.next, NUMBER_STILL_IN_USE);
+    assert.deepEqual((refused.data as GoogleMetadataRecovery).held, [
+      { commandId: key, operation: 'usage', reason: 'owner-present' },
+    ]);
+    assert.equal(controller.store.googleMetadataOperation(key)?.state, 'unknown');
+    controller.store.db
+      .prepare('DELETE FROM google_metadata_operations WHERE command_id=?')
+      .run(key);
+  }
+
+  // A read recorded two hours before the process started had ended by then. Startup settles it.
+  const key = home.id('cmd');
+  hold(key, spawned - 2 * 60 * 60_000);
+  assert.deepEqual(googleMetadataHolds(controller), [
+    { commandId: key, operation: 'usage', reason: 'recoverable' },
+  ]);
+  await controller.close();
+  controller = home.open();
+  assert.equal(controller.store.googleMetadataOperation(key)?.settlement, 'owner-absent');
+  assert.ok(controller.store.receipt(`google-metadata-settled:${key}`));
+  assert.equal(
+    controller.store.transaction(() => controller.store.googleOperationBlocker()),
+    undefined,
+  );
+  // The process that holds the number is still alive.
+  assert.equal(taker.exitCode, null);
+  assert.equal(taker.signalCode, null);
 });

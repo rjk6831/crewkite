@@ -6,10 +6,12 @@ import { AnthropicNativeProfileSchema } from '@crewkite/contracts';
 import { z } from 'zod';
 import { clientRecord, liveModelDefault } from '../client-record.ts';
 import {
+  clientCopies,
   clientDirectories,
   clientHostGate,
   clientVersionStatus,
   findClient,
+  managedClientRoot,
 } from '../client-versions.ts';
 import { fileDigestSync } from '../file-digest.ts';
 import type { ChatClientResolution, NativeProfileResolution } from '../openai/profile.ts';
@@ -163,23 +165,32 @@ export function resolveAnthropicChatClient(
     };
   const found = findClient('anthropic', {
     directories: directories ?? clientDirectories('anthropic', environment),
+    // A caller that names its directories, such as a test, searches only those.
+    copies: directories ? [] : clientCopies('anthropic', environment),
+    managed: directories ? undefined : managedClientRoot(environment),
     home: environment.HOME as string,
     path: environment.PATH,
   });
   if (!found.client) return { status: found.status };
   // A changed build is probed once, before the first turn, and the card shows the result.
-  probeClient({
+  const passed = probeClient({
     executable: found.client.executable,
     sha256: found.client.sha256,
     version: found.client.version,
     environment,
   });
+  // A fetched build that failed the probe is gone. The next search runs the copy before it.
+  if (!passed) return resolveAnthropicChatClient(environment, directories);
   return {
-    status: clientVersionStatus('anthropic', {
-      state: 'version',
-      path: found.client.executable,
-      version: found.client.version,
-    }),
+    status: {
+      ...clientVersionStatus('anthropic', {
+        state: 'version',
+        path: found.client.executable,
+        version: found.client.version,
+        managed: directories ? undefined : managedClientRoot(environment),
+      }),
+      ...(found.status.copy ? { copy: found.status.copy } : {}),
+    },
     profile: {
       facts: AnthropicNativeProfileSchema.parse({
         ...descriptor,

@@ -215,3 +215,37 @@ test('a refresh is refused while another Google metadata operation holds the gat
   assert.deepEqual(home.controller.store.googleAcpSetup(), before);
   assert.equal(home.state.launches, launches);
 });
+
+test('Google reconnects through a model refresh after Sign out, and only when it is applied', async (t) => {
+  const home = readyHome(t);
+  await home.ready();
+  const { controller } = home;
+  const signOut = await controller.execute(
+    CommandSchema.parse({
+      protocol: 1,
+      key: home.id('cmd'),
+      actor: { id: 'terminal', kind: 'cli' },
+      command: 'SignOutProvider',
+      expectedRevision: 0,
+      payload: { family: 'google' },
+    }),
+    'local-owner',
+  );
+  assert.equal(signOut.outcome, 'applied');
+  assert.equal(controller.store.hasConnectedOnce('google'), false);
+  // Sign out ends the connection and keeps the verified setup.
+  assert.equal(controller.store.googleAcpSetup().state, 'ready');
+
+  home.setScenario('no-sign-in');
+  assert.equal((await home.refresh()).outcome, 'blocked');
+  assert.equal(
+    controller.store.hasConnectedOnce('google'),
+    false,
+    'a refused read connects nothing',
+  );
+
+  home.setScenario('complete');
+  assert.equal((await home.refresh()).outcome, 'applied');
+  assert.equal(controller.store.hasConnectedOnce('google'), true);
+  assert.equal(controller.store.signedOut('google'), false);
+});

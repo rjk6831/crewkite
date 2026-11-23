@@ -39,6 +39,22 @@ export const ClientVersionStatusSchema = z.strictObject({
   capabilities: z.array(z.string().min(1).max(80)).max(64).optional(),
   /** The result of the connect-time self-test of the build found, in one plain line. */
   probe: z.string().min(1).max(400).optional(),
+  /** Which copy of the client runs and what CrewKite fetched, for one line on the card. */
+  copy: z
+    .strictObject({
+      /** search-path: where a terminal finds it. provider-app: inside the provider's desktop app. */
+      place: z.enum(['search-path', 'provider-app', 'crewkite']),
+      path: z.string().min(1).max(4096),
+      /** The newest copy CrewKite fetched into its own folder and still holds. */
+      fetched: z
+        .strictObject({ version: z.string().min(1).max(200), at: z.string().min(1).max(40) })
+        .nullable(),
+      /** The last fetched copy CrewKite does not use, with the reason as one sentence. */
+      notUsed: z
+        .strictObject({ version: z.string().min(1).max(200), reason: z.string().min(1).max(300) })
+        .nullable(),
+    })
+    .optional(),
 });
 export type ClientVersionStatus = z.infer<typeof ClientVersionStatusSchema>;
 

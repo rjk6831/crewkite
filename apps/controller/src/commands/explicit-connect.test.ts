@@ -134,3 +134,42 @@ test('a launch reconnect writes one connect line with its time, for the provider
     ['connect openai auto ok ms=n'],
   );
 });
+
+test('sign out of Anthropic or Google ends only the connection, so Connect is needed again', async (t) => {
+  const { controller, command } = await launchFixture(t);
+  for (const family of ['anthropic', 'google'] as const) {
+    controller.store.transaction(() => controller.store.markConnectedOnce(family));
+    const result = await controller.execute(
+      command('SignOutProvider', { family }, 0) as never,
+      'local-owner',
+    );
+    assert.equal(result.outcome, 'applied', family);
+    assert.equal(controller.store.hasConnectedOnce(family), false, family);
+    assert.equal(controller.store.signedOut(family), true, family);
+  }
+  // A Google step in flight holds the setup, so Sign out waits and the connection stays.
+  controller.store.transaction(() => {
+    controller.store.markConnectedOnce('google');
+    controller.store.putGoogleAcpSetup({
+      ...controller.store.googleAcpSetup(),
+      operationId: 'cmd_00000000000000000000000001',
+    });
+  });
+  const held = await controller.execute(
+    command('SignOutProvider', { family: 'google' }, 0) as never,
+    'local-owner',
+  );
+  assert.deepEqual([held.outcome, held.reason], ['blocked', 'google-step-running']);
+  assert.equal(controller.store.hasConnectedOnce('google'), true);
+  // Connecting again clears the signed-out mark, so sends and reads resume.
+  assert.equal(controller.store.signedOut('google'), false);
+});
+
+test('Refresh models on the Anthropic card waits for Connect', async (t) => {
+  const { controller, command } = await launchFixture(t);
+  const result = await controller.execute(
+    command('RefreshChatModels', { family: 'anthropic' }, 0) as never,
+    'local-owner',
+  );
+  assert.deepEqual([result.outcome, result.reason], ['blocked', 'not-connected']);
+});

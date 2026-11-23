@@ -3,10 +3,12 @@ import { type ClientVersionStatus, GoogleNativeProfileSchema } from '@crewkite/c
 import { clientRecord, liveModelDefault } from '../client-record.ts';
 import {
   CLIENT_VERSIONS,
+  clientCopies,
   clientDirectories,
   clientStatusReason,
   clientVersionStatus,
   findClient,
+  managedClientRoot,
 } from '../client-versions.ts';
 import type { NativeProfileResolution } from '../openai/profile.ts';
 import { platformGate } from '../platform.ts';
@@ -104,6 +106,9 @@ export function resolveGoogleUsageClient(
     return { available: false, reason: 'native-home-unavailable' };
   const found = findClient('google', {
     directories: searchDirectories ?? clientDirectories('google', environment),
+    // A caller that names its directories, such as a test, searches only those.
+    copies: searchDirectories ? [] : clientCopies('google', environment),
+    managed: searchDirectories ? undefined : managedClientRoot(environment),
     home: environment.HOME,
     path: environment.PATH,
     cachedOnly: options.cachedOnly,

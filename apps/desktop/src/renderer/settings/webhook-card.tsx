@@ -4,10 +4,10 @@ import type { DesktopCommand, DesktopSource } from '../source.ts';
 
 type Source = Pick<DesktopSource, 'command'>;
 
-// The sentence the controller wrote, without the IPC wrapper text Electron puts in front of it.
+// The preload already strips Electron's wrapper text, so the message is the controller's sentence.
 const sentence = (failure: unknown) =>
   failure instanceof Error && failure.message
-    ? failure.message.replace(/^Error invoking remote method '[^']+': (Error: )?/, '')
+    ? failure.message
     : 'The controller did not accept this request.';
 
 async function send(source: Source, command: 'ReadWebhook' | 'SetWebhook', payload: object) {

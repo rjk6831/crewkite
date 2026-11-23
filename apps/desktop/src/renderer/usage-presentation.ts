@@ -60,6 +60,11 @@ const windowFacts = (window: Window) => {
 const scopeFacts = (windows: readonly Window[]) =>
   canonicalJson(windows.map(windowFacts).sort(compare));
 
+const newest = (windows: readonly Window[]) =>
+  windows
+    .map(({ observation }) => observation.observedAt)
+    .reduce((left, right) => (Date.parse(right) > Date.parse(left) ? right : left));
+
 function displayState(window: Window, nowMs: number): Window['state'] {
   const observation = window.observation;
   // A snapshot may arrive after the last display tick. Larger clock differences
@@ -208,12 +213,13 @@ export function windowLabel(windowId: string, periodSeconds?: number): string {
 
 /** Projection keeps report identity separate from account identity and execution admission. */
 export function projectUsagePresentation(
-  snapshot: Pick<Snapshot, 'routes' | 'usage' | 'usageReaders'>,
+  snapshot: Pick<Snapshot, 'routes' | 'usage' | 'usageReaders' | 'googleMetadataHolds'>,
   reserves: readonly Reserve[] | null,
   nowMs: number,
 ): UsageGaugeCard[] {
   if (!Number.isFinite(nowMs)) throw new RangeError('Usage display time must be finite.');
   const reader = snapshot.usageReaders.find((value) => value.id === 'google-usage-v1') ?? null;
+  const stuck = stuckHolds(snapshot).length > 0;
   const scopes: Scope[] = [];
   for (const route of [...snapshot.routes].sort((a, b) => compare(a.id, b.id))) {
     if (route.family === 'local') continue;
@@ -289,7 +295,8 @@ export function projectUsagePresentation(
         id: `${id}:${observation.windowId}:${occurrence}`,
         windowId: observation.windowId,
         label: windowLabel(observation.windowId, observation.semantics?.periodSeconds),
-        remaining: observation.remaining,
+        // The gauge withholds it too, which covers the Anthropic card built below.
+        remaining: pastReset(observation.resetsAt, nowMs) ? null : observation.remaining,
         resetsAt: observation.resetsAt,
         observedAt: observation.observedAt,
         source: observation.source,
@@ -319,8 +326,25 @@ export function projectUsagePresentation(
     if (readings.length === 0) notices.push('No usage observations.');
     if (weekly.length > 1 || fiveHour.length > 1)
       notices.push('Several windows share a period, so each shows on its own.');
+    const before = orderedWindows.filter(({ observation }) =>
+      pastReset(observation.resetsAt, nowMs),
+    );
+    const unavailable = family === 'google' && !!reader && !reader.available;
+    if (before.length > 0 && !scope.fixture)
+      notices.push(
+        `${readAgo(newest(before), nowMs)}, before the reset. ${
+          family !== 'google'
+            ? 'Refresh reads it again.'
+            : stuck
+              ? 'An interrupted Google operation blocks new quota reads. Recovery on the Google card in Settings has the details.'
+              : unavailable
+                ? 'The quota reader is not available.'
+                : 'The next quota read replaces it.'
+        }`,
+      );
     if (family === 'google' && !scope.fixture) {
-      if (reader && !reader.available)
+      // A reading from before its reset shows no value, so only a current one stays in view.
+      if (unavailable && before.length === 0)
         notices.push('The quota reader is not available. The last readings stay in view.');
       if (googleReports.size > 1)
         notices.push('Google routes report different readings, so each shows on its own.');
@@ -391,7 +415,10 @@ export function usageCardFamily(
 }
 
 /** The controller turned the report's used percent into what remains. */
-export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): UsageCard | null {
+export function anthropicUsageCard(
+  snapshot: Pick<Snapshot, 'usageReaders'>,
+  nowMs: number,
+): UsageCard | null {
   const reader = snapshot.usageReaders.find((value) => value.id === 'anthropic-usage-v1');
   if (!reader) return null;
   const reading = reader.reading;
@@ -425,7 +452,11 @@ export function anthropicUsageCard(snapshot: Pick<Snapshot, 'usageReaders'>): Us
     // A report read under another sign-in says so. A current one needs no tag.
     tags: matching ? [] : ['May be from an earlier sign-in'],
     // Each gauge says how long ago CrewKite read the report. Details say the report has no time of its own.
-    notice: reading ? undefined : 'Refresh Anthropic quota to read the native report.',
+    notice: !reading
+      ? 'Refresh Anthropic quota to read the native report.'
+      : reading.windows.some((window) => pastReset(window.resetsAt, nowMs))
+        ? `${readAgo(reading.receivedAt, nowMs)}, before the reset. Refresh reads it again.`
+        : undefined,
     primary,
     featured,
     auxiliary: rows.filter((row) => !primary.includes(row) && row !== featured),
@@ -491,6 +522,54 @@ export function gaugeColor(percentRemaining: number) {
 export const GAUGE_DOTTED_AFTER_MIN = 60;
 
 /**
+ * Minutes since a reading was taken, or null for a time that cannot be read or lies more than a
+ * minute ahead of this clock. The rail, the card and every gauge age a reading through this one
+ * rule, so the same reading never shows two ages.
+ */
+function readingMinutes(readAt: string | null | undefined, nowMs: number): number | null {
+  const at = readAt ? Date.parse(readAt) : Number.NaN;
+  if (!Number.isFinite(at) || at - nowMs > 60_000) return null;
+  return Math.floor(Math.max(0, nowMs - at) / 60_000);
+}
+
+// The rail writes "m" for minutes so the line fits beside the reset time.
+const ageWords = (minutes: number, short = false) =>
+  minutes < 1
+    ? 'read just now'
+    : minutes < 60
+      ? `read ${minutes} ${short ? 'm' : 'min'} ago`
+      : minutes < 1440
+        ? `read ${Math.floor(minutes / 60)} h ago`
+        : `read ${Math.floor(minutes / 1440)} d ago`;
+
+/**
+ * A percent read before its window reset says nothing about the allowance now, so the rail, the
+ * card and the picker all withhold it. It is never carried over or guessed.
+ */
+export const pastReset = (resetsAt: string | null | undefined, nowMs: number) =>
+  !!resetsAt && Date.parse(resetsAt) <= nowMs;
+
+/**
+ * A catalog entry with every percent from before its reset withheld, on this clock. The catalog
+ * was read on the controller's clock, and a reset can pass before the next read.
+ */
+export function currentAllowance<T extends Pick<ChatCatalogEntry, 'remaining'>>(
+  entry: T,
+  nowMs: number,
+): T {
+  return {
+    ...entry,
+    remaining: entry.remaining.map((window) =>
+      pastReset(window.resetsAt, nowMs) ? { ...window, percent: null } : window,
+    ),
+  };
+}
+
+/** Holds that need the person. A live operation holds the gate too, and that is normal work. */
+export const stuckHolds = (header: Pick<Snapshot, 'googleMetadataHolds'>) =>
+  (header.googleMetadataHolds ?? []).filter((row) => row.reason !== 'runtime-active');
+
+/**
  * How old a gauge reading is, as the label under the gauge: "read 4 min ago", "read 2 h ago" or
  * "age unknown". A time that cannot be read, or that lies more than a minute ahead of the clock,
  * is unknown. `dotted` is true once the read is more than 60 minutes old.
@@ -499,37 +578,24 @@ export function gaugeAge(
   readAt: string | null | undefined,
   nowMs: number,
 ): { label: string; dotted: boolean } {
-  const at = readAt ? Date.parse(readAt) : Number.NaN;
-  if (!Number.isFinite(at) || at - nowMs > 60_000) return { label: 'age unknown', dotted: false };
-  const minutes = Math.floor(Math.max(0, nowMs - at) / 60_000);
-  const label =
-    minutes < 1
-      ? 'read just now'
-      : minutes < 60
-        ? `read ${minutes} min ago`
-        : minutes < 1440
-          ? `read ${Math.floor(minutes / 60)} h ago`
-          : `read ${Math.floor(minutes / 1440)} d ago`;
-  return { label, dotted: minutes > GAUGE_DOTTED_AFTER_MIN };
+  const minutes = readingMinutes(readAt, nowMs);
+  if (minutes === null) return { label: 'age unknown', dotted: false };
+  return { label: ageWords(minutes), dotted: minutes > GAUGE_DOTTED_AFTER_MIN };
 }
 
 /**
- * How long ago CrewKite read a report, in minutes and then hours. `short` writes "read 3 m ago"
- * for the rail, where the line has to fit beside the reset time.
+ * How long ago CrewKite read a report, by the gauges' rule. `short` is the rail's form: lower case
+ * and "m" for minutes. Null when there is no reading time at all.
  */
 export function readAgo(
   readAt: string | null | undefined,
   nowMs: number,
   short = false,
 ): string | null {
-  const at = readAt ? Date.parse(readAt) : Number.NaN;
-  if (!Number.isFinite(at)) return null;
-  const minutes = Math.floor(Math.max(0, nowMs - at) / 60_000);
-  const read = short ? 'read' : 'Read';
-  if (minutes < 1) return `${read} just now`;
-  return minutes < 60
-    ? `${read} ${minutes} ${short ? 'm' : 'min'} ago`
-    : `${read} ${Math.floor(minutes / 60)} h ago`;
+  if (!readAt) return null;
+  const minutes = readingMinutes(readAt, nowMs);
+  const label = minutes === null ? 'age unknown' : ageWords(minutes, short);
+  return short ? label : `${label[0].toUpperCase()}${label.slice(1)}`;
 }
 
 export type RailBar = { text: string; percent: number | null };
@@ -601,7 +667,8 @@ export function railFamilies(
       ? catalog.families
       : [...catalog.families, localPlaceholder],
   );
-  return entries.map((entry) => {
+  return entries.map((listed) => {
+    const entry = currentAllowance(listed, nowMs);
     const model = modelFor(entry);
     // A family this computer cannot run keeps its row, greyed, so every computer shows the same
     // four rows in the same order. Today that is Google on Linux.

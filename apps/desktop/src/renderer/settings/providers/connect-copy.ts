@@ -21,7 +21,7 @@ export const CONNECT_COPY = {
   openaiFirst: 'CrewKite signs in to Codex in its own home. Your Codex app is not touched.',
   openaiWaiting: 'Finish the sign-in in your browser.',
   openaiFailed: 'The sign-in did not finish. Press Connect to try again.',
-  openaiSignedIn: 'Signed in to Codex in CrewKite.',
+  anthropicUnchecked: 'The sign-in check did not finish. Press Connect to run it again.',
   anthropicSignedIn: (version: string | null) =>
     `${claudeCode(version)} is signed in on this device.`,
   anthropicFound: (version: string | null) =>
@@ -39,7 +39,7 @@ export const connectedOnce = (header: WorkspaceState, family: ChatFamily) =>
 export function connectState(
   header: WorkspaceState,
   family: ChatFamily,
-): { line: string; action: 'connect' | 'sign-out' | 'cancel' | null } | null {
+): { line: string; action: 'connect' | 'cancel' | null } | null {
   const once = connectedOnce(header, family);
   if (family === 'openai') {
     const signIn = header.providerConnections?.openAiSignIn;
@@ -49,16 +49,20 @@ export function connectState(
     const reader = header.usageReaders.find((value) => value.family === 'openai');
     if (reader?.readReason === 'unsupported-account')
       return { line: EXPIRED.openai, action: 'connect' };
-    return { line: CONNECT_COPY.openaiSignedIn, action: 'sign-out' };
+    return null;
   }
   if (family === 'anthropic') {
     const connection = header.nativeConnections.find((value) => value.family === 'anthropic');
     const version =
       header.usageReaders.find((value) => value.family === 'anthropic')?.client?.version ?? null;
-    if (once)
-      return connection?.state === 'signed-out'
-        ? { line: EXPIRED.anthropic, action: 'connect' }
-        : null;
+    if (once) {
+      if (connection?.state === 'signed-out') return { line: EXPIRED.anthropic, action: 'connect' };
+      // A check that stopped or timed out leaves the state neither signed in nor running. Connect
+      // runs the sign-in check again.
+      return connection?.state === 'signed-in' || connection?.state === 'checking'
+        ? null
+        : { line: CONNECT_COPY.anthropicUnchecked, action: 'connect' };
+    }
     return connection?.state === 'signed-in'
       ? { line: CONNECT_COPY.anthropicSignedIn(version), action: 'connect' }
       : { line: CONNECT_COPY.anthropicFound(version), action: 'connect' };
