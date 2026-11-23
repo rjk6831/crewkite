@@ -57,7 +57,7 @@ export function resolveGoogleNativeProfile(_environment = process.env): NativePr
 
 // The quota reader runs automatically using one zero-turn /usage command on the installed CLI
 // and never prepares, starts or submits a task. It accepts any build the version table accepts
-// (ADR 0009, amendment of 2026-10-31); the ACP bundle keeps its exact pin.
+// (ADR 0009, amendment of 2026-10-31). The chat agent is found and checked on its own.
 export const googleUsageDescriptor = {
   id: 'google-usage-v1',
   family: 'google',

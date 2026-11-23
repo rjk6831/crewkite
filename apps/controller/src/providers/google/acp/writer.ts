@@ -16,6 +16,7 @@ import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
 import { withGitCeiling } from '../../../host/git-ceiling.ts';
 import { defaultSchedule } from '../../../host/worker.ts';
+import { parseClientVersion } from '../../client-versions.ts';
 import {
   type AcpConnection,
   type AcpDiagnostic,
@@ -30,9 +31,12 @@ import {
   startAcpProcess,
 } from './client.ts';
 import {
+  ACP_EARNED_MODE,
+  ACP_EARNED_REVIEW,
   ACP_SESSION_MODELS,
+  AcpBundlePinSchema,
+  type AcpClient,
   type AcpClientIdentity,
-  AcpClientPinSchema,
   AcpImportIdentitySchema,
   type AcpReviewMapping,
   type AcpSetupProof,
@@ -40,6 +44,7 @@ import {
   acpClientPin,
   acpReviewMappingMatchesClient,
   GoogleAcpReviewMappings,
+  isAcpBundle,
   validateAcpSetupProof,
 } from './profile.ts';
 
@@ -65,7 +70,7 @@ type DecodedConfig = {
 };
 export const AcpToolMappingSchema = z.discriminatedUnion('schema', [
   z.strictObject({
-    client: AcpClientPinSchema,
+    client: AcpBundlePinSchema,
     toolName: acpIdentifier,
     schema: z.literal('replace-target-v1'),
     evidenceHash: HashSchema,
@@ -203,17 +208,31 @@ const initialized = z.object({
     .max(16)
     .default([]),
 });
+// Another build names its own version. It must be the one the copy was found under, which for a
+// fetched copy is the version the registry named.
+const agentInitialized = initialized.extend({
+  protocolVersion: z.number(),
+  agentInfo: z.object({ version: z.string().max(200) }),
+});
+/** Why a build other than the bundle failed a read it cannot pass by trying again. */
+export type AcpQualifyRefusal = 'protocol' | 'version' | 'sign-in-method' | 'models' | 'mode';
 async function initialize(
   connection: AcpConnection,
-  client: AcpClientIdentity,
+  client: AcpClient,
+  refuse: (reason: AcpQualifyRefusal) => never = () => {
+    throw new AcpError('configuration');
+  },
 ): Promise<AcpSetupProof> {
-  const result = initialized.parse(
-    await connection.request('initialize', {
-      protocolVersion: 1,
-      clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
-      clientInfo: { name: 'crewkite', version: '0.1.0' },
-    }),
-  );
+  const reply = await connection.request('initialize', {
+    protocolVersion: 1,
+    clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false },
+    clientInfo: { name: 'crewkite', version: '0.1.0' },
+  });
+  const result = isAcpBundle(client) ? initialized.parse(reply) : agentInitialized.parse(reply);
+  if (!isAcpBundle(client)) {
+    if (result.protocolVersion !== 1) refuse('protocol');
+    if (parseClientVersion(result.agentInfo.version)?.text !== client.version) refuse('version');
+  }
   const personal = result.authMethods.filter(
     (v) => v.id === 'oauth-personal' && (v.type === undefined || v.type === 'agent'),
   );
@@ -268,24 +287,46 @@ export const ACP_DISCOVERY_SETTLE_MS = 5000;
  * Each setup step's deadline. Sign-in waits on the person in the browser, which can take a few
  * minutes with a second factor.
  */
-export const ACP_SETUP_TIMEOUT_MS = { initialize: 30000, authenticate: 300000, discover: 20000 };
+export const ACP_SETUP_TIMEOUT_MS = {
+  initialize: 30000,
+  authenticate: 300000,
+  discover: 20000,
+  // A qualify step is a discover on a build not yet in use, with the settle wait on top, or a
+  // sign-in followed by one.
+  qualify: 25000,
+};
 export type AcpSetupOptions = Omit<AcpProcessOptions, 'timeoutMs'> & {
-  operation: 'initialize' | 'authenticate' | 'discover';
+  /**
+   * qualify: initialize and discover on a build that is not in use yet, in one process, with no
+   * earlier proof. The sign-in is the agent's own saved one, or one the person starts on the
+   * card when signIn is set.
+   */
+  operation: 'initialize' | 'authenticate' | 'discover' | 'qualify';
   priorProof: AcpSetupProof | null;
+  signIn?: boolean;
 } & AcpDependencies;
 export function startGoogleAcpSetup(options: AcpSetupOptions) {
   const mappings = options.reviewMappings ?? GoogleAcpReviewMappings;
-  if (options.operation !== 'initialize') {
+  const qualify = options.operation === 'qualify';
+  if (options.operation !== 'initialize' && !qualify) {
     if (!options.priorProof) throw new AcpError('identity');
     validateAcpSetupProof(options.priorProof, options.client, mappings);
   }
-  return startAcpProcess(
+  let refused: AcpQualifyRefusal | null = null;
+  const refuse = (reason: AcpQualifyRefusal): never => {
+    refused ??= reason;
+    throw new AcpError('configuration');
+  };
+  const handle = startAcpProcess(
     {
       ...options,
-      timeoutMs: ACP_SETUP_TIMEOUT_MS[options.operation],
+      timeoutMs:
+        qualify && options.signIn
+          ? ACP_SETUP_TIMEOUT_MS.authenticate + ACP_SETUP_TIMEOUT_MS.qualify
+          : ACP_SETUP_TIMEOUT_MS[options.operation],
     },
     async (connection) => {
-      const proof = await initialize(connection, options.client);
+      const proof = await initialize(connection, options.client, refuse);
       connection.onRequest = (id) => {
         connection.respond(id, { outcome: { outcome: 'cancelled' } });
         throw new AcpError('permission');
@@ -293,9 +334,11 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
       if (options.operation === 'initialize') return proof;
       // A reply that names no personal sign-in yet is the client's own state, which another try
       // can clear. The person refused nothing.
-      if (!proof.capabilities.authMethods.includes('oauth-personal'))
+      if (!proof.capabilities.authMethods.includes('oauth-personal')) {
+        refused ??= 'sign-in-method';
         throw new AcpError('configuration');
-      if (options.operation === 'authenticate') {
+      }
+      if (options.operation === 'authenticate' || (qualify && options.signIn)) {
         let reply: unknown;
         try {
           reply = await connection.request('authenticate', { methodId: 'oauth-personal' });
@@ -307,12 +350,18 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
           throw error;
         }
         z.object({}).parse(reply);
-        return AcpSetupProofSchema.parse({
-          ...proof,
-          auth: { method: 'oauth-personal', status: 'authenticated' },
-        });
+        if (!qualify)
+          return AcpSetupProofSchema.parse({
+            ...proof,
+            auth: { method: 'oauth-personal', status: 'authenticated' },
+          });
       }
-      if (options.priorProof?.auth.status !== 'authenticated') throw new AcpError('authentication');
+      // A build being qualified holds no proof yet. A session that opens shows its sign-in works,
+      // and the sign-in error on session/new ends the step as a sign-in still required.
+      const auth = qualify
+        ? ({ method: 'oauth-personal', status: 'authenticated' } as const)
+        : options.priorProof?.auth;
+      if (auth?.status !== 'authenticated') throw new AcpError('authentication');
       const replay = bufferSessionUpdates(connection);
       const session = sessionSchema.parse(
         await connection.request('session/new', { cwd: options.directory, mcpServers: [] }),
@@ -340,15 +389,20 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
           };
         });
       settle = undefined;
-      const matches = mappings.filter(
-        (v) =>
-          acpReviewMappingMatchesClient(v, options.client) &&
-          observed.modeValues.some((m) => m.optionId === v.configId && m.valueId === v.valueId),
-      );
+      const matches = isAcpBundle(options.client)
+        ? mappings.filter(
+            (v) =>
+              acpReviewMappingMatchesClient(v, options.client) &&
+              observed.modeValues.some((m) => m.optionId === v.configId && m.valueId === v.valueId),
+          )
+        : await earnedReviewMode(connection, session.sessionId, observed);
       const mode = matches.length === 1 ? matches[0] : null;
+      if (!isAcpBundle(options.client))
+        if (!observed.configOptions) refused ??= 'models';
+        else if (!mode) refused ??= 'mode';
       const discovered = AcpSetupProofSchema.parse({
         ...proof,
-        auth: options.priorProof.auth,
+        auth,
         configOptions: observed.configOptions,
         modeValues: observed.modeValues,
         reviewMode: mode
@@ -369,6 +423,43 @@ export function startGoogleAcpSetup(options: AcpSetupOptions) {
       return validateAcpSetupProof(discovered, options.client, mappings);
     },
   );
+  return Object.assign(handle, {
+    /** Why a build other than the bundle cannot pass, when a read said so. */
+    refusal: (): AcpQualifyRefusal | null => refused,
+  });
+}
+
+/**
+ * A build without a digest-keyed mapping earns the asking mode from its own session: exactly one
+ * select option of category mode, with the id `mode`, that offers `default`, and an
+ * acknowledgement of a set to `default` that lists the option with that value. The set is a
+ * setting on an empty session in a private folder; no prompt is sent. What `default` does on the
+ * build is checked again during each turn.
+ */
+async function earnedReviewMode(
+  connection: AcpConnection,
+  sessionId: string,
+  observed: DecodedConfig,
+): Promise<{ configId: string; valueId: string; evidenceHash: string }[]> {
+  const { configId, valueId } = ACP_EARNED_MODE;
+  if (
+    observed.selectedModes.size !== 1 ||
+    !observed.selectedModes.has(configId) ||
+    !observed.modeValues.some((m) => m.optionId === configId && m.valueId === valueId)
+  )
+    return [];
+  const ack = z
+    .object({ configOptions: z.array(z.object({ id: z.string(), currentValue: z.unknown() })) })
+    .safeParse(
+      await connection.request('session/set_config_option', {
+        sessionId,
+        configId,
+        value: valueId,
+      }),
+    );
+  const confirmed =
+    ack.success && ack.data.configOptions.find((o) => o.id === configId)?.currentValue === valueId;
+  return confirmed ? [{ configId, valueId, evidenceHash: ACP_EARNED_REVIEW }] : [];
 }
 
 const targetSchema = z.strictObject({
@@ -537,8 +628,10 @@ export type AcpMcpServer = {
   args: string[];
   env: { name: string; value: string }[];
 };
-export type AcpWriterOptions = Omit<AcpProcessOptions, 'timeoutMs'> &
+export type AcpWriterOptions = Omit<AcpProcessOptions, 'timeoutMs' | 'client'> &
   AcpDependencies & {
+    /** The writer's tool mapping is keyed to the bundle, so only the bundle runs it. */
+    client: AcpClientIdentity;
     scratch: string;
     timeoutMs?: number;
     plan: AcpWriterPlan;

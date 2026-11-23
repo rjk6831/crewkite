@@ -53,3 +53,7 @@ I made this change because a lease and a closed Google gate protect nothing afte
 I separate a known model-specific quota pool from an explicitly mapped selection. The [provider notes](../providers.md#google-quota-read) name the exact mapping and required windows. The complete account report remains visible. Admission uses the frozen selection at preflight and again before launch. Unknown pools and unmapped selections retain conservative checks; configured reserves remain mandatory.
 
 A separate model pool reaching zero must not consume the allowance of the mapped selection. Missing required windows still require a fresh read and cannot establish admission. This changes the earlier all-bucket admission rule without changing metadata ownership, observation freshness or account matching.
+
+## Amendment, 2026-11-23
+
+Which agent build runs is set in [Proposed ADR 0061](0061-run-the-newest-verified-client-copy.md). The reviewed 1.4.0 bundle stays as the fallback with its digests.

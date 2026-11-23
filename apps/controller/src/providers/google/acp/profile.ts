@@ -7,6 +7,7 @@ import {
   openSync,
   readdirSync,
   readSync,
+  realpathSync,
   type Stats,
 } from 'node:fs';
 import { lstat, open, unlink } from 'node:fs/promises';
@@ -20,6 +21,7 @@ import {
 } from '@crewkite/contracts';
 import { hashCanonical } from '@crewkite/contracts/hash';
 import { z } from 'zod';
+import { clientFileTrust, newestByVersion, parseClientVersion } from '../../client-versions.ts';
 import { DIGEST_PIECE_BYTES, fileDigest, fileDigestSync } from '../../file-digest.ts';
 
 const identifier = z
@@ -33,20 +35,59 @@ const identifier = z
  * `session/set_model`, which a config option ID cannot name.
  */
 export const ACP_SESSION_MODELS = 'session/models';
+/**
+ * The agent build a setup proof belongs to. Any build Google signs may serve the chat route once
+ * its connect-time reads pass, so the version is the one the build reports, in the form
+ * parseClientVersion reads.
+ */
 export const AcpClientPinSchema = z.strictObject({
-  version: z.literal('1.4.0'),
+  version: z
+    .string()
+    .max(64)
+    .refine((value) => parseClientVersion(value)?.text === value),
   sha256: HashSchema,
   signerTeamId: z.string().regex(/^[A-Z0-9]{10}$/),
 });
 export type AcpClientPin = z.infer<typeof AcpClientPinSchema>;
-export const AcpImportIdentitySchema = AcpClientPinSchema.extend({ harnessSha256: HashSchema });
+/**
+ * The 1.4.0 bundle Connect installs. Its pin.json, identity and evidence keep the exact build.
+ * The type stays a string so a bundle identity reads as any other pin.
+ */
+export const AcpBundlePinSchema = AcpClientPinSchema.extend({
+  version: z.string().refine((value): boolean => value === '1.4.0'),
+});
+export const AcpImportIdentitySchema = AcpBundlePinSchema.extend({ harnessSha256: HashSchema });
 export const AcpServerMaximumBytes = 384 * 1024 * 1024;
 export const AcpHarnessMaximumBytes = 128 * 1024 * 1024;
+/** The 1.4.0 bundle in a home: the server and its harness, both checked against the pin. */
 export type AcpClientIdentity = Readonly<
   z.infer<typeof AcpImportIdentitySchema> & { executable: string }
 >;
+/**
+ * A Google agent outside the bundle: a copy on the device or one CrewKite fetched. It was found
+ * signed by Google on this exact file, and its digest is what every launch checks again. `args`
+ * is the launch line, from a closed list. `helpers` are the other programs in a fetched folder.
+ */
+export type AcpAgentIdentity = Readonly<{
+  version: string;
+  sha256: string;
+  signerTeamId: string;
+  executable: string;
+  args: readonly string[];
+  helpers: readonly { path: string; sha256: string }[];
+}>;
+/** Any agent the chat route can start. */
+export type AcpClient = AcpClientIdentity | AcpAgentIdentity;
+export const isAcpBundle = (client: AcpClient | AcpClientPin): client is AcpClientIdentity =>
+  'harnessSha256' in client;
+/**
+ * The only launch lines an agent gets. `acp` is the subcommand a device copy serves the protocol
+ * on, and `--stdio` its default transport, which a registry entry may name. CrewKite passes no
+ * argument whose meaning it has not read, and never one that skips the permission prompts.
+ */
+export const ACP_AGENT_ARGS: readonly (readonly string[])[] = [[], ['acp'], ['acp', '--stdio']];
 export const AcpReviewMappingSchema = z.strictObject({
-  client: AcpClientPinSchema,
+  client: AcpBundlePinSchema,
   harnessSha256: HashSchema.optional(),
   surface: z.literal('config'),
   configId: identifier,
@@ -101,6 +142,15 @@ export const AcpSetupProofSchema = z
   );
 export type AcpSetupProof = z.infer<typeof AcpSetupProofSchema>;
 
+/**
+ * The evidence hash of a review mode a build earned from its own session, for any build without
+ * a digest-keyed mapping. The IDs are the ones the 1.4.0 evidence names: the one `mode` option
+ * and its `default` value, which the session must offer and confirm when set. They are protocol
+ * facts, like the method names. No version, digest or model name decides them.
+ */
+export const ACP_EARNED_MODE = { configId: 'mode', valueId: 'default' } as const;
+export const ACP_EARNED_REVIEW = hashCanonical({ rule: 'earned-review-v1', ...ACP_EARNED_MODE });
+
 const signatureSchema = z.strictObject({
   method: z.literal('macos-codesign'),
   verified: z.literal(true),
@@ -111,7 +161,7 @@ const signatureSchema = z.strictObject({
 export const AcpImportPinSchema = z.strictObject({
   version: z.literal(2),
   profileId: z.literal('google-acp-v1'),
-  client: AcpClientPinSchema,
+  client: AcpBundlePinSchema,
   signature: signatureSchema,
   harness: z.strictObject({ sha256: HashSchema, signature: signatureSchema }),
 });
@@ -121,7 +171,7 @@ export function googleAcpDeveloperIdRequirement(signerTeamId: string): string {
   return `anchor apple generic and certificate 1[field.1.2.840.113635.100.6.2.6] exists and certificate leaf[field.1.2.840.113635.100.6.1.13] exists and certificate leaf[subject.OU] = "${team}"`;
 }
 
-export function acpClientPin(client: AcpClientIdentity | AcpClientPin): AcpClientPin {
+export function acpClientPin(client: AcpClient | AcpClientPin): AcpClientPin {
   return AcpClientPinSchema.parse({
     version: client.version,
     sha256: client.sha256,
@@ -131,7 +181,7 @@ export function acpClientPin(client: AcpClientIdentity | AcpClientPin): AcpClien
 
 export function acpReviewMappingMatchesClient(
   value: AcpReviewMapping,
-  client: AcpClientIdentity | AcpClientPin,
+  client: AcpClient | AcpClientPin,
 ): boolean {
   const mapping = AcpReviewMappingSchema.parse(value);
   return (
@@ -152,11 +202,59 @@ function parseAcpClientIdentity(client: AcpClientIdentity): AcpClientIdentity {
 
 const harnessPath = (executable: string) => join(dirname(executable), 'localharness_external');
 
+function parseAcpAgentIdentity(client: AcpAgentIdentity): AcpAgentIdentity {
+  const path = z
+    .string()
+    .min(1)
+    .max(4096)
+    .refine((value) => isAbsolute(value) && resolve(value) === value);
+  const parsed = z
+    .strictObject({
+      ...AcpClientPinSchema.shape,
+      executable: path,
+      args: z.array(z.string().max(16)).max(2),
+      helpers: z.array(z.strictObject({ path, sha256: HashSchema })).max(64),
+    })
+    .parse(client);
+  if (!ACP_AGENT_ARGS.some((args) => JSON.stringify(args) === JSON.stringify(parsed.args)))
+    throw new Error('Invalid managed launch line.');
+  return parsed;
+}
+
+/**
+ * An agent file runs only while it is the file whose signature was checked: the same real path,
+ * still owned by the person or the system and writable by no one else, with the same digest.
+ * The digest cache answers an unchanged file without reading it. A changed file is hashed again
+ * and refused, so a replaced copy never runs under the earlier signature check. The size bound is
+ * the bundle server's, the largest Google program seen: a fetched server is near 281 MB. The scan
+ * held a device copy to its own bound, and the digest holds it to those bytes.
+ */
+function checkAcpAgentFile(path: string, sha256: string, reuse: boolean) {
+  if (
+    realpathSync(path) !== path ||
+    clientFileTrust(
+      lstatSync(path),
+      AcpServerMaximumBytes,
+      process.getuid?.(),
+      lstatSync(dirname(path)),
+    ) !== 'trusted' ||
+    fileDigestSync(path, { reuse }) !== sha256
+  )
+    throw new Error('Managed executable changed.');
+}
+
 /** With reuse true, a file whose identity matches the last full hash is not read again. */
-export function validateAcpClientIdentity(
-  client: AcpClientIdentity,
-  reuse = false,
-): AcpClientIdentity {
+export function validateAcpClientIdentity<T extends AcpClient>(client: T, reuse = false): T {
+  if (!isAcpBundle(client)) {
+    const agent = parseAcpAgentIdentity(client);
+    checkAcpAgentFile(agent.executable, agent.sha256, reuse);
+    for (const helper of agent.helpers) checkAcpAgentFile(helper.path, helper.sha256, reuse);
+    return agent as T;
+  }
+  return validateAcpBundleIdentity(client, reuse) as T;
+}
+
+function validateAcpBundleIdentity(client: AcpClientIdentity, reuse: boolean): AcpClientIdentity {
   const parsed = parseAcpClientIdentity(client);
   if (hashAcpPrivateFile(parsed.executable, AcpServerMaximumBytes, true, reuse) !== parsed.sha256)
     throw new Error('Managed executable changed.');
@@ -193,14 +291,27 @@ export async function validateAcpClientIdentityAsync(
 
 export function validateAcpSetupProof(
   value: unknown,
-  client: AcpClientIdentity | AcpClientPin,
+  client: AcpClient | AcpClientPin,
   reviewMappings: readonly AcpReviewMapping[] = GoogleAcpReviewMappings,
 ): AcpSetupProof {
   const proof = AcpSetupProofSchema.parse(value);
   if (hashCanonical(proof.client) !== hashCanonical(acpClientPin(client)))
     throw new Error('Setup proof belongs to another client.');
   const mode = proof.reviewMode;
-  if (mode) {
+  // A build with no digest-keyed mapping earns its mode from its own session: one `mode` option
+  // that offers `default`. The bundle never takes this path. Its recorded evidence decides.
+  if (mode && mode.mappingEvidenceHash === ACP_EARNED_REVIEW && 'args' in client) {
+    if (
+      mode.configId !== ACP_EARNED_MODE.configId ||
+      mode.valueId !== ACP_EARNED_MODE.valueId ||
+      !proof.modeValues.length ||
+      proof.modeValues.some((entry) => entry.optionId !== ACP_EARNED_MODE.configId) ||
+      !proof.modeValues.some((entry) => entry.valueId === ACP_EARNED_MODE.valueId) ||
+      mode.discoveryStateHash !==
+        hashCanonical({ configOptions: proof.configOptions, modeValues: proof.modeValues })
+    )
+      throw new Error('Setup proof has no verified request-review mapping.');
+  } else if (mode) {
     const matches = reviewMappings
       .map((entry) => AcpReviewMappingSchema.parse(entry))
       .filter(
@@ -456,19 +567,52 @@ export async function readGoogleAcpPinAsync(
 
 export type AcpProfileResolution = {
   facts: z.infer<typeof GoogleAcpProfileSchema>;
-  client?: AcpClientIdentity;
+  client?: AcpClient;
   environment?: NodeJS.ProcessEnv;
 };
 
+/** The launch identity of a scanned agent, without what only the scan needs. */
+export const acpAgentIdentity = (agent: AcpAgentIdentity): AcpAgentIdentity => ({
+  version: agent.version,
+  sha256: agent.sha256,
+  signerTeamId: agent.signerTeamId,
+  executable: agent.executable,
+  args: [...agent.args],
+  helpers: agent.helpers.map((helper) => ({ path: helper.path, sha256: helper.sha256 })),
+});
+
+/**
+ * The agent the route uses. The stored proof names the copy that last passed every connect-time
+ * read, by digest, so that copy stays in use while it is there. Without one, or when that copy
+ * is gone, setup runs on the bundle, the build I tested, and a newer copy is checked from Ready.
+ * Only a home with no bundle sets up on the newest copy it has.
+ */
+function chooseAcpClient(
+  bundle: AcpClientIdentity | undefined,
+  agents: readonly AcpAgentIdentity[],
+  proof: AcpSetupProof | null,
+): AcpClient | undefined {
+  const pool: AcpClient[] = [...(bundle ? [bundle] : []), ...agents.map(acpAgentIdentity)];
+  const named = proof && pool.find((client) => client.sha256 === proof.client.sha256);
+  return named ?? bundle ?? newestByVersion(pool, (client) => client.version);
+}
+
 export function resolveGoogleAcpProfile(
-  options: { home: string; proof: AcpSetupProof | null; environment: NodeJS.ProcessEnv },
+  options: {
+    home: string;
+    proof: AcpSetupProof | null;
+    environment: NodeJS.ProcessEnv;
+    /** Signed agents the last scan found on the device, newest first. */
+    agents?: readonly AcpAgentIdentity[];
+  },
   dependencies: {
     reviewMappings?: readonly AcpReviewMapping[];
     platform?: NodeJS.Platform;
     arch?: string;
   } = {},
 ): AcpProfileResolution {
-  let client: AcpClientIdentity | undefined;
+  const agents = options.agents ?? [];
+  let client: AcpClient | undefined;
   let proof: AcpSetupProof | null = null;
   let reason: z.infer<typeof GoogleAcpProfileSchema>['reason'] = 'client-unavailable';
   let environment: NodeJS.ProcessEnv | undefined;
@@ -486,7 +630,16 @@ export function resolveGoogleAcpProfile(
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
     }
-    client = readGoogleAcpPin(options.home, true);
+    // With no other agent on the device the bundle is the only client, and a missing or changed
+    // bundle leaves the route without one, with the reason set above.
+    let bundle: AcpClientIdentity | undefined;
+    try {
+      bundle = readGoogleAcpPin(options.home, true);
+    } catch (error) {
+      if (!agents.length) throw error;
+    }
+    client = chooseAcpClient(bundle, agents, options.proof);
+    if (!client) throw new Error('No Google agent.');
     reason = 'acp-capability-missing';
     if (options.environment.HOME !== userInfo().homedir) reason = 'native-home-unavailable';
     else {
@@ -509,7 +662,8 @@ export function resolveGoogleAcpProfile(
       id: 'google-acp-v1',
       family: 'google',
       displayName: 'Google ACP single-file proposal',
-      clientVersion: '1.4.0',
+      // The build in use. Without one the bundle Connect installs is what the route would run.
+      clientVersion: client?.version ?? '1.4.0',
       model: config?.model.currentValue ?? 'unknown',
       effort: config?.thoughtLevel?.currentValue ?? 'unknown',
       effortSupported: config?.thoughtLevel?.supported ?? [],

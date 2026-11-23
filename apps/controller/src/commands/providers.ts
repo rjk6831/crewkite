@@ -24,14 +24,23 @@ import {
   NativeConnectionChecks,
 } from '../providers/anthropic/native-connection.ts';
 import {
+  newerClientVersion,
+  newestByVersion,
+  readManagedRecord,
+} from '../providers/client-versions.ts';
+import type { GoogleAgent } from '../providers/google/acp/agents.ts';
+import {
   GoogleAcpInstallation,
   InstallRecordSchema,
 } from '../providers/google/acp/install-operation.ts';
 import {
-  type AcpClientIdentity,
+  ACP_EARNED_REVIEW,
+  type AcpClient,
   type AcpProfileResolution,
   type AcpSetupProof,
   AcpSetupProofSchema,
+  acpAgentIdentity,
+  isAcpBundle,
   resolveGoogleAcpProfile,
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
@@ -232,7 +241,17 @@ export class ProviderCommands {
         reason: 'consent-required',
         data: { kind: 'google-acp-setup', setup },
       };
-    const refresh = command.command === 'RefreshGoogleAcpModels';
+    // A qualify step sets up a copy that is not in use yet: one the controller found newer, the
+    // next copy when the one in use is gone, or a copy waiting for the sign-in the person starts
+    // with Connect. From Ready it runs like a refresh, so Ready and the copy in use stay unless
+    // the new copy passes.
+    let target = this.acpQualifyTarget?.key === command.key ? this.acpQualifyTarget : undefined;
+    if (!target && command.command === 'AuthenticateGoogleAcp' && setup.state === 'ready') {
+      const waiting = this.waitingGoogleAgent();
+      if (waiting) target = { key: command.key, client: acpAgentIdentity(waiting), signIn: true };
+    }
+    const refresh =
+      command.command === 'RefreshGoogleAcpModels' || (!!target && setup.state === 'ready');
     // A refresh starts from a setup that holds a proof and no step. Anything else connects first.
     if (refresh && (setup.state !== 'ready' || setup.operationId))
       return {
@@ -245,15 +264,18 @@ export class ProviderCommands {
     const blocker = this.store.googleOperationBlocker();
     if (blocker)
       return { outcome: 'blocked', reason: blocker, data: { kind: 'google-acp-setup', setup } };
-    const resolution = this.acpResolution();
-    if (!resolution.client || !resolution.environment)
+    const resolved = this.acpResolution();
+    if (!resolved.client || !resolved.environment)
       return {
         outcome: 'blocked',
-        reason: resolution.facts.reason,
+        reason: resolved.facts.reason,
         data: { kind: 'google-acp-setup', setup },
       };
-    const operation =
-      command.command === 'InitializeGoogleAcp'
+    const client: AcpClient = target?.client ?? resolved.client;
+    const resolution = { ...resolved, client };
+    const operation = target
+      ? 'qualify'
+      : command.command === 'InitializeGoogleAcp'
         ? 'initialize'
         : refresh
           ? 'discover'
@@ -262,7 +284,7 @@ export class ProviderCommands {
             : 'discover';
     let proof: AcpSetupProof | null = null;
     try {
-      if (operation !== 'initialize') {
+      if (operation !== 'initialize' && operation !== 'qualify') {
         if (!('proofId' in command.payload) || command.payload.proofId !== setup.proofId)
           throw Error('ACP proof changed.');
         proof = this.acpProof(command.payload.proofId);
@@ -279,6 +301,7 @@ export class ProviderCommands {
       initialize: 'initializing',
       authenticate: 'authenticating',
       discover: 'discovering',
+      qualify: target?.signIn ? 'authenticating' : 'discovering',
     }[operation];
     // A refresh takes its one revision here and keeps Ready. The fence compares the row's revision
     // with the live one, so nothing else writes setup until the result publishes.
@@ -304,16 +327,32 @@ export class ProviderCommands {
           },
     );
     this.store.putGoogleAcpSetup(next);
-    this.store.beginGoogleMetadata(command.key, `acp-${operation}`, next.revision, this.now());
+    // A qualify step that signs in opens the browser like any sign-in, so recovery treats it as one.
+    const kind =
+      operation === 'qualify'
+        ? target?.signIn
+          ? 'acp-authenticate'
+          : 'acp-discover'
+        : (`acp-${operation}` as const);
+    this.store.beginGoogleMetadata(command.key, kind, next.revision, this.now());
     this.store.recordLaunchIdentity(
       'google-metadata',
       command.key,
       this.launchIdentity,
       this.now(),
     );
+    const qualify = target ? { signIn: target.signIn, previous: setup.modelRefresh } : undefined;
     effects.push(
       () =>
-        void this.launchAcpSetup(command.key, next.revision, operation, proof, resolution, refresh),
+        void this.launchAcpSetup(
+          command.key,
+          next.revision,
+          operation,
+          proof,
+          resolution,
+          refresh,
+          qualify,
+        ),
     );
     return {
       outcome: 'outcome-unknown',
@@ -359,7 +398,10 @@ export class ProviderCommands {
    * client prepares it; a harness that drives each step leaves registration off. Nothing starts
    * until the current Google terms text is acknowledged, and the acknowledgement runs this again.
    */
-  googleAcpPreparationStep(this: Controller): 'initialize' | 'discover' | null {
+  googleAcpPreparationStep(
+    this: Controller,
+    attempted: ReadonlySet<string> = new Set(),
+  ): 'initialize' | 'discover' | { qualify: AcpClient } | null {
     if (
       !this.options.registerGoogleAcp ||
       !this.store.hasConnectedOnce('google') ||
@@ -385,7 +427,44 @@ export class ProviderCommands {
           this.options.googleAcp?.reviewMappings,
         );
     } catch {}
-    if (proof && setup.state === 'ready') return null;
+    // A copy newer than the one in use is checked in the background while the one in use serves
+    // turns. Each copy is tried once per run, newest first.
+    const untried = (clients: readonly AcpClient[]) =>
+      newestByVersion(
+        clients.filter((client) => !attempted.has(client.sha256)),
+        (client) => client.version,
+      );
+    const agents = this.googleAgentPool().map(acpAgentIdentity);
+    if (proof && setup.state === 'ready') {
+      const inUse = resolution.client;
+      const newer = untried(
+        agents.filter((agent) => newerClientVersion(agent.version, inUse.version)),
+      );
+      return newer ? { qualify: newer } : null;
+    }
+    // The stored proof names an agent other than the bundle that the pool does not hold. Until
+    // a scan has completed in this controller, or while the copy is on the device and only its
+    // check did not finish, it is not gone, and nothing is set up in its place. Once it is truly
+    // gone or refused, the next copy is set up on the saved sign-in with no press, the bundle
+    // last, and turns wait meanwhile.
+    let stored: AcpSetupProof | null = null;
+    try {
+      stored = this.acpProof(setup.proofId);
+    } catch {}
+    if (
+      !proof &&
+      stored?.reviewMode?.mappingEvidenceHash === ACP_EARNED_REVIEW &&
+      stored.client.sha256 !== resolution.client.sha256
+    ) {
+      const named = stored.client.sha256;
+      const gone =
+        this.googleAgents !== null &&
+        (this.googleRefused.has(named) || !this.googleUnverified.has(named));
+      if (!gone || setup.auth.status !== 'authenticated') return null;
+      const bundle = this.acpResolution([]).client;
+      const next = untried([resolution.client, ...agents, ...(bundle ? [bundle] : [])]);
+      return next ? { qualify: next } : null;
+    }
     // Recovery of an interrupted sign-in marks the setup's sign-in unknown and keeps the older
     // proof. Discover would act on that sign-in, so the person signs in again first.
     if (proof?.auth.status === 'authenticated' && setup.auth.status === 'authenticated')
@@ -401,25 +480,34 @@ export class ProviderCommands {
    * stop on shutdown work as they do for a click, and a failure lands in the setup state.
    */
   async prepareGoogleAcp(this: Controller) {
+    // Steps by name, copies being qualified by digest, so a run walks down the pool.
     const attempted = new Set<string>();
     for (;;) {
-      const step = this.googleAcpPreparationStep();
-      if (!step || attempted.has(step)) return;
-      attempted.add(step);
+      const step = this.googleAcpPreparationStep(attempted);
+      const name = typeof step === 'string' || !step ? step : step.qualify.sha256;
+      if (!step || !name || attempted.has(name)) return;
+      attempted.add(name);
       const setup = this.store.googleAcpSetup();
+      const key = this.id('cmd');
+      if (typeof step !== 'string')
+        this.acpQualifyTarget = { key, client: step.qualify, signIn: false };
       const command = CommandSchema.parse({
         protocol: 1,
-        key: this.id('cmd'),
+        key,
         actor: { id: 'controller', kind: 'controller' },
         command: step === 'initialize' ? 'InitializeGoogleAcp' : 'DiscoverGoogleAcp',
         expectedRevision: setup.revision,
         payload: {
           profileId: 'google-acp-v1',
           consent: 'automatic',
-          ...(step === 'discover' ? { proofId: setup.proofId } : {}),
+          ...(step !== 'initialize' ? { proofId: setup.proofId } : {}),
         },
       }) as AcpSetupCommand;
-      await this.executeAcpSetup(command, 'local-owner');
+      try {
+        await this.executeAcpSetup(command, 'local-owner');
+      } finally {
+        if (this.acpQualifyTarget?.key === key) this.acpQualifyTarget = undefined;
+      }
     }
   }
 
@@ -427,16 +515,23 @@ export class ProviderCommands {
     this: Controller,
     commandId: string,
     revision: number,
-    operation: 'initialize' | 'authenticate' | 'discover',
+    operation: 'initialize' | 'authenticate' | 'discover' | 'qualify',
     priorProof: AcpSetupProof | null,
     resolution: AcpProfileResolution,
     refresh = false,
+    /** A copy not in use yet: whether the person signs in with it, and the refresh record to keep. */
+    qualify?: {
+      signIn: boolean;
+      previous: ReturnType<typeof GoogleAcpSetupSchema.parse>['modelRefresh'];
+    },
   ) {
     const runtime = this.acpSetupRuntime;
     if (!runtime || runtime.key !== commandId || !resolution.client || !resolution.environment)
       return;
     let result: CommandResult = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
     let beforeSpawn = true;
+    // How the client run ended, once it has. Undefined while it never ran to an end.
+    let ended: string | null | undefined;
     const current = () => {
       const setup = this.store.googleAcpSetup();
       if (
@@ -461,6 +556,7 @@ export class ProviderCommands {
         environment: resolution.environment,
         operation,
         priorProof,
+        ...(qualify ? { signIn: qualify.signIn } : {}),
         ...this.options.googleAcp,
         spawn: this.options.googleAcp?.spawn,
         schedule: this.options.schedule,
@@ -481,6 +577,7 @@ export class ProviderCommands {
       });
       if (runtime.stopped || this.closed) runtime.handle.stop();
       const outcome = await runtime.handle.result;
+      ended = outcome.reason;
       this.store.transaction(() => {
         let setup = this.store.googleAcpSetup();
         const journal = this.store
@@ -497,6 +594,7 @@ export class ProviderCommands {
             outcome,
             known,
             resolution,
+            qualify,
           );
           this.finishMetadataReceipt(commandId, result);
           this.profiles = this.resolveProfiles();
@@ -520,7 +618,7 @@ export class ProviderCommands {
         if (known && !revoked && !outcome.reason && outcome.metadata) {
           const proof = validateAcpSetupProof(
             outcome.metadata,
-            resolution.client as AcpClientIdentity,
+            resolution.client as AcpClient,
             this.options.googleAcp?.reviewMappings,
           );
           incomplete =
@@ -558,7 +656,7 @@ export class ProviderCommands {
                 ? 'acp-setup-timeout'
                 : outcome.reason === 'authentication'
                   ? 'authentication-required'
-                  : !revoked && (operation === 'discover' || incomplete)
+                  : !revoked && (operation === 'discover' || operation === 'qualify' || incomplete)
                     ? 'acp-capability-missing'
                     : null,
           });
@@ -651,6 +749,32 @@ export class ProviderCommands {
         result = { outcome: 'outcome-unknown', reason: 'google-ownership-unknown' };
       }
     } finally {
+      // What the step showed about a build other than the bundle goes on the card before the
+      // step ends, so the next preparation step reads it. A stopped step showed nothing.
+      if (
+        (qualify || !isAcpBundle(resolution.client)) &&
+        ended !== undefined &&
+        !runtime.stopped &&
+        !this.closed
+      )
+        try {
+          const setup = this.store.googleAcpSetup();
+          this.judgeGoogleAgent(
+            resolution.client,
+            {
+              // The step itself made this build the one in use. A failed refresh leaves Ready on
+              // the same build and passes nothing.
+              passed:
+                result.outcome === 'applied' &&
+                setup.state === 'ready' &&
+                setup.client?.sha256 === resolution.client.sha256,
+              reason: ended,
+              refusal: runtime.handle?.refusal() ?? null,
+            },
+            !!qualify,
+          );
+          this.profiles = this.resolveProfiles();
+        } catch {}
       runtime.resolve(CommandResultSchema.parse(result));
     }
     // The quota read waits for Connect. The step that makes the setup ready starts the first one,
@@ -678,6 +802,7 @@ export class ProviderCommands {
     outcome: Awaited<ReturnType<typeof startGoogleAcpSetup>['result']>,
     known: boolean,
     resolution: AcpProfileResolution,
+    qualify?: { previous: ReturnType<typeof GoogleAcpSetupSchema.parse>['modelRefresh'] },
   ): CommandResult {
     const setup = this.store.googleAcpSetup();
     const named = setup.modelRefresh?.commandId === commandId && setup.revision === revision;
@@ -714,10 +839,23 @@ export class ProviderCommands {
       try {
         proof = validateAcpSetupProof(
           outcome.metadata,
-          resolution.client as AcpClientIdentity,
+          resolution.client as AcpClient,
           this.options.googleAcp?.reviewMappings,
         );
       } catch {}
+    }
+    // A copy that is not in use and did not pass changes nothing here: not Ready, not the proof,
+    // not the last refresh the person sees. Its card line says why.
+    if (
+      qualify &&
+      !(proof?.reviewMode && proof.configOptions && proof.auth.status === 'authenticated')
+    ) {
+      const next = refreshed({ modelRefresh: qualify.previous });
+      return {
+        outcome: 'blocked',
+        reason: outcome.reason === 'deadline' ? 'acp-setup-timeout' : 'acp-setup-failed',
+        data: { kind: 'google-acp-setup', setup: next },
+      };
     }
     if (proof?.reviewMode && proof.configOptions && proof.auth.status === 'authenticated') {
       const next = refreshed({
@@ -2137,6 +2275,15 @@ export class ProviderCommands {
     return this.profiles.find((profile) => profile.facts.id === id) ?? unavailableNativeProfile();
   }
 
+  /** A newer copy whose sign-in the card offers, when the record names one still in the pool. */
+  waitingGoogleAgent(this: Controller): GoogleAgent | undefined {
+    const root = this.options.managedClients?.root;
+    const waiting = root ? readManagedRecord(root, 'google').notUsed : null;
+    return waiting?.signIn
+      ? this.googleAgentPool().find((agent) => agent.sha256 === waiting.sha256)
+      : undefined;
+  }
+
   acpProof(this: Controller, proofId = this.store.googleAcpSetup().proofId): AcpSetupProof | null {
     if (!proofId) return null;
     const artifact = this.store.get<Artifact>('artifact', proofId);
@@ -2149,14 +2296,21 @@ export class ProviderCommands {
     );
   }
 
-  acpResolution(this: Controller): NativeProfileResolution & AcpProfileResolution {
+  /**
+   * The Google route's profile over the agent pool. With an empty pool it is the bundle alone, as
+   * a home without any other signed agent has it.
+   */
+  acpResolution(
+    this: Controller,
+    agents: readonly GoogleAgent[] = this.googleAgentPool(),
+  ): NativeProfileResolution & AcpProfileResolution {
     let proof: AcpSetupProof | null = null;
     try {
       proof = this.acpProof();
     } catch {}
     const resolved =
-      this.options.googleAcp?.resolve?.(proof) ??
-      resolveGoogleAcpProfile({ home: this.home, proof, environment: process.env });
+      this.options.googleAcp?.resolve?.(proof, agents) ??
+      resolveGoogleAcpProfile({ home: this.home, proof, environment: process.env, agents });
     return {
       ...resolved,
       ...(resolved.client && resolved.environment

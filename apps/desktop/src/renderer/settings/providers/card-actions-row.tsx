@@ -45,6 +45,8 @@ export function CardActions({
   // setup refuses the read, so the button waits until Recover has cleared it.
   const googleReady = setup?.state === 'ready' && !!setup.proofId;
   const googleRefreshing = setup?.modelRefresh?.outcome === 'running';
+  // A newer Google copy that needs its own sign-in gets Connect. The copy in use keeps running.
+  const waiting = family === 'google' && !!status.copy?.notUsed?.signIn;
   const enabled: Record<CardActionId, boolean> = {
     check: true,
     models:
@@ -52,6 +54,7 @@ export function CardActions({
       (family !== 'google' ||
         (googleReady && !googleRefreshing && stuckHolds(header).length === 0)),
     'sign-out': once,
+    connect: waiting && googleReady && !googleRefreshing && stuckHolds(header).length === 0,
   };
   async function run(id: CardActionId) {
     const source = workspace.source;
@@ -103,6 +106,16 @@ export function CardActions({
             {busy === id ? busyLabel : label}
           </button>
         ))}
+        {waiting && (
+          <button
+            type="button"
+            className="button secondary"
+            disabled={!live || busy !== null || !enabled.connect}
+            onClick={() => void run('connect')}
+          >
+            {busy === 'connect' ? 'Signing in…' : 'Connect'}
+          </button>
+        )}
       </div>
       {line && (
         <p className="st-note" role="status">

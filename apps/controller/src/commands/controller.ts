@@ -92,16 +92,42 @@ import {
   startNativeAuthStatus,
 } from '../providers/anthropic/native-discovery.ts';
 import type { AnthropicUsageRefresh } from '../providers/anthropic/usage-refresh.ts';
+import {
+  managedVersions,
+  newestByVersion,
+  readManagedRecord,
+} from '../providers/client-versions.ts';
+import {
+  type GoogleAgent,
+  type GoogleAgentVerdict,
+  type GoogleScan,
+  googleAgentLine,
+  googleAgentStatus,
+  googleAgentStrike,
+  recordGoogleAgent,
+  scanGoogleAgents,
+} from '../providers/google/acp/agents.ts';
 import type { AcpInstallDependencies } from '../providers/google/acp/install.ts';
 import type { GoogleAcpInstallation } from '../providers/google/acp/install-operation.ts';
 import {
-  type AcpClientIdentity,
+  ACP_EARNED_REVIEW,
+  type AcpClient,
   type AcpProfileResolution,
   type AcpSetupProof,
+  isAcpBundle,
+  validateAcpClientIdentity,
   validateAcpSetupProof,
 } from '../providers/google/acp/profile.ts';
-import type { AcpDependencies, startGoogleAcpSetup } from '../providers/google/acp/writer.ts';
-import { type GooglePromptCapabilities, googleChatAdapter } from '../providers/google/chat.ts';
+import type {
+  AcpDependencies,
+  AcpQualifyRefusal,
+  startGoogleAcpSetup,
+} from '../providers/google/acp/writer.ts';
+import {
+  type GoogleGate,
+  type GooglePromptCapabilities,
+  googleChatAdapter,
+} from '../providers/google/chat.ts';
 import type { CapturedContext } from '../providers/google/native-extension/connector.ts';
 import type {
   googleUsageObservations,
@@ -120,6 +146,7 @@ import {
   connectReadEnded,
   fetchNewerClient,
   type ManagedFamily,
+  refuseManagedClient,
 } from '../providers/managed-client.ts';
 import { openAiChatAdapter } from '../providers/openai/chat.ts';
 import { openAiCreditReading } from '../providers/openai/discovery.ts';
@@ -243,8 +270,13 @@ export type ControllerOptions = {
   googleUsageClient?: () => GoogleUsageClientResolution;
   googleUsageSpawn?: Parameters<typeof startGoogleUsage>[0]['spawn'];
   googleAcp?: AcpDependencies & {
-    resolve?: (proof: AcpSetupProof | null) => AcpProfileResolution;
+    resolve?: (proof: AcpSetupProof | null, agents: readonly GoogleAgent[]) => AcpProfileResolution;
     spawn?: Parameters<typeof startGoogleAcpSetup>[0]['spawn'];
+    /**
+     * Finds the signed Google agents on the device. Without it, a controller that may fetch
+     * clients scans the device itself, and any other runs the 1.4.0 bundle alone.
+     */
+    scan?: () => Promise<GoogleScan>;
   };
   googleAcpInstall?: AcpInstallDependencies;
   registerGoogleAcp?: boolean;
@@ -386,6 +418,19 @@ export class Controller {
   };
   /** The Google setup steps the controller starts on its own at launch. */
   googleAcpPreparation?: Promise<void>;
+  /**
+   * The signed Google agents the last scan found, newest first. Null until a scan completes in
+   * this controller, so nothing reads an agent as gone before anyone looked.
+   */
+  googleAgents: readonly GoogleAgent[] | null = null;
+  /** Digests of copies the last scan saw on the device and could not verify this time. */
+  googleUnverified = new Set<string>();
+  /** Agent builds refused by digest in this controller's life, as the record lists them. */
+  readonly googleRefused = new Set<string>();
+  /** The running scan, fetch and qualify work, one after another. */
+  googleAgentWork: Promise<void> | null = null;
+  /** The newer copy a setup command targets, by command key. */
+  acpQualifyTarget?: { key: string; client: AcpClient; signIn: boolean };
   /** One controller.log line per provider connect, at launch and on the card's Connect. */
   readonly connectLog = new ConnectLog();
   acpStart?: {
@@ -495,7 +540,11 @@ export class Controller {
     // Google setup is three client runs and can take a minute. Recovery above has settled any
     // interrupted step, so the runs that need no click start here.
     if (this.store.hasConnectedOnce('google')) this.connectLog.begin('google', 'auto');
-    this.googleAcpPreparation = this.prepareGoogleAcp()
+    // A controller that scans for signed Google agents scans first, so the steps see the copy the
+    // setup proof names before they decide anything.
+    this.googleAcpPreparation = (
+      this.googleScan() ? this.refreshGoogleAgents(false) : this.prepareGoogleAcp()
+    )
       .catch(() => {})
       .then(() => this.settleGoogleConnect())
       .catch(() => {});
@@ -1234,6 +1283,7 @@ export class Controller {
       anthropicModel: this.anthropicUsage().clientModel(),
       anthropicModels: this.anthropicModelRows,
       googlePrompt: this.googlePrompt,
+      googleAgent: this.googleAgentStatus(),
       local: this.localSetup(),
       connectedOnce: (['openai', 'anthropic', 'google', 'local'] as const).filter((family) =>
         this.store.hasConnectedOnce(family),
@@ -1254,6 +1304,16 @@ export class Controller {
       turns: this.store.db,
       nowMs: Date.parse(this.now()),
     });
+  }
+
+  /** The card's status for the Google agent in use, or null before there is one. */
+  private googleAgentStatus() {
+    try {
+      const client = this.acpResolution().client;
+      return client ? googleAgentStatus(client, this.options.managedClients?.root ?? null) : null;
+    } catch {
+      return null;
+    }
   }
 
   private openAiCredits(): OpenAiCreditReading | null {
@@ -1351,7 +1411,7 @@ export class Controller {
    * asked CrewKite to look, and a download of some hundred megabytes should not start unasked.
    * The next read of the client status names the fetched copy or says why it is not used.
    */
-  fetchNewerClient(family: ManagedFamily, installed: string | null) {
+  fetchNewerClient(family: ManagedFamily, installed: string | null, inUse?: string) {
     const managed = this.options.managedClients;
     if (!managed || !installed || this.closed || this.clientFetches.has(family)) return;
     this.clientFetches.set(
@@ -1359,6 +1419,7 @@ export class Controller {
       fetchNewerClient(family, {
         ...managed,
         installed,
+        ...(inUse ? { inUse } : {}),
         now: this.now,
         signal: this.outputAbort.signal,
       })
@@ -1382,6 +1443,157 @@ export class Controller {
       failure,
       this.now,
     );
+  }
+
+  /** The agents the chat route may run: the last scan without the builds refused by digest. */
+  googleAgentPool(): readonly GoogleAgent[] {
+    return (this.googleAgents ?? []).filter((agent) => !this.googleRefused.has(agent.sha256));
+  }
+
+  /**
+   * The scan for signed Google agents. Without an injected one, a controller that may fetch
+   * clients scans the device itself, and any other runs the 1.4.0 bundle alone.
+   */
+  private googleScan(): (() => Promise<GoogleScan>) | undefined {
+    const managed = this.options.managedClients;
+    return (
+      this.options.googleAcp?.scan ??
+      (managed && this.options.registerGoogleAcp
+        ? () => scanGoogleAgents({ environment: process.env, managed: managed.root })
+        : undefined)
+    );
+  }
+
+  /**
+   * Scans the device for signed Google agents, then lets the preparation step qualify a newer
+   * one while the copy in use keeps serving turns. Check again also fetches a newer published
+   * agent and scans once more. Each run waits for the one before it, so two never start setup
+   * steps side by side.
+   */
+  refreshGoogleAgents(fetch: boolean): Promise<void> {
+    const managed = this.options.managedClients;
+    const scan = this.googleScan();
+    if (!scan || this.closed) return this.googleAgentWork ?? Promise.resolve();
+    // A scan that throws leaves what the last one found, null before any, and the preparation
+    // step still runs on it.
+    const found = async () => {
+      try {
+        const result = await scan();
+        this.googleAgents = result.agents;
+        this.googleUnverified = new Set(result.unverified);
+      } catch {}
+    };
+    const run = async () => {
+      if (this.closed) return;
+      if (managed)
+        for (const entry of readManagedRecord(managed.root, 'google').refused ?? [])
+          this.googleRefused.add(entry.sha256);
+      await found();
+      if (fetch && managed) {
+        // Every version CrewKite holds counts as installed, admitted by this scan or not. A held
+        // copy whose signature check ran out of time is no copy that could not run, so the
+        // fetch must neither fetch it again nor remove it. Nor may it remove the copy the
+        // stored proof names, which is the one in use or the one to come back to.
+        const versions = [
+          ...this.googleAgentPool().map((agent) => agent.version),
+          ...managedVersions(managed.root, 'google'),
+          ...[this.acpResolution([]).client?.version ?? []].flat(),
+        ];
+        let inUse: string | undefined;
+        try {
+          inUse = this.acpProof()?.client.version;
+        } catch {}
+        this.fetchNewerClient(
+          'google',
+          newestByVersion(versions, (version) => version) ?? null,
+          inUse,
+        );
+        await this.clientFetches.get('google');
+        await found();
+      }
+      await this.prepareGoogleAcp();
+    };
+    const work = (this.googleAgentWork ?? Promise.resolve()).then(run).catch(() => {});
+    this.googleAgentWork = work;
+    return work;
+  }
+
+  /**
+   * What the end of a setup step says about a build other than the bundle. A pass clears its
+   * note. A wrong protocol or version refuses the build at once. Missing models or mode, a missing
+   * sign-in method, a crash or a refused request can be passing states, so they refuse it on the
+   * second time in a row and say why each time. A sign-in it needs waits for the person, for a
+   * copy being qualified. Stop, a deadline and a launch that never started say nothing.
+   */
+  judgeGoogleAgent(
+    client: AcpClient,
+    ended: { passed: boolean; reason: string | null; refusal: AcpQualifyRefusal | null },
+    qualify: boolean,
+  ) {
+    const agent = this.googleAgents?.find((value) => value.sha256 === client.sha256);
+    if (isAcpBundle(client) || !agent) return;
+    const root = this.options.managedClients?.root ?? null;
+    // A build the stored proof names as passed is the one in use. A failed step on it, such as
+    // Read models offline, leaves it in use, as it does for the bundle.
+    let inUse: string | undefined;
+    try {
+      const stored = this.acpProof();
+      if (stored?.reviewMode) inUse = stored.client.sha256;
+    } catch {}
+    if (!ended.passed && inUse === agent.sha256) return;
+    if (ended.passed) {
+      googleAgentStrike(agent.sha256, false);
+      if (root) recordGoogleAgent(root, agent, 'passed', this.now());
+      return;
+    }
+    // The version the person keeps using meanwhile, when one runs at all.
+    const running = this.acpResolution();
+    const line = (verdict: GoogleAgentVerdict) =>
+      googleAgentLine(
+        agent,
+        verdict,
+        running.facts.available ? (running.client?.version ?? null) : null,
+      );
+    if (ended.reason === 'authentication') {
+      if (qualify && root) recordGoogleAgent(root, agent, { signIn: line('sign-in') }, this.now());
+      return;
+    }
+    if (ended.refusal === 'protocol' || ended.refusal === 'version')
+      return this.refuseGoogleAgent(agent, line(ended.refusal));
+    const verdict =
+      ended.refusal ??
+      (['protocol', 'output-limit', 'permission', 'configuration'].includes(ended.reason ?? '')
+        ? 'unsteady'
+        : null);
+    if (!verdict) return;
+    if (googleAgentStrike(agent.sha256, true)) this.refuseGoogleAgent(agent, line(verdict));
+    else if (root) recordGoogleAgent(root, agent, { notUsed: line(verdict) }, this.now());
+  }
+
+  /** The build is not run again. A copy CrewKite fetched is removed; one on the device stays. */
+  refuseGoogleAgent(agent: GoogleAgent, line: string) {
+    this.googleRefused.add(agent.sha256);
+    googleAgentStrike(agent.sha256, false);
+    const root = this.options.managedClients?.root;
+    if (!root) return;
+    try {
+      // The fetched folder goes first, with its own note. The route's note, with the digest and
+      // the refused list, then takes its place.
+      if (agent.kind === 'fetched')
+        refuseManagedClient(root, 'google', agent.executable, line, this.now);
+      recordGoogleAgent(root, agent, { refused: line }, this.now());
+    } catch {}
+  }
+
+  /**
+   * A turn on an earned build stopped at a gate. The build goes, and the preparation step sets up
+   * the next copy, the bundle at the end, on the saved sign-in.
+   */
+  googleGate(executable: string, reason: GoogleGate) {
+    const agent = this.googleAgents?.find((value) => value.executable === executable);
+    if (!agent) return;
+    this.refuseGoogleAgent(agent, googleAgentLine(agent, reason, null));
+    void this.refreshGoogleAgents(false);
   }
 
   /** The client a chat turn, model read or quota read launches, found by version range. */
@@ -1673,6 +1885,7 @@ export class Controller {
       onPromptCapabilities: (capabilities) => {
         this.googlePrompt = capabilities;
       },
+      onGate: (executable, reason) => this.googleGate(executable, reason),
       threadTools,
       launch: (request: ChatTurnRequest) => {
         const setup = this.store.googleAcpSetup();
@@ -1688,8 +1901,20 @@ export class Controller {
           optionId: value.optionId,
           supported: value.supported,
         });
+        const client = resolution.client;
+        // A copy that changed since its signature was checked, such as one Google's desktop app
+        // updated, does not run. The scan and the preparation step find and set up what is there.
+        if (!isAcpBundle(client))
+          try {
+            validateAcpClientIdentity(client, true);
+          } catch (error) {
+            void this.refreshGoogleAgents(false);
+            throw error;
+          }
         return {
-          client: resolution.client as AcpClientIdentity,
+          client,
+          earned:
+            !isAcpBundle(client) && proof.reviewMode?.mappingEvidenceHash === ACP_EARNED_REVIEW,
           configuration: proof.configOptions
             ? {
                 model: select(proof.configOptions.model),

@@ -38,5 +38,28 @@ I chose to fetch only into CrewKite's own folder so that CrewKite never touches 
 - The minimum stays in the version table where an older build cannot do the work. Everything above it runs.
 - The writer profiles still need a new qualification for a new build.
 - OpenAI and Anthropic fetch on Check again, from the vendor's own host, only when a copy is already on the device, and only on macOS on Apple silicon. A fetched copy that fails its connect-time read is removed, the last good copy runs, and that version is not fetched again. For OpenAI the build goes on its second failed read in a row, because one failure can be a full disk. For Anthropic the first miss removes it. The OpenAI signature check covers every Mach-O file in the package, the fetch has a 30-minute total bound beside the 90-second stall bound, and the unpacked package is capped at 1 GiB. Only a controller whose home is the one its environment names fetches.
-- I left Google out of step 3. Google signs its builds but publishes no checksum, and the only lists of the newest version are a registry on another host and the client's private updater service. CrewKite still runs the newest Google client copy it finds on the device for quota reads.
-- The Google chat route stays on the fixed 1.4.0 bundle. Moving it needs changes to the writer profile's own pins and a live check that `agy acp` in a newer client speaks the same protocol, signs in the same way and still asks before every edit. Until then the Google model list is the 1.4.0 agent's list.
+- Google follows the rule through its signing identity. The agent is trusted by Google's Developer ID signature and by its connect-time replies. The section dated 23 November 2026 below gives the terms and what they cost me.
+- The one-file Google writer keeps its exact pins and runs on the 1.4.0 agent only.
+
+## Amendment, 2026-11-23
+
+### Google chat agent, 23 November 2026
+
+Google signs its builds but publishes no checksum, so step 3 does not fit it as written. Step 3 left Google out, and its chat route stayed on the 1.4.0 bundle. That held the model list to what the 1.4.0 agent offers, and my account has newer models. I now apply the rule to Google with a different test of the file.
+
+CrewKite runs the newest Google agent on the device that carries Google's Developer ID signature, team EQHXZ8M8AV, checked on the exact file it starts, and that passes the owner and mode checks every client gets. The agent inside Google's desktop app counts when its help lists the `acp` subcommand. CrewKite reads that help before it ever starts the agent, because an older build reads the word as a prompt, and that is a live call. The 1.4.0 bundle a home already holds keeps its digests and stays as the fallback.
+
+A build serves turns only after its own replies pass: protocol version 1, a personal sign-in method CrewKite can start, a model list, and one `mode` option that offers `default` and confirms it when set. A newer build is checked in the background while the copy in use keeps running. A build that fails is not used, and the card says why in one line.
+
+On Check again CrewKite reads the agent protocol's public registry once. When it names a newer Google agent, CrewKite downloads it from Google's download host into its own folder. The registry is not Google's, so it may only name a file on that host, and every program in the download has to carry Google's signature.
+
+I give up something here. CrewKite runs agent builds I have not tested. The connect-time replies show that a build offers the asking mode. They do not show that the mode still asks. So a turn on such a build stops, and CrewKite drops the build, when any of these happens:
+
+- An edit, delete or move completes with no edit permission request before it in the same turn, unless the thread holds an edit grant.
+- The agent asks for the file or terminal service CrewKite keeps off.
+- The agent leaves the asking mode during the turn.
+- The agent starts a subagent in a turn that runs without them.
+
+An edit that lands unasked has already happened when CrewKite sees it. In the scratch copy that is a changed file in a failed turn. Outside it, nothing undoes it. I accept that for the newer models.
+
+The one-file writer keeps its exact pins and its tool mapping keyed to the 1.4.0 digests. It runs on the 1.4.0 agent only and refuses while a newer agent is in use for chat. Until a live check on the real agent, the fetch and the newer agent have run only against scripted replies.

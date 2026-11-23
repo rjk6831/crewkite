@@ -1,7 +1,8 @@
 import { z } from 'zod';
 
 // Where an installed provider client stands against the build CrewKite tested. The chat path and
-// the quota reader accept a range of builds; the writer profiles keep their exact pins.
+// the quota reader accept a range of builds; the writer profiles keep their exact pins. The Google
+// chat agent has no exact pin. A build signed by Google runs once its connect-time reads pass.
 
 /**
  * tested: the exact tested build. newer: above it in the same major version. supported: at or
@@ -49,9 +50,16 @@ export const ClientVersionStatusSchema = z.strictObject({
       fetched: z
         .strictObject({ version: z.string().min(1).max(200), at: z.string().min(1).max(40) })
         .nullable(),
-      /** The last fetched copy CrewKite does not use, with the reason as one sentence. */
+      /**
+       * The last copy CrewKite does not use, with the reason as one sentence. signIn: the copy
+       * waits for the person's sign-in, which Connect starts.
+       */
       notUsed: z
-        .strictObject({ version: z.string().min(1).max(200), reason: z.string().min(1).max(300) })
+        .strictObject({
+          version: z.string().min(1).max(200),
+          reason: z.string().min(1).max(300),
+          signIn: z.literal(true).optional(),
+        })
         .nullable(),
     })
     .optional(),

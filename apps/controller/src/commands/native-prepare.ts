@@ -32,7 +32,7 @@ import {
   materialize,
 } from '../host/source.ts';
 import { defaultSchedule } from '../host/worker.ts';
-import { validateAcpSetupProof } from '../providers/google/acp/profile.ts';
+import { isAcpBundle, validateAcpSetupProof } from '../providers/google/acp/profile.ts';
 import { googleAcpTargetContext } from '../providers/google/acp/writer.ts';
 import { captureContext } from '../providers/google/native-extension/connector.ts';
 import {
@@ -80,6 +80,16 @@ export class NativePrepareCommands {
         !profile.locationHash
       )
         throw Error('ACP setup is unavailable.');
+      // The writer's tool mapping is keyed to the bundle's digests: what a tool titled
+      // `Run replace_file_content?` does on another build can only be learned from an edit. With
+      // another agent in use for chat its first permission would be refused, so the run is
+      // refused before it starts.
+      if (!isAcpBundle(profile.client))
+        return {
+          outcome: 'blocked',
+          reason: 'acp-writer-unmapped',
+          next: 'The one-file Google writer runs on the 1.4.0 agent only. A newer agent is in use for chat.',
+        };
       const proof = validateAcpSetupProof(
         this.acpProof(input.proofId),
         profile.client,

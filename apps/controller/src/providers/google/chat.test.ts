@@ -144,6 +144,7 @@ async function run(
   req: ChatTurnRequest,
   react: (event: AgentEvent, handle: ChatTurnHandle) => void = () => {},
   threadTools?: Parameters<typeof googleChatAdapter>[0]['threadTools'],
+  gated?: { earned: boolean; onGate: (executable: string, reason: string) => void },
 ) {
   const events: AgentEvent[] = [];
   const frames: Frame[] = [];
@@ -163,7 +164,9 @@ async function run(
   const adapter = googleChatAdapter({
     threadTools,
     onPromptCapabilities: (value) => capabilities.push(value),
+    ...(gated ? { onGate: gated.onGate } : {}),
     launch: () => ({
+      ...(gated ? { earned: gated.earned } : {}),
       client: f.client,
       configuration: {
         model: { optionId: 'model-slot', supported: ['fixture-model', 'fixture-other'] },
@@ -1152,4 +1155,93 @@ test('the client starts with Git held to the scratch copy', async () => {
   } finally {
     f.dispose();
   }
+});
+
+// An agent build that earned its review mode from its own replies is held to it during the turn.
+// The 1.4.0 bundle's mode rests on recorded evidence, and the same frames from it end done.
+test('a turn on an agent that earned its review mode stops when an edit lands unasked, the mode is not confirmed, a file or terminal service is asked for, or a subagent starts with subagents off', async () => {
+  const stopped = (what: string) =>
+    `The Google agent ${what}. CrewKite stopped the turn and no longer runs this build.`;
+  const rows: {
+    scenario: AcpChatPeerCase;
+    patch?: Partial<ChatTurnRequest>;
+    /** The option the person picks for each permission request. */
+    answer?: 'deny' | 'always';
+    gate: string | null;
+    message?: string;
+  }[] = [
+    { scenario: 'chat-stream', gate: 'edit', message: stopped('edited a file without asking') },
+    // A thread grant for edits told the agent to stop asking.
+    { scenario: 'chat-stream', patch: { permissionGrants: ['edit'] }, gate: null },
+    { scenario: 'chat-permission', patch: { permissionPolicy: 'allow-edits' }, gate: null },
+    // A request the person denied asked for nothing that landed.
+    {
+      scenario: 'chat-gate-denied',
+      answer: 'deny',
+      gate: 'edit',
+      message: stopped('edited a file without asking'),
+    },
+    // Allow for this thread told the agent to stop asking for edits in this session.
+    { scenario: 'chat-gate-denied', answer: 'always', gate: null },
+    // A policy answer on an agent that offers only allow-always is not the person's grant.
+    {
+      scenario: 'chat-gate-always-only',
+      patch: { permissionPolicy: 'allow-edits' },
+      gate: 'edit',
+      message: stopped('edited a file without asking'),
+    },
+    {
+      scenario: 'chat-gate-mode',
+      gate: 'mode',
+      message: stopped('did not confirm the mode that asks before edits'),
+    },
+    {
+      scenario: 'chat-gate-drift',
+      gate: 'mode',
+      message: stopped('left the mode that asks before edits'),
+    },
+    {
+      scenario: 'chat-gate-fs',
+      gate: 'service',
+      message: stopped('asked for a file or terminal service CrewKite keeps off'),
+    },
+    {
+      scenario: 'chat-gate-terminal',
+      gate: 'service',
+      message: stopped('asked for a file or terminal service CrewKite keeps off'),
+    },
+    {
+      scenario: 'chat-gate-subagent',
+      patch: { subagents: false },
+      gate: 'subagent',
+      message: stopped('started a subagent in a turn that runs without them'),
+    },
+  ];
+  for (const earned of [true, false])
+    for (const row of rows) {
+      const f = rig(row.scenario);
+      try {
+        const gates: [string, string][] = [];
+        const answer = (event: AgentEvent, handle: ChatTurnHandle) => {
+          if (row.answer && event.type === 'permission.requested')
+            handle.respondPermission(event.requestId, row.answer);
+        };
+        const turn = await run(f, request(f, row.patch), answer, undefined, {
+          earned,
+          onGate: (executable, reason) => gates.push([executable, reason]),
+        });
+        const name = `${row.scenario} ${row.answer ?? ''} ${JSON.stringify(row.patch ?? {})} earned=${earned}`;
+        if (earned && row.gate) {
+          assert.equal(turn.result.stopReason, 'error', name);
+          assert.equal(turn.result.failure?.kind, 'protocol', name);
+          assert.equal(turn.result.failure?.message, row.message, name);
+          assert.deepEqual(gates, [[f.client.executable, row.gate]], name);
+        } else {
+          assert.equal(turn.result.stopReason, 'done', name);
+          assert.deepEqual(gates, [], name);
+        }
+      } finally {
+        f.dispose();
+      }
+    }
 });
