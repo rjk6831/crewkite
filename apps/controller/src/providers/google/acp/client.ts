@@ -5,8 +5,10 @@ import { performance } from 'node:perf_hooks';
 import type { Writable } from 'node:stream';
 import { z } from 'zod';
 import { groupAbsent, type Schedule } from '../../../host/worker.ts';
+import { CLIENT_VERSIONS } from '../../client-versions.ts';
 import {
-  type AcpClientIdentity,
+  type AcpClient,
+  isAcpBundle,
   validateAcpClientIdentity,
   validateAcpDirectory,
 } from './profile.ts';
@@ -398,7 +400,7 @@ export type AcpSpawn = (
   },
 ) => ChildProcessWithoutNullStreams;
 export type AcpProcessOptions = {
-  client: AcpClientIdentity;
+  client: AcpClient;
   directory: string;
   environment: NodeJS.ProcessEnv;
   lifecycle: AcpLifecycle;
@@ -674,8 +676,10 @@ export function startAcpProcess<T>(
   if (process.platform === 'win32' || !isAbsolute(options.directory))
     throw new AcpError('identity');
   // The profile hashed this bundle when it resolved. A file whose identity changed since then is
-  // hashed again here, so a replaced bundle never runs under the old digest.
-  const executable = validateAcpClientIdentity(options.client, true).executable;
+  // hashed again here, so a replaced bundle never runs under the old digest. Another agent gets
+  // the same check against the digest its signature was verified on.
+  const client = validateAcpClientIdentity(options.client, true);
+  const executable = client.executable;
   validateAcpDirectory(options.directory);
   try {
     mkdirSync(join(options.directory, 'tmp'), { mode: 0o700 });
@@ -691,12 +695,25 @@ export function startAcpProcess<T>(
     });
   if (now() - started >= options.timeoutMs - 1000) throw new AcpError('deadline');
   sync(() => options.lifecycle.beforePhase());
-  const child = (options.spawn ?? spawn)(executable, [], {
-    cwd: options.directory,
-    detached: true,
-    stdio: ['pipe', 'pipe', 'pipe'],
-    env: acpEnvironment(options.environment, options.directory),
-  });
+  // The bundle starts with no arguments. Another agent starts with its launch line from the
+  // closed list, and with its updater off: a copy inside Google's desktop app must not replace
+  // itself under a digest CrewKite checked.
+  const child = isAcpBundle(client)
+    ? (options.spawn ?? spawn)(executable, [], {
+        cwd: options.directory,
+        detached: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: acpEnvironment(options.environment, options.directory),
+      })
+    : (options.spawn ?? spawn)(executable, [...client.args], {
+        cwd: options.directory,
+        detached: true,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: {
+          ...acpEnvironment(options.environment, options.directory),
+          ...CLIENT_VERSIONS.google.environment,
+        },
+      });
   const group = child.pid ?? 0;
   let reason: AcpReason | null = null,
     stopping = false,

@@ -62,7 +62,8 @@ export const CLIENT_VERSIONS = {
     command: 'agy',
     tested: '1.4.2',
     // 1.4.0 is the oldest build on record that ran a zero-turn -p metadata command with JSON
-    // output. The pinned ACP bundle is separate and keeps its own exact digests.
+    // output. The chat agent reads its own row below and is trusted by its signer and its
+    // connect-time replies. The 1.4.0 bundle a home holds keeps its exact digests.
     minimum: '1.4.0',
     update: 'agy update',
     maximumBytes: 256 * 1024 * 1024,
@@ -188,8 +189,9 @@ export function clientVersionStatus(
     | { state: 'untrusted'; path: string; why: 'shared-write' | 'shared-folder' | 'foreign-owner' }
     | { state: 'version'; path: string; version: string | null; managed?: string | null }
     | { state: 'pinned'; version: string },
+  override?: ClientRowOverride,
 ): ClientVersionStatus {
-  const row = CLIENT_VERSIONS[family];
+  const row = { ...CLIENT_VERSIONS[family], ...override };
   const parsed =
     found.state === 'version' || found.state === 'pinned'
       ? parseClientVersion(found.version ?? '')
@@ -207,7 +209,7 @@ export function clientVersionStatus(
   // refuse a build below the minimum.
   const information = 'information' in row;
   const informed = information && (state === 'older' || state === 'newer');
-  const named = `${row.name} ${version} found${found.state === 'version' ? place(family, found.path, found.managed) : ''}`;
+  const named = `${row.name} ${version} found${found.state === 'version' ? (override?.where ?? place(family, found.path, found.managed)) : ''}`;
   const message = (() => {
     if (information && checked !== null)
       switch (state) {
@@ -262,6 +264,18 @@ export function clientVersionStatus(
     ...recordFields(family, version),
   };
 }
+
+/**
+ * Another program in a family's place, such as the Google chat agent beside the quota client: its
+ * own name, the build I tested and the oldest one accepted. `where` names a copy that `place`
+ * cannot, such as the bundle in CrewKite's home.
+ */
+export type ClientRowOverride = {
+  name: string;
+  tested: string;
+  minimum: string;
+  where?: string;
+};
 
 /** What the client reported about itself, for the build found. */
 function recordFields(family: ClientFamily, version: string | null) {
@@ -368,11 +382,44 @@ export type FindOptions = {
  * found, the search path first. When no build is accepted, the first one found explains why.
  */
 export function findClient(family: ClientFamily, options: FindOptions): FoundClient {
+  const { accepted, first } = survey(family, options);
+  let best: FoundClient | null = null;
+  for (const found of accepted)
+    if (!best?.client || newerClientVersion(found.client.version, best.client.version))
+      best = found;
+  const found: FoundClient = best ??
+    first ?? { status: clientVersionStatus(family, { state: 'missing' }) };
+  return found.client && options.managed !== undefined
+    ? {
+        ...found,
+        status: {
+          ...found.status,
+          copy: clientCopy(family, found.client.executable, options.managed),
+        },
+      }
+    : found;
+}
+
+/**
+ * Every copy findClient accepts, in the order found, with the same real path, owner, mode and
+ * version checks. The Google chat agent runs further checks on each before it may run.
+ */
+export function inspectClients(
+  family: ClientFamily,
+  options: FindOptions,
+): Required<FoundClient>['client'][] {
+  return survey(family, options).accepted.map((found) => found.client);
+}
+
+function survey(
+  family: ClientFamily,
+  options: FindOptions,
+): { accepted: Required<FoundClient>[]; first: FoundClient | null } {
   const row = CLIENT_VERSIONS[family];
   const cache = options.cache ?? reads;
   const now = options.now ?? Date.now;
   let first: FoundClient | null = null;
-  let best: FoundClient | null = null;
+  const accepted: Required<FoundClient>[] = [];
   const seen = new Set<string>();
   const consider = (candidate: string) => {
     let found: FoundClient | null;
@@ -384,8 +431,7 @@ export function findClient(family: ClientFamily, options: FindOptions): FoundCli
     }
     if (!found) return;
     if (!found.client) first ??= found;
-    else if (!best?.client || newerClientVersion(found.client.version, best.client.version))
-      best = found;
+    else accepted.push({ status: found.status, client: found.client });
   };
   for (const directory of new Set(options.directories.filter(isAbsolute))) {
     const location = join(directory, row.command);
@@ -435,17 +481,7 @@ export function findClient(family: ClientFamily, options: FindOptions): FoundCli
     }
     consider(copy);
   }
-  const found: FoundClient = best ??
-    first ?? { status: clientVersionStatus(family, { state: 'missing' }) };
-  return found.client && options.managed !== undefined
-    ? {
-        ...found,
-        status: {
-          ...found.status,
-          copy: clientCopy(family, found.client.executable, options.managed),
-        },
-      }
-    : found;
+  return { accepted, first };
 }
 
 /** True when the left version is the later one. A version that cannot be read is never later. */
@@ -454,6 +490,22 @@ export const newerClientVersion = (left: string, right: string) => {
   const b = parseClientVersion(right);
   return !!a && (!b || compare(a, b) > 0);
 };
+
+/** Newest first, for a sort. A version that cannot be read sorts last; equal ones keep order. */
+export function compareClientVersions(left: string, right: string): number {
+  const a = parseClientVersion(left);
+  const b = parseClientVersion(right);
+  if (!a || !b) return a ? -1 : b ? 1 : 0;
+  return -compare(a, b);
+}
+
+/** The item with the newest version. On a tie the first one wins. */
+export function newestByVersion<T>(items: readonly T[], version: (item: T) => string) {
+  let newest: T | undefined;
+  for (const item of items)
+    if (newest === undefined || newerClientVersion(version(item), version(newest))) newest = item;
+  return newest;
+}
 
 // Where each provider's desktop app keeps its own copy of the client, inside the app bundle. The
 // OpenAI app's bin/codex is a shell wrapper; the binary it runs is named here so the digest covers
@@ -513,7 +565,9 @@ export function clientCopies(
     }
   }
   const own = managedClientRoot(environment);
-  if (own)
+  // CrewKite's Google folder holds the chat agent from the agent registry, which the chat route
+  // starts with its own launch line. The quota client never runs it.
+  if (own && family !== 'google')
     for (const version of entries(join(own, family)))
       copies.push(join(own, family, version, CLIENT_VERSIONS[family].command));
   return copies;
@@ -528,11 +582,26 @@ export function managedVersions(root: string, family: ClientFamily): string[] {
  * What CrewKite keeps about its own copies of one family, in `clients/<family>.json` beside the
  * family's folder: the newest build it fetched and the last fetched build it does not use. A
  * sticky entry is one the same download would fail again, so that version is not fetched twice.
+ * For the Google chat agent the entry can name a copy on the device too, and `signIn` marks one
+ * that waits for the person's sign-in. `refused` lists Google agent builds by digest that failed
+ * a connect-time or turn-time check. None of them is tried again, and a changed file is new.
  */
 export type ManagedRecord = {
   fetched: { version: string; at: string } | null;
-  notUsed: { version: string; at: string; reason: string; sticky: boolean } | null;
+  notUsed: {
+    version: string;
+    at: string;
+    reason: string;
+    sticky: boolean;
+    signIn?: true;
+    /** The Google copy the note is about, by digest. */
+    sha256?: string;
+  } | null;
+  refused?: readonly { sha256: string; version: string }[];
 };
+
+/** The most refused builds a record keeps, newest first. */
+export const MANAGED_REFUSED_LIMIT = 16;
 
 export const managedRecordFile = (root: string, family: ClientFamily) =>
   join(root, `${family}.json`);
@@ -545,7 +614,16 @@ export function readManagedRecord(root: string, family: ClientFamily): ManagedRe
     const raw = JSON.parse(readFileSync(managedRecordFile(root, family), 'utf8')) as {
       fetched?: Record<string, unknown> | null;
       notUsed?: Record<string, unknown> | null;
+      refused?: unknown;
     };
+    // A record written before the list existed has none. A damaged entry is left out.
+    const refused = (Array.isArray(raw.refused) ? raw.refused : [])
+      .slice(0, MANAGED_REFUSED_LIMIT)
+      .flatMap((entry: { sha256?: unknown; version?: unknown } | null) => {
+        const sha256 = typeof entry?.sha256 === 'string' ? entry.sha256 : '';
+        const version = text(entry?.version, 200);
+        return /^[a-f0-9]{64}$/.test(sha256) && version ? [{ sha256, version }] : [];
+      });
     const fetched = { version: text(raw.fetched?.version, 200), at: text(raw.fetched?.at, 40) };
     const notUsed = {
       version: text(raw.notUsed?.version, 200),
@@ -561,8 +639,14 @@ export function readManagedRecord(root: string, family: ClientFamily): ManagedRe
               at: notUsed.at,
               reason: notUsed.reason,
               sticky: raw.notUsed?.sticky === true,
+              ...(raw.notUsed?.signIn === true ? { signIn: true as const } : {}),
+              ...(typeof raw.notUsed?.sha256 === 'string' &&
+              /^[a-f0-9]{64}$/.test(raw.notUsed.sha256)
+                ? { sha256: raw.notUsed.sha256 }
+                : {}),
             }
           : null,
+      ...(refused.length ? { refused } : {}),
     };
   } catch {
     return { fetched: null, notUsed: null };
@@ -605,7 +689,11 @@ export function clientCopy(
     // A fetched build that was removed since is no longer a copy CrewKite holds.
     fetched: record.fetched && held.includes(record.fetched.version) ? record.fetched : null,
     notUsed: record.notUsed
-      ? { version: record.notUsed.version, reason: record.notUsed.reason }
+      ? {
+          version: record.notUsed.version,
+          reason: record.notUsed.reason,
+          ...(record.notUsed.signIn ? { signIn: true as const } : {}),
+        }
       : null,
   };
 }

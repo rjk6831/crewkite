@@ -24,6 +24,7 @@ import {
   findClient,
   forgetClientReads,
   foundLocationTrust,
+  inspectClients,
   parseClientVersion,
   unreadableRetryMs,
 } from './client-versions.ts';
@@ -394,6 +395,21 @@ test('the newest trusted copy runs wherever it sits, and an unsafe newer one nev
     // A copy outside the search path is named, so the card says which one runs.
     assert.match(found.status.message, /^Codex 0\.169\.0-alpha\.11\.1 found in ChatGPT\.app\. /);
     assert.equal(runs(), 2, 'the unsafe copy never ran');
+    // Every accepted copy, in the order found, for a caller that checks each one further.
+    assert.deepEqual(
+      inspectClients('openai', {
+        directories: [bin],
+        copies: [own, unsafe, app],
+        home: userInfo().homedir,
+        cache,
+        now: () => 0,
+      }).map((found) => [found.executable, found.version]),
+      [
+        [realpathSync(join(bin, 'codex')), '0.163.0'],
+        [own, '0.165.0'],
+        [app, '0.169.0-alpha.11.1'],
+      ],
+    );
     // A newer build on the search path wins in turn.
     link(client('codex-update', "echo 'codex-cli 0.170.0'"));
     assert.equal(find().client?.version, '0.170.0');

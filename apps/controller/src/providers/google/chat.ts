@@ -36,7 +36,7 @@ import {
   chatAcpLimits,
   startAcpProcess,
 } from './acp/client.ts';
-import { ACP_SESSION_MODELS, type AcpClientIdentity } from './acp/profile.ts';
+import { ACP_SESSION_MODELS, type AcpClient } from './acp/profile.ts';
 import { permissionDetail } from './permission-detail.ts';
 
 // One chat turn on the published ACP agent. The connection, process ownership and stop
@@ -46,9 +46,14 @@ import { permissionDetail } from './permission-detail.ts';
 
 type Select = { optionId: string; supported: readonly string[] };
 
-/** Facts the controller resolves for one turn from the pinned client and its setup proof. */
+/** Facts the controller resolves for one turn from the agent in use and its setup proof. */
 export type GoogleChatLaunch = {
-  client: AcpClientIdentity;
+  client: AcpClient;
+  /**
+   * The build earned its review mode from its own session replies, with no recorded evidence
+   * behind it. The turn then checks that the mode holds: see `gateLines`.
+   */
+  earned?: boolean;
   /** Option ids and values the setup proof observed. Null skips model and thought-level choice. */
   configuration: { model: Select; thoughtLevel: Select | null } | null;
   /** The mode the setup proof verified as "ask before editing". */
@@ -59,6 +64,21 @@ export type GoogleChatLaunch = {
   lifecycle?: AcpLifecycle;
   spawn?: AcpSpawn;
   schedule?: Schedule;
+};
+
+/**
+ * What an earned build did that the route forbids. Each one stops the turn, and the controller
+ * stops running the build.
+ */
+export type GoogleGate = 'edit' | 'mode' | 'service' | 'subagent';
+const stopped = (what: string) =>
+  `The Google agent ${what}. CrewKite stopped the turn and no longer runs this build.`;
+const gateLines = {
+  edit: stopped('edited a file without asking'),
+  'mode-ack': stopped('did not confirm the mode that asks before edits'),
+  'mode-drift': stopped('left the mode that asks before edits'),
+  service: stopped('asked for a file or terminal service CrewKite keeps off'),
+  subagent: stopped('started a subagent in a turn that runs without them'),
 };
 
 /** The block types the agent said it takes in a prompt. The protocol defaults each to false. */
@@ -607,6 +627,8 @@ export function googleChatAdapter(deps: {
   onPromptCapabilities?: (capabilities: GooglePromptCapabilities) => void;
   /** The thread tools server for this turn, with its own token. Null runs the turn without. */
   threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
+  /** Called once when a turn on an earned build stops at a gate, with the agent's path. */
+  onGate?: (executable: string, reason: GoogleGate) => void;
 }): ChatAdapter {
   return {
     family: 'google',
@@ -703,6 +725,45 @@ export function googleChatAdapter(deps: {
       }
       // A tool call frame without an ID this file can read still gets a card under its own ID.
       let unnamedCalls = 0;
+      // A build that earned its review mode is held to it. Edits are counted. Tool call IDs are
+      // never matched: this agent keys a call's terminal update by the permission prompt's ID, so
+      // an ID match would misfire. Every completed edit, delete or move in the turn, its own
+      // session or a subagent's, must have a permission request for one of those kinds before it
+      // that was answered with an allow option. A false trip refuses a good build and the bundle
+      // runs, which is the safe direction.
+      let gated: ChatFailure | null = null;
+      let editsAllowed = 0;
+      // The person's Allow for this thread on an edit goes to the agent as allow-always, and the
+      // agent stops asking for edits in this session. The live turn's grants do not change, so the
+      // count stops for the rest of the turn. A policy answer that fell back to allow-always is
+      // the controller's choice, so it counts the one edit and trusts nothing after it.
+      let editsTrusted = false;
+      const allowedEdit = (kind: ChatPermissionOption['kind'], person: boolean) => {
+        editsAllowed++;
+        if (person && kind === 'allow-thread') editsTrusted = true;
+      };
+      let editsDone = 0;
+      const countedChildEdits = new Set<string>();
+      let running: ReturnType<typeof startAcpProcess<void>> | null = null;
+      function gate(reason: GoogleGate, line: keyof typeof gateLines): ChatFailure | null {
+        if (!launch?.earned) return null;
+        if (gated) return gated;
+        gated = chatFailure({ stage, kind: 'protocol', message: gateLines[line] });
+        try {
+          deps.onGate?.(launch.client.executable, reason);
+        } catch {}
+        cancel();
+        try {
+          running?.stop();
+        } catch {}
+        return gated;
+      }
+      function editDone() {
+        editsDone++;
+        // A person who allowed edits for the whole thread told the agent to stop asking.
+        if (editsDone > editsAllowed && !editsTrusted && !limit.grants.includes('edit'))
+          gate('edit', 'edit');
+      }
 
       // One line of metadata per frame goes to the private work folder, so a client whose framing
       // does not match this file can be diagnosed from a real run.
@@ -843,6 +904,7 @@ export function googleChatAdapter(deps: {
             found ?? (resolve(scratch, parsed.data.path) === scratch ? null : parsed.data.path);
         }
         if (fresh && startsSubagent(update)) {
+          if (request.subagents === false) gate('subagent', 'subagent');
           const model = inputField(update.rawInput, ['model']);
           subagents.update(call.id, call.id, {
             ...(typeof model === 'string' ? { model } : {}),
@@ -901,8 +963,10 @@ export function googleChatAdapter(deps: {
             outcome === 'ok' ? 'done' : outcome === 'denied' ? 'stopped' : 'failed',
           );
         const files = [...call.diffs];
-        if (outcome === 'ok' && call.kind === 'edit')
+        if (outcome === 'ok' && call.kind === 'edit') {
           for (const path of call.paths) changed.add(path);
+          if (phase === 'turn') editDone();
+        }
         const first = outcome === 'ok' ? files[0] : undefined;
         const note =
           outcome === 'denied'
@@ -1030,6 +1094,14 @@ export function googleChatAdapter(deps: {
           });
         // A call the person was asked about has a card, and its result belongs on it.
         if (childCards.has(parsed.data.toolCallId)) tool(raw, false);
+        else if (
+          parsed.data.status === 'completed' &&
+          toolKind(childCalls.get(parsed.data.toolCallId)?.kind ?? parsed.data.kind) === 'edit' &&
+          !countedChildEdits.has(parsed.data.toolCallId)
+        ) {
+          countedChildEdits.add(parsed.data.toolCallId);
+          editDone();
+        }
         const kind = toolKind(parsed.data.kind);
         const action =
           cardTitle(kind, null, parsed.data.rawInput) || parsed.data.title?.trim() || null;
@@ -1065,15 +1137,36 @@ export function googleChatAdapter(deps: {
           case 'usage_update':
             settle();
             return context(raw);
+          case 'config_option_update':
+          case 'current_mode_update':
+            return modeHeld(raw);
         }
       }
+      /** An earned build that moves its mode off the asking value during the turn is stopped. */
+      function modeHeld(raw: Record<string, unknown>) {
+        const review = launch?.reviewMode;
+        if (!review || replaying) return;
+        const options = optionAck.safeParse(raw);
+        const current = options.success
+          ? options.data.configOptions.find((option) => option.id === review.configId)?.currentValue
+          : raw.currentModeId;
+        if (current !== undefined && current !== review.valueId) gate('mode', 'mode-drift');
+      }
+      // Updates held from before the prompt describe the session before the mode was set.
+      let replaying = false;
 
       // The request is parked before its event goes out, so an answer given from inside the
       // emit callback still finds it.
       function answer(id: RpcId, method: string, params: Record<string, unknown>) {
         const live = connection;
         if (!live) return;
-        if (method !== 'session/request_permission') return live.respond(id, {});
+        if (method !== 'session/request_permission') {
+          // Both services are off in initialize. An earned build that asks for one anyway gets no
+          // answer, and the turn stops.
+          if ((method.startsWith('fs/') || method.startsWith('terminal/')) && launch?.earned)
+            return void gate('service', 'service');
+          return live.respond(id, {});
+        }
         const parsed = permissionRequest.safeParse(params);
         // A subagent of this turn asks under its own session and gets the parent's policy. Any
         // other session is declined.
@@ -1190,6 +1283,7 @@ export function googleChatAdapter(deps: {
         });
         if (automatic) {
           if (refuses) call.denied = true;
+          else if (call.kind === 'edit') allowedEdit(automatic.kind, false);
           reply(live, id, { outcome: { outcome: 'selected', optionId: automatic.id } });
           send({
             type: 'permission.resolved',
@@ -1388,7 +1482,25 @@ export function googleChatAdapter(deps: {
                 );
             }
           }
-          if (launch?.reviewMode) await set(launch.reviewMode.configId, launch.reviewMode.valueId);
+          const review = launch?.reviewMode;
+          if (review && launch?.earned) {
+            // An earned build must say the mode took. An acknowledgement that cannot be read or
+            // leaves the option out proves nothing.
+            const ack = optionAck.safeParse(
+              await live.request('session/set_config_option', {
+                sessionId: id,
+                configId: review.configId,
+                value: review.valueId,
+              }),
+            );
+            const option = ack.success
+              ? ack.data.configOptions.find((o) => o.id === review.configId)
+              : undefined;
+            if (option?.currentValue !== review.valueId) {
+              const failure = gate('mode', 'mode-ack');
+              if (failure) throw new TurnFailure(failure);
+            }
+          } else if (review) await set(review.configId, review.valueId);
           if (cancelled) return;
 
           const parts: string[] = [];
@@ -1415,7 +1527,9 @@ export function googleChatAdapter(deps: {
             );
           phase = 'turn';
           promptStarted = true;
+          replaying = true;
           for (const params of buffered.splice(0)) guard(() => update(params));
+          replaying = false;
           const reply = promptResult.safeParse(
             await live.request('session/prompt', { sessionId: id, prompt: blocks }),
           );
@@ -1466,7 +1580,6 @@ export function googleChatAdapter(deps: {
         }
       }
 
-      let running: ReturnType<typeof startAcpProcess<void>> | null = null;
       let startFailure: ChatFailure | null = null;
       if (launch && !early) {
         try {
@@ -1510,6 +1623,7 @@ export function googleChatAdapter(deps: {
       }
 
       function conclude(outcome: AcpProcessOutcome<void>): Ending {
+        if (gated) return { stopReason: 'error', failure: gated };
         const fail = (error: unknown): Ending => {
           const failure = failureFor(
             error,
@@ -1603,6 +1717,7 @@ export function googleChatAdapter(deps: {
           pending.delete(requestId);
           const call = calls.get(entry.callId);
           if (call && kind === 'deny') call.denied = true;
+          else if (call?.kind === 'edit') allowedEdit(kind, true);
           try {
             reply(connection, entry.rpc, { outcome: { outcome: 'selected', optionId: choice } });
           } catch {

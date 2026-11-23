@@ -147,6 +147,9 @@ export class UsageCommands {
     forgetClientReads(family);
     try {
       if (family === 'google') {
+        // The chat agent is found apart from the quota client: a scan for signed agents, a fetch
+        // of a newer published one, and a check of any newer copy in the background.
+        void this.refreshGoogleAgents(true);
         this.usageResolution = this.options.googleUsageClient?.() ?? resolveGoogleUsageClient();
         const status = this.usageResolution.status;
         return status

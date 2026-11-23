@@ -34,33 +34,41 @@ import {
   readManagedRecord,
 } from './client-versions.ts';
 import { ACP_SIGNATURE_MS, signaturePhase } from './google/acp/import.ts';
-import { googleAcpDeveloperIdRequirement } from './google/acp/profile.ts';
+import { ACP_AGENT_ARGS, googleAcpDeveloperIdRequirement } from './google/acp/profile.ts';
 
 // CrewKite's own copy of a provider client. When the vendor has published a build newer than
 // every copy on the device, CrewKite fetches it into clients/<family>/<version> under its state
 // root. Nothing here writes anywhere else, so a client the person installed stays as it is. A
-// download is kept only when its bytes match the checksum the vendor publishes for that build and
-// its macOS signature names the vendor's Developer ID team. No digest of one build lives here.
+// download is kept only when its macOS signature names the vendor's Developer ID team and, where
+// the vendor publishes a checksum for that build, its bytes match it. No digest of one build lives
+// here.
 //
-// Google has no entry. Its downloads are signed, but the only lists of its newest version I know
-// are the ACP registry, which Google does not host, and the client's own updater service, which
-// is not published. The Google chat agent keeps its fixed archive (google/acp/install.ts).
+// Google publishes no checksum and no list of its builds I can read. The agent protocol's public
+// registry lists Google's chat agent, but Google does not host it. So the registry only says which
+// build is newest and what to start. The archive must come from Google's own download host, under
+// the path the reviewed 1.4.0 archive uses, and every program in it must carry Google's signature.
+// A wrong registry can at worst name another file Google signed. The entry's launch line is kept
+// beside the copy in agent.json, and only with arguments I have read the meaning of.
 
-export type ManagedFamily = 'openai' | 'anthropic';
+export type ManagedFamily = 'openai' | 'anthropic' | 'google';
 
-type Published = {
-  url: string;
-  hash: { algorithm: 'sha256' | 'sha512'; encoding: 'hex' | 'base64'; value: string };
-  /** file: the download is the client. npm: a package tarball with the native build inside. */
-  form: 'file' | 'npm';
-};
+// file: the download is the client. npm: a package tarball with the native build inside.
+// archive: a zip or gzip tar with the client and its helpers, started as cmd with args.
+type Checksum = { algorithm: 'sha256' | 'sha512'; encoding: 'hex' | 'base64'; value: string };
+type Published = { url: string } & (
+  | { form: 'file' | 'npm'; hash: Checksum }
+  // Google publishes no checksum for its archive. The signature is the trust rule there.
+  | { form: 'archive'; hash?: undefined; cmd: string; args: readonly string[] }
+);
 type Read = (url: string) => Promise<Buffer>;
 type Source = {
   vendor: string;
   /** The Developer ID team that signs the vendor's macOS builds. */
   team: string;
-  /** The one host a fetch for this family may reach. */
+  /** The one host a fetch for this family may read metadata from. */
   host: string;
+  /** The one host the build itself may come from, when it differs from the metadata host. */
+  downloadHost?: string;
   latest: (read: Read) => Promise<string>;
   published: (read: Read, version: string) => Promise<Published>;
 };
@@ -70,6 +78,61 @@ const NPM = 'https://registry.npmjs.org/@openai%2fcodex';
 const RELEASES = 'https://downloads.claude.ai/claude-code-releases';
 // The native build inside the OpenAI platform package, the same path openAiNativeSibling reads.
 const NPM_BUILD = 'package/vendor/aarch64-apple-darwin';
+const REGISTRY = 'https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json';
+// The launch lines whose meaning I have read, the same list the launch checks. Any other argument
+// could change what the agent may do, so an entry that names one is not fetched.
+const GOOGLE_ARGS = ACP_AGENT_ARGS.map((args) => JSON.stringify(args));
+
+const object = (value: unknown) =>
+  value && typeof value === 'object' && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : null;
+
+/**
+ * Google's entry in the agent registry, strict on every field CrewKite uses and blind to the
+ * rest. The entry is the one whose macOS arm64 archive sits on Google's download host. An ID or a
+ * name in a registry Google does not host proves nothing. The entry's environment is never read,
+ * and package manager entries are ignored: CrewKite runs no package manager for this.
+ */
+function googleEntry(bytes: Buffer) {
+  const agents = object(json(bytes))?.agents;
+  if (!Array.isArray(agents) || agents.length > 512 || !agents.every(object))
+    throw new Error('registry');
+  const found = agents.flatMap((agent: Record<string, unknown>) => {
+    const binary = object(object(object(agent.distribution)?.binary)?.['darwin-aarch64']);
+    let archive: URL;
+    try {
+      archive = new URL(String(binary?.archive));
+    } catch {
+      return [];
+    }
+    const google =
+      typeof binary?.archive === 'string' &&
+      archive.protocol === 'https:' &&
+      archive.host === 'dl.google.com' &&
+      !archive.username &&
+      !archive.password &&
+      archive.pathname.startsWith('/agy-extensions/releases/');
+    return binary && google ? [{ agent, binary, archive }] : [];
+  });
+  if (found.length !== 1) throw new Error('registry');
+  const [{ agent, binary, archive }] = found;
+  const version = typeof agent.version === 'string' ? parseClientVersion(agent.version) : null;
+  const { cmd, args = [] } = binary;
+  const segments = typeof cmd === 'string' ? cmd.replace(/^\.\//, '').split('/') : [];
+  if (
+    !version ||
+    version.text !== agent.version ||
+    version.prerelease ||
+    !/\.(zip|tar\.gz|tgz)$/.test(archive.pathname) ||
+    typeof cmd !== 'string' ||
+    cmd.length > 200 ||
+    segments.some((segment) => !segment || segment === '..' || /[\\\0]/.test(segment)) ||
+    !GOOGLE_ARGS.includes(JSON.stringify(args))
+  )
+    throw new Error('registry');
+  return { version: version.text, archive: archive.href, cmd, args: args as string[] };
+}
 
 const SOURCES: Record<ManagedFamily, Source> = {
   // npm publishes the macOS arm64 build as its own version of the package, with a sha512
@@ -114,6 +177,20 @@ const SOURCES: Record<ManagedFamily, Source> = {
       };
     },
   },
+  // The agent registry's one Google entry names the version, the archive and the launch line. Both
+  // reads below are the same GET, because a fetch reads each URL once.
+  google: {
+    vendor: 'Google',
+    team: 'EQHXZ8M8AV',
+    host: 'cdn.agentclientprotocol.com',
+    downloadHost: 'dl.google.com',
+    latest: async (read) => googleEntry(await read(REGISTRY)).version,
+    published: async (read, version) => {
+      const entry = googleEntry(await read(REGISTRY));
+      if (entry.version !== version) throw new Error('unpublished');
+      return { url: entry.archive, form: 'archive', cmd: entry.cmd, args: entry.args };
+    },
+  },
 };
 
 export type FetchOutcome =
@@ -130,6 +207,8 @@ export type FetchOptions = {
   root: string;
   /** The newest version among the copies on the device. Only a later build is fetched. */
   installed: string;
+  /** The version of the copy in use. A held copy of it is never pruned. */
+  inUse?: string;
   /** The only network access. The controller passes the real one; every test passes its own. */
   fetch: typeof fetch;
   /** The time a record carries, as the controller's clock gives it. */
@@ -165,7 +244,7 @@ const MACH_O = new Set([
  * Every Mach-O file under a folder. The package brings helper programs and libraries beside the
  * client, and each of them runs too. A link that leaves the folder throws.
  */
-function machOFiles(folder: string, root = realpathSync(folder)): string[] {
+export function machOFiles(folder: string, root = realpathSync(folder)): string[] {
   const found: string[] = [];
   for (const entry of readdirSync(folder, { withFileTypes: true })) {
     const path = join(folder, entry.name);
@@ -186,8 +265,37 @@ function machOFiles(folder: string, root = realpathSync(folder)): string[] {
   return found;
 }
 
+const execute = promisify(execFile);
+const TOOL = { env: { PATH: '/usr/bin:/bin', LANG: 'C' }, timeout: 120_000 };
+
+/** Throws once a gzip file inflates past the bound, before tar writes a byte of it. */
+async function gunzipWithin(file: string, signal: AbortSignal) {
+  let unpacked = 0;
+  await pipeline(
+    createReadStream(file),
+    createGunzip(),
+    new Writable({
+      write(chunk: Buffer, _encoding, done) {
+        unpacked += chunk.length;
+        done(unpacked > UNPACKED_BYTES ? new Error('too-large') : null);
+      },
+    }),
+    { signal },
+  );
+}
+
+/** The bytes of every file under a folder. Links are counted as links and never followed. */
+function folderBytes(folder: string): number {
+  let total = 0;
+  for (const entry of readdirSync(folder, { withFileTypes: true })) {
+    const path = join(folder, entry.name);
+    total += entry.isDirectory() ? folderBytes(path) : lstatSync(path).size;
+  }
+  return total;
+}
+
 /** The same Developer ID requirement the Google bundle is checked against, for another team. */
-async function verifyDeveloperId(executable: string, team: string) {
+export async function verifyDeveloperId(executable: string, team: string) {
   if (process.platform !== 'darwin') throw new Error('signature-refused');
   await signaturePhase(
     executable,
@@ -204,7 +312,7 @@ async function verifyDeveloperId(executable: string, team: string) {
   );
 }
 
-function writeRecord(root: string, family: ManagedFamily, record: ManagedRecord) {
+export function writeRecord(root: string, family: ManagedFamily, record: ManagedRecord) {
   const file = managedRecordFile(root, family);
   mkdirSync(root, { recursive: true, mode: 0o700 });
   writeFileSync(`${file}.next`, `${JSON.stringify(record)}\n`, { mode: 0o600 });
@@ -236,9 +344,15 @@ export async function fetchNewerClient(
     AbortSignal.timeout(options.totalMs ?? TOTAL_MS),
     ...(options.signal ? [options.signal] : []),
   ]);
-  const receive = async (url: string, maximum: number, hash?: Hash, path?: string) => {
+  const receive = async (
+    url: string,
+    host: string,
+    maximum: number,
+    hash?: Hash,
+    path?: string,
+  ) => {
     const target = new URL(url);
-    if (target.protocol !== 'https:' || target.host !== source.host) throw new Error('host');
+    if (target.protocol !== 'https:' || target.host !== host) throw new Error('host');
     watch();
     const response = await options.fetch(url, {
       signal,
@@ -271,9 +385,16 @@ export async function fetchNewerClient(
     );
     return Buffer.concat(kept);
   };
-  const read: Read = (url) => receive(url, METADATA_BYTES);
+  // Each URL is read once per fetch. Google's version and its archive come from one registry GET.
+  const reads = new Map<string, Promise<Buffer>>();
+  const read: Read = (url) => {
+    const reply = reads.get(url) ?? receive(url, source.host, METADATA_BYTES);
+    reads.set(url, reply);
+    return reply;
+  };
   const folder = join(options.root, family);
   let staging: string | undefined;
+  let archive: string | undefined;
   try {
     const latest = parseClientVersion(await source.latest(read));
     // A prerelease is never what the vendor calls its latest build.
@@ -282,12 +403,17 @@ export async function fetchNewerClient(
     const before = readManagedRecord(options.root, family);
     if (
       !newerClientVersion(version, options.installed) ||
-      (before.notUsed?.sticky && before.notUsed.version === version)
+      (before.notUsed?.sticky && before.notUsed.version === version) ||
+      // A build the Google route refused would fail the same checks again. Its download would
+      // have a new digest, so the version decides here.
+      before.refused?.some((build) => build.version === version)
     )
       return { outcome: 'current' };
+    // A download takes minutes. The route may record a refusal or a sign-in meanwhile, so each
+    // write reads the record again and changes only what the fetch owns.
     const refuse = (reason: string, sticky: boolean): FetchOutcome => {
       writeRecord(options.root, family, {
-        ...before,
+        ...readManagedRecord(options.root, family),
         notUsed: { version, at: options.now(), reason, sticky },
       });
       return { outcome: 'refused', version, reason };
@@ -309,46 +435,53 @@ export async function fetchNewerClient(
     for (const name of readdirSync(folder))
       if (name.startsWith('.fetch-')) rmSync(join(folder, name), { recursive: true, force: true });
     staging = mkdtempSync(join(folder, '.fetch-'));
-    const download = join(staging, published.form === 'npm' ? '.package.tgz' : command);
-    const hash = createHash(published.hash.algorithm);
+    // An archive lands beside the staging folder, so no member it holds can write over it.
+    const zip = published.form === 'archive' && new URL(published.url).pathname.endsWith('.zip');
+    if (published.form === 'archive') archive = `${staging}${zip ? '.zip' : '.tgz'}`;
+    const download = archive ?? join(staging, published.form === 'npm' ? '.package.tgz' : command);
+    const hash = published.hash && createHash(published.hash.algorithm);
     await receive(
       published.url,
-      published.form === 'npm' ? PACKAGE_BYTES : CLIENT_VERSIONS[family].maximumBytes,
+      source.downloadHost ?? source.host,
+      published.form === 'file' ? CLIENT_VERSIONS[family].maximumBytes : PACKAGE_BYTES,
       hash,
       download,
     );
     // The stall bound is for the network. The unpack and each signature check have their own.
     clearTimeout(watchdog);
-    if (hash.digest(published.hash.encoding) !== published.hash.value)
+    if (published.hash && hash?.digest(published.hash.encoding) !== published.hash.value)
       // A cut download reads the same as a changed one, so the same version may be tried again.
       return refuse(
         `The download did not match the checksum ${source.vendor} publishes for it.`,
         false,
       );
     if (published.form === 'npm') {
-      let unpacked = 0;
-      await pipeline(
-        createReadStream(download),
-        createGunzip(),
-        new Writable({
-          write(chunk: Buffer, _encoding, done) {
-            unpacked += chunk.length;
-            done(unpacked > UNPACKED_BYTES ? new Error('too-large') : null);
-          },
-        }),
-        { signal },
-      );
+      await gunzipWithin(download, signal);
       // tar refuses a member that leaves the folder or passes through a link.
-      await promisify(execFile)(
+      await execute(
         '/usr/bin/tar',
         ['-xzf', download, '-C', staging, '--strip-components=3', NPM_BUILD],
-        { env: { PATH: '/usr/bin:/bin', LANG: 'C' }, timeout: 120_000, signal },
+        { ...TOOL, signal },
       );
       rmSync(download);
       // Discovery reads clients/<family>/<version>/<command>. The package keeps it under bin.
       symlinkSync(join('bin', command), join(staging, command));
+    } else if (published.form === 'archive') {
+      // A zip states its unpacked size up front. A gzip tar is counted as it inflates.
+      if (zip) {
+        const listing = await execute('/usr/bin/zipinfo', ['-t', download], { ...TOOL, signal });
+        const declared = /(\d+) bytes uncompressed/.exec(listing.stdout);
+        if (!declared || Number(declared[1]) > UNPACKED_BYTES) throw new Error('too-large');
+      } else await gunzipWithin(download, signal);
+      // bsdtar reads zip and gzip tar alike, and refuses a member that leaves the folder.
+      await execute('/usr/bin/tar', ['-xf', download, '-C', staging], { ...TOOL, signal });
+      // shortcut: a zip that lies about its sizes can fill the disk until the 120 s bound.
+      // Upgrade: count bytes while inflating, as install.ts does for the fixed archive.
+      if (folderBytes(staging) > UNPACKED_BYTES) throw new Error('too-large');
     } else chmodSync(download, 0o500);
-    const executable = realpathSync(join(staging, command));
+    const executable = realpathSync(
+      join(staging, published.form === 'archive' ? published.cmd : command),
+    );
     if (!executable.startsWith(`${realpathSync(staging)}/`) || !lstatSync(executable).isFile())
       return refuse('The download holds no client where the package keeps it.', true);
     let programs: string[];
@@ -372,20 +505,38 @@ export async function fetchNewerClient(
         true,
       );
     }
+    if (published.form === 'archive') {
+      // Discovery starts the copy with the entry's launch line, which only this file carries. A
+      // file of that name from the archive is CrewKite's to replace.
+      const launch = join(staging, 'agent.json');
+      rmSync(launch, { recursive: true, force: true });
+      writeFileSync(launch, `${JSON.stringify({ cmd: published.cmd, args: published.args })}\n`, {
+        mode: 0o600,
+        flag: 'wx',
+      });
+    }
     rmSync(join(folder, version), { recursive: true, force: true });
     renameSync(staging, join(folder, version));
     const held = managedVersions(options.root, family).sort((left, right) =>
       newerClientVersion(left, right) ? -1 : 1,
     );
     for (const older of held.filter((name) => name !== version).slice(1))
-      rmSync(join(folder, older), { recursive: true, force: true });
-    writeRecord(options.root, family, { fetched: { version, at: options.now() }, notUsed: null });
+      if (older !== options.inUse) rmSync(join(folder, older), { recursive: true, force: true });
+    const current = readManagedRecord(options.root, family);
+    writeRecord(options.root, family, {
+      ...current,
+      fetched: { version, at: options.now() },
+      // A note the Google route wrote names its copy by digest and stays. Any other note was
+      // about an earlier fetch.
+      notUsed: current.notUsed?.sha256 ? current.notUsed : null,
+    });
     return { outcome: 'fetched', version };
   } catch {
     return { outcome: 'unavailable' };
   } finally {
     clearTimeout(watchdog);
     if (staging) rmSync(staging, { recursive: true, force: true });
+    if (archive) rmSync(archive, { force: true });
   }
 }
 

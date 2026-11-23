@@ -18,8 +18,13 @@ import { test } from 'node:test';
 import { forgetProbes, probeClient } from './anthropic/client-probe.ts';
 import { PASSED_FLAGS } from './anthropic/protocol.ts';
 import { forgetClientRecord } from './client-record.ts';
-import { clientCopies, findClient, managedClientRoot } from './client-versions.ts';
-import { fetchNewerClient, refuseManagedClient } from './managed-client.ts';
+import {
+  clientCopies,
+  findClient,
+  managedClientRoot,
+  managedRecordFile,
+} from './client-versions.ts';
+import { type FetchOutcome, fetchNewerClient, refuseManagedClient } from './managed-client.ts';
 
 const mac = { platform: 'darwin', arch: 'arm64' };
 const script = (line: string) => `#!/bin/sh\necho "${line}"\n`;
@@ -44,12 +49,20 @@ function client(folder: string, name: string, line: string) {
   return join(folder, name);
 }
 
-/** Answers the vendor's published files from memory and lists every URL asked for. */
-function vendor(files: Record<string, Buffer | string>) {
+/**
+ * Answers the vendor's published files from memory and lists every URL asked for. A moved URL
+ * answers with a redirect, which fails as fetch fails when the caller refuses redirects.
+ */
+function vendor(files: Record<string, Buffer | string>, moved: Record<string, string> = {}) {
   const asked: string[] = [];
-  const fetcher = (async (input: string | URL | Request) => {
-    const url = String(input);
+  const fetcher = (async (input: string | URL | Request, init?: RequestInit) => {
+    let url = String(input);
     asked.push(url);
+    if (moved[url]) {
+      if (init?.redirect === 'error') throw new TypeError('fetch failed');
+      url = moved[url];
+      asked.push(url);
+    }
     const body = files[url];
     return body === undefined
       ? new Response('not found', { status: 404 })
@@ -100,6 +113,45 @@ function openAiRelease(base: string, version: string, host = 'registry.npmjs.org
     [url]: tarball,
   };
 }
+
+const registry = 'https://cdn.agentclientprotocol.com/registry/v1/latest/registry.json';
+const googleReleases = 'https://dl.google.com/agy-extensions/releases/macos';
+
+/**
+ * The agent as Google's archive holds it: the server and a helper program beside it, both Mach-O
+ * by their first four bytes, and a note that is not a program.
+ */
+function googleArchive(base: string, kind: 'zip' | 'tgz') {
+  const pack = join(base, `pack-${kind}`);
+  mkdirSync(join(pack, 'lib'), { recursive: true });
+  writeFileSync(join(pack, 'agy_acp_server.par'), Buffer.from('cffaedfe0c000001', 'hex'), {
+    mode: 0o755,
+  });
+  writeFileSync(join(pack, 'lib/localharness_external'), Buffer.from('cffaedfe0c000002', 'hex'));
+  writeFileSync(join(pack, 'NOTICE'), 'notice\n');
+  const file = join(base, `agent.${kind}`);
+  const made = spawnSync('/usr/bin/tar', [
+    ...(kind === 'zip' ? ['--format=zip', '-cf'] : ['-czf']),
+    file,
+    '-C',
+    pack,
+    '.',
+  ]);
+  assert.equal(made.status, 0);
+  return readFileSync(file);
+}
+
+/** One registry agent offering a macOS arm64 archive, with the extra fields the registry carries. */
+const listed = (version: string, binary: Record<string, unknown>) => ({
+  id: `agent-${version}`,
+  name: 'Agent',
+  version,
+  distribution: {
+    binary: { 'darwin-aarch64': { cmd: './agy_acp_server.par', ...binary } },
+    npx: { package: '@example/agent', args: ['--acp'] },
+  },
+  extra: { kept: false },
+});
 
 const find = (
   family: 'openai' | 'anthropic',
@@ -204,6 +256,241 @@ test('a fetched client is kept and run only when its bytes match the published c
   assert.equal(found.client?.executable.startsWith(`${signed.root}/openai/0.200.0/`), true);
   assert.deepEqual(found.status.copy?.fetched, { version: '0.200.0', at: now() });
   assert.equal(found.status.copy?.place, 'crewkite');
+});
+
+test("the Google agent is fetched only from the registry's one entry on Google's download host, with one registry read, and kept only when every program in it is signed by Google", {
+  skip: process.platform !== 'darwin' && 'the archive is unpacked with the macOS bsdtar',
+}, async (t) => {
+  const now = () => '2026-11-23T00:00:00.000Z';
+  const { base } = setup(t);
+  const zip = `${googleReleases}/agy-acp-server-1.6.0-darwin-arm64.zip`;
+  const tgz = `${googleReleases}/agy-acp-server-1.6.0-darwin-arm64.tar.gz`;
+  const elsewhere = 'https://downloads.example/agy-extensions/releases/macos/agent-1.6.0.zip';
+  const files = {
+    [zip]: googleArchive(base, 'zip'),
+    [tgz]: googleArchive(base, 'tgz'),
+    [elsewhere]: googleArchive(base, 'zip'),
+  };
+  // The registry lists other agents beside Google's: one with an archive on its own host, one
+  // through a package manager.
+  const others = [
+    {
+      id: 'other',
+      version: '9.0.0',
+      distribution: {
+        binary: {
+          'darwin-aarch64': { archive: 'https://github.com/example/a.tar.gz', cmd: './a' },
+        },
+      },
+    },
+    { id: 'npm-only', version: '9.0.0', distribution: { npx: { package: '@example/other' } } },
+  ];
+  const google = (binary: Record<string, unknown> = {}) =>
+    listed('1.6.0', { archive: zip, args: ['acp'], env: { AGENT_FLAG: '1' }, ...binary });
+  const server = 'agy_acp_server.par EQHXZ8M8AV';
+  const helper = 'localharness_external EQHXZ8M8AV';
+  const rows: {
+    name: string;
+    agents: unknown[];
+    moved?: Record<string, string>;
+    refused?: string;
+    unsigned?: string;
+    /** Copies CrewKite holds before the fetch, and the version of the one in use. */
+    held?: string[];
+    inUse?: string;
+    /** The route writes the record while the archive downloads. */
+    routeNote?: boolean;
+    expect: FetchOutcome;
+    kept?: { cmd: string; args: string[] };
+    folders?: string[];
+    downloaded: string[];
+    checked: string[];
+  }[] = [
+    {
+      name: 'a zip archive',
+      agents: [...others, google()],
+      expect: { outcome: 'fetched', version: '1.6.0' },
+      kept: { cmd: './agy_acp_server.par', args: ['acp'] },
+      downloaded: [zip],
+      checked: [server, helper],
+    },
+    {
+      name: 'a gzip tar archive with no arguments',
+      agents: [google({ archive: tgz, args: undefined }), ...others],
+      expect: { outcome: 'fetched', version: '1.6.0' },
+      kept: { cmd: './agy_acp_server.par', args: [] },
+      downloaded: [tgz],
+      checked: [server, helper],
+    },
+    {
+      name: 'a second entry on the same host',
+      agents: [google(), { ...google({ archive: tgz }), id: 'copy' }],
+      expect: { outcome: 'unavailable' },
+      downloaded: [],
+      checked: [],
+    },
+    {
+      name: 'an archive on another host',
+      agents: [others[1], google({ archive: elsewhere })],
+      expect: { outcome: 'unavailable' },
+      downloaded: [],
+      checked: [],
+    },
+    {
+      name: 'a download that redirects',
+      agents: [google()],
+      moved: { [zip]: elsewhere },
+      expect: { outcome: 'unavailable' },
+      downloaded: [zip],
+      checked: [],
+    },
+    {
+      name: 'arguments outside the list',
+      agents: [google({ args: ['acp', '--yolo'] })],
+      expect: { outcome: 'unavailable' },
+      downloaded: [],
+      checked: [],
+    },
+    {
+      name: 'a launch file outside the folder',
+      agents: [google({ cmd: '../agy_acp_server.par' })],
+      expect: { outcome: 'unavailable' },
+      downloaded: [],
+      checked: [],
+    },
+    {
+      name: 'a package manager entry only',
+      agents: [
+        {
+          ...google(),
+          distribution: {
+            npx: { package: '@example/agent', args: ['acp'] },
+            uvx: { package: 'example-agent', args: ['acp'] },
+          },
+        },
+      ],
+      expect: { outcome: 'unavailable' },
+      downloaded: [],
+      checked: [],
+    },
+    {
+      name: 'a version the route already refused',
+      agents: [google()],
+      refused: '1.6.0',
+      expect: { outcome: 'current' },
+      downloaded: [],
+      checked: [],
+    },
+    {
+      // The fetch prunes old copies but never the one in use, and a note the route wrote during
+      // the download stays.
+      name: 'the copy in use and a route note during the download',
+      agents: [google()],
+      held: ['1.4.5', '1.5.0'],
+      inUse: '1.4.5',
+      routeNote: true,
+      expect: { outcome: 'fetched', version: '1.6.0' },
+      kept: { cmd: './agy_acp_server.par', args: ['acp'] },
+      folders: ['1.4.5', '1.5.0', '1.6.0'],
+      downloaded: [zip],
+      checked: [server, helper],
+    },
+    {
+      name: 'an unsigned helper',
+      agents: [google()],
+      unsigned: 'localharness_external',
+      expect: {
+        outcome: 'refused',
+        version: '1.6.0',
+        reason: 'Its signature does not name the Google Developer ID team EQHXZ8M8AV.',
+      },
+      downloaded: [zip],
+      checked: [server, helper],
+    },
+  ];
+  for (const row of rows) {
+    const at = setup(t);
+    if (row.refused) {
+      mkdirSync(at.root, { recursive: true });
+      const refused = [{ sha256: 'a'.repeat(64), version: row.refused }];
+      writeFileSync(
+        managedRecordFile(at.root, 'google'),
+        JSON.stringify({ fetched: null, notUsed: null, refused }),
+      );
+    }
+    for (const version of row.held ?? []) {
+      mkdirSync(join(at.root, 'google', version), { recursive: true });
+      writeFileSync(join(at.root, 'google', version, 'agy'), 'held');
+    }
+    const published = vendor(
+      { ...files, [registry]: JSON.stringify({ version: '1.0.0', agents: row.agents }) },
+      row.moved,
+    );
+    const note = {
+      version: '1.5.5',
+      at: now(),
+      reason: 'The copy in Example.app needs its own Google sign-in.',
+      sticky: false,
+      signIn: true,
+      sha256: 'b'.repeat(64),
+    };
+    const routeRefused = [{ sha256: 'c'.repeat(64), version: '1.5.4' }];
+    const checked: string[] = [];
+    const outcome = await fetchNewerClient('google', {
+      root: at.root,
+      installed: '1.5.5',
+      ...(row.inUse ? { inUse: row.inUse } : {}),
+      fetch: (async (input: string | URL | Request, init?: RequestInit) => {
+        if (row.routeNote && String(input) === zip)
+          writeFileSync(
+            managedRecordFile(at.root, 'google'),
+            JSON.stringify({ fetched: null, notUsed: note, refused: routeRefused }),
+          );
+        return published.fetcher(input, init);
+      }) as typeof fetch,
+      verify: async (program, team) => {
+        checked.push(`${basename(program)} ${team}`);
+        if (basename(program) === row.unsigned) throw new Error('signature-refused');
+      },
+      host: mac,
+      now,
+    });
+    assert.deepEqual(outcome, row.expect, row.name);
+    // One read of the registry per fetch, and a download only from the entry it names.
+    assert.deepEqual(
+      published.asked.filter((url) => url === registry),
+      [registry],
+      row.name,
+    );
+    assert.deepEqual(
+      published.asked.filter((url) => url !== registry),
+      row.downloaded,
+      row.name,
+    );
+    assert.deepEqual(checked.sort(), row.checked, row.name);
+    const folder = join(at.root, 'google');
+    if (!row.kept) {
+      assert.equal(existsSync(join(folder, '1.6.0')), false, row.name);
+      continue;
+    }
+    // The archive and the staging folder are gone. The launch line holds the entry's file and
+    // arguments and nothing else, so the entry's environment is never applied.
+    assert.deepEqual(readdirSync(folder).sort(), row.folders ?? ['1.6.0'], row.name);
+    if (row.routeNote)
+      assert.deepEqual(
+        JSON.parse(readFileSync(managedRecordFile(at.root, 'google'), 'utf8')),
+        { fetched: { version: '1.6.0', at: now() }, notUsed: note, refused: routeRefused },
+        row.name,
+      );
+    assert.deepEqual(
+      readdirSync(join(folder, '1.6.0')).sort(),
+      ['NOTICE', 'agent.json', 'agy_acp_server.par', 'lib'],
+      row.name,
+    );
+    const launch = join(folder, '1.6.0/agent.json');
+    assert.deepEqual(JSON.parse(readFileSync(launch, 'utf8')), row.kept, row.name);
+    assert.equal(lstatSync(launch).mode & 0o777, 0o600, row.name);
+  }
 });
 
 test('a fetched client that fails its connect-time read is not used and the last good copy runs', (t) => {

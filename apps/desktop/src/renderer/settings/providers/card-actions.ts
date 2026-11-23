@@ -2,7 +2,8 @@ import type { ClientVersionStatus } from '@crewkite/contracts';
 import type { DesktopCommand } from '../../source.ts';
 
 export type CardFamily = 'openai' | 'anthropic' | 'google';
-export type CardActionId = 'check' | 'models' | 'sign-out';
+/** connect: the sign-in for a newer Google copy that waits for one, shown only then. */
+export type CardActionId = 'check' | 'models' | 'sign-out' | 'connect';
 
 /** The actions every cloud card offers, in the order the card shows them. */
 export const CARD_ACTIONS: readonly { id: CardActionId; label: string; busy: string }[] = [
@@ -14,11 +15,13 @@ export const CARD_ACTIONS: readonly { id: CardActionId; label: string; busy: str
 const done = {
   check: (time: string) => `Checked at ${time}.`,
   models: (time: string) => `Models read at ${time}.`,
+  connect: (time: string) => `Signed in at ${time}.`,
 };
 const refused = {
   check: 'The client could not be checked.',
   models: 'The model list could not be read. Refresh models to try again.',
   'sign-out': 'Sign out did not go through. Try again.',
+  connect: 'The sign-in did not finish. Press Connect to try again.',
 };
 // OpenAI signs out of the home CrewKite owns. The other two end CrewKite's connection and leave
 // the client signed in, so the line says that.
@@ -49,6 +52,7 @@ export function actionCommand(
   google: { revision: number; proofId: string },
 ): DesktopCommand {
   if (id === 'check') return { command: 'CheckProviderClient', payload: { family } };
+  if (id === 'connect') return waitingSignInCommand(google);
   if (id === 'models')
     return family === 'google'
       ? {
@@ -73,22 +77,47 @@ const day = (iso: string) => {
 /**
  * What the copy line adds to the status message above it. The message already names the version
  * and an app or CrewKite's own folder, so this says only where a search-path copy came from, when
- * CrewKite fetched the copy in use, and a fetched build it does not use. The Google status is the
- * quota client, so its line says what that client does. Null when there is nothing to add.
+ * CrewKite fetched the copy in use, and a build it does not use. The Google status is the chat
+ * agent, and a Google build it does not use can be a copy on the device, whose reason names where
+ * it sits. Null when there is nothing to add.
  */
 export function clientCopyLine(family: CardFamily, status: ClientVersionStatus): string | null {
   const copy = status.copy;
   if (!status.accepted || !copy) return null;
   const lines: string[] = [];
-  if (copy.place === 'search-path')
-    lines.push(`${family === 'google' ? 'Reads quota' : 'Runs'} from your search path.`);
+  if (copy.place === 'search-path') lines.push('Runs from your search path.');
   else if (copy.place === 'crewkite') {
     const fetched = copy.fetched?.version === status.version ? day(copy.fetched.at) : null;
     lines.push(fetched ? `Fetched by CrewKite on ${fetched}.` : 'Kept by CrewKite.');
   }
-  if (copy.notUsed)
+  if (copy.notUsed) {
+    const reason = copy.notUsed.reason.replace(/\.?$/, '.');
     lines.push(
-      `CrewKite fetched ${copy.notUsed.version} and does not use it. ${copy.notUsed.reason.replace(/\.?$/, '.')}`,
+      family === 'google'
+        ? `CrewKite does not use ${copy.notUsed.version}. ${reason}`
+        : `CrewKite fetched ${copy.notUsed.version} and does not use it. ${reason}`,
     );
+  }
   return lines.length ? lines.join(' ') : null;
+}
+
+/**
+ * The sign-in for a newer Google copy that waits for one. It is the setup's own sign-in command,
+ * sent from Ready: the controller runs it against the waiting copy and keeps the copy in use
+ * until the new one passes.
+ */
+export function waitingSignInCommand(google: {
+  revision: number;
+  proofId: string;
+}): DesktopCommand {
+  return {
+    command: 'AuthenticateGoogleAcp',
+    expectedRevision: google.revision,
+    payload: {
+      profileId: 'google-acp-v1',
+      proofId: google.proofId,
+      method: 'oauth-personal',
+      consent: 'explicit',
+    },
+  };
 }

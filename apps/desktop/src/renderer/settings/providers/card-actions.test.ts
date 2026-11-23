@@ -73,11 +73,38 @@ test('the client line adds only what the status message lacks', () => {
       status({ copy: copy('search-path', '/usr/local/bin/codex') }),
       'Runs from your search path.',
     ],
+    // The Google status is the chat agent in use.
     [
-      'Google reads quota',
+      'Google agent on the search path',
       'google',
       status({ copy: copy('search-path', '/usr/local/bin/agy') }),
-      'Reads quota from your search path.',
+      'Runs from your search path.',
+    ],
+    [
+      'Google bundle in the home, with a newer copy waiting for its sign-in',
+      'google',
+      status({
+        copy: copy('crewkite', '/h/providers/google-acp-v1/a/agy_acp_server.par', {
+          notUsed: {
+            version: '1.5.5',
+            reason:
+              'The copy in Example.app needs its own Google sign-in. Press Connect to sign in with it. Until then 1.4.0 runs.',
+            signIn: true,
+          },
+        }),
+      }),
+      'Kept by CrewKite. CrewKite does not use 1.5.5. The copy in Example.app needs its own Google sign-in. Press Connect to sign in with it. Until then 1.4.0 runs.',
+    ],
+    [
+      'Google agent CrewKite fetched',
+      'google',
+      status({
+        version: '1.5.7',
+        copy: copy('crewkite', '/s/clients/google/1.5.7/agy', {
+          fetched: { version: '1.5.7', at: '2026-11-23T03:04:05.000Z' },
+        }),
+      }),
+      'Fetched by CrewKite on 23 Nov 2026.',
     ],
     [
       'fetched copy in use',

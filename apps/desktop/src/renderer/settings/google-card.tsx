@@ -14,6 +14,9 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
   // an older read left windows behind.
   const connected = entry?.connected === true;
   const [connecting, setConnecting] = useState<GoogleSetupStage | null>(null);
+  // The card's status is the chat agent in use. Before there is one, the quota client stands in.
+  const quota = header.usageReaders.find((reader) => reader.family === 'google')?.client;
+  const agent = entry?.client;
   const cards = usageCards(
     scopes.filter(({ family }) => family === 'google'),
     { usageReaders: [] },
@@ -25,7 +28,7 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
       entry={entry}
       evidence={providerEvidence('google', entry, header, now)}
       reasonLine={googleReasonLine(entry?.reason, header, connecting)}
-      client={header.usageReaders.find((reader) => reader.family === 'google')?.client}
+      client={agent ?? quota}
       cloud={{ header, workspace }}
       main={
         <>
@@ -38,6 +41,7 @@ export function GoogleCard({ header, workspace, entry, now, actions, scopes }: C
           />
           <GoogleRecovery header={header} workspace={workspace} />
           <ClientStatus family="google" header={header} now={now} facts={false}>
+            {agent && quota && <p className="st-note">Quota client: {quota.message}</p>}
             {connected && (
               <QuotaRefresh
                 family="google"

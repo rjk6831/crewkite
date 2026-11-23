@@ -60,6 +60,18 @@ export const acpPeerCases = [
   'outside-two-rejects',
   'outside-execute',
   'hunk-brain-write',
+  // A newer agent build. It names its own version and offers one `mode` option with `default`,
+  // the shape a build earns its review mode from. Each variant breaks one of the route's reads.
+  'earned',
+  'earned-models-changed',
+  'earned-protocol-2',
+  'earned-version-mismatch',
+  'earned-no-default',
+  'earned-two-modes',
+  'earned-mode-ack',
+  'earned-no-models',
+  'earned-sign-in',
+  'earned-sign-in-cancelled',
 ] as const;
 export type AcpPeerCase = (typeof acpPeerCases)[number];
 
@@ -71,46 +83,92 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
     submitted = false,
     suppliedSnapshot = false,
     hunkStep = 0;
-  const config = [
+  const earned = scenario.startsWith('earned');
+  const earnedConfig = [
+    ...(scenario === 'earned-no-models'
+      ? []
+      : [
+          {
+            id: 'model',
+            name: 'Model',
+            category: 'model',
+            type: 'select',
+            currentValue: scenario === 'earned-models-changed' ? 'm-three' : 'm-one',
+            options:
+              scenario === 'earned-models-changed'
+                ? [{ value: 'm-three', name: 'Three' }]
+                : [
+                    { value: 'm-one', name: 'One' },
+                    { value: 'm-two', name: 'Two' },
+                  ],
+          },
+        ]),
     {
-      id: 'model-slot',
-      name: 'Model',
-      category: 'model',
+      id: 'mode',
+      name: 'Mode',
+      category: 'mode',
       type: 'select',
-      currentValue: 'fixture-model',
+      currentValue: 'accept_edits',
       options: [
-        { value: 'fixture-model', name: 'Model' },
-        { value: 'fixture-other', name: 'Other' },
+        ...(scenario === 'earned-no-default' ? [] : [{ value: 'default', name: 'Ask' }]),
+        { value: 'accept_edits', name: 'Accept edits' },
       ],
     },
-    ...(scenario === 'missing-thought'
-      ? []
-      : [
+    ...(scenario === 'earned-two-modes'
+      ? [
           {
-            id: 'thought-slot',
-            name: 'Thought',
-            category: 'thought_level',
-            type: 'select',
-            currentValue: 'fixture-low',
-            options: [{ value: 'fixture-low', name: 'Low' }],
-          },
-        ]),
-    ...(scenario === 'missing-mode'
-      ? []
-      : [
-          {
-            id: 'mode-slot',
-            name: 'Mode',
+            id: 'second-mode',
+            name: 'Second mode',
             category: 'mode',
             type: 'select',
-            currentValue: 'fixture-open',
-            options: [
-              { value: 'fixture-review', name: 'Review' },
-              { value: 'fixture-open', name: 'Open' },
-            ],
+            currentValue: 'default',
+            options: [{ value: 'default', name: 'Ask' }],
           },
-        ]),
+        ]
+      : []),
   ];
+  const config = earned
+    ? earnedConfig
+    : [
+        {
+          id: 'model-slot',
+          name: 'Model',
+          category: 'model',
+          type: 'select',
+          currentValue: 'fixture-model',
+          options: [
+            { value: 'fixture-model', name: 'Model' },
+            { value: 'fixture-other', name: 'Other' },
+          ],
+        },
+        ...(scenario === 'missing-thought'
+          ? []
+          : [
+              {
+                id: 'thought-slot',
+                name: 'Thought',
+                category: 'thought_level',
+                type: 'select',
+                currentValue: 'fixture-low',
+                options: [{ value: 'fixture-low', name: 'Low' }],
+              },
+            ]),
+        ...(scenario === 'missing-mode'
+          ? []
+          : [
+              {
+                id: 'mode-slot',
+                name: 'Mode',
+                category: 'mode',
+                type: 'select',
+                currentValue: 'fixture-open',
+                options: [
+                  { value: 'fixture-review', name: 'Review' },
+                  { value: 'fixture-open', name: 'Open' },
+                ],
+              },
+            ]),
+      ];
   function emit(value: object) {
     const line = `${JSON.stringify(value)}\n`;
     process.stdout.write(line.slice(0, 11));
@@ -218,8 +276,11 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
           return;
         }
         result(message.id, {
-          protocolVersion: scenario === 'bad-version' ? 2 : 1,
-          agentInfo: { name: 'fixture', version: '1.4.0' },
+          protocolVersion: scenario === 'bad-version' || scenario === 'earned-protocol-2' ? 2 : 1,
+          agentInfo: {
+            name: 'fixture',
+            version: !earned ? '1.4.0' : scenario === 'earned-version-mismatch' ? '1.5.4' : '1.5.5',
+          },
           agentCapabilities: { sessionCapabilities: scenario === 'no-close' ? {} : { close: {} } },
           authMethods:
             scenario === 'no-sign-in' ? [] : [{ id: 'oauth-personal', name: 'Personal' }],
@@ -227,7 +288,7 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
       } else if (message.method === 'authenticate') {
         assert.equal(message.params.methodId, 'oauth-personal');
         // The person closed the browser sign-in.
-        if (scenario === 'sign-in-cancelled')
+        if (scenario === 'sign-in-cancelled' || scenario === 'earned-sign-in-cancelled')
           process.stdout.write(
             `${JSON.stringify({ jsonrpc: '2.0', id: message.id, error: { code: -32603, message: 'Sign-in cancelled' } })}\n`,
           );
@@ -269,7 +330,9 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
           assert.deepEqual(server.env, []);
           assert(!Object.hasOwn(server, 'cwd'));
         }
-        if (scenario === 'session-update') {
+        if (scenario === 'earned-sign-in')
+          emit({ jsonrpc: '2.0', id: message.id, error: { code: -32000, message: 'Sign in' } });
+        else if (scenario === 'session-update') {
           process.stdout.write(
             `${JSON.stringify({ jsonrpc: '2.0', id: message.id, result: { sessionId: 'fixture-session', configOptions: config } })}\n${JSON.stringify({ jsonrpc: '2.0', method: 'session/update', params: { sessionId: 'fixture-session', update: { sessionUpdate: 'available_commands_update', availableCommands: [] } } })}\n`,
           );
@@ -292,7 +355,9 @@ export function runAcpPeer(scenario: AcpPeerCase, fresh = false) {
         option.currentValue =
           scenario === 'bad-ack' && option.id === 'model-slot'
             ? 'fixture-other'
-            : message.params.value;
+            : scenario === 'earned-mode-ack' && option.id === 'mode'
+              ? 'accept_edits'
+              : message.params.value;
         if (
           (scenario === 'corrected-model-ack' && option.id === 'model-slot') ||
           (scenario === 'corrected-mode-ack' && option.id === 'mode-slot')
@@ -667,6 +732,14 @@ export const acpChatPeerCases = [
   'chat-max-tokens',
   'chat-unknown',
   'chat-attach',
+  // Turns an agent that earned its review mode must not get away with.
+  'chat-gate-mode',
+  'chat-gate-drift',
+  'chat-gate-fs',
+  'chat-gate-terminal',
+  'chat-gate-subagent',
+  'chat-gate-denied',
+  'chat-gate-always-only',
 ] as const;
 export type AcpChatPeerCase = (typeof acpChatPeerCases)[number];
 
@@ -771,7 +844,11 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
       });
       chunk('agent_message_chunk', 'Changed it.');
       terminal('end_turn');
-    } else if (scenario.startsWith('chat-permission')) {
+    } else if (
+      scenario.startsWith('chat-permission') ||
+      scenario === 'chat-gate-denied' ||
+      scenario === 'chat-gate-always-only'
+    ) {
       const execute = scenario === 'chat-permission-execute';
       chunk('agent_message_chunk', 'Asking first.');
       update({
@@ -794,13 +871,43 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
         params: {
           sessionId: session,
           toolCall: { toolCallId: 'tool-1' },
+          // The always-only case offers no allow-once, so a policy answer can only pick always.
           options: [
-            { optionId: 'once', name: 'Once', kind: 'allow_once' },
+            ...(scenario === 'chat-gate-always-only'
+              ? []
+              : [{ optionId: 'once', name: 'Once', kind: 'allow_once' }]),
             { optionId: 'always', name: 'Always', kind: 'allow_always' },
             { optionId: 'deny', name: 'Deny', kind: 'reject_once' },
           ],
         },
       });
+    } else if (scenario === 'chat-gate-drift') {
+      const mode = config.find((v) => v.id === 'mode-slot');
+      assert(mode);
+      mode.currentValue = 'fixture-open';
+      update({ sessionUpdate: 'config_option_update', configOptions: config });
+      chunk('agent_message_chunk', 'Mode changed.');
+      terminal('end_turn');
+    } else if (scenario === 'chat-gate-fs' || scenario === 'chat-gate-terminal')
+      emit({
+        jsonrpc: '2.0',
+        id: 'service-1',
+        method: scenario === 'chat-gate-fs' ? 'fs/read_text_file' : 'terminal/create',
+        params:
+          scenario === 'chat-gate-fs'
+            ? { sessionId: session, path: file }
+            : { sessionId: session, command: 'ls' },
+      });
+    else if (scenario === 'chat-gate-subagent') {
+      update({
+        sessionUpdate: 'tool_call',
+        toolCallId: 'sub-1',
+        title: 'invoke_subagent',
+        kind: 'other',
+        status: 'in_progress',
+      });
+      update({ sessionUpdate: 'tool_call_update', toolCallId: 'sub-1', status: 'completed' });
+      terminal('end_turn');
     } else if (scenario === 'chat-cancel') chunk('agent_message_chunk', 'working');
     else if (scenario === 'chat-quota')
       emit({
@@ -890,7 +997,13 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
         else {
           assert(option.options.some((v) => v.value === message.params.value));
           option.currentValue = message.params.value;
-          result(message.id, { configOptions: config });
+          // This case acknowledges the mode with a list that leaves the mode out.
+          result(message.id, {
+            configOptions:
+              scenario === 'chat-gate-mode' && option.id === 'mode-slot'
+                ? config.filter((v) => v.id !== 'mode-slot')
+                : config,
+          });
         }
       } else if (message.method === 'session/prompt') {
         assert.equal(message.params.sessionId, session);
@@ -899,6 +1012,8 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
       } else if (message.method === 'session/cancel') {
         // A cancel can trail a prompt that a declined permission already ended.
         if (!answered) terminal('cancelled');
+      } else if (message.id === 'service-1') {
+        if (!answered) terminal('end_turn');
       } else if (message.id === 'perm-1') {
         const outcome = message.result?.outcome;
         chunk('agent_message_chunk', ` outcome=${JSON.stringify(outcome)}`);
@@ -908,6 +1023,16 @@ export function runAcpChatPeer(scenario: AcpChatPeerCase) {
           status:
             outcome?.outcome === 'selected' && outcome.optionId !== 'deny' ? 'completed' : 'failed',
         });
+        // After the first answer, these cases make a second edit without asking.
+        if (scenario === 'chat-gate-denied' || scenario === 'chat-gate-always-only')
+          update({
+            sessionUpdate: 'tool_call',
+            toolCallId: 'edit-2',
+            title: 'Edit net.mjs',
+            kind: 'edit',
+            status: 'completed',
+            locations: [{ path: join(cwd, 'net.mjs') }],
+          });
         terminal(outcome?.outcome === 'cancelled' ? 'cancelled' : 'end_turn');
       } else throw Error('Unsupported fixture request.');
     } catch {

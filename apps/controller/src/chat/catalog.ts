@@ -8,6 +8,7 @@ import {
   type ChatFamily,
   type ChatTurnStats,
   ChatTurnStatsSchema,
+  type ClientVersionStatus,
   type LocalSetup,
   type Observation,
 } from '@crewkite/contracts';
@@ -48,6 +49,8 @@ export type ChatCatalogInput = {
   anthropicModels?: readonly AnthropicLiveModel[] | null;
   /** What the Google client's last initialize declared in this controller's life, or null. */
   googlePrompt?: GooglePromptCapabilities | null;
+  /** The Google agent in use against the build I tested, or null before there is one. */
+  googleAgent?: ClientVersionStatus | null;
   local: LocalSetup;
   /**
    * The families the person connected on this device, from the connected-once receipts. A client
@@ -216,6 +219,8 @@ function google(input: ChatCatalogInput): Entry {
       models,
       configuration?.model.currentValue,
     ),
+    // The card names the agent copy in use, as the other cards name their client.
+    ...(input.googleAgent ? { client: input.googleAgent } : {}),
     accepts: declared
       ? [
           ...(declared.image ? ['image/*'] : []),
