@@ -4,10 +4,12 @@ import { userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { type ClientVersionStatus, NativeProfileSchema } from '@crewkite/contracts';
 import {
+  clientCopies,
   clientDirectories,
   clientHostGate,
   clientVersionStatus,
   findClient,
+  managedClientRoot,
   openAiNativeSibling,
 } from '../client-versions.ts';
 import { fileDigestSync } from '../file-digest.ts';
@@ -186,6 +188,9 @@ export function resolveOpenAiChatClient(
     };
   const found = findClient('openai', {
     directories: options.directories ?? clientDirectories('openai', environment),
+    // A caller that names its directories, such as a test, searches only those.
+    copies: options.directories ? [] : clientCopies('openai', environment),
+    managed: options.directories ? undefined : managedClientRoot(environment),
     home: environment.HOME as string,
     path: environment.PATH,
     siblings: openAiNativeSibling,

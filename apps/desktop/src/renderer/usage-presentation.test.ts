@@ -21,6 +21,7 @@ import {
   projectUsagePresentation,
   railConnections,
   railFamilies,
+  readAgo,
   spendText,
   usageCardFamily,
   windowLabel,
@@ -34,6 +35,8 @@ const live = (family: Route['family']): Route => ({
   fake: false,
 });
 const nowMs = Date.parse(DEMO_TIME) + 60_000;
+// The Anthropic fixtures reset at DEMO_TIME, so their cards are read just before it.
+const beforeReset = Date.parse(DEMO_TIME) - 1;
 const window = (
   route: Route,
   windowId: string,
@@ -199,30 +202,40 @@ test('native usage gauges show the remaining percent without inventing freshness
     },
   };
   const before = JSON.stringify(reader);
-  const card = anthropicUsageCard({ usageReaders: [reader] });
+  const card = anthropicUsageCard({ usageReaders: [reader] }, beforeReset);
   assert(card);
   // A single per-model window sits between the main gauges as the smaller featured one.
-  const withModel = anthropicUsageCard({
-    usageReaders: [
-      {
-        ...reader,
-        reading: {
-          ...reader.reading,
-          windows: [
-            ...reader.reading.windows,
-            { windowId: 'weekly-fable', remaining: { unit: 'percent', value: 89 }, resetsAt: null },
-          ],
+  const withModel = anthropicUsageCard(
+    {
+      usageReaders: [
+        {
+          ...reader,
+          reading: {
+            ...reader.reading,
+            windows: [
+              ...reader.reading.windows,
+              {
+                windowId: 'weekly-fable',
+                remaining: { unit: 'percent', value: 89 },
+                resetsAt: null,
+              },
+            ],
+          },
         },
-      },
-    ],
-  });
+      ],
+    },
+    beforeReset,
+  );
   assert.equal(withModel?.featured?.label, 'Fable, weekly');
   assert.ok(!withModel?.auxiliary?.some((row) => row.windowId === 'weekly-fable'));
   // Off can mean no balance on an account with the switch on, so only on shows a row.
   const credits = (is_enabled: boolean) =>
-    anthropicUsageCard({
-      usageReaders: [{ ...reader, reading: { ...reader.reading, extraUsage: { is_enabled } } }],
-    })?.credits;
+    anthropicUsageCard(
+      {
+        usageReaders: [{ ...reader, reading: { ...reader.reading, extraUsage: { is_enabled } } }],
+      },
+      beforeReset,
+    )?.credits;
   assert.deepEqual(credits(false), []);
   assert.deepEqual(
     credits(true)?.map((row) => [row.label, row.value]),
@@ -289,24 +302,30 @@ test('native usage gauges show the remaining percent without inventing freshness
   ];
   for (const [given, label, dotted] of ages)
     assert.deepEqual(gaugeAge(given, nowMs), { label, dotted }, `${given}`);
-  const repeated = anthropicUsageCard({
-    usageReaders: [
-      {
-        ...reader,
-        reading: {
-          ...reader.reading,
-          windows: [reader.reading.windows[1], reader.reading.windows[1]],
+  const repeated = anthropicUsageCard(
+    {
+      usageReaders: [
+        {
+          ...reader,
+          reading: {
+            ...reader.reading,
+            windows: [reader.reading.windows[1], reader.reading.windows[1]],
+          },
         },
-      },
-    ],
-  });
+      ],
+    },
+    beforeReset,
+  );
   assert.equal(new Set(repeated?.primary.map((row) => row.id)).size, 2);
   assert.equal(JSON.stringify(reader), before);
-  const prior = anthropicUsageCard({
-    usageReaders: [{ ...reader, readingScopeHash: 'c'.repeat(64) }],
-  });
+  const prior = anthropicUsageCard(
+    {
+      usageReaders: [{ ...reader, readingScopeHash: 'c'.repeat(64) }],
+    },
+    beforeReset,
+  );
   assert(prior?.tags?.includes('May be from an earlier sign-in'));
-  assert.equal(anthropicUsageCard({ usageReaders: [] }), null);
+  assert.equal(anthropicUsageCard({ usageReaders: [] }, beforeReset), null);
 });
 
 test('the rail shows five-hour and weekly bars, one bar for a single window, and No limits for Local', () => {
@@ -808,4 +827,87 @@ test('API spend never reads as zero when nothing reported it, and never joins th
   // A subscription connection keeps its allowance bars and has no spend line, and Local has none.
   assert.deepEqual(railConnections(read, 'anthropic'), []);
   assert.deepEqual(railConnections(read, 'local'), []);
+});
+
+test('a reading past its reset reads the same on the rail and the card, with its age and what blocks a new one', () => {
+  // The 7 November Google reading, looked at 304 hours later behind a held quota read.
+  const read = new Date(nowMs - 304 * 3_600_000).toISOString();
+  const passed = new Date(nowMs - 290 * 3_600_000).toISOString();
+  const route = live('google');
+  const old = (windowId: string, value: number, periodSeconds: number): Window => ({
+    observation: ObservationSchema.parse({
+      routeId: route.id,
+      windowId,
+      kind: 'weekly',
+      semantics: { scope: 'provider', periodSeconds },
+      remaining: { value, unit: 'percent' },
+      resetsAt: passed,
+      observedAt: read,
+      source: 'client',
+      confidence: 'reported',
+    }),
+    state: 'reset-pending',
+  });
+  const [card] = projectUsagePresentation(
+    {
+      routes: [route],
+      usage: [old('gemini-5h', 100, 18_000), old('gemini-weekly', 76, 604_800)],
+      usageReaders: [{ ...reader, lastObservedAt: read }],
+      googleMetadataHolds: [
+        { commandId: `cmd_${'1'.repeat(26)}`, operation: 'usage', reason: 'owner-present' },
+      ],
+    },
+    null,
+    nowMs,
+  );
+  // The card withholds a percent from before the reset, as the rail does.
+  assert.deepEqual(
+    [card.primary.fiveHour?.remaining, card.primary.weekly?.remaining],
+    [null, null],
+  );
+  assert.equal(
+    card.notice,
+    'Read 12 d ago, before the reset. An interrupted Google operation blocks new quota reads. Recovery on the Google card in Settings has the details.',
+  );
+  const [google] = railFamilies(
+    {
+      families: [
+        {
+          family: 'google',
+          connected: true,
+          reason: null,
+          models: [],
+          defaultModel: null,
+          // A catalog read before the reset passed still carries the percent.
+          remaining: [
+            {
+              windowId: 'gemini-5h',
+              label: 'five-hour',
+              percent: 100,
+              resetsAt: passed,
+              observedAt: read,
+            },
+            {
+              windowId: 'gemini-weekly',
+              label: 'weekly',
+              percent: 76,
+              resetsAt: passed,
+              observedAt: read,
+            },
+          ],
+          readAt: read,
+          accepts: null,
+        },
+      ],
+    },
+    nowMs,
+  );
+  assert.deepEqual(
+    google.bars.map((bar) => bar.text),
+    ['5 h unknown', 'week unknown'],
+  );
+  // One age everywhere, and a time ahead of this clock is never "just now".
+  assert.equal(google.read, gaugeAge(read, nowMs).label);
+  assert.equal(google.read, 'read 12 d ago');
+  assert.equal(readAgo(new Date(nowMs + 3_600_000).toISOString(), nowMs, true), 'age unknown');
 });

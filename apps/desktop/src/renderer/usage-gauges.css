@@ -222,7 +222,7 @@
 .usage-gauge.is-unknown-value .usage-gauge-track {
   stroke-linecap: butt;
 }
-.usage-gauge.state-reset-pending .usage-gauge-track {
+.usage-gauge.is-before-reset .usage-gauge-track {
   stroke: color-mix(in srgb, var(--amber) 80%, var(--surface-hover));
   stroke-dasharray: 3 5;
   stroke-linecap: butt;
@@ -607,8 +607,7 @@
   font-size: 10px;
   font-weight: 500;
 }
-.usage-meter-flag.flag-low,
-.usage-meter-flag.flag-reset-pending {
+.usage-meter-flag.flag-low {
   --flag: var(--amber);
 }
 .usage-meter-flag.flag-exhausted {
@@ -787,7 +786,7 @@
   .usage-gauge-track,
   .usage-gauge.is-unscaled .usage-gauge-track,
   .usage-gauge.tone-exhausted .usage-gauge-track,
-  .usage-gauge.state-reset-pending .usage-gauge-track {
+  .usage-gauge.is-before-reset .usage-gauge-track {
     stroke: GrayText;
   }
   .usage-gauges-meter {

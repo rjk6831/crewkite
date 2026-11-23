@@ -350,16 +350,17 @@ const admission = z.strictObject({
 export type GoogleClientIdentity = z.infer<typeof client>;
 export type GoogleWriterAdmission = z.infer<typeof admission>;
 
-// This floor refuses known permission bugs. It does not qualify a later build.
+// This floor refuses known permission bugs below 1.1.12. It does not qualify a later build, and a
+// later major one runs too: the connect-time reads decide what it may do (ADR 0061).
 export function googleVersionEligible(version: string): boolean {
   const match = /^(\d+)\.(\d+)\.(\d+)$/.exec(version);
   if (!match) return false;
   const [major, minor, patch] = match.slice(1).map(Number);
   return (
-    major === 1 &&
+    Number.isSafeInteger(major) &&
     Number.isSafeInteger(minor) &&
     Number.isSafeInteger(patch) &&
-    (minor > 1 || (minor === 1 && patch >= 12))
+    (major > 1 || (major === 1 && (minor > 1 || (minor === 1 && patch >= 12))))
   );
 }
 

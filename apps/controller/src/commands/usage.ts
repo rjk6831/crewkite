@@ -80,6 +80,8 @@ export class UsageCommands {
       client: () =>
         this.options.chatClients?.anthropic ? this.chatClientFor('anthropic').status : undefined,
       blocked: () => {
+        // Sign out ends every read of the family, so the periodic and post-turn reads stop too.
+        if (this.store.signedOut('anthropic')) return 'anthropic-connect-required';
         const connection = this.nativeConnections().status();
         if (connection.state === 'unknown') return 'anthropic-connection-ownership-unknown';
         if (connection.state === 'checking') return 'anthropic-connection-ownership-pending';
@@ -152,7 +154,9 @@ export class UsageCommands {
           : { outcome: 'applied', reason: this.usageResolution.reason };
       }
       if (family === 'openai') this.options.openAiUsageClient?.();
-      return { outcome: 'applied', next: this.chatClientFor(family).status.message };
+      const status = this.chatClientFor(family).status;
+      this.fetchNewerClient(family, status.version);
+      return { outcome: 'applied', next: status.message };
     } catch {
       return { outcome: 'blocked', reason: 'client-check-failed' };
     }
@@ -415,6 +419,32 @@ export class UsageCommands {
       })();
     }
     this.openAiAccountChanged();
+    return { outcome: 'applied' };
+  }
+
+  /**
+   * Ends CrewKite's connection to Anthropic or Google. The sign-in for both lives in the person's
+   * own home, so no client file and no sign-in is touched. The family drops out of the catalog,
+   * its launch, periodic and post-turn reads stop, and a send on it is refused until Connect
+   * runs. A turn already running is not stopped. A Google step that still runs holds the setup,
+   * so Sign out waits for it.
+   */
+  signOutProvider(
+    this: Controller,
+    command: Extract<Command, { command: 'SignOutProvider' }>,
+  ): CommandResult {
+    if (command.expectedRevision !== 0) return { outcome: 'stale-revision', revision: 0 };
+    const { family } = command.payload;
+    if (family === 'google' && this.store.googleAcpSetup().operationId)
+      return {
+        outcome: 'blocked',
+        reason: 'google-step-running',
+        next: 'A Google setup step is still running. Cancel it or wait for it, then sign out.',
+      };
+    this.store.transaction(() => {
+      this.store.forgetConnectedOnce(family);
+      this.store.markSignedOut(family);
+    });
     return { outcome: 'applied' };
   }
 
@@ -906,7 +936,19 @@ export class UsageCommands {
         next: `Refresh after ${new Date(Date.parse(reader.last_attempt_at) + 60000).toISOString()}.`,
       };
     const blocker = this.store.googleOperationBlocker();
-    if (blocker) return { outcome: 'blocked', reason: blocker };
+    if (blocker)
+      return {
+        outcome: 'blocked',
+        reason: blocker,
+        // The reason code alone leaves the card with nothing to say. An unknown owner is a held
+        // metadata row, which Recovery lists, or a Google task that only its own Stop can close.
+        next:
+          blocker === 'google-operation-active'
+            ? 'Another Google operation is running. Refresh when it ends.'
+            : this.store.heldGoogleMetadata().length
+              ? 'An interrupted Google operation is holding Google quota reads. Recovery on the Google card in Settings says why and what releases it.'
+              : 'CrewKite cannot confirm that an interrupted Google task ended, so Google quota reads wait. Stop that task, then refresh.',
+      };
     this.store.recordGoogleUsageAttempt(now);
     // observeUsageCommand resolved the client before this transaction opened.
     if (!this.usageResolution.available)

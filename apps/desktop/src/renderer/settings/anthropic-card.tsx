@@ -6,6 +6,7 @@ import { ClientStatus, clientFor } from './client-status.tsx';
 import { Allowance, type CardProps, CreditSwitch, ProviderCard } from './provider-card.tsx';
 import { providerEvidence } from './provider-evidence.ts';
 import { ConnectLine } from './providers/connect.tsx';
+import { connectedOnce } from './providers/connect-copy.ts';
 
 const signInText = (state: string | undefined) =>
   state === 'signed-in'
@@ -27,13 +28,14 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
   const cards = usageCards(
     scopes.filter(({ family }) => family === 'anthropic'),
     header,
+    now,
   );
   return (
     <ProviderCard
       family="anthropic"
       entry={entry}
       evidence={providerEvidence('anthropic', entry, header, now)}
-      onCheck={() => actions.checkClient('anthropic')}
+      cloud={{ header, workspace }}
       detail={connection?.state === 'signed-in' ? 'Signed in with a subscription' : undefined}
       main={
         <ClientStatus family="anthropic" header={header} now={now}>
@@ -45,16 +47,6 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
             connect={clientReady ? () => actions.checkAnthropic() : undefined}
           />
           <p role="status">{signInText(connection?.state)}</p>
-          <div className="st-actions">
-            <button
-              type="button"
-              className="button secondary"
-              disabled={!connected || !clientReady || busy || connection?.state === 'checking'}
-              onClick={() => void actions.checkAnthropic()}
-            >
-              Check Anthropic sign-in
-            </button>
-          </div>
           {/* The signed-in line above says enough. Other states carry the step to take. */}
           {connection?.next && connection.state !== 'signed-in' && (
             <p className="st-note">{connection.next}</p>
@@ -69,7 +61,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
               >
                 native client sign-in instructions
               </a>
-              , then check again.
+              , then press Connect.
             </p>
           )}
           {connection?.observedAt && (
@@ -83,6 +75,7 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
               className="button secondary"
               disabled={
                 !connected ||
+                !connectedOnce(header, 'anthropic') ||
                 !reader?.available ||
                 busy ||
                 reader.readState === 'intent' ||
@@ -105,7 +98,9 @@ export function AnthropicCard({ header, workspace, entry, now, actions, scopes }
                 </button>
               )}
           </div>
-          <p className="st-note">Usage is read again every five minutes while Anthropic is idle.</p>
+          <p className="st-note">
+            Usage is read again every five minutes while Anthropic is idle and connected.
+          </p>
           {failure && <p role="status">{failure}</p>}
           {detail && reader?.readReason && reader.readReason !== 'reported' && (
             <>

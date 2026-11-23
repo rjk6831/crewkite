@@ -82,7 +82,7 @@ export class NativeConnectionChecks {
           state: 'blocked',
           reason: 'anthropic-connection-interrupted',
           observedAt: this.options.now(),
-          next: 'The previous check stopped. Check the native sign-in again.',
+          next: 'The previous check stopped. Press Connect to check the sign-in again.',
         };
         return status;
       }
@@ -253,11 +253,11 @@ export class NativeConnectionChecks {
             : metadata?.status === 'subscription-candidate'
               ? 'Native subscription sign-in observed. Billing and task qualification require their own checks.'
               : metadata?.expired
-                ? 'The Anthropic sign-in has expired. Run claude auth login in Terminal and choose your Claude subscription account, then check again.'
+                ? 'The Anthropic sign-in has expired. Run claude auth login in Terminal and choose your Claude subscription account, then press Connect.'
                 : metadata?.status === 'signed-out'
-                  ? 'Sign in through the native client, then check again.'
+                  ? 'Sign in through the native client, then press Connect.'
                   : observed.reason
-                    ? 'Check the native client and retry the sign-in check.'
+                    ? 'Check the native client, then press Connect to check the sign-in again.'
                     : 'Use a native subscription sign-in. This authentication method is unsupported.',
         };
         record('complete', value);
@@ -274,7 +274,7 @@ export class NativeConnectionChecks {
             state: 'blocked',
             reason: error.reason,
             observedAt: this.options.now(),
-            next: 'Check the native client and retry the sign-in check.',
+            next: 'Check the native client, then press Connect to check the sign-in again.',
           };
           try {
             record('complete', value);

@@ -45,6 +45,7 @@ import { type BrowserWindow, dialog, ipcMain, safeStorage, shell } from 'electro
 import { attachRequest } from '../shared/attach.ts';
 import { attachmentTarget, PREVIEW_EXTENSIONS } from '../shared/open-file.ts';
 import { ComposerFiles } from './attach.ts';
+import { takesWindowLock } from './command-lock.ts';
 import { installDiagnostics } from './diagnostics.ts';
 import { ExportStage } from './export.ts';
 import { installFeedback } from './feedback.ts';
@@ -292,109 +293,7 @@ export async function installBridge(
     });
     const refused = grants.refusal(command);
     if (refused) throw new Error(refused);
-    if (
-      [
-        'GetWorkspaceState',
-        'GetProjectPage',
-        'GetTaskPage',
-        'GetTaskActivityPage',
-        'GetArtifactRange',
-        'GetTaskOperations',
-        'ReadChatThread',
-        'SearchChatHistory',
-        'ReadChatTurnEvents',
-        'ReadChatChanges',
-        'ReadChatCatalog',
-        'ReadChatAnalytics',
-        'ReadExtensions',
-        'CompleteChatMention',
-        'ReadChatInstructions',
-        'ReadChatPrompts',
-        'SaveChatPrompt',
-        'DeleteChatPrompt',
-        'ReadProjectNotes',
-        'AddProjectNote',
-        'EditProjectNote',
-        'RemoveProjectNote',
-        'ReadSavedCrews',
-        'SaveCrew',
-        'DeleteCrew',
-        'SetDefaultCrew',
-        'ImportSavedCrews',
-        'SetCreditSpending',
-        'ReadConnections',
-        'ReadWebhook',
-        // A sign-in check waits up to 30 s on the connection's own client. It holds no lock, so the
-        // window stays usable meanwhile, and it writes no receipt: a repeat only reads again.
-        'ProveConnection',
-        'AssignConnection',
-        'UnassignConnection',
-        'SetKeepConnected',
-        'DisconnectConnection',
-        'ForgetConnection',
-        'SetFamilyModel',
-        'RefreshChatModels',
-        'ReadChatBranchStatus',
-        'PushChatBranch',
-        'OpenChatPullRequest',
-        'CheckChatMerge',
-        'ReadRemoteEffects',
-        'ReadAcceptance',
-        'CancelAcceptance',
-        'ReadDependencyPreparation',
-        // A copy can take minutes. It holds no lock, so the window stays usable meanwhile, and
-        // it writes no receipt: the controller refuses a second one for the same copy.
-        'PrepareDependencies',
-        // A draft saves nothing and can take three minutes, so it must not hold the window's lock.
-        'DraftDesignSystem',
-        // Recipe, schedule and result reads change nothing, so none of them holds the window's
-        // lock. A check resolution reads git, and an export reads its records one page at a time.
-        'ReadRecipes',
-        'ReadRecipe',
-        'ResolveRecipeChecks',
-        'DraftRecipe',
-        'ReadSchedules',
-        'ReadRecipeRuns',
-        'ReadResults',
-        'ExportResults',
-        'ProposeRemoteEffect',
-        'ConfirmRemoteEffect',
-        'CancelRemoteEffect',
-        'ReconcileRemoteEffect',
-        'SettleRemoteEffect',
-        'ReadRemoteEffectPreview',
-        'ReadReviewComments',
-        'ReadMergeReadiness',
-        'GetProjectOperation',
-        'PrepareProjectCommand',
-        'StartProjectCommand',
-        'ReadGitHub',
-        'StopProjectOperation',
-        'ObserveUsage',
-        'RefreshAnthropicUsage',
-        'StopAnthropicUsage',
-        'CheckNativeConnection',
-        'CheckProviderClient',
-        'RefreshTaskModelCatalog',
-        'InstallGoogleAcp',
-        'StopGoogleAcpInstall',
-        'InitializeGoogleAcp',
-        'AuthenticateGoogleAcp',
-        'DiscoverGoogleAcp',
-        'StopGoogleAcpSetup',
-        'RecoverGoogleMetadata',
-        'RefreshGoogleAcpModels',
-        'AcknowledgeGoogleTerms',
-        'SignInOpenAi',
-        'SignOutOpenAi',
-        'ConfigureLocal',
-        'BeginLocalConnectionInput',
-        'CancelLocalConnectionInput',
-        'DisconnectLocal',
-        'RefreshLocalModels',
-        'SelectLocalModel',
-      ].includes(command.command)
-    ) {
+    if (!takesWindowLock(command.command)) {
       if (!client) throw new Error('The controller is offline.');
       // A remembered token goes to the controller in memory first, so the connect that follows
       // uses it with no token window. Without one, or when the hand over fails, the window asks.
@@ -425,28 +324,30 @@ export async function installBridge(
     const stopTurn = command.command === 'StopChatTurn' || command.command === 'SteerChatMessage';
     const cancellation = stopSetup || matchesStart || stopTurn;
     if (!stopTurn && (cancelling || (busy && !(matchesSetup || matchesStart))))
-      throw new Error('Wait for the pending desktop command.');
+      throw new Error('Another change is still running. Try again when it finishes.');
     if (
       receipts.commands.length &&
       'expectedRevision' in command &&
       command.command !== 'StopRun' &&
       !cancellation
     )
-      throw new Error('Resolve the uncertain command with exact retry before another change.');
+      throw new Error(
+        'An earlier change may not have finished. Retry it before making another change.',
+      );
     if (
       command.command === 'StopRun' &&
       receipts.commands.some(
         (item) => item.command === 'StopRun' && item.payload.taskId === command.payload.taskId,
       )
     )
-      throw new Error('Retry the existing uncertain stop with its exact command key.');
+      throw new Error('An earlier stop may not have finished. Retry it before stopping again.');
     if (
       command.command === 'StopChatTurn' &&
       receipts.commands.some(
         (item) => item.command === 'StopChatTurn' && item.payload.turnId === command.payload.turnId,
       )
     )
-      throw new Error('Retry the existing uncertain stop with its exact command key.');
+      throw new Error('An earlier stop may not have finished. Retry it before stopping again.');
     if (
       stopSetup &&
       receipts.commands.some(
@@ -455,7 +356,9 @@ export async function installBridge(
           item.payload.operationId === command.payload.operationId,
       )
     )
-      throw new Error('Retry the existing uncertain setup stop with its exact command key.');
+      throw new Error(
+        'An earlier setup stop may not have finished. Retry it before stopping again.',
+      );
     const lock = stopTurn ? null : cancellation ? 'cancelling' : 'busy';
     if (lock === 'cancelling') cancelling = true;
     if (lock === 'busy') {
@@ -487,7 +390,9 @@ export async function installBridge(
   ipcMain.handle('crewkite:pick-project', async (event) => {
     assertSender(event, window);
     if (busy || cancelling || receipts.commands.length)
-      throw new Error('Resolve the pending desktop command first.');
+      throw new Error(
+        'Another change is still pending. Wait for it, or retry it, before choosing a project.',
+      );
     busy = true;
     try {
       const choice = await dialog.showOpenDialog(window, {
@@ -514,7 +419,8 @@ export async function installBridge(
   });
   ipcMain.handle('crewkite:retry', async (event, expected: unknown) => {
     assertSender(event, window);
-    if (busy || cancelling) throw new Error('Wait for the pending desktop command.');
+    if (busy || cancelling)
+      throw new Error('Another change is still running. Try again when it finishes.');
     const command = receipts.commands[0];
     if (expected !== undefined) {
       if (

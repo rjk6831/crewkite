@@ -264,6 +264,12 @@ export type ChatServiceDeps = {
   /** True when the person acknowledged the current Google terms text (ADR 0002). */
   googleTermsAcknowledged: () => boolean;
   /**
+   * False for a family the person connected and then signed out of in Settings. A turn on it
+   * would start a client CrewKite no longer reads, so the send is refused until Connect runs.
+   * Left out, every family counts as connected.
+   */
+  signedOut?: (family: ChatFamily) => boolean;
+  /**
    * Read the family's usage again and wait for the reading to land in the catalog. A start at
    * reset calls it before it runs anything. Without it the catalog's last reading decides.
    */
@@ -3394,6 +3400,10 @@ export class ChatService {
     if (!adapter) throw Error('No adapter is registered for this provider.');
     if (turn.selection.family === 'google' && !this.deps.googleTermsAcknowledged())
       throw Error('Acknowledge the Google terms in Settings > Google before using Google.');
+    if (this.deps.signedOut?.(turn.selection.family))
+      throw Error(
+        `${familyName[turn.selection.family]} is signed out of CrewKite. Press Connect on its card in Settings.`,
+      );
     if (this.closed || live.stopRequested) return stoppedResult;
     // The connection proves its mode again right before the adapter sends anything. A Disconnect,
     // a Forget or another mode since admission fails the turn unsent.
@@ -5732,6 +5742,11 @@ export class ChatService {
       return blocked(
         'google-terms-not-acknowledged',
         'Acknowledge the Google terms in Settings > Google before using Google.',
+      );
+    if (this.deps.signedOut?.(selection.family))
+      return blocked(
+        'provider-signed-out',
+        `${familyName[selection.family]} is signed out of CrewKite. Press Connect on its card in Settings, then send again.`,
       );
     if (!this.deps.adapters.has(selection.family))
       return blocked('provider-unavailable', 'Connect this provider in Settings or pick another.');

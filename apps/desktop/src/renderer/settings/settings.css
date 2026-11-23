@@ -127,13 +127,12 @@
   color: var(--text-dim);
   font-size: 11px;
 }
-/* The client line: one sentence with the build and its check date, and Check again beside it.
-   The self-test and capabilities sit under both at full width, so a long capability list never
+/* The client line: one sentence with the build and its check date. The actions, the client copy
+   line, the self-test and the capabilities follow at full width, so a long capability list never
    squeezes the sentence. */
 .st-client {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
+  grid-template-columns: minmax(0, 1fr);
   gap: var(--space-4) var(--space-6);
   margin: calc(-1 * var(--space-4)) 0 var(--space-8);
   color: var(--text-muted);

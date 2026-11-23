@@ -1,12 +1,17 @@
 import { join } from 'node:path';
 import { CREWKITE_VERSION } from '@crewkite/contracts/version';
-import { app, BrowserWindow, Menu, nativeTheme, protocol, screen, session } from 'electron';
+import { app, BrowserWindow, dialog, Menu, nativeTheme, protocol, screen, session } from 'electron';
 import { installThreadAttention } from './attention.ts';
 import { installBridge } from './bridge.ts';
 import { watchRendererCrashes } from './diagnostics.ts';
 import { installOnboarding } from './onboarding-ipc.ts';
 import { OnboardingStore } from './onboarding-store.ts';
-import { DesktopController, prepareStateDirectory, resolveRuntime } from './runtime.ts';
+import {
+  DesktopController,
+  prepareStateDirectory,
+  resolveRuntime,
+  secondLaunchMessage,
+} from './runtime.ts';
 import { rendererURL, secureSession, secureWindow } from './security.ts';
 import { installUpdateChecks } from './updates.ts';
 import { BoundsStore, clampBounds, MINIMUM_SIZE } from './window-bounds.ts';
@@ -28,8 +33,14 @@ async function start() {
   app.setPath('sessionData', join(paths.profile, 'session'));
   app.setPath('crashDumps', join(paths.profile, 'crashes'));
   app.setAppLogsPath(join(paths.profile, 'logs'));
-  if (!app.requestSingleInstanceLock()) app.quit();
-  else {
+  if (!app.requestSingleInstanceLock()) {
+    // Another CrewKite holds this profile. A silent quit reads as a launch that did nothing, so
+    // this one says which app holds it. It starts no controller and signals nothing.
+    const message = await secondLaunchMessage(paths);
+    console.error(message);
+    await tell('info', message);
+    app.quit();
+  } else {
     const controller = new DesktopController(paths);
     ownedController = controller;
     let closing = false;
@@ -130,10 +141,26 @@ async function start() {
     window.show();
   }
 }
+/**
+ * A dialog for a launch that ends before its window opens. On Linux a dialog shown before ready
+ * only prints, so it waits for ready. The running app brings its own window forward on the same
+ * launch, so this one takes focus to stay in view.
+ */
+async function tell(type: 'info' | 'error', message: string) {
+  await app.whenReady();
+  app.focus({ steal: true });
+  await dialog.showMessageBox({ type, message, buttons: ['OK'] });
+}
+
 void start().catch(async (error: unknown) => {
-  console.error(
-    `Desktop startup failed: ${error instanceof Error ? error.message.slice(0, 512) : 'unknown error'}`,
-  );
+  // A failed check in a child process carries its own sentence on the last line of the message,
+  // such as a home a newer CrewKite already moved to its schema.
+  const reason =
+    error instanceof Error
+      ? (error.message.trim().split('\n').at(-1) ?? '').slice(0, 512)
+      : 'unknown error';
+  console.error(`Desktop startup failed: ${reason}`);
   await ownedController?.close();
+  await tell('error', `CrewKite could not start. ${reason}`).catch(() => {});
   app.exit(1);
 });

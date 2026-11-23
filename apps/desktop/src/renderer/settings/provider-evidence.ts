@@ -5,7 +5,7 @@ import {
   type GoogleMetadataRecovery,
   type WorkspaceState,
 } from '@crewkite/contracts';
-import { readAgo } from '../usage-presentation.ts';
+import { readAgo, stuckHolds } from '../usage-presentation.ts';
 
 /**
  * What each provider card states as separate facts. A Ready setup, a model list, a quota read and
@@ -41,9 +41,7 @@ function googleModels(count: number, header: Pick<WorkspaceState, 'googleAcpSetu
     : `${listed}. Last refresh unconfirmed, earlier list kept`;
 }
 
-/** Holds that need the person. A live operation holds the gate too, and that is normal work. */
-export const stuckHolds = (header: Pick<WorkspaceState, 'googleMetadataHolds'>) =>
-  (header.googleMetadataHolds ?? []).filter((row) => row.reason !== 'runtime-active');
+export { stuckHolds };
 
 export function providerEvidence(
   family: ChatFamily,

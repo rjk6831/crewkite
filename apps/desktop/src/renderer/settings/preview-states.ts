@@ -74,7 +74,7 @@ export function providerFacts(
           authMethod: 'none',
           observedAt: at(now, -3),
           reason: 'not-logged-in',
-          next: 'Sign in with the Anthropic client, then press Check Anthropic sign-in.',
+          next: 'Sign in with the Anthropic client, then press Connect.',
         })),
       };
     default:

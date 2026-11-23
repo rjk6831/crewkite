@@ -22,6 +22,7 @@ import {
   resolveAnthropicCompactNativeProfile,
   resolveAnthropicNativeProfile,
 } from './providers/anthropic/profile.ts';
+import { managedClientRoot } from './providers/client-versions.ts';
 import { googleAcpCacheDirectory } from './providers/google/acp/install.ts';
 import { resolveGoogleNativeProfile } from './providers/google/profile.ts';
 import { refreshAvailableMemory, startGpuProbe } from './providers/local/hardware.ts';
@@ -119,6 +120,17 @@ export async function startController(options: ControllerOptions) {
             openai: () => resolveOpenAiChatClient(),
             anthropic: () => resolveAnthropicChatClient(),
           }
+        : undefined,
+    // Check again may fetch a newer client into CrewKite's own folder. This is the only place
+    // that hands the controller a network fetch for it. A controller started on another home
+    // than the environment names, as the bench does, gets none, so it cannot fetch into the
+    // person's real state folder.
+    managedClients:
+      !options.nativeProfile &&
+      !options.nativeProfiles &&
+      options.home === (process.env.CREWKITE_HOME ?? join(homedir(), '.crewkite')) &&
+      managedClientRoot(process.env)
+        ? { root: managedClientRoot(process.env) as string, fetch }
         : undefined,
     registerGoogleAcp: !options.nativeProfile && !options.nativeProfiles,
     // Every home shares one verified copy of the Google client archive in the user's cache.

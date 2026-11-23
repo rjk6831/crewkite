@@ -1,3 +1,5 @@
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import {
   type CommandResult,
   GOOGLE_RECOVERY_HOLD_COPY,
@@ -11,13 +13,17 @@ import { sweepGoogleUsageDirectories } from './google-usage-sweep.ts';
 
 // Google metadata recovery (ADR 0054). Startup, the Recover command and Stop on an unknown setup
 // step share this one rule. A row that holds the Google gate is released only when a current probe
-// proves its recorded group gone and nothing in this controller could still drive it. Its result
-// stays unknown. Recovery sends no prompt, opens no browser and replays nothing.
+// proves its recorded group gone, or the process table proves its number went to a later process,
+// and nothing in this controller could still drive it. Its result stays unknown. Recovery sends no
+// prompt, opens no browser and replays nothing.
 
 export type GoogleRecoveryConsent = 'automatic' | 'explicit';
 
 export const SIGN_IN_RELEASED =
   'The interrupted Google sign-in is released. A sign-in already open in your browser may still complete, so sign in again to check it.';
+
+// The card already shows why the row holds. A refused Recover says only what it did.
+export const NUMBER_STILL_IN_USE = 'The process number is still in use. Nothing was released.';
 
 /**
  * The zero probe. It sends no signal. Only ESRCH proves the group gone. EPERM means some process
@@ -32,12 +38,71 @@ function probeGroup(group: number): 'absent' | 'present' | 'refused' {
   }
 }
 
+// PATH can name any program. These two locations cover macOS and Linux.
+const PS = ['/bin/ps', '/usr/bin/ps'].find((path) => existsSync(path));
+const MONTHS = 'JanFebMarAprMayJunJulAugSepOctNovDec';
+// Ordinary clock corrections stay far below an hour. On Linux, procps derives a start time from
+// the boot time, which moves when the wall clock is stepped.
+const REUSE_MARGIN_MS = 60 * 60 * 1000;
+
 /**
- * Why a row holds the gate. `recoverable` means a current probe proved its group gone and nothing
- * else stands in the way, so recovery may settle it.
+ * When the process whose PID equals the group number started, read from the process table. It
+ * sends no signal. Null when no such process exists, ps fails, or its answer does not parse.
+ */
+function leaderStartedAt(group: number): number | null {
+  if (!PS) return null;
+  let line: string;
+  try {
+    // shortcut: this blocks the controller for one ps run, bounded at one second, on every
+    // snapshot and recovery while a held number still answers. Upgrade: read the start time off
+    // the event loop and keep it per row.
+    line = execFileSync(PS, ['-o', 'lstart=', '-p', String(group)], {
+      env: { TZ: 'UTC', LC_ALL: 'C' },
+      encoding: 'utf8',
+      timeout: 1000,
+      maxBuffer: 1024,
+      stdio: ['ignore', 'pipe', 'ignore'],
+    });
+  } catch {
+    return null;
+  }
+  // macOS and procps both print `Thu Nov 12 15:03:27 2026`, with the day padded by a space.
+  const match = /^[A-Z][a-z]{2} ([A-Z][a-z]{2}) +(\d{1,2}) (\d{2}):(\d{2}):(\d{2}) (\d{4})$/.exec(
+    line.trim(),
+  );
+  if (!match) return null;
+  const month = MONTHS.indexOf(match[1] as string);
+  if (month < 0) return null;
+  const [day, hour, minute, second, year] = match.slice(2).map(Number) as [
+    number,
+    number,
+    number,
+    number,
+    number,
+  ];
+  return Date.UTC(year, month / 3, day, hour, minute, second);
+}
+
+/**
+ * Whether the recorded number provably belongs to a later process. The row is written at intent,
+ * and the spawn follows in the same synchronous run after the commit, so the read's own process
+ * started within milliseconds of `started_at`. macOS and Linux never hand out a PID while a process
+ * group or session with that number exists. So a process that holds the number as its PID and
+ * started more than the margin after the row was created after the read's group and session had
+ * ended. A group whose leader is gone proves nothing: its members may be the read's own children.
+ */
+function numberReused(row: Pick<GoogleMetadataOperation, 'process_group' | 'started_at'>) {
+  const started = leaderStartedAt(row.process_group as number);
+  return started !== null && started - Date.parse(row.started_at) > REUSE_MARGIN_MS;
+}
+
+/**
+ * Why a row holds the gate. `recoverable` means a current probe proved its group gone, or the
+ * process table proved its number reused, and nothing else stands in the way, so recovery may
+ * settle it.
  */
 export function classifyGoogleMetadata(
-  row: Pick<GoogleMetadataOperation, 'kind' | 'process_group'>,
+  row: Pick<GoogleMetadataOperation, 'kind' | 'process_group' | 'started_at'>,
   facts: {
     consent: GoogleRecoveryConsent;
     runtimeActive: boolean;
@@ -51,8 +116,9 @@ export function classifyGoogleMetadata(
   // ESRCH in this PID namespace says nothing about a process on another machine.
   if (facts.conflict) return 'provenance-conflict';
   const answer = probeGroup(row.process_group);
-  if (answer === 'present') return 'owner-present';
-  if (answer === 'refused') return 'owner-unconfirmed';
+  // The process table is read only when the probe left absence unproven.
+  if (answer !== 'absent' && !numberReused(row))
+    return answer === 'present' ? 'owner-present' : 'owner-unconfirmed';
   // A browser sign-in may still finish after its client is gone. Only a person releases it.
   return row.kind === 'acp-authenticate' && facts.consent === 'automatic'
     ? 'authentication-needs-person'
@@ -88,8 +154,9 @@ function classify(controller: Controller, consent: GoogleRecoveryConsent) {
 }
 
 /**
- * Every row holding the gate, with why, for the snapshot. It sends the zero probe and settles
- * nothing, so a row whose group is gone reads `recoverable` until startup or Recover settles it.
+ * Every row holding the gate, with why, for the snapshot. It sends the zero probe, may read the
+ * process table and settles nothing, so a row whose group is gone reads `recoverable` until startup
+ * or Recover settles it.
  */
 export function googleMetadataHolds(controller: Controller): GoogleMetadataRecovery['held'] {
   return classify(controller, 'automatic').map(({ row, decision }) => ({
@@ -204,7 +271,10 @@ export function recoverGoogleMetadataCommand(controller: Controller): CommandRes
       outcome: 'blocked',
       reason:
         hold.reason === 'runtime-active' ? 'google-operation-active' : 'google-ownership-unknown',
-      next: GOOGLE_RECOVERY_HOLD_COPY[hold.reason],
+      next:
+        !recovery.settled.length && ['owner-present', 'owner-unconfirmed'].includes(hold.reason)
+          ? NUMBER_STILL_IN_USE
+          : GOOGLE_RECOVERY_HOLD_COPY[hold.reason],
       data: recovery,
     };
   return {

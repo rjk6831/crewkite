@@ -239,6 +239,40 @@ function listening(socketPath: string) {
   });
 }
 
+/**
+ * The home's controller record, with a refusal when this desktop must leave that controller alone.
+ * A live
+ * controller on another schema reads and writes this home its own way, and its owner lock keeps a
+ * second controller from starting. Only its own app can end it cleanly. A controller from before
+ * this check records no schema. A record left by one that stopped names a socket nobody listens
+ * on, and starting ours is safe.
+ */
+async function homeController(home: string, root: string) {
+  const { schema, ...endpoint } = readControllerEndpoint(home);
+  const bundled = bundledSchema(root);
+  if (schema === bundled || !(await listening(endpoint.socketPath))) return { endpoint };
+  return {
+    endpoint,
+    refusal:
+      (schema ?? 0) < bundled
+        ? 'An older CrewKite is still running with this home. Quit it from its menu, then open CrewKite again.'
+        : 'A newer CrewKite is running with this home. Use that version.',
+  };
+}
+
+/**
+ * What a launch says when another CrewKite already holds this profile. Electron's lock answers
+ * only yes or no, and a running 0.1.0 cannot reply, so the controller record in the home tells an
+ * older or newer app from one of this version. A home with no record yet gets the plain sentence.
+ */
+export async function secondLaunchMessage(paths: Pick<RuntimePaths, 'home' | 'root'>) {
+  try {
+    const { refusal } = await homeController(paths.home, paths.root);
+    if (refusal) return refusal;
+  } catch {}
+  return 'CrewKite is already open with this profile. Use the window that is open.';
+}
+
 export class DesktopController {
   readonly paths: RuntimePaths;
   client: ControllerClient | null = null;
@@ -256,18 +290,8 @@ export class DesktopController {
     return this.starting;
   }
   private async endpoint() {
-    const { schema, ...endpoint } = readControllerEndpoint(this.paths.home);
-    const bundled = bundledSchema(this.paths.root);
-    // A live controller on another schema reads and writes this home its own way, and its owner
-    // lock keeps a second controller from starting. Only its own app can end it cleanly. A
-    // controller from before this check records no schema. A record left by one that stopped
-    // names a socket nobody listens on, and starting ours is safe.
-    if (schema !== bundled && (await listening(endpoint.socketPath)))
-      throw new IncompatibleController(
-        (schema ?? 0) < bundled
-          ? 'An older CrewKite is still running with this home. Quit it from its menu, then open CrewKite again.'
-          : 'A newer CrewKite is running with this home. Use that version.',
-      );
+    const { endpoint, refusal } = await homeController(this.paths.home, this.paths.root);
+    if (refusal) throw new IncompatibleController(refusal);
     const client = new ControllerClient({ ...endpoint, actor: desktopActor });
     try {
       await client.connect();

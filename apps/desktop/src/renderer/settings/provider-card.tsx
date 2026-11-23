@@ -18,6 +18,7 @@ import { ClientRecord } from './client-status.tsx';
 import { readFamilyDefaults, writeFamilyDefault } from './preferences.ts';
 import type { ProviderActions } from './provider-actions.ts';
 import type { ProviderEvidence } from './provider-evidence.ts';
+import { CardActions } from './providers/card-actions-row.tsx';
 
 export type CatalogEntry = ChatCatalogRead['families'][number];
 
@@ -50,15 +51,7 @@ export function focusSettingsCard(family: ChatFamily) {
 
 // The family's models and the default the person picks among them. A choice the provider no
 // longer lists stays saved, and the catalog's default applies until the model is listed again.
-function Models({
-  family,
-  entry,
-  children,
-}: {
-  family: ChatFamily;
-  entry: CatalogEntry | undefined;
-  children?: ReactNode;
-}) {
+function Models({ family, entry }: { family: ChatFamily; entry: CatalogEntry | undefined }) {
   const models = entry?.models ?? [];
   const selectId = useId();
   const hintId = useId();
@@ -128,7 +121,6 @@ function Models({
               : 'Models appear after this provider connects.'}
         </p>
       )}
-      {children}
     </section>
   );
 }
@@ -238,9 +230,8 @@ export function ProviderCard({
   reasonLine,
   main,
   side,
-  models,
   client,
-  onCheck,
+  cloud,
   evidence,
 }: {
   family: ChatFamily;
@@ -251,29 +242,14 @@ export function ProviderCard({
   reasonLine?: string;
   main: ReactNode;
   side: ReactNode;
-  /** Shown under the model list, such as a way to read it again. */
-  models?: ReactNode;
   /** The installed client against its tested build. The catalog entry's own when left out. */
   client?: ClientVersionStatus;
-  /** Reads the client again, after the person updates or installs it. */
-  onCheck?: () => Promise<void> | void;
+  /** The shared actions of a cloud card. Local has none. */
+  cloud?: { header: WorkspaceState; workspace: Workspace; modelNote?: string | null };
   /** Sign-in, model list, quota read and any blocker, each stated on its own. */
   evidence: ProviderEvidence;
 }) {
   const found = client ?? entry?.client;
-  // The check often finds what was already shown, so the button says it ran and when.
-  const [checking, setChecking] = useState(false);
-  const [checkedAt, setCheckedAt] = useState<string | null>(null);
-  async function check() {
-    if (!onCheck || checking) return;
-    setChecking(true);
-    try {
-      await onCheck();
-    } finally {
-      setChecking(false);
-      setCheckedAt(new Date().toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }));
-    }
-  }
   const titleId = useId();
   const card = useRef<HTMLElement>(null);
   // A family this computer cannot run keeps its card, greyed, with the one line that says why.
@@ -323,17 +299,7 @@ export function ProviderCard({
       {!unavailable && found && (
         <div className={found.accepted ? 'st-client' : 'st-client is-refused'}>
           <p role="status">{found.message}</p>
-          {onCheck && (
-            <button
-              type="button"
-              className="button secondary"
-              disabled={checking}
-              onClick={() => void check()}
-            >
-              {checking ? 'Checking…' : 'Check again'}
-            </button>
-          )}
-          {checkedAt && !checking && <small className="st-hint">Checked at {checkedAt}.</small>}
+          {cloud && family !== 'local' && <CardActions family={family} status={found} {...cloud} />}
           <ClientRecord status={found} family={family} />
         </div>
       )}
@@ -341,9 +307,7 @@ export function ProviderCard({
         <div className="st-body">
           <div className="st-col">{main}</div>
           <div className="st-col">
-            <Models family={family} entry={entry}>
-              {models}
-            </Models>
+            <Models family={family} entry={entry} />
             {side}
           </div>
         </div>

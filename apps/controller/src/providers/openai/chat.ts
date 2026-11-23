@@ -123,6 +123,13 @@ export type OpenAiChatDeps = Readonly<{
   }) => void;
   /** The thread tools server for this turn, with its own token. Null runs the turn without. */
   threadTools?: (request: ChatTurnRequest) => ThreadToolsServer | null;
+  /**
+   * How the client's connect-time reads ended. A sentence when the client failed them: it closed
+   * or crashed before it answered initialize, answered it with an error, or runs with a setting
+   * that decides access other than the one CrewKite set. Null when they passed. A turn that Stop
+   * or a deadline ended reports nothing.
+   */
+  onConnectRead?: (executable: string, failure: string | null) => void;
 }>;
 
 export function openAiChatAdapter(deps: OpenAiChatDeps): ChatAdapter {
@@ -556,6 +563,7 @@ class OpenAiChatTurn {
   private readonly degraded = new Set<string>();
   /** True once the client answered initialize, so it accepted the settings it was started with. */
   private initialized = false;
+  private executable: string | undefined;
   private nextId = 1;
   private readonly waiting = new Map<RpcId, (reply: Reply) => void>();
   private threadId: string | null = null;
@@ -713,6 +721,7 @@ class OpenAiChatTurn {
       this.version = launch.version;
       this.codex = features(launch.version);
       const executable = verifiedClient(launch);
+      this.executable = executable;
       step = 'storage';
       const env = withGitCeiling(
         nativeDiscoveryEnvironment(this.profileEnvironment(launch.environment)),
@@ -775,8 +784,10 @@ class OpenAiChatTurn {
   // sign-in and on whether included usage remains.
   private initialize() {
     this.call('initialize', initializeParams(), (reply) => {
-      if ('error' in reply)
+      if ('error' in reply) {
+        this.connectRead('It answered initialize with an error.');
         return this.fail(this.providerFailure('session', 'initialize', reply.error));
+      }
       this.initialized = true;
       const served = serverVersion.safeParse(reply.result).data?.userAgent;
       if (served) {
@@ -884,6 +895,13 @@ class OpenAiChatTurn {
         return next();
       }
       const { missing, different } = confirmSettings(this.settings, reply.result);
+      // A setting that decides access and differs ends the turn (ADR 0048), and counts as a
+      // failed connect-time read like initialize.
+      this.connectRead(
+        different.length
+          ? `It runs with ${different.map(({ key }) => key).join(', ')} set to another value than CrewKite set.`
+          : null,
+      );
       if (different.length)
         return this.fail(
           chatFailure({
@@ -2110,8 +2128,22 @@ class OpenAiChatTurn {
     this.later(2250, () => this.settle());
   }
 
+  private connectRead(failure: string | null) {
+    try {
+      if (this.executable) this.deps.onConnectRead?.(this.executable, failure);
+    } catch {}
+  }
+
   private exited(code: number | null, signal: NodeJS.Signals | null) {
     this.closed = true;
+    // A turn that already ended, by Stop, a deadline or a failure, says nothing about the build.
+    // CrewKite signals the client only after that, so a signal here is the client's own crash.
+    if (!this.initialized && !this.outcome && this.terminal === undefined)
+      this.connectRead(
+        signal
+          ? `It stopped on ${signal} before it answered initialize.`
+          : `It closed before it answered initialize, with code ${code}.`,
+      );
     if (this.terminal !== undefined) this.fail(this.providerFailure('stream', null, this.terminal));
     // A client that closes before it answers initialize refused its command line or its config
     // file. Its own words stay in the detail.

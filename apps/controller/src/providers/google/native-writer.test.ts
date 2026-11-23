@@ -188,7 +188,8 @@ else {
       ['1.1.11', false],
       ['1.1.12', true],
       ['1.3.4', true],
-      ['2.0.0', false],
+      ['2.0.0', true],
+      ['0.9.0', false],
       ['1.1.12-beta', false],
     ] as const)
       assert.equal(googleVersionEligible(version), eligible);

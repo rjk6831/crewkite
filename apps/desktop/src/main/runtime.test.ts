@@ -26,6 +26,7 @@ import {
   IncompatibleController,
   offlineNotice,
   resolveRuntime,
+  secondLaunchMessage,
 } from './runtime.ts';
 
 const app = realpathSync(fileURLToPath(new URL('../..', import.meta.url)));
@@ -279,6 +280,49 @@ test('the desktop attaches only to a live controller on its own schema and start
     assert.equal(outcome, row.outcome, `schema ${row.schema}, live ${row.live}`);
     // The token goes only to a controller the desktop attaches to.
     assert.equal(tokens.length, outcome === 'attached' ? 1 : 0);
+  }
+});
+
+test('a launch that finds the profile in use says which CrewKite holds it', async (t) => {
+  const root = realpathSync(join(app, '../..'));
+  const bundled = readdirSync(join(root, 'apps/controller/migrations')).filter((name) =>
+    name.endsWith('.sql'),
+  ).length;
+  const state = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-second-launch-')));
+  const sockets: string[] = [];
+  t.after(() => {
+    for (const socket of sockets) rmSync(socket, { force: true });
+    rmSync(state, { recursive: true, force: true });
+  });
+  const open = 'CrewKite is already open with this profile. Use the window that is open.';
+  for (const [index, row] of [
+    // 0.1.0 records no schema.
+    {
+      schema: undefined,
+      record: true,
+      outcome:
+        'An older CrewKite is still running with this home. Quit it from its menu, then open CrewKite again.',
+    },
+    { schema: bundled, record: true, outcome: open },
+    // The other app holds the profile but its controller has not written its record yet.
+    { schema: undefined, record: false, outcome: open },
+  ].entries()) {
+    const home = join(state, `home-${index}`);
+    mkdirSync(home, { mode: 0o700 });
+    writeFileSync(join(home, 'token'), 'a'.repeat(64), { mode: 0o600 });
+    const socketPath = controllerSocketPlace(home);
+    sockets.push(socketPath);
+    const server = createServer((socket) => socket.on('error', () => {}));
+    server.listen(socketPath);
+    await once(server, 'listening');
+    if (row.record) {
+      if (row.schema === undefined)
+        writeFileSync(join(home, 'control-socket'), socketPath, { mode: 0o600 });
+      else publishControllerSocket(home, socketPath, row.schema);
+    }
+    const outcome = await secondLaunchMessage({ home, root });
+    await new Promise((closed) => server.close(closed));
+    assert.equal(outcome, row.outcome, `schema ${row.schema}, record ${row.record}`);
   }
 });
 

@@ -155,6 +155,7 @@ export function GoogleSetup({
   snapshot,
   workspace,
   onConnecting,
+  connectedOnce = true,
 }: {
   snapshot: Pick<
     Snapshot,
@@ -163,6 +164,8 @@ export function GoogleSetup({
   workspace: Workspace;
   /** The step this card's Connect is on, and null once it ends, so the card head can follow. */
   onConnecting?: (stage: GoogleSetupStage | null) => void;
+  /** False after Sign out, while the setup still holds its verified client. */
+  connectedOnce?: boolean;
 }) {
   const setup = snapshot.googleAcpSetup;
   const installation = snapshot.googleAcpInstall;
@@ -193,6 +196,8 @@ export function GoogleSetup({
   const unknown = setup?.state === 'unknown' || installUnknown;
   const needsRepair = unknown || setup?.state === 'blocked' || installation?.state === 'blocked';
   const ready = setup?.state === 'ready';
+  // Sign out on the card ends the connection and keeps a Ready setup, so Connect shows again.
+  const signedOut = ready && !connectedOnce;
   const working = !!requested || active || installing || cancelBusy;
   const termsAcknowledged = googleTermsCurrent(setup?.googleTerms);
   const termsAccepted = termsAcknowledged || termsChecked;
@@ -271,6 +276,31 @@ export function GoogleSetup({
     if (!connected || working || installUnknown || !termsAccepted) return;
     stopPolling();
     const currentGeneration = generation.current;
+    if (signedOut) {
+      // The setup already holds a verified proof, so Connect reads the models again, which
+      // connects Google on this device with no browser and no download.
+      setRequested('discover');
+      setMessage(null);
+      setRetry(null);
+      try {
+        const result = await workspace.metadataCommand({
+          command: 'RefreshGoogleAcpModels',
+          expectedRevision: setup?.revision ?? 0,
+          payload: {
+            profileId: 'google-acp-v1',
+            proofId: setup?.proofId ?? '',
+            consent: 'explicit',
+          },
+        });
+        if (result.outcome !== 'applied' && result.outcome !== 'already-applied')
+          setMessage(result.next ?? googleConnectError(null));
+      } catch {
+        setMessage(googleConnectError(null));
+      } finally {
+        if (mounted.current) setRequested(null);
+      }
+      return;
+    }
     // The press shows its first step at once. The first status read can take a few seconds.
     setRequested(startingGoogleStage({ googleAcpInstall: installation, googleAcpSetup: setup }));
     setMessage(null);
@@ -476,7 +506,7 @@ export function GoogleSetup({
       </div>
       <div className="gs-actions">
         {/* The button stays where it is while Connect runs, so Cancel never takes its place. */}
-        {!ready && !installUnknown && (
+        {(!ready || signedOut) && !installUnknown && (
           <button
             className="button primary"
             type="button"
@@ -497,6 +527,12 @@ export function GoogleSetup({
           </button>
         )}
       </div>
+      {signedOut && !working && (
+        <p className="muted small">
+          Disconnected from CrewKite. The client stays signed in. Press Connect Google to use it
+          again.
+        </p>
+      )}
       {progress ? (
         <GoogleProgress progress={progress} retry={retry} />
       ) : requested ? (

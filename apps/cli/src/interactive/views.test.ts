@@ -141,7 +141,13 @@ test('each interactive view draws a scripted thread in colour and without it und
         ? {
             ...entry,
             readAt: '2026-10-28T10:00:00.000Z',
-            remaining: entry.remaining.map((window) => ({ ...window, percent: 30 })),
+            // Read two hours ago with its reset still ahead. A reading past its reset shows no
+            // percent at all, so it would draw no gauge to dot.
+            remaining: entry.remaining.map((window) => ({
+              ...window,
+              percent: 30,
+              resetsAt: '2026-10-29T00:00:00.000Z',
+            })),
           }
         : entry,
     ),

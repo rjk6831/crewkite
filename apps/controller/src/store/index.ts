@@ -555,7 +555,7 @@ export class Store {
   /**
    * Whether the person connected this provider on this device at least once. Reads that run on
    * their own, such as the quota read at launch, wait for it, so a provider nobody connected never
-   * starts a client. The mark is a row in receipts and is never removed.
+   * starts a client. The mark is a row in receipts. Sign out and Disconnect remove it.
    */
   hasConnectedOnce(provider: Route['family']): boolean {
     return !!this.db
@@ -569,8 +569,34 @@ export class Store {
     this.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`connected-once:${provider}`);
   }
 
+  /**
+   * Whether the person signed this provider out in Settings and has not connected it since. A
+   * provider nobody ever connected is not signed out, so the send path can tell the two apart.
+   */
+  signedOut(provider: Route['family']): boolean {
+    return !!this.db
+      .prepare('SELECT 1 FROM receipts WHERE command_key=?')
+      .get(`signed-out:${provider}`);
+  }
+
+  markSignedOut(provider: Route['family']) {
+    if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
+    const key = `signed-out:${provider}`;
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO receipts(command_key,request_hash,principal,result) VALUES (?,?,?,?)',
+      )
+      .run(
+        key,
+        createHash('sha256').update(key).digest('hex'),
+        'local-owner',
+        canonicalJson({ outcome: 'applied' }),
+      );
+  }
+
   markConnectedOnce(provider: Route['family']) {
     if (!this.transactionEvents) throw new Error('Receipt writes require a transaction.');
+    this.db.prepare('DELETE FROM receipts WHERE command_key=?').run(`signed-out:${provider}`);
     const key = `connected-once:${provider}`;
     this.db
       .prepare(

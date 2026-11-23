@@ -311,7 +311,7 @@ pnpm crewkite native setup refresh --family google --consent --json
 
 Each command performs only its named action. Initialization and discovery send no model prompt. Personal authentication can open a browser, contact Google and write native authentication state. CrewKite retains result codes and safe client proofs. Setup commands use the current persisted revision; Stop names the current operation. An uncertain command keeps its exact retry key. A fresh setup action does not replay it.
 
-Recover releases an interrupted metadata operation only when its recorded process group is gone, and with this explicit consent an interrupted sign-in. It sends no prompt and opens no browser, and a released operation's result stays unknown. Every other held operation keeps its reason. Refresh reads the model list again from Ready and keeps the earlier list if the read fails.
+Recover releases an interrupted metadata operation only when its recorded process group is gone or its number now belongs to a process that started more than an hour after the read, and with this explicit consent an interrupted sign-in. It sends no prompt and opens no browser, and a released operation's result stays unknown. Every other held operation keeps its reason. Refresh reads the model list again from Ready and keeps the earlier list if the read fails.
 
 Setup status returns `{ cursor, setup, profile, holds }`. Import returns `{ imported, reason, client }`, with version, digest and signer team only. Authentication and configuration do not establish entitlement or route qualification. Missing verified review mappings keep launch unavailable even when discovery exposes model choices.
 

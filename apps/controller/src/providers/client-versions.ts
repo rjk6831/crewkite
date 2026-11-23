@@ -3,7 +3,15 @@ import {
   type SpawnSyncReturns,
   spawnSync,
 } from 'node:child_process';
-import { lstatSync, mkdtempSync, realpathSync, rmSync, type Stats } from 'node:fs';
+import {
+  lstatSync,
+  mkdtempSync,
+  readdirSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  type Stats,
+} from 'node:fs';
 import { tmpdir, userInfo } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import type { ClientVersionState, ClientVersionStatus } from '@crewkite/contracts';
@@ -118,25 +126,21 @@ function compare(left: Version, right: Version): number {
 }
 
 /**
- * Where a reported version stands against the family's tested build and minimum. A later major
- * version is refused: the adapters parse each client's native frames, and a major release is
- * where those change without notice. Under major 0 a newer minor is still accepted as newer,
- * because one client ships a new 0.minor about every week.
+ * Where a reported version stands against the family's tested build and minimum. Only the minimum
+ * refuses, because an older build cannot do the work. A later build, a new major one included,
+ * runs, and the connect-time reads decide what it may do: a version number cannot say whether a
+ * build still speaks the frames the adapters parse, and a refusal kept people on old models.
  */
 export function clientVersionState(
   reported: string | null,
   row: { tested: string; minimum: string },
-): Extract<
-  ClientVersionState,
-  'tested' | 'newer' | 'supported' | 'older' | 'new-major' | 'unreadable'
-> {
+): Extract<ClientVersionState, 'tested' | 'newer' | 'supported' | 'older' | 'unreadable'> {
   const version = reported === null ? null : parseClientVersion(reported);
   const tested = parseClientVersion(row.tested);
   const minimum = parseClientVersion(row.minimum);
   if (!tested || !minimum) throw new Error('The client version table is invalid.');
   if (!version) return 'unreadable';
   if (compare(version, minimum) < 0) return 'older';
-  if (version.core[0] > tested.core[0]) return 'new-major';
   const order = compare(version, tested);
   return order === 0 ? 'tested' : order > 0 ? 'newer' : 'supported';
 }
@@ -164,13 +168,25 @@ export function clientStatusReason(
   }
 }
 
+/**
+ * Where a copy outside the search path sits, for the status line: the provider's app or CrewKite's
+ * own folder. A copy on the search path needs no words; it is the one a terminal runs.
+ */
+function place(family: ClientFamily, path: string, managed?: string | null) {
+  if (path.includes('/Library/Application Support/Claude/')) return " in Claude.app's own folder";
+  // A fetched build can sit a level down, as the OpenAI package keeps its binary under bin.
+  if (managed && managedVersionOf(managed, family, path)) return " in CrewKite's own folder";
+  const app = /\/([^/]+\.app)\/Contents\//.exec(path);
+  return app ? ` in ${app[1]}` : '';
+}
+
 /** The line Settings and the CLI show for a found client, in plain words. */
 export function clientVersionStatus(
   family: ClientFamily,
   found:
     | { state: 'missing' | 'unavailable'; detail?: string }
     | { state: 'untrusted'; path: string; why: 'shared-write' | 'shared-folder' | 'foreign-owner' }
-    | { state: 'version'; path: string; version: string | null }
+    | { state: 'version'; path: string; version: string | null; managed?: string | null }
     | { state: 'pinned'; version: string },
 ): ClientVersionStatus {
   const row = CLIENT_VERSIONS[family];
@@ -186,39 +202,36 @@ export function clientVersionStatus(
         ? clientVersionState(found.version, row)
         : found.state;
   const version = parsed?.text ?? (found.state === 'pinned' ? found.version : null);
-  const tested = parseClientVersion(row.tested)?.core[0] ?? 0;
   const checked = 'checkedOn' in row ? `Checked with ${row.tested} on ${row.checkedOn}` : null;
   // A row marked as information accepts every build and says what the probe decides. Other rows
-  // refuse a build below the minimum and a new major version.
+  // refuse a build below the minimum.
   const information = 'information' in row;
-  const informed = information && (state === 'older' || state === 'new-major' || state === 'newer');
+  const informed = information && (state === 'older' || state === 'newer');
+  const named = `${row.name} ${version} found${found.state === 'version' ? place(family, found.path, found.managed) : ''}`;
   const message = (() => {
     if (information && checked !== null)
       switch (state) {
         // The found build is the checked build, so the line names it once.
         case 'tested':
-          return `${row.name} ${version} found, checked on ${'checkedOn' in row ? row.checkedOn : ''}.`;
+          return `${named}, checked on ${'checkedOn' in row ? row.checkedOn : ''}.`;
         case 'supported':
-          return `${row.name} ${version} found. ${checked}; builds from ${row.minimum} on are supported.`;
+          return `${named}. ${checked}; builds from ${row.minimum} on are supported.`;
         case 'newer':
-        case 'new-major':
-          return `${row.name} ${version} found. ${checked}; this build is newer than the last checked build.`;
+          return `${named}. ${checked}; this build is newer than the last checked build.`;
         case 'older':
-          return `${row.name} ${version} found. ${checked}; this build is older than ${row.minimum}, so read-only turns ask before each command.`;
+          return `${named}. ${checked}; this build is older than ${row.minimum}, so read-only turns ask before each command.`;
       }
     switch (state) {
       case 'tested':
         return 'checkedOn' in row
-          ? `${row.name} ${version} found, checked on ${row.checkedOn}.`
-          : `${row.name} ${version} found, the tested build.`;
+          ? `${named}, checked on ${row.checkedOn}.`
+          : `${named}, the tested build.`;
       case 'newer':
-        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}; a newer build runs while its flags and replies match what CrewKite sends.`;
+        return `${named}. ${checked ?? `Tested with ${row.tested}`}; a newer build runs while its flags and replies match what CrewKite sends.`;
       case 'supported':
-        return `${row.name} ${version} found. ${checked ?? `Tested with ${row.tested}`}; builds from ${row.minimum} on are supported.`;
+        return `${named}. ${checked ?? `Tested with ${row.tested}`}; builds from ${row.minimum} on are supported.`;
       case 'older':
         return `${row.name} ${version} is older than the minimum ${row.minimum}. Update it with ${row.update}, then press Check again.`;
-      case 'new-major':
-        return `${row.name} ${version} found. CrewKite is tested with ${row.tested} and does not run a new major version yet. Install a ${tested}.x build, or update CrewKite.`;
       case 'unreadable':
         return `CrewKite could not read the version of ${row.name} at ${found.state === 'version' ? found.path : row.command}. Run ${row.command} --version in a terminal to see why, then check again.`;
       case 'untrusted': {
@@ -330,6 +343,10 @@ export type FindOptions = {
   path?: string;
   /** Extra candidates beside a found entry, as the OpenAI package keeps its native binary. */
   siblings?: (entry: string) => string[];
+  /** Copies outside the search path, from `clientCopies`. Each gets the same checks. */
+  copies?: readonly string[];
+  /** CrewKite's own client folder, from `managedClientRoot`. The status then names the copy. */
+  managed?: string | null;
   cache?: ClientReads;
   now?: () => number;
   timeoutMs?: number;
@@ -343,17 +360,33 @@ export type FindOptions = {
 };
 
 /**
- * The first trusted client in the search directories whose version CrewKite accepts. The real
- * path, owner and mode checks run before the client does. The version comes from the client's
- * own --version flag in its own process group, with no input, a minimal environment and a time
- * bound. When no build is accepted, the first one found explains why.
+ * The newest trusted client CrewKite accepts, from the search directories and the copies outside
+ * them. A person can have one build on the search path and a newer one inside a provider's desktop
+ * app, and the newer one serves the newer models. The real path, owner and mode checks run before
+ * the client does. The version comes from the client's own --version flag in its own process
+ * group, with no input, a minimal environment and a time bound. Equal versions keep the first one
+ * found, the search path first. When no build is accepted, the first one found explains why.
  */
 export function findClient(family: ClientFamily, options: FindOptions): FoundClient {
   const row = CLIENT_VERSIONS[family];
   const cache = options.cache ?? reads;
   const now = options.now ?? Date.now;
   let first: FoundClient | null = null;
+  let best: FoundClient | null = null;
   const seen = new Set<string>();
+  const consider = (candidate: string) => {
+    let found: FoundClient | null;
+    try {
+      found = inspect(family, candidate, seen, options, cache, now);
+    } catch {
+      // Nothing about one candidate may stop the search or the caller.
+      found = null;
+    }
+    if (!found) return;
+    if (!found.client) first ??= found;
+    else if (!best?.client || newerClientVersion(found.client.version, best.client.version))
+      best = found;
+  };
   for (const directory of new Set(options.directories.filter(isAbsolute))) {
     const location = join(directory, row.command);
     let entry: string;
@@ -377,20 +410,204 @@ export function findClient(family: ClientFamily, options: FindOptions): FoundCli
     } catch {
       continue;
     }
-    for (const candidate of [...(options.siblings?.(entry) ?? []), entry]) {
-      let found: FoundClient | null;
-      try {
-        found = inspect(family, candidate, seen, options, cache, now);
-      } catch {
-        // Nothing about one candidate may stop the search or the caller.
-        found = null;
+    for (const candidate of [...(options.siblings?.(entry) ?? []), entry]) consider(candidate);
+  }
+  for (const copy of options.copies ?? []) {
+    if (!isAbsolute(copy)) continue;
+    // The same rule as a search-path entry: a link placed in a folder other users can change
+    // could point anywhere, so the entry itself is checked before the link is followed.
+    try {
+      if (
+        foundLocationTrust(lstatSync(dirname(copy)), lstatSync(copy), process.getuid?.()) !==
+        'trusted'
+      ) {
+        first ??= {
+          status: clientVersionStatus(family, {
+            state: 'untrusted',
+            path: copy,
+            why: 'shared-folder',
+          }),
+        };
+        continue;
       }
-      if (!found) continue;
-      if (found.client) return found;
-      first ??= found;
+    } catch {
+      continue;
+    }
+    consider(copy);
+  }
+  const found: FoundClient = best ??
+    first ?? { status: clientVersionStatus(family, { state: 'missing' }) };
+  return found.client && options.managed !== undefined
+    ? {
+        ...found,
+        status: {
+          ...found.status,
+          copy: clientCopy(family, found.client.executable, options.managed),
+        },
+      }
+    : found;
+}
+
+/** True when the left version is the later one. A version that cannot be read is never later. */
+export const newerClientVersion = (left: string, right: string) => {
+  const a = parseClientVersion(left);
+  const b = parseClientVersion(right);
+  return !!a && (!b || compare(a, b) > 0);
+};
+
+// Where each provider's desktop app keeps its own copy of the client, inside the app bundle. The
+// OpenAI app's bin/codex is a shell wrapper; the binary it runs is named here so the digest covers
+// what runs. The Anthropic app downloads its copy into its own support folder, read below.
+const APP_COPIES: Record<ClientFamily, readonly string[]> = {
+  openai: [
+    'ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+    'Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+  ],
+  anthropic: [],
+  google: ['Gemini.app/Contents/Helpers/agy'],
+};
+
+/** The folder CrewKite keeps its own client copies in, one folder per family and version. */
+export function managedClientRoot(environment: NodeJS.ProcessEnv): string | null {
+  // The controller's own default home when nothing names one (apps/controller/src/main.ts).
+  const root =
+    environment.CREWKITE_INSTALLED_STATE_ROOT ??
+    environment.CREWKITE_HOME ??
+    (environment.HOME ? join(environment.HOME, '.crewkite') : undefined);
+  return root && isAbsolute(root) ? join(root, 'clients') : null;
+}
+
+// A folder listing, newest version names first, bounded so a crowded folder costs little: each
+// copy is hashed and run once per build. Missing folders list nothing.
+const entries = (folder: string, limit = 4) => {
+  try {
+    return readdirSync(folder)
+      .filter((name) => !name.startsWith('.'))
+      .sort((left, right) => right.localeCompare(left, 'en', { numeric: true }))
+      .slice(0, limit);
+  } catch {
+    return [];
+  }
+};
+
+/**
+ * Every copy of a client outside the search path: the one a provider's desktop app carries and
+ * the ones CrewKite keeps in its own folder. Paths only. findClient applies the same checks to
+ * each and runs the newest it accepts. Nothing here runs or changes a client.
+ */
+export function clientCopies(
+  family: ClientFamily,
+  environment: NodeJS.ProcessEnv,
+  host: { platform: string } = process,
+): string[] {
+  const copies: string[] = [];
+  const home = environment.HOME && isAbsolute(environment.HOME) ? environment.HOME : null;
+  if (host.platform === 'darwin') {
+    for (const applications of ['/Applications', ...(home ? [join(home, 'Applications')] : [])])
+      for (const inside of APP_COPIES[family]) copies.push(join(applications, inside));
+    if (family === 'anthropic' && home) {
+      const support = join(home, 'Library/Application Support/Claude/claude-code');
+      for (const version of entries(support))
+        for (const build of entries(join(support, version)))
+          copies.push(join(support, version, build, 'claude.app/Contents/MacOS/claude'));
     }
   }
-  return first ?? { status: clientVersionStatus(family, { state: 'missing' }) };
+  const own = managedClientRoot(environment);
+  if (own)
+    for (const version of entries(join(own, family)))
+      copies.push(join(own, family, version, CLIENT_VERSIONS[family].command));
+  return copies;
+}
+
+/** The versions CrewKite holds of a family's client, by folder name. */
+export function managedVersions(root: string, family: ClientFamily): string[] {
+  return entries(join(root, family)).filter((name) => parseClientVersion(name)?.text === name);
+}
+
+/**
+ * What CrewKite keeps about its own copies of one family, in `clients/<family>.json` beside the
+ * family's folder: the newest build it fetched and the last fetched build it does not use. A
+ * sticky entry is one the same download would fail again, so that version is not fetched twice.
+ */
+export type ManagedRecord = {
+  fetched: { version: string; at: string } | null;
+  notUsed: { version: string; at: string; reason: string; sticky: boolean } | null;
+};
+
+export const managedRecordFile = (root: string, family: ClientFamily) =>
+  join(root, `${family}.json`);
+
+/** A missing or damaged record reads as empty. It is a note for the card and decides no trust. */
+export function readManagedRecord(root: string, family: ClientFamily): ManagedRecord {
+  const text = (value: unknown, limit: number) =>
+    typeof value === 'string' && value.length > 0 && value.length <= limit ? value : null;
+  try {
+    const raw = JSON.parse(readFileSync(managedRecordFile(root, family), 'utf8')) as {
+      fetched?: Record<string, unknown> | null;
+      notUsed?: Record<string, unknown> | null;
+    };
+    const fetched = { version: text(raw.fetched?.version, 200), at: text(raw.fetched?.at, 40) };
+    const notUsed = {
+      version: text(raw.notUsed?.version, 200),
+      at: text(raw.notUsed?.at, 40),
+      reason: text(raw.notUsed?.reason, 300),
+    };
+    return {
+      fetched: fetched.version && fetched.at ? { version: fetched.version, at: fetched.at } : null,
+      notUsed:
+        notUsed.version && notUsed.at && notUsed.reason
+          ? {
+              version: notUsed.version,
+              at: notUsed.at,
+              reason: notUsed.reason,
+              sticky: raw.notUsed?.sticky === true,
+            }
+          : null,
+    };
+  } catch {
+    return { fetched: null, notUsed: null };
+  }
+}
+
+/** The version folder a file sits in when it is one of CrewKite's own copies, else null. */
+export function managedVersionOf(
+  root: string,
+  family: ClientFamily,
+  executable: string,
+): string | null {
+  let folder: string;
+  try {
+    folder = realpathSync(join(root, family));
+  } catch {
+    return null;
+  }
+  if (!executable.startsWith(`${folder}/`)) return null;
+  const version = executable.slice(folder.length + 1).split('/')[0];
+  return parseClientVersion(version)?.text === version ? version : null;
+}
+
+/** Which copy runs and what CrewKite fetched, in the shape the card reads. */
+export function clientCopy(
+  family: ClientFamily,
+  executable: string,
+  root: string | null,
+): NonNullable<ClientVersionStatus['copy']> {
+  const record = root ? readManagedRecord(root, family) : { fetched: null, notUsed: null };
+  const held = root ? managedVersions(root, family) : [];
+  return {
+    place:
+      root && managedVersionOf(root, family, executable)
+        ? 'crewkite'
+        : place(family, executable)
+          ? 'provider-app'
+          : 'search-path',
+    path: executable.slice(0, 4096),
+    // A fetched build that was removed since is no longer a copy CrewKite holds.
+    fetched: record.fetched && held.includes(record.fetched.version) ? record.fetched : null,
+    notUsed: record.notUsed
+      ? { version: record.notUsed.version, reason: record.notUsed.reason }
+      : null,
+  };
 }
 
 /** One candidate: null to skip it, a status that refuses it, or an accepted client. */
@@ -431,7 +648,12 @@ function inspect(
   ) {
     if (options.cachedOnly)
       return {
-        status: clientVersionStatus(family, { state: 'version', path: executable, version: null }),
+        status: clientVersionStatus(family, {
+          state: 'version',
+          path: executable,
+          version: null,
+          managed: options.managed,
+        }),
       };
     const failures = read?.key === key ? read.failures : 0;
     // The digest is taken before the client runs. A file CrewKite cannot read, such as one that
@@ -461,6 +683,7 @@ function inspect(
     state: 'version',
     path: executable,
     version: read.version,
+    managed: options.managed,
   });
   return status.accepted && read.sha256
     ? {

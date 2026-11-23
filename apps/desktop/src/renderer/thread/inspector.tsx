@@ -280,7 +280,7 @@ function UsageTab({
   const actions = useProviderActions({ metadataCommand: (input) => source.command(input) });
   if (!header) return <p className="th-muted">Usage is not available yet.</p>;
   const scopes = projectUsagePresentation(header, null, now);
-  const cards = usageCards(scopes, header);
+  const cards = usageCards(scopes, header, now);
   const familyOf = new Map(scopes.map((scope) => [scope.id, scope.family]));
   // Each provider's Refresh sits in its own card's header, as a small icon button.
   const refresh = (card: UsageCard) => {

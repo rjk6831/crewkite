@@ -17,6 +17,7 @@ import { test } from 'node:test';
 import {
   CLIENT_VERSIONS,
   type ClientReads,
+  clientCopies,
   clientFileTrust,
   clientVersionState,
   clientVersionStatus,
@@ -29,7 +30,7 @@ import {
 
 const row = { tested: '0.163.0', minimum: '0.150.0' };
 
-test('the chat path accepts a client at or above the minimum within the tested major and refuses the rest', () => {
+test('the chat path accepts a client at or above the minimum, a new major build included, and refuses an older one', () => {
   for (const [output, state] of [
     ['codex-cli 0.163.0', 'tested'],
     ['codex-cli 0.170.2', 'newer'],
@@ -38,9 +39,9 @@ test('the chat path accepts a client at or above the minimum within the tested m
     ['0.150.0', 'supported'],
     ['codex-cli 0.149.9', 'older'],
     ['0.9.0', 'older'],
-    // A later major release is where native frames change without notice, so it is refused.
-    ['1.0.0', 'new-major'],
-    ['codex-cli 2.3.1', 'new-major'],
+    // A later major release runs too. The connect-time reads decide what it may do.
+    ['1.0.0', 'newer'],
+    ['codex-cli 2.3.1', 'newer'],
     // A prerelease ranks below its own release.
     ['0.163.0-alpha.2', 'supported'],
     ['0.164.0-beta.1', 'newer'],
@@ -199,8 +200,8 @@ test('Settings and the CLI name the found version and the state in plain words',
     ],
     [
       at('google', '2.0.0'),
-      false,
-      'Antigravity CLI 2.0.0 found. CrewKite is tested with 1.4.2 and does not run a new major version yet. Install a 1.x build, or update CrewKite.',
+      true,
+      'Antigravity CLI 2.0.0 found. Tested with 1.4.2; a newer build runs while its flags and replies match what CrewKite sends.',
     ],
     [
       at('google', null),
@@ -360,6 +361,99 @@ test('finding a client runs its version flag once per build and refuses an unsaf
 
     link(client('codex-silent', "echo 'no version here'"));
     assert.equal(find().status.state, 'unreadable');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test('the newest trusted copy runs wherever it sits, and an unsafe newer one never runs', () => {
+  const { root, bin, store, client, runs, link } = scratch();
+  try {
+    const cache: ClientReads = new Map();
+    // The search path holds an old build. A provider's desktop app and CrewKite's own folder hold
+    // newer ones, and a newer file other users can change sits beside them.
+    link(client('codex-path', "echo 'codex-cli 0.163.0'"));
+    const bundle = join(store, 'ChatGPT.app/Contents/MacOS');
+    mkdirSync(bundle, { recursive: true, mode: 0o755 });
+    const app = join(bundle, 'codex');
+    writeFileSync(app, "#!/bin/sh\necho 'codex-cli 0.169.0-alpha.11.1'\n");
+    chmodSync(app, 0o755);
+    const own = client('codex-own', "echo 'codex-cli 0.165.0'");
+    const unsafe = client('codex-unsafe', "echo 'codex-cli 0.180.0'", 0o775);
+    const find = () =>
+      findClient('openai', {
+        directories: [bin],
+        copies: [own, unsafe, app],
+        home: userInfo().homedir,
+        cache,
+        now: () => 0,
+      });
+    const found = find();
+    assert.equal(found.client?.executable, app);
+    assert.equal(found.client?.version, '0.169.0-alpha.11.1');
+    // A copy outside the search path is named, so the card says which one runs.
+    assert.match(found.status.message, /^Codex 0\.169\.0-alpha\.11\.1 found in ChatGPT\.app\. /);
+    assert.equal(runs(), 2, 'the unsafe copy never ran');
+    // A newer build on the search path wins in turn.
+    link(client('codex-update', "echo 'codex-cli 0.170.0'"));
+    assert.equal(find().client?.version, '0.170.0');
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("the copies outside the search path are the desktop apps and CrewKite's own folder", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'crewkite-client-copies-')));
+  try {
+    const support = join(root, 'Library/Application Support/Claude/claude-code');
+    for (const version of ['2.1.9', '2.1.10'])
+      mkdirSync(join(support, version, 'b1'), { recursive: true });
+    mkdirSync(join(root, 'state/clients/anthropic/2.1.11'), { recursive: true });
+    const environment = { HOME: root, CREWKITE_HOME: join(root, 'state') };
+    const own = join(root, 'state/clients/anthropic/2.1.11/claude');
+    for (const [family, platform, copies] of [
+      [
+        'openai',
+        'darwin',
+        [
+          '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+          '/Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+          join(
+            root,
+            'Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+          ),
+          join(
+            root,
+            'Applications/Codex.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex',
+          ),
+        ],
+      ],
+      [
+        'google',
+        'darwin',
+        [
+          '/Applications/Gemini.app/Contents/Helpers/agy',
+          join(root, 'Applications/Gemini.app/Contents/Helpers/agy'),
+        ],
+      ],
+      [
+        'anthropic',
+        'darwin',
+        [
+          // The newest version folder first, by number.
+          join(support, '2.1.10/b1/claude.app/Contents/MacOS/claude'),
+          join(support, '2.1.9/b1/claude.app/Contents/MacOS/claude'),
+          own,
+        ],
+      ],
+      // Linux has no desktop app copies here; CrewKite's own folder still counts.
+      ['anthropic', 'linux', [own]],
+    ] as const)
+      assert.deepEqual(
+        clientCopies(family, environment, { platform }),
+        copies,
+        `${family} ${platform}`,
+      );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
